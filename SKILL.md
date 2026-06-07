@@ -46,6 +46,7 @@ wall. Spawn each from its template charter.
 - Bots background `pr-watch.sh` (Bash run_in_background) and yield - never foreground-block a timeout, never gh-poll in a loop. The pr-shipper and pr-triage DO background pr-watch themselves (verified pattern): each bot runs pr-watch.sh with run_in_background, yields, and is re-invoked on completion. Cap relaunches (~3) + escalate; branch on exit code (pr-watch: 0=settled/blocked, 1=timeout->bounded relaunch, 2=setup-error->STOP+escalate, never retry).
 - Read-only bots run unattended safely ONLY because their charter forbids every mutation. Keep the charter ironclad.
 - LEAD IS THE SOLE HUMAN-FACING CHANNEL. Teammates NEVER emit an AskUserQuestion or trigger a human permission prompt - they MESSAGE THE LEAD instead. The lead SERIALIZES those and surfaces exactly ONE ask to the maintainer at a quiescent point (not mid-stream of team activity). This exists because concurrent teammate prompts are not FIFO'd: they clobber the input box and overwrite whatever the maintainer is mid-typing. Auto-mode bots plus the deterministic floor are configured precisely so teammates have NOTHING to prompt about (no permission decisions reach them). Batch asks, prefer plain-text asks over UI dialogs during active team work, and never let a teammate steal the human's focus.
+- LEAD SIGNAL DISCIPLINE (low-noise comms). The harness auto-renders every teammate message (reports, idle pings) to the maintainer; the lead CANNOT mute that, so it reduces noise by NOT adding to it. The lead goes SILENT during normal pipeline churn (no status recaps, no echoing teammate reports) and produces a maintainer-facing turn ONLY for (a) a decision that is the maintainer's to make, or (b) a ship-gate. Mark those two with a `## ▶ NEEDS YOU - <topic>` or `## ▶ SHIP-GATE #N - <name>` HEADING (NOT a blockquote - MD tables do not render inside `>`), and code-fence the actionable bits (URLs, SHAs, commands) - markdown structure + code fences are the only reliable visual emphasis in the terminal (raw ANSI is escaped by the renderer). Put any verification table as a TOP-LEVEL MD table (Claude Code redraws those well). Anything NOT prefixed `▶` is ignorable background. Ship-gate cards carry the closes-list, head SHA, a verification table, and a live URL (or an explicit "no URL: config-only" reason) per the punch-list rule. Maintainer-approved house style (2026-06-06 dogfood).
 - One server instance per agent on a LEASED port (from `orchestrate-resources.py`; never hand-picked); never dev-restart (it pkills all). The encryption key is provisioned as a 0600 file beside the DB, never as an env value (see stillwater profile docs).
 - DETERMINISTIC FLOOR (phase 1, INSTALLED): `~/.claude/scripts/orchestrate-guard.sh` is the PreToolUse `Bash` deny authority (deny outranks the shared allow-list). It hard-denies push-to-main/master, bare `--force`/`-f` (non-lease), and `--no-verify` ALWAYS, and hard-denies the MUTATING merge-by-API path (`gh api ... pulls/{n}/merge`) WHILE THIS session's `$TMUX`-keyed marker `~/.claude/orchestrate-floor.d/<sanitized-$TMUX>` is present and fresh (<=72h) (P3-A refcounting: per-session keying so parallel leads never disarm each other and a solo/non-tmux session is never gated; see `DESIGN-phase3a-marker-refcounting.md`). `gh pr merge` itself is NOT hook-gated: it is gated by the ALLOW-LIST (settings.json lists the non-merge `gh pr` subcommands but omits `merge`), so Claude Code PROMPTS the human for it - a human approves their own merge, an auto-mode bot stalls. (A PreToolUse hook on this CC honors a hard deny but IGNORES `permissionDecision:ask`, so the hook cannot prompt - the allow-list does. Verified by live test 2026-06-06; the earlier `ask` approach was rejected.) Tier-1 (push-main/force/no-verify) stays a hard deny. It fails OPEN on any internal error - the determinism guarantee lives in `test-orchestrate-guard.py`, not in fail-closed runtime. STILL CHARTER-LEVEL (NOT on the floor): generic `gh api -X` (the lead needs it mid-session for CodeQL dismiss / `resolveReviewThread`) and PR-blindness. Adversarial evasion (aliases, `$(...)`, wrapper scripts) is explicitly out of scope - the floor catches the honest-but-misaligned bot on the obvious command path, not an actively-evading one. The HIGH lifecycle items below (ref-ownership, single-writer stack, `head_sha` SHA-compare) are codified as charter invariants under the LEAD-DRIVEN model (lead owns git + watch + stack). See `DESIGN-deterministic-floor.md` + `REVIEW-FINDINGS.md`.
 - SINGLE REF-ADVANCER. Exactly ONE agent advances a branch's ref: the implementer worktree (commits + any rebase happen THERE). The pr-shipper is PUSH-ONLY - it pushes the branch by name and NEVER rebases, amends, or otherwise rewrites history. Before any fix round, the respawned implementer asserts the worktree exists, its branch matches, and reconciles worktree-HEAD vs `origin/<branch>` (fast-forward or rebase locally in the worktree) BEFORE editing - so the one ref-advancer is always reconciled with the remote it is about to re-push.
@@ -85,6 +86,7 @@ GUARDRAILS (naive Ralph bites here):
 - OBJECTIVE EXIT only: green gate, K-clean-rounds, CR-settled. Never "looks done."
 - ANTI-THRASH: if the loop oscillates (fix A re-breaks B), stop and surface to the lead.
 - HUMAN GATE STAYS: a loop converges a branch to SHIPPABLE; it NEVER auto-ships or auto-merges. The maintainer still gives the PR-go and the merge.
+- GO MEANS GO (maintainer directive, 2026-06-06). When the maintainer gives a go on a gated step (ship-gate, merge), EXECUTE IT FULLY and immediately - do not re-confirm, re-gate, hedge, or re-ask for an approval already given. The gate exists to GET the go; once given, the lead acts decisively. This does NOT weaken the gates: a branch must still genuinely pass build + prep + hostile review before a ship-gate is presented, and merge stays human. The directive only forbids double-prompting on an approval the maintainer already gave. (Inverse still holds per feedback_no_implicit_merge: "looks good"/"stabilized" is NOT a go.)
 
 ## Context discipline (protect every long-lived window)
 A Medium-effort Opus lead survives only a few hours before forced compaction, and teammates burn context too. Treat context as a budgeted resource, not free.
@@ -119,17 +121,25 @@ A Medium-effort Opus lead survives only a few hours before forced compaction, an
 - Teardown: `shutdown_request` each teammate -> WAIT for the "terminated" notice -> only then `TeamDelete` (it refuses while a member is alive). Keep every worktree until its PR MERGES (the keep-until-merge rule above) - never remove a worktree whose PR is still open. Then run `orchestrate-setup.py down --team <team>` to best-effort release the session's resource leases (non-fatal on failure).
 - Resume: read the checkpoint block FIRST, then re-spawn only what is needed.
 
-## Floor-friction feedback log (standing rule)
-When a deterministic-floor gate (or any hard gate) BLOCKS something that was legitimate, OR you
-spot a convenience that would NOT sacrifice security, the LEAD logs it to
+## Session feedback log (standing rule)
+ALL friction and improvement ideas surfaced during a run go to ONE place:
 `~/Developer/cc-orchestrator/orchestrate-session-feedback.md` (local, gitignored running log; see its
-header for the entry format). Log BOTH orchestration-specific frictions and general ones.
-Teammates that hit a blocked gate surface it to the lead, who records it (teammates do not write
-the log directly). This is the triage queue: entries get folded into guard/skill/charter fixes -
-the Tier-2 merge `ask` circuit-breaker came from exactly such a logged block (the floor was
-denying the human's own `! gh pr merge`). The security bar for any "convenience" entry: it must
-preserve the floor's guarantees (human-authorized merge, NO autonomous bot merge, and the
-always-on push-main/force/no-verify denies). Append, never rewrite; triage separately.
+header for the entry format). This covers a deterministic-floor (or any hard) gate that BLOCKS
+something legitimate, a convenience that would NOT sacrifice security, doc-drift, AND suggested
+improvements to this skill / charters / templates / playbook (house style, new invariants,
+lifecycle tweaks). NEVER edit `SKILL.md`, `templates/`, or `orchestrate-guard.sh` DIRECTLY mid-run:
+the skills dir (`~/.claude/skills/orchestrate`) is a SYMLINK to this repo, so an in-run edit
+silently mutates the canonical source AND races with the PR/CI work in flight (this rule itself
+came from that exact 2026-06-06 dogfood snag - a house-style note edited straight into SKILL.md
+collided with an in-flight PR and had to be reverted cross-session). Record it in the log; the
+LEAD folds it into the real file via the repo's normal PR process in a deliberate triage pass
+(do the edit in an ISOLATED git worktree so the live symlinked file is never touched until merge).
+Teammates that hit a blocked gate or have a suggestion surface it to the lead, who records it
+(teammates do not write the log directly). This is the triage queue: entries get folded into
+guard/skill/charter fixes - the Tier-2 merge `ask` circuit-breaker came from exactly such a logged
+block (the floor was denying the human's own `! gh pr merge`). The security bar for any
+"convenience" entry: it must preserve the floor's guarantees (human-authorized merge, NO autonomous
+bot merge, and the always-on push-main/force/no-verify denies). Append, never rewrite; triage separately.
 
 ## References
 - Templates live in `templates/` next to this file.
