@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""Proof harness for orchestrate-guard.sh.
+
+Runs each case through BOTH input channels (stdin JSON, $TOOL_INPUT env) and the
+specified marker state, asserting the guard's decision:
+  - "block": exit 2 (hard deny, stderr reason).
+  - "allow": exit 0 with NO permissionDecision on stdout (plain pass-through).
+
+MERGE GATING (revised 2026-06-06): `gh pr merge` is NOT gated by this hook - it is gated
+by the allow-list (settings.json omits a `gh pr merge` entry, so Claude Code PROMPTS the
+human; an auto-mode bot stalls). A PreToolUse hook on this CC honors a hard deny but
+IGNORES `permissionDecision:"ask"`, so the hook cannot prompt - hence `gh pr merge` is a
+plain "allow" here, and ONLY the merge-by-API path (`gh api ... pulls/N/merge` mutating)
+stays a marker-gated hook deny (because `gh api *` is broadly allow-listed). The harness
+also asserts the guard NEVER emits a permissionDecision anymore.
+Run: python3 test-orchestrate-guard.py
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+GUARD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "orchestrate-guard.sh")
+
+
+# Fixed test $TMUX for the common single-session cases.
+DEFAULT_TMUX = "/tmp/tmux-test,1,0"
+
+
+def _key(tmux):
+    """Mirror the guard's sanitization EXACTLY (byte-mode; contract; see DESIGN)."""
+    return re.sub(rb'[^A-Za-z0-9]', b'_', tmux.encode("utf-8", "surrogateescape")).decode("ascii")
+
+
+def run_guard(command, *, marker_active, channel, tmux=DEFAULT_TMUX,
+              foreign_keys=(), stale_self=False, ttl_hours=24):
+    """Invoke the guard. Returns (exit_code, stdout, stderr). channel in {'stdin','env'}.
+    command=None means 'send no command at all' (empty-read case).
+      - marker_active: arm THIS session's key (fresh) under FLOOR_DIR.
+      - tmux: the $TMUX value the guard sees (None => unset => never gated).
+      - foreign_keys: extra $TMUX values to arm (fresh) - other sessions' markers.
+      - stale_self: arm THIS session's key with an OLD mtime (older than TTL)."""
+    with tempfile.TemporaryDirectory() as td:
+        floor_dir = os.path.join(td, "orchestrate-floor.d")
+        os.makedirs(floor_dir, exist_ok=True)
+        # Default 24 (not the guard's 72h default) so the stale_self case only needs a
+        # ~25h-old file; passed to the guard via ORCHESTRATE_FLOOR_TTL_HOURS below.
+        # Overridable per-case (e.g. ttl_hours=0/-5) to exercise the guard's TTL clamp.
+        if marker_active and tmux is not None:
+            open(os.path.join(floor_dir, _key(tmux)), "w").close()  # fresh mtime
+        if stale_self and tmux is not None:
+            p = os.path.join(floor_dir, _key(tmux))
+            open(p, "w").close()
+            old = time.time() - (ttl_hours + 1) * 3600
+            os.utime(p, (old, old))
+        for fk in foreign_keys:
+            open(os.path.join(floor_dir, _key(fk)), "w").close()
+        env = dict(os.environ)
+        env["ORCHESTRATE_FLOOR_DIR"] = floor_dir
+        env["ORCHESTRATE_FLOOR_TTL_HOURS"] = str(ttl_hours)
+        if tmux is None:
+            env.pop("TMUX", None)
+        else:
+            env["TMUX"] = tmux
+        env.pop("TOOL_INPUT", None)
+        env.pop("ORCHESTRATE_FLOOR_MARKER", None)  # legacy var is gone
+        stdin_data = ""
+        if command is not None:
+            payload = {"tool_name": "Bash", "tool_input": {"command": command}}
+            if channel == "stdin":
+                stdin_data = json.dumps(payload)
+            elif channel == "env":
+                env["TOOL_INPUT"] = json.dumps({"command": command})
+        p = subprocess.run([GUARD], input=stdin_data, env=env,
+                           capture_output=True, text=True, timeout=5)
+        return p.returncode, p.stdout, p.stderr
+
+
+def has_decision(stdout):
+    """True if stdout carries any hook permissionDecision. The guard should NEVER emit one
+    now (the ask approach was rejected - CC ignored it); this catches a regression."""
+    try:
+        json.loads(stdout)["hookSpecificOutput"]["permissionDecision"]
+        return True
+    except (ValueError, KeyError, TypeError):
+        return False
+
+
+# Case table: (label, command, marker_active, expected_mode in {"block","allow"})
+# command=None => empty-read case (no stdin, no env).
+CASES = [
+    ("empty-read fails open (no stdin/env)", None, False, "allow"),
+    # Tier-1 push-main: blocked ALWAYS (marker irrelevant)
+    ("git push origin main", "git push origin main", False, "block"),
+    ("git -C wt push origin main", "git -C ../wt push origin main", False, "block"),
+    ("git push origin HEAD:main (refspec)", "git push origin HEAD:main", False, "block"),
+    ("safe-push.sh main", "scripts/safe-push.sh main", False, "block"),
+    ("push master", "git push origin master", False, "block"),
+    # false-positive guards
+    ("branch named maintenance allowed", "git push origin maintenance # prep-pr-ok", False, "allow"),
+    ("branch named domain allowed", "git push origin domain # prep-pr-ok", False, "allow"),
+    ("feature branch push (advisory only, has override)",
+     "git push origin feat # prep-pr-ok", False, "allow"),
+    # Tier-1 force / no-verify: blocked ALWAYS
+    ("bare --force push", "git push --force origin feat", False, "block"),
+    ("-f push", "git push -f origin feat", False, "block"),
+    ("safe-push --force", "scripts/safe-push.sh feat --force", False, "block"),
+    ("--no-verify push", "git push --no-verify origin feat", False, "block"),
+    # Tier-1 git --no-verify on ANY git subcommand (broadened from push-only): blocked ALWAYS
+    ("git commit --no-verify", "git commit --no-verify", False, "block"),
+    ("git commit -m msg --no-verify", 'git commit -m msg --no-verify', False, "block"),
+    ("git rebase --no-verify", "git rebase --no-verify", False, "block"),
+    ("git commit -m msg (no flag) allowed", "git commit -m msg", False, "allow"),
+    ("git pull --no-verify (pull forwards to merge)", "git pull --no-verify", False, "block"),
+    # scoped-negative: --no-verify with NO git invocation must NOT be blocked
+    ("sometool --no-verify (no git) allowed", "sometool --no-verify", False, "allow"),
+    # subcommand-scoping false-positive guards (FP-round1): the `git` word + `--no-verify`
+    # substring present, but NO git subcommand that accepts the flag -> must ALLOW.
+    ("gh issue title bans --no-verify mentioning git allowed",
+     'gh issue create --title "ban --no-verify in git workflows" --body x', False, "allow"),
+    ("git config alias with --no-verify in value allowed",
+     'git config alias.foo "log --no-verify-style"', False, "allow"),
+    # global opts between git and the accepting subcommand still block (anchoring is loose)
+    ("git -C dir commit --no-verify still blocks", "git -C ../wt commit --no-verify", False, "block"),
+    # subcommand that does NOT accept --no-verify + token in an arg -> allow
+    ("git log --grep with --no-verify in pattern allowed",
+     'git log --grep="--no-verify"', False, "allow"),
+    # Tier-1 gh pr merge --admin (admin-bypass overriding branch protection): blocked ALWAYS.
+    # SUBCOMMAND-anchored: `gh pr merge` is the ONLY gh subcommand that accepts --admin.
+    ("gh pr merge --admin", "gh pr merge --admin 1868", False, "block"),
+    ("gh pr merge --squash --admin", "gh pr merge --squash --admin 1868", False, "block"),
+    ("gh -R o/r pr merge --admin (global flags)", "gh -R o/r pr merge --admin 5", False, "block"),
+    # scoped-negative: --admin with NO gh invocation must NOT be blocked
+    ("sometool --admin (no gh) allowed", "sometool --admin", False, "allow"),
+    ("gh pr view (no admin) allowed", "gh pr view 123", False, "allow"),
+    ("gh pr list (no admin) allowed", "gh pr list", False, "allow"),
+    # subcommand-scoping false-positive guards (FP-round1): --admin in a NON-merge gh
+    # subcommand cannot be a real bypass (gh rejects the flag there) -> must ALLOW.
+    # `gh repo edit --admin` is NOT a bypass (repo edit takes no --admin); gh would error.
+    ("gh repo edit --admin (not a merge bypass) allowed", "gh repo edit --admin", False, "allow"),
+    ("gh pr create --title with --admin literal allowed",
+     'gh pr create --title "block gh --admin"', False, "allow"),
+    ("gh issue comment body documents --admin allowed",
+     'gh issue comment 5 -b "document the --admin flag"', False, "allow"),
+    ("git commit msg mentions gh --admin (no pr merge) allowed",
+     'git commit -m "doc the --admin gh flag"', False, "allow"),
+    # gh absent -> admin deny cannot fire even if pr/merge/--admin words are in prose
+    ("git commit msg 'pr merge --admin' (no gh word) allowed",
+     'git commit -m "do not pr merge --admin"', False, "allow"),
+    ("--force-with-lease allowed", "git push --force-with-lease origin feat # prep-pr-ok", False, "allow"),
+    ("git clean --force allowed", "git clean --force", False, "allow"),
+    # `gh pr merge` is NOT hook-gated (allow-list + CC prompt handle it) -> plain allow,
+    # marker present or not. The hook must NOT block it and must NOT emit a decision.
+    ("gh pr merge (marker active) -> allow (allow-list/prompt gates it)", "gh pr merge 1868", True, "allow"),
+    ("gh pr merge --auto (active) -> allow", "gh pr merge --auto 1868", True, "allow"),
+    ("gh -R o/r pr merge (active) -> allow", "gh -R o/r pr merge 1868", True, "allow"),
+    ("gh pr merge (marker absent) -> allow", "gh pr merge 1868", False, "allow"),
+    # merge-by-API stays a marker-gated HARD DENY (gh api * is broadly allow-listed)
+    ("merge-by-API PUT (active) -> block", "gh api -X PUT repos/o/r/pulls/1/merge", True, "block"),
+    ("merge-by-API --method PUT (active) -> block", "gh api --method PUT repos/o/r/pulls/1/merge", True, "block"),
+    ("merge-by-API field-implies-POST (active) -> block",
+     "gh api repos/o/r/pulls/1/merge -f merge_method=squash", True, "block"),
+    ("merge-by-API --method=PUT glued (active) -> block", "gh api --method=PUT repos/o/r/pulls/1/merge", True, "block"),
+    ("merge-by-API -XPUT glued (active) -> block", "gh api -XPUT repos/o/r/pulls/1/merge", True, "block"),
+    ("merge-by-API -X=PUT (active) -> block", "gh api -X=PUT repos/o/r/pulls/1/merge", True, "block"),
+    ("merge-by-API --field= glued (active) -> block", "gh api repos/o/r/pulls/1/merge --field=merge_method=squash", True, "block"),
+    ("merge-by-API -f glued (active) -> block", "gh api repos/o/r/pulls/1/merge -fmerge_method=squash", True, "block"),
+    # merge-by-API with marker ABSENT -> allowed (solo session untouched)
+    ("merge-by-API PUT (absent) allowed", "gh api -X PUT repos/o/r/pulls/1/merge", False, "allow"),
+    # false-positives: plain-ALLOW even with marker active
+    ("gh pr create title contains merge (active)",
+     'gh pr create --title "merge auth refactor"', True, "allow"),
+    ("gh api GET merge-status check (active)",
+     "gh api repos/o/r/pulls/5/merge", True, "allow"),
+    ("CodeQL dismiss -X PATCH (active) allowed",
+     "gh api -X PATCH repos/o/r/code-scanning/alerts/5", True, "allow"),
+    ("CodeQL dismiss --method=PATCH glued (active) allowed",
+     "gh api --method=PATCH repos/o/r/code-scanning/alerts/5", True, "allow"),
+    ("gh pr view (active) allowed", "gh pr view 1868", True, "allow"),
+    # prep-pr-ok advisory gate
+    ("feature push without override blocked", "git push origin feat", False, "block"),
+    ("push main + prep-pr-ok still blocked", "git push origin main # prep-pr-ok", False, "block"),
+    # non-push commands always allowed
+    ("ls allowed", "ls -la", False, "allow"),
+    ("git status allowed", "git status", False, "allow"),
+    # per-clause hard denies (FP1 fix)
+    ("compound: checkout main && push feat (FP1 allowed)",
+     "git checkout main && git push origin feat # prep-pr-ok", False, "allow"),
+    ("compound: clean --force && push feat (FP1 allowed)",
+     "git clean --force && git push origin feat # prep-pr-ok", False, "allow"),
+    ("compound: commit msg has main && push feat (FP1 allowed)",
+     'git commit -m "fix main bug" && git push origin feat # prep-pr-ok', False, "allow"),
+    ("compound: rm -f && push feat (FP1 allowed)",
+     "rm -f x.tmp && git push origin feat # prep-pr-ok", False, "allow"),
+    ("compound: push main && ls still blocks (no per-clause bypass)",
+     "git push origin main && ls", False, "block"),
+    # compound: `gh pr merge` is not hook-gated, so view && merge is plain allow...
+    ("compound: view && gh-pr-merge (active) -> allow (not hook-gated)",
+     "gh pr view 5 && gh pr merge 5", True, "allow"),
+    # ...but a merge-by-API clause in a compound still hard-blocks (per-clause)
+    ("compound: view && merge-by-API (active) -> block (per-clause)",
+     "gh pr view 5 && gh api -X PUT repos/o/r/pulls/5/merge", True, "block"),
+    # a `gh pr merge` ASK must not pre-empt a Tier-1 push-main: it is not gated anyway,
+    # but the push-main in a later clause must still hard-block.
+    ("compound: gh-pr-merge && push main still BLOCKS (Tier-1 wins)",
+     "gh pr merge 5 && git push origin main", True, "block"),
+    ("compound: gh-pr-merge && force push still BLOCKS (Tier-1 wins)",
+     "gh pr merge 5 && git push --force origin feat", True, "block"),
+    # G1: quoted main destination
+    ("G1 quoted 'main' dest blocked", "git push origin 'main'", False, "block"),
+    ('G1 quoted "main" dest blocked', 'git push origin "main"', False, "block"),
+    # G2 accepted limitation
+    ("G2 glued -fu force accepted-limitation (allowed w/ override)",
+     "git push -fu origin feat # prep-pr-ok", False, "allow"),
+    # push-subcommand anchoring
+    ("commit msg says 'push to main' is NOT a push (allowed)",
+     'git -C ../wt commit -m "ci: docker job runs only on push to main"', False, "allow"),
+    ("git log main..HEAD read-only ref (allowed)", "git log main..HEAD", False, "allow"),
+    ("git merge-base main HEAD read-only (allowed)", "git merge-base main HEAD", False, "allow"),
+    ("git diff main..HEAD read-only (allowed)", "git diff main..HEAD", False, "allow"),
+    ("git rev-list main..HEAD read-only (allowed)", "git rev-list main..HEAD", False, "allow"),
+    ("env-prefix real push origin main still blocks",
+     "GIT_PAGER=cat git push origin main", False, "block"),
+    ("git -C wt push origin main still blocks", "git -C ../wt push origin main", False, "block"),
+    ("commit msg mentions safe-push + main is NOT a push (allowed)",
+     'git commit -m "doc: use safe-push.sh for features, never push main"', False, "allow"),
+    ("bash-wrapped safe-push to main still blocks", "bash scripts/safe-push.sh main", False, "block"),
+    ("env-prefix safe-push to main still blocks", "FOO=bar scripts/safe-push.sh main", False, "block"),
+    ("./safe-push.sh master still blocks", "./safe-push.sh master", False, "block"),
+    ("~/.claude path safe-push main still blocks", "~/.claude/scripts/safe-push.sh main", False, "block"),
+    ("cd wt && safe-push main still blocks (per-clause)", "cd ../wt && safe-push.sh main", False, "block"),
+    ("safe-push feature branch allowed (override)", "scripts/safe-push.sh feat # prep-pr-ok", False, "allow"),
+    ("gh pr diff allowed", "gh pr diff 1868", False, "allow"),
+    ("gh api PR resource GET allowed (marker active)", "gh api repos/o/r/pulls/1", True, "allow"),
+    ("gh api graphql field-flag non-merge allowed (marker active, F8)", "gh api graphql -f query=...resolveReviewThread...", True, "allow"),
+]
+
+FAILS = []
+
+
+def check(label, command, marker_active, expected):
+    channels = ["stdin", "env"] if command is not None else ["stdin"]
+    for ch in channels:
+        rc, stdout, _stderr = run_guard(command, marker_active=marker_active, channel=ch)
+        if expected == "block":
+            ok = (rc == 2)
+        elif expected == "allow":
+            # plain allow: exit 0 AND no permissionDecision leaked onto stdout
+            ok = (rc == 0 and not has_decision(stdout))
+        else:
+            ok = False
+        status = "ok" if ok else "FAIL"
+        if not ok:
+            FAILS.append(f"{label} [{ch}]: expected {expected}, got exit {rc} "
+                         f"hasDecision={has_decision(stdout)}")
+        print(f"  [{status}] {label} [{ch}] -> exit {rc} (want {expected})")
+
+
+def main():
+    for label, command, marker_active, expected in CASES:
+        check(label, command, marker_active, expected)
+
+    # --- P3-A refcount / keying properties (merge-by-API is the only marker-gated path) ---
+    MERGE_API = "gh api -X PUT repos/o/r/pulls/1/merge"
+    SESS_A = "/tmp/tmux-501/default,111,0"
+    SESS_B = "/tmp/tmux-501/default,222,1"
+
+    def expect(label, rc, want):
+        ok = (rc == 2) if want == "block" else (rc == 0)
+        print(f"  [{'ok' if ok else 'FAIL'}] {label} -> exit {rc} (want {want})")
+        if not ok:
+            FAILS.append(f"{label}: expected {want}, got exit {rc}")
+
+    rc, _o, _e = run_guard(MERGE_API, marker_active=True, channel="stdin", tmux=SESS_A)
+    expect("refcount: armed self merge-by-API blocked", rc, "block")
+    rc, _o, _e = run_guard(MERGE_API, marker_active=False, channel="stdin",
+                           tmux=SESS_B, foreign_keys=[SESS_A])
+    expect("refcount: foreign marker does NOT gate me", rc, "allow")
+    rc, _o, _e = run_guard(MERGE_API, marker_active=False, channel="stdin",
+                           tmux=None, foreign_keys=[SESS_A])
+    expect("refcount: empty $TMUX never gated", rc, "allow")
+    rc, _o, _e = run_guard(MERGE_API, marker_active=False, channel="stdin",
+                           tmux=SESS_A, stale_self=True)
+    expect("refcount: stale self marker not gated", rc, "allow")
+    rc, _o, _e = run_guard(MERGE_API, marker_active=True, channel="stdin",
+                           tmux=SESS_A, foreign_keys=[SESS_B])
+    expect("refcount: two armed - A gated under A", rc, "block")
+    rc, _o, _e = run_guard(MERGE_API, marker_active=True, channel="stdin",
+                           tmux=SESS_B, foreign_keys=[SESS_A])
+    expect("refcount: two armed - B gated under B", rc, "block")
+    rc, _o, _e = run_guard("git" + " push origin main", marker_active=False,
+                           channel="stdin", tmux=None)
+    expect("refcount: Tier-1 push-main blocks regardless of $TMUX", rc, "block")
+
+    # Tier-1 git --no-verify and gh --admin are marker-INDEPENDENT: no $TMUX, no marker.
+    rc, _o, _e = run_guard("git commit --no-verify", marker_active=False,
+                           channel="stdin", tmux=None)
+    expect("marker-indep: git --no-verify blocks with no $TMUX/marker", rc, "block")
+    rc, _o, _e = run_guard("gh pr merge --admin 1868", marker_active=False,
+                           channel="stdin", tmux=None)
+    expect("marker-indep: gh --admin blocks with no $TMUX/marker", rc, "block")
+
+    # Post-disarm isolation (the defect P3-A fixes): with only B armed (A's marker
+    # removed), A is NOT gated but B still is. foreign_keys arms B; marker_active=False
+    # for A models A having been disarmed while B stays live.
+    rc, _o, _e = run_guard(MERGE_API, marker_active=False, channel="stdin",
+                           tmux=SESS_A, foreign_keys=[SESS_B])
+    expect("refcount: after A disarmed, A not gated (B still armed)", rc, "allow")
+    rc, _o, _e = run_guard(MERGE_API, marker_active=True, channel="stdin",
+                           tmux=SESS_B, foreign_keys=[])
+    expect("refcount: after A disarmed, B still gated", rc, "block")
+
+    # Key-contract: a known $TMUX maps to the expected sanitized filename, AND the guard
+    # actually finds a marker placed at that exact path. Guards against sanitization drift
+    # (e.g. tr -cs squeeze) that the value-specific cases above would not catch.
+    contract_tmux = "/tmp/tmux-501/default,111,0"
+    if _key(contract_tmux) != "_tmp_tmux_501_default_111_0":
+        FAILS.append(f"key-contract: _key({contract_tmux!r}) = {_key(contract_tmux)!r}, "
+                     "expected '_tmp_tmux_501_default_111_0'")
+        print("  [FAIL] key-contract: sanitized key mismatch")
+    else:
+        print("  [ok] key-contract: sanitized key == _tmp_tmux_501_default_111_0")
+    rc, _o, _e = run_guard(MERGE_API, marker_active=True, channel="stdin", tmux=contract_tmux)
+    expect("key-contract: guard finds marker at the known sanitized path", rc, "block")
+
+    # TTL clamp: a non-positive ORCHESTRATE_FLOOR_TTL_HOURS must NOT silently disarm the
+    # gate. The guard rejects 0/negative/non-integer and falls back to 72h, so a FRESH
+    # marker still blocks. (Without the clamp, age_h < 0 would be false -> never active.)
+    rc, _o, _e = run_guard(MERGE_API, marker_active=True, channel="stdin", tmux=SESS_A, ttl_hours=0)
+    expect("ttl-clamp: TTL=0 still blocks a fresh marker (clamped to 72h)", rc, "block")
+    rc, _o, _e = run_guard(MERGE_API, marker_active=True, channel="stdin", tmux=SESS_A, ttl_hours=-5)
+    expect("ttl-clamp: TTL=-5 still blocks a fresh marker (clamped to 72h)", rc, "block")
+
+    # Locale-independent key: a multibyte $TMUX is sanitized byte-wise (LC_ALL=C tr) on the
+    # guard side, matching run_guard's byte-mode _key for placing the marker. If they agreed
+    # only under a UTF-8 locale this would fail when the guard runs under LC_ALL=C.
+    mb_tmux = "/tmp/tmux-café/sock,7,0"
+    rc, _o, _e = run_guard(MERGE_API, marker_active=True, channel="stdin", tmux=mb_tmux)
+    expect("locale: multibyte $TMUX keys identically (guard finds the marker)", rc, "block")
+
+    # Regression: hard-deny block messages must NOT echo a re-enabling token.
+    HARD_DENY = [
+        ("git push origin main", False),
+        ("git push --force origin feat", False),
+        ("git push --no-verify origin feat", False),
+        ("git commit --no-verify", False),
+        ("gh pr merge --admin 1868", False),
+        ("gh api -X PUT repos/o/r/pulls/1/merge", True),  # merge-by-API stays a hard deny
+    ]
+    for cmd, active in HARD_DENY:
+        rc, _stdout, stderr = run_guard(cmd, marker_active=active, channel="stdin")
+        if rc != 2:
+            FAILS.append(f"regression setup: '{cmd}' expected block(2), got {rc}")
+        elif "prep-pr-ok" in stderr:
+            FAILS.append(f"regression: hard-deny message for '{cmd}' leaks the prep-pr-ok bypass token")
+        else:
+            print(f"  [ok] regression: '{cmd}' blocks without leaking a bypass token")
+
+    # Regression: the guard must NEVER emit a hook permissionDecision anymore (the `ask`
+    # approach was rejected - this CC ignores it; emitting it is dead/misleading output).
+    saw_decision = False
+    for cmd, active in [("gh pr merge 1868", True), ("gh api -X PUT repos/o/r/pulls/1/merge", True),
+                        ("git push origin main", False)]:
+        _rc, stdout, _stderr = run_guard(cmd, marker_active=active, channel="stdin")
+        if has_decision(stdout):
+            saw_decision = True
+            FAILS.append(f"regression: guard emitted a permissionDecision for '{cmd}' (ask was removed)")
+    if not saw_decision:
+        print("  [ok] regression: guard emits no permissionDecision on any path (ask removed)")
+
+    print()
+    if FAILS:
+        print(f"{len(FAILS)} FAILED:")
+        for f in FAILS:
+            print(f"  - {f}")
+        sys.exit(1)
+    print(f"All {len(CASES)} allow/block cases + P3-A refcount/key-contract cases "
+          f"+ {len(HARD_DENY) + 1} regressions passed.")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

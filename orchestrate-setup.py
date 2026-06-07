@@ -1,0 +1,566 @@
+#!/usr/bin/env python3
+"""orchestrate-setup.py - bootstrap/teardown for an orchestrate session.
+
+  doctor [--repo PATH]                          read-only prerequisite check (exit 0 ok, 1 hard-fail)
+  up --team NAME --repo PATH [--spacing SEC]    arm a session (scaffold + marker + armed self-test)
+  down [--team NAME]                            disarm (rm marker + print teardown checklist)
+
+Design: ~/.claude/skills/orchestrate/DESIGN-phase2-setup.md
+All real paths come from env vars (see below) so the harness drives temp fixtures.
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+
+def _int_env(name, default, minimum=None):
+    """Parse an int env var, falling back to default on absent-or-malformed (no
+    ugly import-time traceback from a typo in an obscure override). When `minimum`
+    is given, a parsed value below it is clamped UP to default (not to the minimum),
+    so e.g. a TTL of 0 or negative cannot turn the floor into a footgun."""
+    try:
+        val = int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+    if minimum is not None and val < minimum:
+        return default
+    return val
+
+
+HOME = os.path.expanduser("~")
+SETTINGS = os.environ.get("ORCHESTRATE_SETTINGS", os.path.join(HOME, ".claude", "settings.json"))
+FLOOR_DIR = os.environ.get("ORCHESTRATE_FLOOR_DIR", os.path.join(HOME, ".claude", "orchestrate-floor.d"))
+# minimum=1: a TTL of 0/negative would make _gc_stale_tombstones treat EVERY marker
+# (including a live foreign session's fresh one) as stale and delete it - the cardinal
+# P3-A cross-session-disarm sin. Clamp back to the default instead.
+TTL_HOURS = _int_env("ORCHESTRATE_FLOOR_TTL_HOURS", 72, minimum=1)
+GUARD = os.environ.get("ORCHESTRATE_GUARD", os.path.join(HOME, ".claude", "scripts", "orchestrate-guard.sh"))
+TEMPLATES = os.environ.get("ORCHESTRATE_TEMPLATES_DIR", os.path.join(HOME, ".claude", "skills", "orchestrate", "templates"))
+ARTIFACTS = os.environ.get("ORCHESTRATE_ARTIFACT_DIR", "/tmp")
+
+PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
+
+
+def _emit(status, msg):
+    print(f"[{status:4}] {msg}")
+    return status
+
+
+def _load_settings():
+    try:
+        with open(SETTINGS) as f:
+            return json.load(f)
+    except OSError:
+        return None
+    except json.JSONDecodeError:
+        print(f"WARN: settings.json present but unparseable at {SETTINGS}", file=sys.stderr)
+        return None
+
+
+def check_agent_teams(settings):
+    on = os.environ.get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS") == "1"
+    if not on and settings:
+        on = settings.get("env", {}).get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS") == "1"
+    mode = (settings or {}).get("teammateMode")
+    if on and mode == "tmux":
+        return _emit(PASS, "Agent Teams enabled (env=1, teammateMode=tmux)")
+    return _emit(FAIL, f"Agent Teams not ready (enabled={on}, teammateMode={mode!r}); set CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 + teammateMode=tmux")
+
+
+def check_tmux():
+    if not shutil.which("tmux"):
+        return _emit(FAIL, "tmux not installed")
+    if not os.environ.get("TMUX"):
+        return _emit(FAIL, "lead is NOT inside tmux ($TMUX empty) - teammates will not spawn; relaunch claude inside tmux")
+    return _emit(PASS, "tmux installed and lead is inside it")
+
+
+GUARD_HOOK_JSON = """  Add this to ~/.claude/settings.json under hooks.PreToolUse (verify-and-print; this
+  script never writes settings.json):
+    { "matcher": "Bash", "hooks": [ { "type": "command",
+      "command": "bash \\"$HOME/.claude/scripts/orchestrate-guard.sh\\"" } ] }"""
+
+
+def check_guard_wired(settings):
+    hooks = (settings or {}).get("hooks", {}).get("PreToolUse", [])
+    for block in hooks:
+        if block.get("matcher") == "Bash":
+            for h in block.get("hooks", []):
+                if "orchestrate-guard.sh" in h.get("command", ""):
+                    return _emit(PASS, "guard wired as the PreToolUse Bash hook")
+    _emit(FAIL, "guard NOT wired as a PreToolUse Bash hook")
+    print(GUARD_HOOK_JSON)
+    return FAIL
+
+
+def check_guard_healthy():
+    try:
+        p = subprocess.run([GUARD, "--self-test"], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as e:
+        return _emit(FAIL, f"guard self-test could not run ({e}); guard at {GUARD}")
+    if p.returncode == 0:
+        return _emit(PASS, "guard --self-test passes (not failing open)")
+    return _emit(FAIL, f"guard --self-test FAILED (rc={p.returncode}); guard may be failing open")
+
+
+def check_repo_main(repo):
+    """Returns (status, head_sha_or_None)."""
+    if not repo:
+        return _emit(WARN, "no --repo given; skipping repo/HEAD check"), None
+    try:
+        head = subprocess.run(["git", "-C", repo, "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, timeout=15)
+        dirty = subprocess.run(["git", "-C", repo, "status", "--porcelain"],
+                              capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as e:
+        return _emit(FAIL, f"could not inspect repo {repo}: {e}"), None
+    if head.returncode != 0:
+        return _emit(FAIL, f"{repo} is not a git repo"), None
+    h = head.stdout.strip()
+    if dirty.stdout.strip():
+        return _emit(WARN, f"{repo} HEAD={h} but working tree is DIRTY (stray files won't block, just a heads-up)"), h
+    return _emit(PASS, f"{repo} clean at HEAD={h}"), h
+
+
+def _normalize_allow_entry(entry):
+    """Collapse leading // inside tool parens to a single / (Claude-Code idiom -> real path)."""
+    import re
+    return re.sub(r'\(//([^)]+)\)', r'(/\1)', entry)
+
+
+def check_allowlist(settings):
+    import re
+    allow_raw = (settings or {}).get("permissions", {}).get("allow", [])
+    # Normalize settings entries the same way so comparisons are apples-to-apples.
+    allow = set(_normalize_allow_entry(e) for e in allow_raw)
+    req_file = os.path.join(TEMPLATES, "required-permissions.md")
+    try:
+        text = open(req_file).read()
+    except OSError:
+        return _emit(WARN, f"required-permissions.md not found at {req_file}; skipping allow-list diff")
+    # Extract only the "## Needed allow-list entries" section (stop at the next ## heading).
+    section_match = re.search(r'^## Needed allow-list entries[^\n]*\n(.*?)(?=^## |\Z)',
+                               text, re.MULTILINE | re.DOTALL)
+    if not section_match:
+        return _emit(WARN, "required-permissions.md has no '## Needed allow-list entries' section; skipping diff")
+    section = section_match.group(1)
+    needed = set()
+    for line in section.splitlines():
+        # Skip lines that are commentary/notes (not prescriptive allow-list items).
+        if "NOTE:" in line:
+            continue
+        for entry in re.findall(r"`(Bash\([^`]+\)|Write\([^`]+\)|Edit\([^`]+\)|Read\([^`]+\))`", line):
+            needed.add(_normalize_allow_entry(entry))
+    missing = sorted(n for n in needed if n not in allow)
+    if not missing:
+        return _emit(PASS, "allow-list covers the documented bot entries")
+    _emit(WARN, f"{len(missing)} allow-list entries from required-permissions.md are MISSING:")
+    for m in missing:
+        print(f"         {m}")
+    return WARN
+
+
+def scaffold_artifacts(team, repo, spacing):
+    # P3-A: all artifacts live under a per-team dir so parallel teams don't clobber each
+    # other (stack drops its <team>- prefix - the dir now carries the team identity).
+    team_dir = os.path.join(ARTIFACTS, team)
+    os.makedirs(team_dir, exist_ok=True)
+    stack = os.path.join(team_dir, "stack.json")
+    with open(stack, "w") as f:
+        json.dump([], f)
+    triage = os.path.join(team_dir, "pr-triage")
+    os.makedirs(triage, exist_ok=True)
+    os.makedirs(os.path.join(team_dir, "adv-review"), exist_ok=True)
+    brief_out = os.path.join(team_dir, "pr-shipper-brief.md")
+    src = os.path.join(TEMPLATES, "pr-shipper-brief.md")
+    try:
+        body = open(src).read()
+    except OSError:
+        body = "# pr-shipper brief\n(template not found; fill manually)\n"
+    # Substitute the real template tokens: <REPO>, <STACK>, <SPACING_MIN>.
+    # The team is captured in the injected header comment; the template has no team token.
+    body = (body.replace("<REPO>", repo)
+                .replace("<STACK>", stack)
+                .replace("<SPACING_MIN>", str(spacing)))
+    header = f"<!-- rendered by orchestrate-setup.py: team={team} repo={repo} spacing={spacing}min stack={stack} -->\n"
+    with open(brief_out, "w") as f:
+        f.write(header + body)
+    return stack, triage, brief_out
+
+
+# First char must be alphanumeric: blocks path-escape (`.`/`..`/`/`) AND leading-dash
+# names like `-rf` that would later be mis-parsed as flags by shell tools touching the dir.
+TEAM_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
+
+
+def _validate_team(team):
+    """A team name becomes a /tmp path component, so reject anything that could escape
+    the artifact dir or break os.path.join. SystemExit -> clean non-zero, no traceback."""
+    if not team or not TEAM_RE.match(team):
+        raise SystemExit(f"up: ABORT - invalid --team {team!r}; must start with a letter or "
+                         "digit and contain only [A-Za-z0-9._-] (no '/', no leading '.'/'-').")
+
+
+def _now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _session_key():
+    """This session's marker key, mirroring the guard's sanitization EXACTLY.
+    Returns None when $TMUX is empty (a non-tmux session is never an orchestrate
+    session and must never arm/own a marker)."""
+    tmux = os.environ.get("TMUX", "")
+    if not tmux:
+        return None
+    # Byte-mode to match the guard's `LC_ALL=C tr -c 'A-Za-z0-9' '_'` (each non-alnum
+    # BYTE -> '_'), so the two sides key identically regardless of locale. surrogateescape
+    # round-trips the original env bytes; the result is pure ASCII alnum/underscore.
+    raw = tmux.encode("utf-8", "surrogateescape")
+    return re.sub(rb'[^A-Za-z0-9]', b'_', raw).decode("ascii")
+
+
+def _marker_path():
+    key = _session_key()
+    return os.path.join(FLOOR_DIR, key) if key else None
+
+
+def arm_marker(team, repo, head):
+    """Arm THIS session's keyed marker. Refuses without $TMUX (cannot key it)."""
+    path = _marker_path()
+    if not path:
+        raise RuntimeError("cannot arm the floor without $TMUX (no session key)")
+    os.makedirs(FLOOR_DIR, exist_ok=True)
+    with open(path, "w") as f:
+        f.write(f"orchestrate session\nteam: {team}\nstarted: {_now_iso()}\n"
+                f"repo: {repo}\nhead: {head}\ntmux: {os.environ.get('TMUX', '')}\n")
+    return path
+
+
+def _feed_guard(command):
+    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+    p = subprocess.run([GUARD], input=payload, capture_output=True, text=True, timeout=15)
+    return p.returncode
+
+
+def armed_self_test():
+    """With the marker armed, the guard must HARD-DENY (exit 2) BOTH:
+      - Tier-1 push-main, AND
+      - Tier-2 merge-by-API (`gh api ... pulls/N/merge` mutating).
+    `gh pr merge` is intentionally NOT hook-gated (the allow-list + a Claude Code prompt
+    gate it, because a PreToolUse hook on this CC honors a deny but ignores `ask`), so it
+    is not asserted here. Payloads are built here and fed on stdin, so the live hook never
+    sees a trigger on the command line (the orchestrate test-driving rule)."""
+    t1 = _feed_guard("git push origin main")
+    t2 = _feed_guard("gh api -X PUT repos/o/r/pulls/5/merge")
+    return t1 == 2 and t2 == 2
+
+
+# The literal command the Tier-2 merge gate keeps OUT of the allow-list so Claude Code
+# prompts the human. Assembled from pieces so this source line carries no trigger string
+# for the live PreToolUse Bash hook (which inspects command lines, not file contents).
+MERGE_TARGET = "gh pr " + "merge"
+
+
+# Regex (string body) matching the FAMILY of commands the Tier-2 gate must keep gated:
+# the bare merge command, optionally followed by an argument boundary and any args. Built
+# from MERGE_TARGET so this source line carries no trigger triple.
+_MERGE_FAMILY_RE = re.compile("^" + re.escape(MERGE_TARGET) + r"(\s.*)?$", re.DOTALL)
+
+
+def _rule_to_regex(pattern):
+    """Translate a Bash allow specifier (the inner part of `Bash(<pattern>)`) into a regex
+    body describing the set of command strings it GRANTS, faithful to Claude Code permission
+    semantics (https://code.claude.com/docs/en/permissions):
+
+      - a trailing ` *` (space-star) or `:*` is a BOUNDARY wildcard: it grants the literal
+        prefix followed by a word/argument boundary (whitespace) and then anything. So
+        `gh pr:*` grants `gh pr <anything>` but NOT `gh project` (no boundary after `gh pr`).
+      - any OTHER `*` -- leading, infix, or a trailing `*` with no preceding space -- is a
+        PLAIN glob translated to `.*` (matches any run, including spaces). So `gh pr*` is a
+        plain prefix that matches `gh pr merge`, and `gh*merge` matches across a space.
+      - a wildcard-free specifier matches the command exactly, or that command followed by
+        an argument boundary (CC prefix-matches a bare specifier against the same command
+        with trailing args), modeled as `<literal>(\\s.*)?`.
+
+    The specifier is matched LITERALLY: a quoted or space-padded specifier (e.g. `"gh pr"`
+    or ` gh pr:*`) carries those characters into the regex, so it cannot match a real
+    command (which carries no quotes/leading space). No trimming or unquoting is done -- that
+    is intentional, so a quoted/padded rule never spuriously shadows the gate."""
+    if pattern.endswith(" *") or pattern.endswith(":*"):
+        prefix = re.escape(pattern[:-2]).replace(r"\*", ".*")
+        # literal prefix, then an argument boundary (whitespace) + anything, or nothing
+        return prefix + r"(\s.*)?"
+    if "*" in pattern:
+        return re.escape(pattern).replace(r"\*", ".*")
+    # wildcard-free: exact command, or that command followed by an argument boundary
+    return re.escape(pattern) + r"(\s.*)?"
+
+
+def _merge_rule_shadows(pattern):
+    """Does this Bash allow PATTERN grant ANY command in the merge family (the bare
+    `gh pr merge` or any merge invocation with args)? If so it silently re-grants merge and
+    defeats the human-in-the-loop gate, so the doctor must FAIL.
+
+    Sound test: the rule shadows iff the language of commands it grants INTERSECTS the merge
+    family. Both languages have the shape `literal-stem` + (glob / boundary tail), so the
+    intersection is non-empty iff one side's regex matches a minimal concrete member of the
+    other. We probe both directions:
+      - the rule's regex matches the bare target, or the target with one trailing arg
+        (catches every prefix/boundary/glob rule that grants merge-with-args), AND
+      - the family regex matches the rule's literal stem (its specifier with globs emptied)
+        (catches a rule LONGER than the target, e.g. `gh pr merge --squash`, which grants
+        only a specific merge invocation that the family still covers)."""
+    rule_re = re.compile("^" + _rule_to_regex(pattern) + "$", re.DOTALL)
+    if rule_re.match(MERGE_TARGET) or rule_re.match(MERGE_TARGET + " x"):
+        return True
+    # Reverse direction: is the rule itself a (more specific) merge invocation? Empty the
+    # globs to get a concrete command the rule grants, and test family membership.
+    rule_stem = pattern.replace("*", "")
+    return bool(_MERGE_FAMILY_RE.match(rule_stem))
+
+
+def _cascade_files():
+    """The settings files to scan, in cascade order. An ORCHESTRATE_SETTINGS_FILES env
+    override (colon-separated paths) replaces the default cascade so the harness can point
+    at temp fixtures. The default cascade is: user settings (+ .local) then project
+    settings (+ .local); the project root is ORCHESTRATE_PROJECT_DIR, else the git toplevel
+    of CWD, else project files are skipped."""
+    override = os.environ.get("ORCHESTRATE_SETTINGS_FILES")
+    if override is not None:
+        return [p for p in override.split(":") if p]
+    files = [os.path.join(HOME, ".claude", "settings.json"),
+             os.path.join(HOME, ".claude", "settings.local.json")]
+    project = os.environ.get("ORCHESTRATE_PROJECT_DIR")
+    if not project:
+        try:
+            r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                               capture_output=True, text=True, timeout=15)
+            project = r.stdout.strip() if r.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError):
+            project = None
+    if project:
+        files.append(os.path.join(project, ".claude", "settings.json"))
+        files.append(os.path.join(project, ".claude", "settings.local.json"))
+    return files
+
+
+def _scan_merge_gate_shadows():
+    """Scan the settings cascade for allow-rules that shadow the merge gate.
+    Returns (shadows, errors):
+      shadows = list of (file, rule_string) where a Bash allow-rule grants the squash-merge.
+      errors  = list of (file, message) for files that exist but are unparseable.
+    Missing files are skipped silently; an absent/non-list `permissions.allow` is no rules."""
+    shadows, errors = [], []
+    for path in _cascade_files():
+        if not os.path.exists(path):
+            continue
+        # Fault isolation: any problem with ONE file is recorded and the scan continues to
+        # the remaining files. A miss here = a shadow in a later file is silently hidden and
+        # the merge gate is defeated, so a single odd file must never abort the cascade scan.
+        try:
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+            except OSError as e:
+                errors.append((path, f"unreadable: {e}"))
+                continue
+            except json.JSONDecodeError as e:
+                errors.append((path, f"unparseable JSON: {e}"))
+                continue
+            # A non-object top level (e.g. a JSON array) or a non-dict `permissions`
+            # (e.g. null) grants no rules -- it is NOT an error and must NOT crash.
+            if not isinstance(data, dict):
+                continue
+            perms = data.get("permissions")
+            if not isinstance(perms, dict):
+                continue
+            allow = perms.get("allow")
+            if not isinstance(allow, list):
+                continue
+            for rule in allow:
+                if not isinstance(rule, str):
+                    continue
+                m = re.fullmatch(r"Bash\((.*)\)", rule)
+                if not m:
+                    continue  # non-Bash rules (Read/Write/Edit) cannot grant a Bash command
+                if _merge_rule_shadows(m.group(1)):
+                    shadows.append((path, rule))
+        except Exception as e:  # noqa: BLE001 - last-resort guard so one odd file never aborts the cascade
+            errors.append((path, f"scan error: {e}"))
+            continue
+    return shadows, errors
+
+
+def check_merge_gate_shadows():
+    """Doctor check: a single allow-rule anywhere in the cascade that matches the
+    squash-merge command silently re-grants merge and DEFEATS the human-in-the-loop gate.
+    Treat any shadow (or an unparseable cascade file) as a HARD doctor failure."""
+    shadows, errors = _scan_merge_gate_shadows()
+    if not shadows and not errors:
+        return _emit(PASS, f"no settings-cascade rule shadows the {MERGE_TARGET!r} gate")
+    if errors:
+        for path, msg in errors:
+            _emit(FAIL, f"settings file in cascade could not be scanned: {path} ({msg})")
+    if shadows:
+        _emit(FAIL, f"{len(shadows)} allow-rule(s) SHADOW the {MERGE_TARGET!r} gate "
+                    "(any one silently re-grants merge - remove/narrow them):")
+        for path, rule in shadows:
+            print(f"         {rule}   in {path}")
+        print(f"         Fix: narrow each to the non-merge subcommands (e.g. {MERGE_TARGET.rsplit(' ',1)[0]} "
+              "view/diff/checks/create/list), never a blanket prefix that covers 'merge'.")
+    return FAIL
+
+
+def cmd_doctor(args):
+    settings = _load_settings()
+    repo_status, _head = check_repo_main(getattr(args, "repo", None))
+    results = [check_agent_teams(settings), check_tmux(),
+               check_guard_wired(settings), check_guard_healthy(),
+               repo_status, check_allowlist(settings),
+               check_merge_gate_shadows()]
+    hard_fail = any(s == FAIL for s in results)
+    print()
+    print("doctor: HARD-FAIL (fix the FAIL lines above before `up`)" if hard_fail else "doctor: ok (no hard fail)")
+    return 1 if hard_fail else 0
+
+
+def cmd_up(args):
+    _validate_team(args.team)  # reject a path-unsafe team name before doing any work
+    print("Pre-flight doctor:")
+    rc = cmd_doctor(args)
+    if rc != 0:
+        print("\nup: ABORT - doctor reported a hard failure; fix it and re-run.", file=sys.stderr)
+        return rc
+    # Reuse HEAD from doctor's check_repo_main; add timeout + empty-tolerant fallback.
+    _repo_status, head = check_repo_main(args.repo)
+    if not head:
+        head_result = subprocess.run(["git", "-C", args.repo, "rev-parse", "--short", "HEAD"],
+                                     capture_output=True, text=True, timeout=15)
+        head = head_result.stdout.strip() if head_result.returncode == 0 else "unknown"
+    stack, triage, brief = scaffold_artifacts(args.team, args.repo, args.spacing)
+    try:
+        marker_path = arm_marker(args.team, args.repo, head)
+    except OSError as e:
+        # FLOOR_DIR unwritable or not a directory: abort cleanly (safe direction - not
+        # armed) instead of a raw traceback.
+        print(f"\nup: ABORT - cannot arm the floor marker under {FLOOR_DIR}: {e}", file=sys.stderr)
+        return 1
+    # Treat an exception from the self-test (e.g. the guard binary vanished between
+    # doctor and here) the same as a failed test: never leave a half-armed orphan marker.
+    try:
+        self_test_ok = armed_self_test()
+    except (OSError, subprocess.SubprocessError):
+        # OSError = guard binary vanished/unrunnable; SubprocessError (incl. TimeoutExpired)
+        # = guard hung. Either way: never leave a half-armed orphan marker.
+        self_test_ok = False
+    if not self_test_ok:
+        try:
+            os.remove(marker_path)
+        except OSError:
+            pass
+        # The scaffolded /tmp artifacts are intentionally LEFT here: they are inert without
+        # a marker file, so they cannot trigger any floor action - and they are useful for
+        # post-mortem debugging of why the self-test failed.
+        print("\nup: ABORT - armed self-test FAILED: with the marker armed the guard did not "
+              "hard-deny push-main and/or merge-by-API (both must exit 2). The floor is failing "
+              "open. Marker REMOVED. Fix the guard before standing up a session.", file=sys.stderr)
+        return 1
+    print(f"\nup: SESSION ARMED."
+          f"\n  marker:   {marker_path}"
+          f"\n  team dir: {os.path.join(ARTIFACTS, args.team)}"
+          f"\n  stack:    {stack}\n  triage:   {triage}\n  brief:    {brief}"
+          f"\n  Merges are now HUMAN-ONLY via the ! prefix until `down`.")
+    return 0
+
+
+TEARDOWN_CHECKLIST = """down: marker removed (Tier-2 merge-gating OFF).
+Team teardown is the lead's job (tool calls, not this script):
+  1. SendMessage shutdown_request to EACH teammate.
+  2. WAIT for each "terminated" notice.
+  3. THEN TeamDelete (it refuses while a member is alive).
+  4. LEAVE worktrees that still have open PRs; clean the rest with `make remove-worktree`."""
+
+
+def _gc_stale_tombstones():
+    """Best-effort: remove markers in FLOOR_DIR older than TTL. Never fatal."""
+    cutoff = time.time() - TTL_HOURS * 3600
+    try:
+        entries = os.listdir(FLOOR_DIR)
+    except OSError:
+        return
+    for name in entries:
+        p = os.path.join(FLOOR_DIR, name)
+        try:
+            if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
+                os.remove(p)
+        except OSError:
+            pass
+
+
+def _release_session_resources(team):
+    """Best-effort: release this session's resource leases. Never fatal."""
+    if not team:
+        return
+    resources = os.path.join(os.path.dirname(os.path.abspath(__file__)), "orchestrate-resources.py")
+    if not os.path.exists(resources):
+        return
+    try:
+        out = subprocess.run([sys.executable, resources, "list", "--session", team, "--json"],
+                             capture_output=True, text=True, timeout=15)
+        leases = json.loads(out.stdout) if out.returncode == 0 and out.stdout.strip() else []
+        for lease in leases:
+            subprocess.run([sys.executable, resources, "release", "--lease", lease["id"]],
+                           capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass  # teardown hygiene must never crash down
+
+
+def cmd_down(args):
+    path = _marker_path()
+    existed = bool(path) and os.path.exists(path)
+    if path:
+        try:
+            os.remove(path)
+        except OSError:
+            # FileNotFoundError (already disarmed) or NotADirectoryError (FLOOR_DIR is a
+            # file) etc.: down is best-effort teardown, never crash on a bad marker path.
+            pass
+    _gc_stale_tombstones()
+    _release_session_resources(getattr(args, "team", None))
+    if existed:
+        print(TEARDOWN_CHECKLIST)
+    else:
+        checklist_body = TEARDOWN_CHECKLIST.split("\n", 1)[1]
+        print("down: no marker present (already disarmed).")
+        print(checklist_body)
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog="orchestrate-setup.py")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    d = sub.add_parser("doctor")
+    d.add_argument("--repo")
+
+    u = sub.add_parser("up")
+    u.add_argument("--team", required=True)
+    u.add_argument("--repo", required=True)
+    u.add_argument("--spacing", default="12",
+                   help="approx minutes between pr-shipper pushes (default: 12)")
+
+    w = sub.add_parser("down")
+    w.add_argument("--team")
+
+    args = p.parse_args()
+    return {"doctor": cmd_doctor, "up": cmd_up, "down": cmd_down}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

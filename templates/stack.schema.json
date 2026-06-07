@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pr-shipper stack",
+  "description": "FIFO array of PR entries the pr-shipper opens, index 0 first. Lead appends only maintainer-approved (shippable) branches.",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["branch", "base", "title", "body_file", "labels", "head_sha"],
+    "properties": {
+      "branch": { "type": "string", "description": "feature branch name (ref shared across worktrees)" },
+      "base": { "type": "string", "default": "main" },
+      "title": { "type": "string", "description": "PR title; becomes the squash-merge commit subject. Only real GitHub issue refs, never TaskList IDs." },
+      "body_file": { "type": "string", "description": "absolute path to the PR body markdown (lead-vetted refs)" },
+      "labels": { "type": "string", "description": "comma-separated labels for gh pr create --label" },
+      "head_sha": { "type": "string", "pattern": "^[0-9a-f]{7,40}$", "description": "Pinned commit SHA the maintainer approved for this branch. pr-shipper hard-compares this to the pushed HEAD before gh pr create (enforcement: phase 3)." },
+      "pushed_to_origin": { "type": "boolean", "description": "true if branch already on origin (push becomes a no-op)" },
+      "stacked_at": { "type": "string", "description": "human timestamp, Pacific" },
+      "notes": { "type": "string", "description": "shippable rationale, gate state, caveats" }
+    }
+  }
+}

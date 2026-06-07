@@ -1,0 +1,8 @@
+# Python
+__pycache__/
+*.pyc
+
+# Ephemeral working state (durable design lives in DESIGN-*/PLAN-*/ROADMAP-*; these are
+# session-scoped and follow the "no ephemeral docs in git" convention)
+SESSION-STATE.md
+CRITIQUE-*.md

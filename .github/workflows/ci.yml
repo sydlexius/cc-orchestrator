@@ -1,0 +1,59 @@
+# CI for cc-orchestrator: the deterministic gates that guard the security floor and the
+# resource registry. Conventions mirrored from sydlexius/stillwater (pinned action SHAs,
+# least-privilege permissions, persist-credentials: false, concurrency).
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    name: harnesses + lint + self-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Install ruff
+        run: pip install ruff
+
+      # shellcheck + jq are preinstalled on ubuntu-latest; tmux is NOT needed
+      # (the harnesses only set $TMUX as an env string, never invoke the binary).
+      - name: shellcheck (security guard)
+        run: shellcheck orchestrate-guard.sh
+
+      - name: ruff (F,E741)
+        run: ruff check --select F,E741 orchestrate-resources.py orchestrate-setup.py test-orchestrate-guard.py test-orchestrate-resources.py test-orchestrate-setup.py
+
+      # Must invoke via ./ so the self-test's "$0" re-invocation resolves
+      # (bash orchestrate-guard.sh would make $0 a bare name -> 127).
+      - name: guard self-test
+        run: ./orchestrate-guard.sh --self-test
+
+      - name: harness - guard
+        run: python3 test-orchestrate-guard.py
+
+      - name: harness - resources
+        run: python3 test-orchestrate-resources.py
+
+      - name: harness - setup
+        run: python3 test-orchestrate-setup.py
