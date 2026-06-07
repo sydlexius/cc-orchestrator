@@ -56,15 +56,28 @@ fi
 [ -z "$cmd" ] && exit 0
 
 # --- matchers (honest-path; whole-word, separator-aware) -------------------
-# A real git push INVOCATION: the `push` SUBCOMMAND following `git` and any global
-# options (-C <dir>, -c <kv>, --flag). NOT the bare word "push" appearing in a commit
-# message or other prose - matching that wrongly blocked a `git commit` whose message
-# said "push to main". Tolerates an env prefix (FOO=bar git push) and the lead's
-# routine `git -C <worktree> push`. (-C/-c consume their following arg; other -flags
-# do not.) Known residual: a literal "git push" phrase inside a commit message still
-# matches - a far narrower prose case than the reported one; string hook, honest-path.
+# A real git push INVOCATION at COMMAND POSITION: `git` at clause start (after an optional
+# env prefix, a bash/sh wrapper, and/or a path), its global options (-C <dir>, -c <kv>,
+# --flag), then the `push` SUBCOMMAND. CLAUSE-START anchored (mirrors looks_like_safe_push)
+# so a `git push` appearing as a quoted ARGUMENT (`pgrep/grep -f 'git push origin'`) or as
+# prose inside a heredoc/echo body is NOT matched - the per-clause loop puts a real
+# `cd x && git push` invocation at its own clause start, so it still blocks. Tolerates an env
+# prefix (FOO=bar git push) and the lead's routine `git -C <worktree> push`. (-C/-c consume
+# their following arg; other -flags do not.) FP2 (2026-06-07): the prior `(^|non-word)git...
+# push` matched a git-push sequence ANYWHERE in a clause, which denied read-only inspectors
+# and even the feedback-log entry documenting this very block (dogfood report). Known residual:
+# a heredoc/echo body line that is ITSELF a clause-leading `git push ...` - vanishingly rare;
+# string hook, honest-path.
+# Command-position INTRODUCERS that still leave the NEXT word at command position, so a real
+# push after them must keep being caught (the old `(^|non-word)git` matched these; the
+# clause-start anchor must not regress them). Covers a subshell/group open `(`/`{`, a leading
+# redirection, and the prefix builtins/keywords. A QUOTE is deliberately NOT an introducer:
+# `'git push'` keeps git preceded by a quote, so the FP2 read-only-inspector / prose cases
+# stay allowed. Shared by both matchers so they cannot drift. (Honest-path accepted limits:
+# an env prefix BEFORE an introducer, or `eval` of a QUOTED push - evasion is out of scope.)
+_INTRO='([({][[:space:]]*|[^[:space:]]*[<>][^[:space:]]*[[:space:]]+|(command|nohup|time|eval|exec|then|do|else)[[:space:]]+)*'
 looks_like_git_push() {
-  printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-])git([[:space:]]+(-[Cc][[:space:]]+[^[:space:]]+|-[^[:space:]]+))*[[:space:]]+push([[:space:]]|$)'
+  printf '%s' "$cmd" | grep -Eq '^[[:space:]]*'"$_INTRO"'([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*((bash|sh)[[:space:]]+)?([^[:space:]]*/)?git([[:space:]]+(-[Cc][[:space:]]+[^[:space:]]+|-[^[:space:]]+))*[[:space:]]+push([[:space:]]|$)'
 }
 # A real safe-push INVOCATION: the wrapper at a COMMAND position - clause start,
 # after an optional env prefix (FOO=bar), a bash/sh wrapper, and/or a path
@@ -73,7 +86,7 @@ looks_like_git_push() {
 # fixes for the push subcommand). Per-clause splitting puts a `cd x && safe-push
 # ...` invocation at its own clause start, so this anchor still catches it.
 looks_like_safe_push() {
-  printf '%s' "$cmd" | grep -Eq '^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*((bash|sh)[[:space:]]+)?([^[:space:]]*/)?safe-push(\.sh)?([[:space:]]|$)'
+  printf '%s' "$cmd" | grep -Eq '^[[:space:]]*'"$_INTRO"'([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*((bash|sh)[[:space:]]+)?([^[:space:]]*/)?safe-push(\.sh)?([[:space:]]|$)'
 }
 is_push() { looks_like_git_push || looks_like_safe_push; }
 
@@ -186,9 +199,12 @@ marker_active() {
 # command (e.g. `git checkout main && git push origin feat`) would otherwise trip
 # a deny meant for another clause - a real false-positive on routine one-liners.
 # Evaluate the Tier-1 (always) and Tier-2 (marker-gated merge-by-API) HARD denies
-# against each shell clause independently. EXISTING newlines are collapsed to spaces
-# FIRST so a backslash-continued push to main (`git push origin \<nl>main`) stays ONE
-# clause and is still caught; only the separators && || ; | start a new clause.
+# against each shell clause independently. Backslash-newline CONTINUATIONS are joined
+# first (so `git push origin \<nl>main` stays ONE clause and is still caught), then the
+# separators && || ; | AND a bare newline each start a new clause. A bare newline is a real
+# command separator: `echo hi<nl>git push origin main` is TWO commands and the second must
+# still be caught - the old `tr '\n' ' '` collapse merged them into one `echo`-led clause and
+# silently hid the push (FP2-round2 regression caught by the adversarial pass).
 # Over-splitting only ever REDUCES false-positives: a genuine `git push ... main`
 # keeps push and main adjacent in the same clause, so it still blocks. The matchers
 # are pure greps (no side effects); the marker stat stays short-circuited (only
@@ -201,6 +217,9 @@ marker_active() {
 # allow-list makes Claude Code prompt the human for it (the hook cannot prompt on this
 # CC). REVISED 2026-06-06 after a live test proved CC ignores `permissionDecision:ask`.
 orig_cmd="$cmd"
+# Tracks whether ANY clause is a real push INVOCATION (command-position anchored), for the
+# advisory gate after the loop. Initialized here so it is always defined under `set -u`.
+is_push_clause=0
 # Perf short-circuit: every per-clause check needs one of the word `push` (is_push,
 # incl. safe-push), a `gh` word (merge-by-API or gh --admin), a `git` word (git
 # --no-verify), or the tokens `--no-verify` / `--admin` (the broadened Tier-1 flags).
@@ -232,16 +251,22 @@ if printf '%s' "$orig_cmd" | grep -Eq 'push|--no-verify|--admin|(^|[^[:alnum:]_-
       echo "BLOCKED: merge-by-API is not allowed from Claude during an orchestrate session. Merge via 'gh pr merge' (it prompts you for approval) or the GitHub UI." >&2
       exit 2
     fi
-  done < <(printf '%s' "$orig_cmd" | tr '\n' ' ' | sed -E 's/(&&|[|][|]|;|[|])/\n/g')
+    # Record a real push INVOCATION in THIS clause (command-position anchored) for the
+    # advisory gate below. A "push" substring in a quoted arg / prose does NOT set this.
+    is_push && is_push_clause=1
+  done < <(printf '%s' "$orig_cmd" | awk '{ rec = (NR==1 ? $0 : rec "\n" $0) } END { gsub(/\\\n/, "", rec); gsub(/&&|[|][|]|;|[|]/, "\n", rec); print rec }')
 fi
 cmd="$orig_cmd"
 
 # --- (3) prep-pr-ok advisory gate (feature pushes), LAST -------------------
-# Whole-command (not per-clause): the override may sit in a trailing comment after
-# a pipe. It is checked LAST and can ONLY satisfy this advisory gate - it can never
-# reach a hard deny above (so `git push origin main # prep-pr-ok` stays blocked,
-# since main+push share one clause and Tier-1 already fired in the loop).
-if is_push; then
+# Fires when ANY clause was a real push INVOCATION (is_push_clause, set per-clause in the
+# loop above using the command-position-anchored matchers) - NOT merely a "push" substring
+# somewhere on the line. Per-clause detection is required so `make && git push origin feat`
+# still hits the advisory (the whole-command anchor would miss a push after the first clause).
+# The override (prep-pr-ok) is matched whole-command since it may sit in a trailing comment
+# after a pipe; it can ONLY satisfy this advisory - a push-to-main already hard-blocked in the
+# loop (`git push origin main # prep-pr-ok` stays blocked: Tier-1 fired before we got here).
+if [ "$is_push_clause" -eq 1 ]; then
   if printf '%s' "$cmd" | grep -q 'prep-pr-ok'; then
     exit 0
   fi

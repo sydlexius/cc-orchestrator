@@ -236,6 +236,49 @@ CASES = [
     ("gh pr diff allowed", "gh pr diff 1868", False, "allow"),
     ("gh api PR resource GET allowed (marker active)", "gh api repos/o/r/pulls/1", True, "allow"),
     ("gh api graphql field-flag non-merge allowed (marker active, F8)", "gh api graphql -f query=...resolveReviewThread...", True, "allow"),
+    # FP-round2 (2026-06-07): `git push` / `safe-push` appearing as a quoted ARGUMENT to a
+    # read-only inspector, or as prose inside a heredoc/echo body, is NOT a push invocation.
+    # Before this round, looks_like_git_push matched `git ... push` ANYWHERE in a clause (only
+    # looks_like_safe_push was command-position anchored), so a read-only diagnostic or a log
+    # entry documenting the guard was denied (the dogfood-lead report: pgrep blocked, and a
+    # `cat >> log <<EOF ... git push ... EOF` blocked the very entry describing the block).
+    # Fix anchors looks_like_git_push to command position (clause start) and makes the advisory
+    # push-detection per-clause. Read-only inspectors + documentation must ALLOW.
+    ("FP2: pgrep -f for a 'git push origin' pattern (read-only) allowed",
+     "pgrep -f 'git push origin'", False, "allow"),
+    ("FP2: grep -f patterns 'git push origin' (read-only, -f not a force) allowed",
+     "grep -f patterns 'git push origin'", False, "allow"),
+    ("FP2: echo documenting 'git push' prose allowed",
+     "echo 'documenting git push origin behavior'", False, "allow"),
+    ("FP2: heredoc log append whose BODY mentions git push allowed",
+     "cat >> notes.md <<'EOF'\nthe git push origin command was denied\nEOF", False, "allow"),
+    ("FP2: ps | grep 'git push' pipeline (read-only) allowed",
+     "ps aux | grep 'git push origin'", False, "allow"),
+    ("FP2: rg 'safe-push' in a log (read-only) allowed",
+     "rg 'safe-push' /tmp/run.log", False, "allow"),
+    # FP-round2 negatives: real pushes embedded in compounds with inspectors must STILL gate.
+    ("FP2-neg: pgrep ... && real push main still BLOCKS (per-clause)",
+     "pgrep -f 'git push' && git push origin main", False, "block"),
+    ("FP2-neg: echo prose && real feature push still advisory-blocks",
+     "echo 'doc git push' && git push origin feat", False, "block"),
+    # FP2-round2 (adversarial pass): a real push after a command-position INTRODUCER, or as a
+    # bare-newline-separated second command, MUST still block. The first clause-start anchor
+    # regressed these vs the old "anywhere-in-clause" matcher; the _INTRO group + bare-newline
+    # split restore them. push-to-main = hard block; feature = advisory block.
+    ("FP2r2: subshell ( git push origin main ) blocks", "( git push origin main )", False, "block"),
+    ("FP2r2: command git push origin main blocks", "command git push origin main", False, "block"),
+    ("FP2r2: nohup git push origin main blocks", "nohup git push origin main", False, "block"),
+    ("FP2r2: time git push origin main blocks", "time git push origin main", False, "block"),
+    ("FP2r2: leading redirect git push main blocks", ">/tmp/x git push origin main", False, "block"),
+    ("FP2r2: if/then git push origin main blocks", "if true; then git push origin main; fi", False, "block"),
+    ("FP2r2: bare-newline second command push main blocks", "echo hi\ngit push origin main", False, "block"),
+    ("FP2r2: bare-newline feature push advisory-blocks", "echo hi\ngit push origin feat", False, "block"),
+    ("FP2r2: subshell feature push advisory-blocks", "( git push origin feat )", False, "block"),
+    # backslash-newline CONTINUATION to main stays ONE clause and still blocks (preserved)
+    ("FP2r2: backslash-newline continued push main blocks", "git push origin \\\nmain", False, "block"),
+    # a heredoc/prose body line that does NOT lead with git stays allowed across a bare newline
+    ("FP2r2: heredoc body bare-newline git-push prose allowed",
+     "cat <<'EOF'\nfirst line\nthe git push origin step was denied\nEOF", False, "allow"),
 ]
 
 FAILS = []
