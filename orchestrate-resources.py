@@ -28,6 +28,11 @@ STATE = os.environ.get("ORCHESTRATE_RESOURCES_FILE", os.path.join(HOME, ".claude
 RESOURCE_BASE = os.environ.get("ORCHESTRATE_RESOURCE_BASE", "/tmp/orchestrate")
 PORT_RANGE = os.environ.get("ORCHESTRATE_PORT_RANGE", "1980-2080")
 FLOOR_DIR = os.environ.get("ORCHESTRATE_FLOOR_DIR", os.path.join(HOME, ".claude", "orchestrate-floor.d"))
+# F2(c): orchestrate-setup.py `up` scaffolds artifacts under ARTIFACTS/<team> and persists
+# the stillwater profile config to <team>/profile.env. The session name passed to `allocate`
+# IS the team name, so derive the team dir the SAME way `up` does (ORCHESTRATE_ARTIFACT_DIR,
+# default /tmp) - no divergent hardcoded path.
+ARTIFACTS = os.environ.get("ORCHESTRATE_ARTIFACT_DIR", "/tmp")
 
 
 def _int_env(name, default, minimum=None):
@@ -374,6 +379,49 @@ def _provision_stillwater(lease, data_dir, db_path, keyfile, src_db):
         os.chmod(dst_key, 0o600)
 
 
+def _parse_profile_env(path):
+    """Parse a <team-dir>/profile.env (the eval-able `export K=V` file `up` writes) into a
+    dict. Tolerant: skips blanks, `#` comments, and any line not matching `[export ]K=V`.
+    Never raises on a missing/unreadable file (returns {}) - this is a best-effort fallback,
+    not a hard dependency. Values are taken verbatim (`up` writes unquoted paths)."""
+    out = {}
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except OSError:
+        return out
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, val = line.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        if key:
+            out[key] = val
+    return out
+
+
+def _stillwater_config(args):
+    """Resolve the stillwater profile config vars with precedence:
+      1. real os.environ (an exported value ALWAYS wins - preserve existing behavior), then
+      2. <ARTIFACTS>/<session>/profile.env (what `up` persisted for the session).
+    Returns a dict of only the keys that resolved to a non-empty value. Validation
+    (missing-required, nonexistent keyfile) stays in the caller, unchanged."""
+    keys = ("ORCHESTRATE_STILLWATER_KEYFILE", "ORCHESTRATE_STILLWATER_MUSIC",
+            "ORCHESTRATE_STILLWATER_DB")
+    file_cfg = _parse_profile_env(os.path.join(ARTIFACTS, args.session, "profile.env"))
+    resolved = {}
+    for k in keys:
+        v = os.environ.get(k, "") or file_cfg.get(k, "")
+        if v:
+            resolved[k] = v
+    return resolved
+
+
 def _profile_stillwater(lease, args):
     """Populate the env bundle for a stillwater instance.
 
@@ -392,19 +440,22 @@ def _profile_stillwater(lease, args):
     """
     data_dir = lease["resources"]["data_dir"]["value"]
     port = lease["resources"]["port"]["value"]
+    # F2(c): resolve config with precedence (exported env wins, then <team-dir>/profile.env)
+    # so a session armed via `up` need not re-export the 3 paths every allocate.
+    cfg = _stillwater_config(args)
     # Validate ALL required config up front (F2): report every missing key in a single
     # error rather than one hard-fail per key across sequential retries.
     required = ("ORCHESTRATE_STILLWATER_KEYFILE", "ORCHESTRATE_STILLWATER_MUSIC")
-    missing = [n for n in required if not os.environ.get(n, "")]
+    missing = [n for n in required if not cfg.get(n)]
     if missing:
         sys.exit("orchestrate-resources: required config not set (no path is guessed): "
                  + ", ".join(missing) + ". Set them and retry.")
-    keyfile = os.environ["ORCHESTRATE_STILLWATER_KEYFILE"]
+    keyfile = cfg["ORCHESTRATE_STILLWATER_KEYFILE"]
     if not os.path.isfile(keyfile):
         sys.exit(f"orchestrate-resources: ORCHESTRATE_STILLWATER_KEYFILE {keyfile!r} does not "
                  "exist or is not a file (a dangling key symlink would make the binary silently "
                  "auto-generate a wrong key).")
-    music = os.environ["ORCHESTRATE_STILLWATER_MUSIC"]
+    music = cfg["ORCHESTRATE_STILLWATER_MUSIC"]
     db_path = os.path.join(data_dir, "stillwater.db")
     # Env bundle - the secret key is intentionally absent.
     lease["env"] = {
@@ -416,7 +467,7 @@ def _profile_stillwater(lease, args):
         "SW_LOG_LEVEL": "debug",
     }
     lease["meta"]["keyfile_src"] = keyfile
-    src_db = os.environ.get("ORCHESTRATE_STILLWATER_DB", "")
+    src_db = cfg.get("ORCHESTRATE_STILLWATER_DB", "")
     # Always record setup hints (useful when --provision is not given).
     setup_hint = [
         f"mkdir -p {os.path.join(data_dir, 'backups')}",

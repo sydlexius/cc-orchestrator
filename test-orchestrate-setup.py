@@ -173,6 +173,52 @@ def main():
               os.path.isdir(os.path.join(art, "demo", "pr-triage")) and
               os.path.isdir(os.path.join(art, "beta", "pr-triage")))
 
+        # F2(c): up captures whichever ORCHESTRATE_STILLWATER_{KEYFILE,MUSIC,DB} are set
+        # in the env at up-time and persists them to <team-dir>/profile.env (0600, eval-able
+        # `export K=V` lines) so allocate can read them without re-exporting every session.
+        # These are PATHS (not secret material), so 0600 is hygiene, not a secrecy boundary.
+        swkey = os.path.join(td, "real.key"); open(swkey, "w").write("K\n")
+        swmusic = os.path.join(td, "music")
+        swdb = os.path.join(td, "src.db")
+        pe_ov = dict(upov)
+        pe_ov.update({"ORCHESTRATE_STILLWATER_KEYFILE": swkey,
+                      "ORCHESTRATE_STILLWATER_MUSIC": swmusic,
+                      "ORCHESTRATE_STILLWATER_DB": swdb})
+        rc, out = run(["up", "--team", "swteam", "--repo", repo], env_overrides=pe_ov)
+        prof = os.path.join(art, "swteam", "profile.env")
+        check("up writes <team-dir>/profile.env when stillwater env is set", rc == 0 and os.path.isfile(prof))
+        prof_body = open(prof).read() if os.path.isfile(prof) else ""
+        check("profile.env persists KEYFILE/MUSIC/DB as export lines",
+              f"export ORCHESTRATE_STILLWATER_KEYFILE={swkey}" in prof_body and
+              f"export ORCHESTRATE_STILLWATER_MUSIC={swmusic}" in prof_body and
+              f"export ORCHESTRATE_STILLWATER_DB={swdb}" in prof_body)
+        check("profile.env is 0600",
+              os.path.isfile(prof) and (os.stat(prof).st_mode & 0o777) == 0o600)
+        # Only SET keys are persisted; an unset optional key (DB) is omitted, not blank.
+        marker_demo = os.path.join(floor_dir, _key(TEST_TMUX))
+        if os.path.exists(marker_demo):
+            os.remove(marker_demo)
+        pe_ov2 = dict(upov)
+        pe_ov2.update({"ORCHESTRATE_STILLWATER_KEYFILE": swkey,
+                       "ORCHESTRATE_STILLWATER_MUSIC": swmusic})
+        pe_ov2.pop("ORCHESTRATE_STILLWATER_DB", None)
+        rc, out = run(["up", "--team", "swteam2", "--repo", repo], env_overrides=pe_ov2)
+        prof2 = os.path.join(art, "swteam2", "profile.env")
+        prof2_body = open(prof2).read() if os.path.isfile(prof2) else ""
+        check("absent optional DB key omitted from profile.env",
+              "ORCHESTRATE_STILLWATER_KEYFILE" in prof2_body and
+              "ORCHESTRATE_STILLWATER_DB" not in prof2_body)
+        # up with NO stillwater env still succeeds (profile.env empty or just absent keys).
+        marker_demo = os.path.join(floor_dir, _key(TEST_TMUX))
+        if os.path.exists(marker_demo):
+            os.remove(marker_demo)
+        pe_ov3 = dict(upov)
+        for k in ("ORCHESTRATE_STILLWATER_KEYFILE", "ORCHESTRATE_STILLWATER_MUSIC",
+                  "ORCHESTRATE_STILLWATER_DB"):
+            pe_ov3.pop(k, None)
+        rc, out = run(["up", "--team", "noenv", "--repo", repo], env_overrides=pe_ov3)
+        check("up with no stillwater env still succeeds (rc0)", rc == 0 and "SESSION ARMED" in out)
+
         # P3-A: an invalid --team (path-escape / separators) is rejected cleanly, no dir made.
         rc, out = run(["up", "--team", "a/b", "--repo", repo], env_overrides=upov)
         check("up rejects --team with a slash (no traceback)",

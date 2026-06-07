@@ -232,6 +232,51 @@ def main():
         check("stillwater both vars missing -> single error names BOTH",
               rc2 != 0 and "ORCHESTRATE_STILLWATER_KEYFILE" in (out2 + err2)
               and "ORCHESTRATE_STILLWATER_MUSIC" in (out2 + err2))
+        # --- F2(c): stillwater config fallback to <team-dir>/profile.env ---
+        # When the ORCHESTRATE_STILLWATER_* vars are NOT in the env, allocate (stillwater)
+        # reads them from <team-dir>/profile.env, where team-dir is ARTIFACTS/<session>
+        # (same convention `up` uses). Real os.environ values still WIN over the file.
+        print("\n  [F2(c): profile.env fallback]")
+        art = os.path.join(td, "artifacts")
+        pe_ov = dict(ov); pe_ov["ORCHESTRATE_ARTIFACT_DIR"] = art
+        pkey = os.path.join(td, "pe.key"); open(pkey, "w").write("PK\n"); os.chmod(pkey, 0o600)
+        # session name becomes the team-dir component, like `up --team <session>`.
+        pe_team_dir = os.path.join(art, "PE"); os.makedirs(pe_team_dir, exist_ok=True)
+        with open(os.path.join(pe_team_dir, "profile.env"), "w") as pf:
+            pf.write(f"export ORCHESTRATE_STILLWATER_KEYFILE={pkey}\n")
+            pf.write("export ORCHESTRATE_STILLWATER_MUSIC=/pe-music\n")
+        # env UNSET for the two required vars + profile.env present -> allocate succeeds.
+        rc, out, err = run(["allocate", "--session", "PE", "--teammate", "a",
+                            "--profile", "stillwater"], env_overrides=pe_ov)
+        check("profile.env fallback: allocate succeeds with env UNSET (rc0)", rc == 0)
+        if rc == 0:
+            le = json.loads(out)
+            check("profile.env fallback: SW_MUSIC_PATH read from file",
+                  le["env"]["SW_MUSIC_PATH"] == "/pe-music")
+            check("profile.env fallback: keyfile from file recorded",
+                  le["meta"].get("keyfile_src") == pkey)
+        # env SET wins over the file (precedence: os.environ first, then profile.env).
+        winkey = os.path.join(td, "win.key"); open(winkey, "w").write("W\n"); os.chmod(winkey, 0o600)
+        pe_win = dict(pe_ov)
+        pe_win["ORCHESTRATE_STILLWATER_KEYFILE"] = winkey
+        pe_win["ORCHESTRATE_STILLWATER_MUSIC"] = "/env-music"
+        rc, out, err = run(["allocate", "--session", "PE", "--teammate", "b",
+                            "--profile", "stillwater"], env_overrides=pe_win)
+        check("profile.env precedence: env-set MUSIC wins over file (rc0)", rc == 0)
+        if rc == 0:
+            lew = json.loads(out)
+            check("profile.env precedence: SW_MUSIC_PATH is the env value, not the file's",
+                  lew["env"]["SW_MUSIC_PATH"] == "/env-music")
+            check("profile.env precedence: keyfile is the env value, not the file's",
+                  lew["meta"].get("keyfile_src") == winkey)
+        # missing in BOTH env and file -> still errors clearly naming the var.
+        empty_team_dir = os.path.join(art, "EMPTY"); os.makedirs(empty_team_dir, exist_ok=True)
+        open(os.path.join(empty_team_dir, "profile.env"), "w").close()  # present but empty
+        rc, out, err = run(["allocate", "--session", "EMPTY", "--teammate", "a",
+                            "--profile", "stillwater"], env_overrides=pe_ov)
+        check("profile.env: missing in BOTH -> error names ORCHESTRATE_STILLWATER_KEYFILE",
+              rc != 0 and "ORCHESTRATE_STILLWATER_KEYFILE" in (out + err))
+
         # --provision: places encryption.key (0600) beside DB + mkdir backups + seeds DB copy.
         # src DB is a real SQLite file (the backup-API provisioner requires a valid DB).
         srcdb = os.path.join(td, "src.db")
