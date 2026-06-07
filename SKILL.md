@@ -102,13 +102,14 @@ A Medium-effort Opus lead survives only a few hours before forced compaction, an
 ## Setup sequence
 1. Verify prerequisites (above). Print missing permissions.
 2. `TeamCreate` the team (e.g. `<milestone>-impl`).
-3. Instantiate per-team artifacts under `/tmp/<team>/` (P3-A namespacing, so parallel teams don't clobber): `orchestrate-setup.py up` scaffolds `/tmp/<team>/{stack.json (=[]),pr-triage/,adv-review/,pr-shipper-brief.md}`. (Manual fallback: `mkdir -p /tmp/<team>/pr-triage /tmp/<team>/adv-review`; stack = `/tmp/<team>/stack.json`.)
+3. Instantiate per-team artifacts under `/tmp/<team>/` (P3-A namespacing, so parallel teams don't clobber): `orchestrate-setup.py up --team <team> --repo <owner/repo>` scaffolds `/tmp/<team>/{stack.json (=[]),pr-triage/,adv-review/,pr-shipper-brief.md}` (both `--team` and `--repo` are required). (Manual fallback: `mkdir -p /tmp/<team>/pr-triage /tmp/<team>/adv-review`; stack = `/tmp/<team>/stack.json`.)
 4. The shipper brief is rendered into `/tmp/<team>/pr-shipper-brief.md` by `up` (from `templates/pr-shipper-brief.md`, repo/spacing/stack filled). `--team` must be a filesystem-safe slug `[A-Za-z0-9._-]+`.
 5. Build a DISPATCH MAP (issue/cluster -> {worktree, branch, model, effort}). Scout inline first if the work-list is unknown. Do NOT hand-pick ports or data dirs - those are leased in step 6.
 6. For each implementer in the map, the LEAD runs:
    ```
    orchestrate-resources.py allocate --session <team> --teammate <name> --profile stillwater [--provision]
    ```
+   The `stillwater` profile requires two env config vars up front (validated together; missing ones are reported in one error): `ORCHESTRATE_STILLWATER_KEYFILE` (path to the real 0600 encryption key) and `ORCHESTRATE_STILLWATER_MUSIC` (shared music library path). `ORCHESTRATE_STILLWATER_DB` (source DB to snapshot) is optional and only used by `--provision`; with `--provision` it is taken point-in-time via the SQLite backup API (live WAL folded in). Set these (e.g. source a per-session `profile.env`) before each allocate.
    This prints the lease JSON on STDOUT (machine-readable) and the eval-able `export KEY=VALUE` block on STDERR (by design - stdout stays pure JSON). The LEAD reads the STDERR block and exports those env vars into the teammate's tmux pane as REAL environment. This is the AUTHORITATIVE delivery: it wins over any `.env` file (per D6 precedence - dev-restart.sh already prioritizes exported env over .env). Ports and data dirs are collision-free leases; never hand-pick fixed values. The written `lease.env_file` is a durable fallback record only.
    Then spawn implementers from the map (charter + build task only). Spawn pr-shipper + pr-triage from their charters when the first branch nears shippable.
 7. Run the pipeline. Maintain the checkpoint block (`templates/SESSION-STATE.checkpoint.md`) continuously.
