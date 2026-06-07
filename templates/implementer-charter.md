@@ -22,4 +22,7 @@ PR or the code review. You only ever receive "build this" or "fix this".
 
 ## Reporting
 - Report build/fix completion to the lead with: the committed SHA, what changed, and any blocker. Both-theme verify UI work. Run/keep your assigned port up for the lead's UAT.
+- PER-ITEM on a FIX round: for EVERY numbered item in the fix-list, report DONE (with the change) or SKIPPED (with the reason). Do NOT report "complete" until every item is addressed -- a fix-list is not done just because the first item is. (If the fix-list arrived as multiple messages, treat them as ONE list and address all of them before reporting complete.)
+- NEVER report complete with UNCOMMITTED or staged-but-uncommitted changes. Before any "done" report, confirm a clean `git status` AND that HEAD actually advanced (the commit landed). "Staged but idle" is a failure state to SURFACE to the lead, not to go quiet on.
+- ANSWER explicit lead questions. If the fix-list or a lead message contains a question (e.g. "is line N in-diff or pre-existing?"), your report MUST answer it -- do not silently skip it.
 - You will be checkpointed + torn down when your branch is stacked; a fresh copy of you may be respawned later with a fix-list. That is expected - your worktree persists, and the fix-list is self-contained (you need no PR/CR context).
