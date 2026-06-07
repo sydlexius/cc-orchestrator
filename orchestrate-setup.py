@@ -41,7 +41,11 @@ FLOOR_DIR = os.environ.get("ORCHESTRATE_FLOOR_DIR", os.path.join(HOME, ".claude"
 # P3-A cross-session-disarm sin. Clamp back to the default instead.
 TTL_HOURS = _int_env("ORCHESTRATE_FLOOR_TTL_HOURS", 72, minimum=1)
 GUARD = os.environ.get("ORCHESTRATE_GUARD", os.path.join(HOME, ".claude", "scripts", "orchestrate-guard.sh"))
-TEMPLATES = os.environ.get("ORCHESTRATE_TEMPLATES_DIR", os.path.join(HOME, ".claude", "skills", "orchestrate", "templates"))
+# Script-relative: templates ship ALONGSIDE this script in the repo, so resolve them relative
+# to the script (realpath resolves the ~/.claude/scripts deploy symlink to the repo). The old
+# default was an absolute ~/.claude/skills/orchestrate/templates path that only existed via
+# the skill symlink - it broke on any host without it (e.g. CI), so up/doctor found no templates.
+TEMPLATES = os.environ.get("ORCHESTRATE_TEMPLATES_DIR", os.path.join(os.path.dirname(os.path.realpath(__file__)), "templates"))
 ARTIFACTS = os.environ.get("ORCHESTRATE_ARTIFACT_DIR", "/tmp")
 
 PASS, WARN, FAIL = "PASS", "WARN", "FAIL"

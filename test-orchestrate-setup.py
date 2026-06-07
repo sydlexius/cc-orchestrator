@@ -71,11 +71,6 @@ def check(label, cond):
 
 
 def main():
-    # Task 1: skeleton runs and doctor exits 0 with no checks.
-    rc, out = run(["doctor"])
-    check("doctor skeleton exits 0", rc == 0)
-    check("doctor prints no-hard-fail", "no hard fail" in out)
-
     with tempfile.TemporaryDirectory() as td:
         good = os.path.join(td, "settings.json")
         json.dump({"teammateMode": "tmux", "env": {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}}, open(good, "w"))
@@ -87,6 +82,13 @@ def main():
                    "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
                        {"type": "command", "command": 'bash "$HOME/.claude/scripts/orchestrate-guard.sh"'}]}]}},
                   open(wired, "w"))
+
+        # Skeleton: doctor against a fully-healthy fixture exits 0 with "no hard fail".
+        # Run with explicit fixtures (NOT the bare ambient env) so it is host-independent:
+        # a CI runner has no ~/.claude wiring, so an unconfigured default correctly hard-fails.
+        rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": wired, "ORCHESTRATE_GUARD": guard}, tmux=True)
+        check("doctor skeleton (healthy fixture) exits 0", rc == 0)
+        check("doctor prints no-hard-fail", "no hard fail" in out)
 
         rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": wired, "ORCHESTRATE_GUARD": guard}, tmux=True)
         check("teams+tmux PASS -> no hard fail (rc0)", rc == 0 and "Agent Teams enabled" in out)

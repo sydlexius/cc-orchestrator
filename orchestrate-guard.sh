@@ -158,9 +158,11 @@ is_merge_api() {
 
 # THIS session's marker present AND fresh. Keyed by $TMUX (sanitized) so one
 # session's marker never gates another, and a non-tmux (solo) session - which can
-# never be an orchestrate session - is never gated. mtime via BSD `stat -f %m`
-# (macOS, the ship target) with a GNU `stat -c %Y` fallback so the gate also works
-# on Linux/CI - without the fallback, stat fails there and Tier-2 silently fails OPEN.
+# never be an orchestrate session - is never gated. mtime via GNU `stat -c %Y` with a
+# BSD `stat -f %m` fallback. GNU-FIRST is deliberate: GNU's `stat -f` is --file-system and
+# succeeds-with-garbage on an unknown %m (so it can't be the fallback), whereas BSD cleanly
+# REJECTS `-c` (illegal option) so its fallback fires. Works on Linux/CI + macOS; without it
+# stat fails on the off-platform and Tier-2 silently fails OPEN.
 marker_active() {
   [ -n "${TMUX:-}" ] || return 1
   local key marker mtime now age_h
@@ -171,7 +173,7 @@ marker_active() {
   key=$(printf '%s' "$TMUX" | LC_ALL=C tr -c 'A-Za-z0-9' '_')
   marker="$FLOOR_DIR/$key"
   [ -f "$marker" ] || return 1
-  mtime=$(stat -f %m "$marker" 2>/dev/null || stat -c %Y "$marker" 2>/dev/null) || return 1
+  mtime=$(stat -c %Y "$marker" 2>/dev/null || stat -f %m "$marker" 2>/dev/null) || return 1
   # Fail OPEN (return inactive) if date fails: an empty `now` would arithmetic to 0,
   # making age_h negative and the marker wrongly read as active (fail-CLOSED).
   now=$(date +%s) || return 1
