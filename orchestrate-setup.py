@@ -198,6 +198,31 @@ def scaffold_artifacts(team, repo, spacing):
     return stack, triage, brief_out
 
 
+# The stillwater profile config keys `up` captures from its env and persists for the
+# session so `orchestrate-resources.py allocate` can read them without re-exporting each
+# time. These are PATHS (keyfile path, music dir, source DB), NOT secret material - the
+# encryption KEY itself stays a 0600 file beside the DB, never stored here; only its path is.
+PROFILE_ENV_KEYS = ("ORCHESTRATE_STILLWATER_KEYFILE", "ORCHESTRATE_STILLWATER_MUSIC",
+                    "ORCHESTRATE_STILLWATER_DB")
+
+
+def write_profile_env(team_dir):
+    """Persist whichever PROFILE_ENV_KEYS are set in this env to <team_dir>/profile.env as
+    eval-able `export K=V` lines, created 0600. Only set keys are written; absent keys are
+    simply omitted (no hard-fail if none are set - the generic profile needs none)."""
+    set_keys = [(k, os.environ[k]) for k in PROFILE_ENV_KEYS if os.environ.get(k, "")]
+    path = os.path.join(team_dir, "profile.env")
+    # 0600 from birth (these are paths, not secrets, but no reason to make them world-readable).
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("# stillwater profile config captured at `up` time (PATHS, not secret material;\n"
+                "# the encryption key stays a 0600 file beside the DB - only its path is here).\n")
+        for k, v in set_keys:
+            f.write(f"export {k}={v}\n")
+    os.chmod(path, 0o600)  # enforce even if it pre-existed with looser perms
+    return path
+
+
 # First char must be alphanumeric: blocks path-escape (`.`/`..`/`/`) AND leading-dash
 # names like `-rf` that would later be mis-parsed as flags by shell tools touching the dir.
 TEAM_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
@@ -448,6 +473,9 @@ def cmd_up(args):
                                      capture_output=True, text=True, timeout=15)
         head = head_result.stdout.strip() if head_result.returncode == 0 else "unknown"
     stack, triage, brief = scaffold_artifacts(args.team, args.repo, args.spacing)
+    # F2(c): capture the stillwater profile config from the env now so allocate can read it
+    # from the team dir for the rest of the session (no re-exporting the 3 paths each time).
+    write_profile_env(os.path.join(ARTIFACTS, args.team))
     try:
         marker_path = arm_marker(args.team, args.repo, head)
     except OSError as e:
