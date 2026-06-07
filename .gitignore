@@ -6,4 +6,3 @@ __pycache__/
 # session-scoped and follow the "no ephemeral docs in git" convention)
 SESSION-STATE.md
 CRITIQUE-*.md
-orchestrate-session-feedback.md
