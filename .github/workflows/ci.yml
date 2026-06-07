@@ -1,6 +1,11 @@
 # CI for cc-orchestrator: the deterministic gates that guard the security floor and the
 # resource registry. Conventions mirrored from sydlexius/stillwater (pinned action SHAs,
 # least-privilege permissions, persist-credentials: false, concurrency).
+#
+# Runs on BOTH ubuntu and macos: the guard ships on macOS (BSD `stat -f`) but must also
+# work on Linux (GNU `stat -c`), and the first CI run caught exactly that divergence -
+# so both platform branches are validated here. shellcheck/ruff are platform-independent,
+# so they run once (on ubuntu); the harnesses + self-test run on both.
 name: CI
 
 on:
@@ -19,9 +24,13 @@ permissions:
 
 jobs:
   gates:
-    name: harnesses + lint + self-test
-    runs-on: ubuntu-latest
+    name: gates (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -36,14 +45,16 @@ jobs:
       - name: Install ruff
         run: pip install ruff
 
-      # shellcheck + jq are preinstalled on ubuntu-latest; tmux is NOT needed
-      # (the harnesses only set $TMUX as an env string, never invoke the binary).
+      # Platform-independent lint: run once, on Linux. (jq is preinstalled on both runners.)
       - name: shellcheck (security guard)
+        if: runner.os == 'Linux'
         run: shellcheck orchestrate-guard.sh
 
       - name: ruff (F,E741)
+        if: runner.os == 'Linux'
         run: ruff check --select F,E741 orchestrate-resources.py orchestrate-setup.py test-orchestrate-guard.py test-orchestrate-resources.py test-orchestrate-setup.py
 
+      # Platform-sensitive: run on BOTH macOS (BSD stat) and Linux (GNU stat).
       # Must invoke via ./ so the self-test's "$0" re-invocation resolves
       # (bash orchestrate-guard.sh would make $0 a bare name -> 127).
       - name: guard self-test
