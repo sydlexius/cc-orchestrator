@@ -4,6 +4,7 @@ Run: python3 test-orchestrate-resources.py"""
 import datetime as _dt
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -226,9 +227,19 @@ def main():
         rc4, out4, err4 = run(["allocate", "--session", "S", "--teammate", "c3", "--profile", "stillwater"], env_overrides=sw_badkey)
         check("stillwater nonexistent KEYFILE -> error (no dangling key symlink)",
               rc4 != 0 and "does not exist" in (out4 + err4).lower())
-        # --provision: places encryption.key (0600) beside DB + mkdir backups + seeds DB copy
+        # both required vars missing at once -> ONE error naming BOTH (F2: validate
+        # all required config up front, not one hard-fail per missing key).
+        check("stillwater both vars missing -> single error names BOTH",
+              rc2 != 0 and "ORCHESTRATE_STILLWATER_KEYFILE" in (out2 + err2)
+              and "ORCHESTRATE_STILLWATER_MUSIC" in (out2 + err2))
+        # --provision: places encryption.key (0600) beside DB + mkdir backups + seeds DB copy.
+        # src DB is a real SQLite file (the backup-API provisioner requires a valid DB).
         srcdb = os.path.join(td, "src.db")
-        open(srcdb, "wb").write(b"sqlite-stub")
+        _seed = sqlite3.connect(srcdb)
+        _seed.execute("CREATE TABLE t (v TEXT)")
+        _seed.execute("INSERT INTO t VALUES ('seed')")
+        _seed.commit()
+        _seed.close()
         swp = dict(sw)
         swp["ORCHESTRATE_STILLWATER_DB"] = srcdb
         rc, out, _ = run(["allocate", "--session", "S", "--teammate", "c", "--profile", "stillwater", "--provision"], env_overrides=swp)
@@ -249,6 +260,33 @@ def main():
         dd2 = lease2["resources"]["data_dir"]["value"]
         check("--provision no-srcdb: backups dir created", os.path.isdir(os.path.join(dd2, "backups")))
         check("--provision no-srcdb: encryption.key placed", os.path.exists(os.path.join(dd2, "encryption.key")))
+
+        # --provision WAL freshness (F3): the leased copy must include commits still
+        # resident in the live WAL, not just rows already folded into the main .db.
+        # Build a WAL-mode source: 'in-main' is checkpointed into the .db file, then
+        # autocheckpoint is disabled and 'in-wal' is committed so it stays in the WAL.
+        # Keep `live` OPEN across the subprocess so close-on-exit cannot checkpoint it.
+        waldb = os.path.join(td, "wal-src.db")
+        live = sqlite3.connect(waldb)
+        live.execute("PRAGMA journal_mode=WAL")
+        live.execute("CREATE TABLE t (v TEXT)")
+        live.execute("INSERT INTO t VALUES ('in-main')")
+        live.commit()
+        live.execute("PRAGMA wal_checkpoint(TRUNCATE)")   # fold 'in-main' into the .db
+        live.execute("PRAGMA wal_autocheckpoint=0")        # stop auto-checkpoint
+        live.execute("INSERT INTO t VALUES ('in-wal')")
+        live.commit()                                       # stays in the WAL only
+        swwal = dict(sw); swwal["ORCHESTRATE_STILLWATER_DB"] = waldb
+        rc, out, _ = run(["allocate", "--session", "S", "--teammate", "wal",
+                          "--profile", "stillwater", "--provision"], env_overrides=swwal)
+        lease3 = json.loads(out)
+        copydb = os.path.join(lease3["resources"]["data_dir"]["value"], "stillwater.db")
+        conn = sqlite3.connect(copydb)
+        rows = sorted(r[0] for r in conn.execute("SELECT v FROM t").fetchall())
+        conn.close()
+        live.close()
+        check("--provision copy includes WAL-resident commits (F3 point-in-time)",
+              rows == ["in-main", "in-wal"])
 
         # --- Fix 1: path traversal -- '..' in session/teammate rejected ---
         print("\n  [Fix 1: path traversal guard]")

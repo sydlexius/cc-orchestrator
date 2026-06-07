@@ -18,8 +18,10 @@ import os
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
+import urllib.parse
 
 HOME = os.path.expanduser("~")
 STATE = os.environ.get("ORCHESTRATE_RESOURCES_FILE", os.path.join(HOME, ".claude", "orchestrate-resources.json"))
@@ -311,29 +313,44 @@ def cmd_release(args):
     return 0
 
 
-def _require_cfg(name):
-    """Return the value of env var `name`, or exit with a clear message naming the var."""
-    val = os.environ.get(name, "")
-    if not val:
-        sys.exit(f"orchestrate-resources: required config {name} is not set "
-                 "(no real path is guessed). Set it and retry.")
-    return val
+def _snapshot_sqlite(src_db, dst_db):
+    """Point-in-time copy of a (possibly live) SQLite DB via the online backup API (F3).
+
+    A plain file copy of the .db drops the live -wal side-car, so the leased copy can
+    miss the most recent committed writes. The backup API reads a consistent snapshot
+    (committed WAL folded in) from a READ-ONLY connection -- safe against the running
+    instance's concurrent writers -- and yields a self-contained dst (no wal/shm)."""
+    # mode=ro: never perturb the live source. A running instance guarantees the
+    # -wal/-shm exist and the data dir is writable, so a read-only WAL open succeeds.
+    # Drop any stale side-cars from a prior provision into the same (reused) lease dir;
+    # a leftover dst-wal would otherwise be replayed and shadow this fresh snapshot.
+    for sidecar in (dst_db + "-wal", dst_db + "-shm"):
+        try:
+            os.remove(sidecar)
+        except OSError:
+            pass
+    src_uri = "file:" + urllib.parse.quote(src_db) + "?mode=ro"
+    src = sqlite3.connect(src_uri, uri=True)
+    try:
+        dst = sqlite3.connect(dst_db)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
 
 
 def _provision_stillwater(lease, data_dir, db_path, keyfile, src_db):
     """Materialize the data directory contents for a stillwater instance:
-    - copy real DB + clean WAL/SHM side-cars (when src_db is given and exists)
+    - snapshot the real DB via the SQLite backup API (point-in-time, WAL folded in)
+      when src_db is given and exists
     - mkdir backups/
     - place encryption.key (symlink preferred; 0600 copy fallback)
     The key is never written into env or instance.env (see _profile_stillwater)."""
     os.makedirs(os.path.join(data_dir, "backups"), exist_ok=True)
     if src_db and os.path.exists(src_db):
-        shutil.copyfile(src_db, db_path)
-        for sidecar in (db_path + "-wal", db_path + "-shm"):
-            try:
-                os.remove(sidecar)
-            except OSError:
-                pass
+        _snapshot_sqlite(src_db, db_path)
     dst_key = os.path.join(data_dir, "encryption.key")
     # Prefer a symlink so the TARGET's 0600 is what os.stat follows; fall back to a
     # 0600 copy if the symlink fails (cross-device, permission, etc.).
@@ -375,12 +392,19 @@ def _profile_stillwater(lease, args):
     """
     data_dir = lease["resources"]["data_dir"]["value"]
     port = lease["resources"]["port"]["value"]
-    keyfile = _require_cfg("ORCHESTRATE_STILLWATER_KEYFILE")
+    # Validate ALL required config up front (F2): report every missing key in a single
+    # error rather than one hard-fail per key across sequential retries.
+    required = ("ORCHESTRATE_STILLWATER_KEYFILE", "ORCHESTRATE_STILLWATER_MUSIC")
+    missing = [n for n in required if not os.environ.get(n, "")]
+    if missing:
+        sys.exit("orchestrate-resources: required config not set (no path is guessed): "
+                 + ", ".join(missing) + ". Set them and retry.")
+    keyfile = os.environ["ORCHESTRATE_STILLWATER_KEYFILE"]
     if not os.path.isfile(keyfile):
         sys.exit(f"orchestrate-resources: ORCHESTRATE_STILLWATER_KEYFILE {keyfile!r} does not "
                  "exist or is not a file (a dangling key symlink would make the binary silently "
                  "auto-generate a wrong key).")
-    music = _require_cfg("ORCHESTRATE_STILLWATER_MUSIC")
+    music = os.environ["ORCHESTRATE_STILLWATER_MUSIC"]
     db_path = os.path.join(data_dir, "stillwater.db")
     # Env bundle - the secret key is intentionally absent.
     lease["env"] = {
@@ -399,8 +423,8 @@ def _profile_stillwater(lease, args):
         f"ln -sfn {keyfile} {os.path.join(data_dir, 'encryption.key')}  # real key beside DB (0600 via target)",
     ]
     if src_db:
-        setup_hint = [f"cp {src_db} {db_path}",
-                      f"rm -f {db_path}-wal {db_path}-shm"] + setup_hint
+        setup_hint = [f"sqlite3 {shlex.quote(src_db)} \".backup '{db_path}'\"  "
+                      "# point-in-time snapshot incl. live WAL (cp would drop the -wal)"] + setup_hint
     lease["meta"]["setup_hint"] = setup_hint
     if args.provision:
         _provision_stillwater(lease, data_dir, db_path, keyfile, src_db)

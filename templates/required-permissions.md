@@ -10,7 +10,7 @@ silently. Changes may require a session restart to take effect.
 
 ## Needed allow-list entries (bare-invocation + bash forms as the repo uses)
 - `Bash(scripts/safe-push.sh *)` and `Bash(scripts/safe-push.sh)`  (pr-shipper push; bare form, since the repo's `bash scripts/*.sh` rules do not cover it)
-- `Bash(gh pr *)`  (pr create / view / diff / checks; also covers `gh pr comment` if ever needed - but triage charter forbids it)
+- The NON-MERGE `gh pr` subcommands, ENUMERATED (never a blanket `gh pr *` wildcard): `Bash(gh pr view *)`, `Bash(gh pr diff *)`, `Bash(gh pr checks *)`, `Bash(gh pr create *)`, `Bash(gh pr list *)`, `Bash(gh pr status *)`, `Bash(gh pr edit *)`, `Bash(gh pr ready *)`, `Bash(gh pr comment *)`. `merge` is DELIBERATELY OMITTED so CC prompts the human (the merge gate; see the merge-gating note below). A blanket `gh pr *` wildcard (i.e. wrapping the whole `gh pr` space in one allow-rule) re-grants merge and silently defeats the gate - do NOT list it here or add it to settings.json.
 - `Bash(gh api *)`  (read endpoints for triage; NOTE: this also permits `-X POST/PATCH` - keep it scoped by charter, or omit and let triage use only `gh pr view`)
 - `Bash(gh issue *)`  (lead files tracking issues)
 - `Bash(git *)`  (push is hook-gated against main; safe-push wraps it)
