@@ -4,6 +4,13 @@ A Claude Code team-agent orchestrator: a lead-orchestrated multi-agent pipeline 
 several PRs in parallel, plus the deterministic security floor and cross-session resource registry
 it runs on. This file is hand-maintained (no `/init`); keep it accurate and lean.
 
+## >> ON SESSION START / RESUME: read SESSION-STATE.md FIRST <<
+
+`SESSION-STATE.md` (in this repo root; gitignored, machine-local) is the running checkpoint -
+the top banner has current status + the next actions. Read it before doing anything when the
+user says "pick up where we left off", "resume orchestrator work", "continue orchestrator", or
+otherwise asks to continue. It supersedes any stale detail below it in that file.
+
 ## Style and conventions
 
 - No emoji in code, commits, comments, or docs. No em-dashes in any user-facing output (use
