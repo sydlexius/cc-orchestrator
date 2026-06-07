@@ -125,7 +125,7 @@ A Medium-effort Opus lead survives only a few hours before forced compaction, an
 
 ## Session feedback log (standing rule)
 ALL friction and improvement ideas surfaced during a run go to ONE place:
-`~/Developer/cc-orchestrator/orchestrate-session-feedback.md` (local, gitignored running log; see its
+`~/.claude/orchestrate-session-feedback.md` (machine-local running log, OUTSIDE the repo so writing it never touches the repo tree; see its
 header for the entry format). This covers a deterministic-floor (or any hard) gate that BLOCKS
 something legitimate, a convenience that would NOT sacrifice security, doc-drift, AND suggested
 improvements to this skill / charters / templates / playbook (house style, new invariants,
