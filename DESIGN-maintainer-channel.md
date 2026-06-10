@@ -965,4 +965,17 @@ F9-A-1). Because this is a content change after a dry round, the K=2 counter is
 RESET - rounds 12 and 13 must both be fully dry to converge (no unverified edit
 rides into convergence).
 
-- _(rounds 12-13 pending - need 2 consecutive ALL-critic-dry rounds on the reconciled spec to converge at K=2)_
+### Round 12 (2026-06-10) - ALL THREE DRY (K=1, clean - no edits)
+
+3 parallel critics on the reconciled spec: ALL returned DRY (0 findings), no
+unfiled residuals this time. Authority (A) traced every named bypass path
+(forged/spoofed sentinel, replay, compromised account, delimiter-escape, one-step
+indirect, re-laundering) and confirmed the round-11 reconciliation is a pure
+narrowing (two wrapper forms -> one stronger canonical form) with no authority
+surface change. Concurrent/watermark (B) re-confirmed all mechanics intact and
+untouched by the round-11 edit. Implementation-completeness (C) verified no
+normative section still directs the old open-only wrapper, and that regex,
+floor, placeholder, predicate, templates, and watermark cadence all align across
+the DESIGN normative text and Testing strategy. K=1 (clean, no edits made).
+
+- _(round 13 pending - one more ALL-critic-dry round converges the spec at K=2)_
