@@ -79,18 +79,41 @@ authority. This matters MORE now that the channel is third-party SaaS (and the
 target channel is public), not self-hosted. Full-parity (allowlisted-sender ==
 terminal go) is explicitly rejected.
 
-### D3 - Target: a dedicated channel, with a watermark read (not thread replies)
+### D3 - Target: ONE channel PER REPO, with `#codebots` as the shared fallback
 
-Target = the existing channel **`#codebots` (`C0B8Y401QR2`, PUBLIC)** per the
-maintainer (a switch from the private `#cc-orchestrator-lead` test channel).
+The lead orchestrates against MULTIPLE target repos. A single shared channel
+would (a) interleave `▶` cards from different repos' runs, and (b) make the
+INBOUND read ambiguous - a "go" reply read via `slack_read_channel` could not be
+attributed to a specific repo's run. So the target is a DEDICATED channel PER
+REPO. This needs NO schema change: `ORCHESTRATE_SLACK_CHANNEL` already lives in
+the per-session `profile.env` (tied to the target repo), so each repo simply
+carries its own channel id.
+
+**Channel resolution order (the lead picks the first that resolves):**
+1. `ORCHESTRATE_SLACK_CHANNEL` from the run's `profile.env` - the EXPLICIT target.
+   Set it to the repo's OWN dedicated channel (PREFERRED; may be private to scope
+   who sees repo internals), OR to `#codebots` (`C0B8Y401QR2`, PUBLIC) when you
+   deliberately want the shared GENERAL/TESTING channel.
+2. else terminal-only `▶` cards (D4 graceful degradation).
+
+There is NO automatic fallback to a public channel: an unset config means
+terminal-only, never a surprise post to `#codebots`. `#codebots` is reached only
+by explicitly putting its id in `profile.env`. (PUBLIC is acceptable per the
+maintainer for shared/testing use; the lead must be mindful that cards may
+reference repo internals there.)
+
+**Every card is tagged with the repo name** (e.g. a `[<repo>]` prefix) regardless
+of target, so runs are distinguishable even when several share `#codebots` during
+testing.
+
+**Read mechanics (apply to whichever channel resolved):**
 - Self-DMs can be push-suppressed by Slack -> a channel gives a durable stream.
-- PUBLIC is acceptable per the maintainer; the lead must be mindful that cards
-  may reference repo internals.
 - **Live-test finding (spec-relevant):** a maintainer reply arrived as a
   TOP-LEVEL channel message, not a threaded reply, so `slack_read_thread` on the
   parent `ts` missed it. Therefore inbound MUST read channel history since a
   stored watermark `ts` (`slack_read_channel`, newest-first), advancing the
-  watermark after each read - NOT rely on in-thread replies.
+  watermark after each read - NOT rely on in-thread replies. The watermark is
+  per-channel (so switching a repo to its own channel starts a fresh watermark).
 
 ### D4 - Optional + graceful degradation
 
