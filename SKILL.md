@@ -5,12 +5,16 @@ description: Use when scaffolding and running a lead-orchestrated multi-agent se
 
 # Orchestrate: lead-run multi-agent PR pipeline
 
-**Version 0.1.0** (semver; releases tagged `vX.Y.Z`). Bump on any material change to this skill, its templates, or the runtime - PATCH for a fix, MINOR for a new rule/feature, MAJOR for a breaking charter or deterministic-floor change - so `/reload-skills` surfaces the new number and drift between the symlinked repo and the loaded skill is visible. History: `git log` + the GitHub Release notes cut at each `vX.Y.Z` tag.
+**Version 0.2.0** (semver; releases tagged `vX.Y.Z`). Bump on any material change to this skill, its templates, or the runtime - PATCH for a fix, MINOR for a new rule/feature, MAJOR for a breaking charter or deterministic-floor change - so `/reload-skills` surfaces the new number and drift between the symlinked repo and the loaded skill is visible. History: `git log` + the GitHub Release notes cut at each `vX.Y.Z` tag.
 
 You are the LEAD (orchestrator). You delegate building and the mechanical PR
 lifecycle to single-purpose teammates, and you keep for yourself the decisions
 and every privileged outward step. This skill is the playbook + templates for
 standing that up and running it to completion.
+
+## Lead operating contract (READ FIRST - the rule that makes this work)
+When you are orchestrating (a team is stood up), you ORCHESTRATE; you do NOT build. The LEAD never writes, edits, or fixes code in the target repo - EVERY build, edit, and fix goes to a PR-blind implementer teammate (issue hints, else Opus/medium; see the role table). Your hands do decisions, gates, the dispatch map, the checkpoint, and the privileged outward steps (push / `gh pr create` / merge-go) - never the target repo's code.
+SELF-CHECK (at the moment of temptation): if you are about to use Edit/Write on target-repo code, or run a build/fix yourself, STOP - that is an implementer's job; spawn or respawn a PR-blind implementer with the fix-list + its charter. (A lone quick fix with no team is "When NOT to use" below - do it inline; but the moment a team exists, delegation of build work is absolute.)
 
 ## When to use
 - The user wants to ship MULTIPLE PRs (a milestone push, a cluster of issues) with parallel agents.
@@ -43,6 +47,7 @@ wall. Spawn each from its template charter.
 
 ## Hard invariants (never violate)
 - NO bot ever merges. Merge + post-merge-cleanup are the maintainer's/lead's only.
+- LEAD-NO-IMPLEMENT. The lead never writes/edits/fixes target-repo code; ALL build work delegates to a PR-blind implementer. (Hard-invariant restatement of the Lead operating contract near the top, which carries the full rule + the at-the-keyboard self-check.)
 - Per-PR human go at STACK time: a branch is appended to the shipper stack only after the maintainer deems it shippable (UAT punch-list or AskUserQuestion + live URL).
 - Lead vets EVERY PR body/title `#N` ref against `gh issue view N` before stacking (small TaskList IDs collide with old issues).
 - RESOLVE issue->PR before dispatching pr-triage. The lead never assumes issue number == PR number. Before it dispatches pr-triage (or backgrounds a `pr-watch`) for a piece of work, it resolves the actual open PR via `gh pr list --head <branch> --state open` (or the recorded stack-entry -> shipped-`#N` mapping) and triages THAT PR number. Dispatching triage against a guessed/unresolved number just makes `pr-watch` exit 2 (could-not-look), never a real review.
