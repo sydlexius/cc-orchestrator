@@ -5,7 +5,7 @@ description: Use when scaffolding and running a lead-orchestrated multi-agent se
 
 # Orchestrate: lead-run multi-agent PR pipeline
 
-**Version 0.7.0** (semver; releases tagged `vX.Y.Z`). Bump on any material change to this skill, its templates, or the runtime - PATCH for a fix, MINOR for a new rule/feature, MAJOR for a breaking charter or deterministic-floor change - so `/reload-skills` surfaces the new number and drift between the symlinked repo and the loaded skill is visible. History: `git log` + the GitHub Release notes cut at each `vX.Y.Z` tag.
+**Version 0.7.1** (semver; releases tagged `vX.Y.Z`). Bump on any material change to this skill, its templates, or the runtime - PATCH for a fix, MINOR for a new rule/feature, MAJOR for a breaking charter or deterministic-floor change - so `/reload-skills` surfaces the new number and drift between the symlinked repo and the loaded skill is visible. History: `git log` + the GitHub Release notes cut at each `vX.Y.Z` tag.
 
 You are the LEAD (orchestrator). You delegate building and the mechanical PR
 lifecycle to single-purpose teammates, and you keep for yourself the decisions
@@ -294,10 +294,14 @@ slug/encoding). The lead is the single writer.
   `ORCHESTRATE_SLACK_CHANNEL` is set, at session start the lead arms a recurring `ScheduleWakeup`
   whose sole job is: READ the channel since the watermark FIRST, answer any non-privileged inbound
   (react :eyes:, then respond), and re-arm. At every wake it reads the channel FIRST. Cadence is
-  ADAPTIVE: ~90s while a conversation is ACTIVE (a sub-prompt-cache-window poll is acceptable when
+  ADAPTIVE: ~60s while a conversation is ACTIVE (a sub-prompt-cache-window poll is acceptable when
   actively conversing - e.g. a maintainer message within the last ~10min or a NEEDS-YOU card
-  outstanding), relaxing to ~240-270s when idle. This converts the polled channel into a
-  pseudo-push so benign inbound is never dropped. Tear the wakeup DOWN on `down`. A post-only lead
+  outstanding), relaxing to ~240-270s when idle. 60s is the FLOOR, not a free parameter: `ScheduleWakeup`
+  CLAMPS the delay to [60, 3600], so a tighter "30s" poll the maintainer might ask for is not achievable
+  via the scheduler - 60s active is the tightest the runtime allows. A true sub-60s push would need a
+  Slack->session event bridge that this harness does not provide today (`Monitor` watches files/processes/CI,
+  not Slack MCP events), so polling at the 60s floor is the responsive ceiling. This converts the polled
+  channel into a pseudo-push so benign inbound is never dropped. Tear the wakeup DOWN on `down`. A post-only lead
   that ignores inbound is a repeated trust failure; owning the channel means watching it.
 - **Read-receipt reactions (#29).** The lead reacts :eyes: (via `slack_add_reaction`) to each
   maintainer Slack message once read, as an explicit read-receipt: absence of :eyes: means the
