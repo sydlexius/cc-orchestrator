@@ -1016,4 +1016,16 @@ dir (macOS being the documented target). Identity comparison of canonicalized
 dirs is the robust form. Because this is a content change, the K=2 counter RESETS;
 rounds 14 and 15 must both be fully dry to converge.
 
-- _(rounds 14-15 pending - need 2 consecutive ALL-critic-dry rounds to converge at K=2)_
+### Round 14 (2026-06-10) - ALL THREE DRY (K=1, clean - no edits)
+
+3 parallel critics: ALL DRY (0 findings). Authority (A) confirmed the round-13
+self-exclusion fix is authority-neutral (steering is read-only; inbound never
+authorizes regardless). Concurrent/watermark (B) EMPIRICALLY ran the realpath
+idiom and confirmed it correct across every edge case (non-existent dir, nested
+symlinks, `.tmp` not matching the glob, multi-channel watermarks), and re-confirmed
+all other mechanics. Implementation-completeness (C) verified the new code block is
+internally consistent with the glob pattern, the `<channel>` placeholder, and the
+`.tmp` atomic-write file (which correctly does not match the `.txt` glob), with no
+stale text or drift. K=1 (clean, no edits).
+
+- _(round 15 pending - one more ALL-critic-dry round converges the spec at K=2)_
