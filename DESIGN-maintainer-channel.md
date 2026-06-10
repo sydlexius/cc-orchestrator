@@ -194,4 +194,58 @@ Per `DESIGN-deterministic-floor.md`: record each adversarial finding, the fix,
 and the lesson. Converge at K=2 consecutive dry rounds before the spec is
 declared complete.
 
-- _(pending: round 1)_
+### Round 1 (2026-06-09) - NOT DRY (7 findings; fixes queued, not yet applied)
+
+Adversarial critic pass (TARGET = this spec; THREAT MODEL = honest-operator
+misconfig + inbound injection + channel-as-authority-bypass; Slack infra
+compromise OUT of scope). Priority order: F1-3, F1-1, F1-2 before round 2.
+
+- **F1-1 (SHOULD-FIX, authority-bypass).** The conservative model lists what
+  inbound MAY NOT *authorize*, but the maintainer's real "go" vocabulary
+  ("go"/"ship"/"push") is natural language; the spec never states the positive
+  rule. FIX: add to the invariant - a privileged authorization is recognized
+  ONLY from the TERMINAL input channel; an identical-looking go arriving inbound
+  on Slack MUST be ignored for authority and may at most prompt the lead to
+  re-emit the gate card on the terminal.
+- **F1-2 (SHOULD-FIX, injection).** Inbound text (public `#codebots` -> any
+  workspace member) lands verbatim in the lead's context; "context only" is
+  under-defined. FIX: (a) lead ingests inbound as clearly-delimited UNTRUSTED
+  quotation (a third party speaking, never system/maintainer instructions);
+  (b) tighten "MAY direct non-privileged investigation" - it is a suggestion,
+  never a command, and never sources commands/URLs/paths to execute (the floor
+  does NOT cover arbitrary curl/file-read -> guard against SSRF/exfil foothold).
+- **F1-3 (BLOCKER-adjacent, under-spec).** `check_slack_channel()` CANNOT probe
+  plugin/channel reachability: MCP tools are callable only by the runtime agent,
+  not from the stdlib `doctor` subprocess. The spec over-promises. FIX: redefine
+  the check to what stdlib can verify (absent -> WARN; malformed channel-id ->
+  WARN; never FAIL); move "unreachable" out of doctor's contract into the
+  RUNTIME degradation contract (validated by the lead's first slack_send_message,
+  degrade-on-failure per D4).
+- **F1-4 (SHOULD-FIX, misconfig).** Per-repo solves OUTBOUND ambiguity via
+  `[repo]` tags, but a SHARED channel (blessed for testing) reintroduces INBOUND
+  ambiguity: human replies rarely carry a repo tag, and concurrent runs clobber
+  the per-channel watermark. FIX: when a channel is shared by >1 concurrent run,
+  inbound steering is DISABLED (read-ambiguous) and the lead falls back to
+  terminal for steering on that channel.
+- **F1-5 (NICE-TO-HAVE, degradation).** State in Error behavior that the
+  terminal card is emitted unconditionally and FIRST; Slack send is best-effort
+  AFTER, and its failure never suppresses/delays the terminal card (prevents an
+  implementer reordering into "try Slack, skip terminal on success").
+- **F1-6 (NICE-TO-HAVE, under-spec).** Watermark storage is unspecified. FIX:
+  store per-channel in the team artifact dir (e.g.
+  `<team>/slack-watermark.<channel>.txt`), single-writer = the lead (consistent
+  with SINGLE-WRITER STACK). On missing/corrupt watermark, default to "read from
+  now" (never replays an old reply as authority) and log once. Resolves F1-4's
+  race (lead is sole writer).
+- **F1-7 (NICE-TO-HAVE, testing).** Drop the untestable "present-but-unreachable
+  -> WARN" case (no MCP plugin in the harness); replace with absent -> WARN,
+  malformed-id -> WARN, never-FAIL, and the `ORCHESTRATE_SLACK_CHANNEL`
+  round-trip (verified testable: `write_profile_env` persists any PROFILE_ENV_KEYS
+  member, `_parse_profile_env` reads it back).
+
+SOUND classes (logged for convergence): consistency with SKILL.md invariants
+(PR-blind, single-writer, lead-sole-channel, floor authority); D3
+no-auto-public-fallback; conventions (emoji/em-dash clean, WARN-not-FAIL,
+stdlib-only). Out-of-scope items correctly fenced.
+
+- _(pending: round 2 - apply F1-* fixes, then re-attack for a dry round; K=2 to converge)_
