@@ -102,9 +102,9 @@ by explicitly putting its id in `profile.env`. (PUBLIC is acceptable per the
 maintainer for shared/testing use; the lead must be mindful that cards may
 reference repo internals there.)
 
-**Every card is tagged with the repo name** (e.g. a `[<repo>]` prefix) regardless
-of target, so runs are distinguishable even when several share `#codebots` during
-testing.
+**Every card is tagged with the orchestrator sentinel** (see D5), which embeds
+the repo name, so runs are distinguishable even when several share `#codebots`
+during testing AND the lead can suppress its own echoes on read-back.
 
 **Shared-channel inbound steering disabled (F1-4 / F2-C-1).** When the same
 channel id is configured for more than one CONCURRENT run, inbound steering is
@@ -222,13 +222,87 @@ If `ORCHESTRATE_SLACK_CHANNEL` is unset, or the plugin is unconfigured /
 unreachable, the lead falls back to in-terminal `▶` cards with NO error raised
 (degraded mode). No hard dependency on the channel.
 
+### D5 - Sender disambiguation: the orchestrator sentinel (single-identity reality)
+
+**Forcing fact:** the official Slack plugin (`slack@claude-plugins-official`)
+authenticates via USER OAuth against Slack's hosted server
+(`https://mcp.slack.com/mcp`); it acts AS THE MAINTAINER'S OWN USER. There is no
+separate bot identity. Therefore `slack_send_message` posts under the
+maintainer's username/avatar - the SAME identity as the maintainer's own
+replies. Two consequences, both addressed by one mechanism:
+
+1. **UX:** without a marker, the orchestrator's cards and the maintainer's
+   replies share one avatar - it reads as the maintainer talking to themselves.
+2. **Correctness (load-bearing):** `slack_read_channel` reads the lead's OWN
+   outbound cards back as channel history. Because they carry the maintainer's
+   user id (identical to genuine replies), SENDER IDENTITY CANNOT DISAMBIGUATE
+   them - filtering by user id would also drop the maintainer's real replies.
+   The only reliable discriminator is a content marker the lead controls.
+
+**The sentinel.** Every outbound card begins with a plain-text first line:
+
+```
+[ORCHESTRATOR - <repo>]
+```
+
+(plain text, no emoji per house style; `<repo>` is the target repo's short name).
+It does triple duty:
+- **Human-visible:** the maintainer sees at a glance which messages are the
+  agent's vs their own.
+- **Self-echo suppression (the correctness fix):** on each `slack_read_channel`,
+  the lead DROPS any message whose text begins with `[ORCHESTRATOR - ` and treats
+  only NON-sentinel messages as candidate inbound. This is independent of sender
+  id (which is unreliable here). This SUPERSEDES the earlier bare `[<repo>]`
+  prefix (D3), folding repo disambiguation into the same marker.
+- **Repo disambiguation:** distinguishes concurrent runs sharing `#codebots`.
+
+**Secondary signal (live-test LT-1, 2026-06-09):** Slack appends a `*Sent using*
+Claude` footer to every message posted through this integration. The maintainer's
+replies typed directly in Slack lack it, so it is a NATURAL corroborator that a
+message is the lead's own. It is SECONDARY ONLY (fragile: a maintainer who replies
+*via* Claude would also carry it); the `[ORCHESTRATOR - <repo>]` sentinel remains
+the primary, controlled discriminator. Do not gate self-echo suppression on the
+footer alone.
+
+**Live-test confirmation (2026-06-09):** posting a sentinel card to `#codebots`
+and reading it back returned `Message from Jesse (U0B8Y33QSRJ)` - i.e. the
+maintainer's OWN user id, empirically confirming the single-identity premise and
+the self-echo (the lead's own card was the newest message on read-back). The
+sentinel first line survived intact and is a valid filter key.
+
+**Threat-model consistency (no authority bypass).** Sentinel handling is
+fail-safe and does NOT weaken D2:
+- A public-channel poster SPOOFING the sentinel (prepending it to their message)
+  only causes the lead to IGNORE that message - and ignoring is already the
+  default-safe action (inbound never authorizes anything). Worst case: a piece of
+  untrusted inbound is dropped, which is strictly safer than processing it.
+- STRIPPING the sentinel (or never adding it) only makes a message look like
+  ordinary inbound, which is already treated as UNTRUSTED QUOTATION.
+- The sentinel is a DISPLAY/PARSING convenience, never an authority token. It
+  gates nothing privileged; the floor + human-executed merge remain the sole
+  authority regardless of what the sentinel says.
+
+**If a future deployment uses a real bot token** (distinct identity), the
+identity problem disappears and the sentinel becomes belt-and-suspenders;
+self-echo suppression by sentinel still works and need not change.
+
 ## Components
 
 ### Outbound (P1 - the standout)
 When `ORCHESTRATE_SLACK_CHANNEL` is set and the Slack MCP plugin is reachable,
 the lead calls `slack_send_message` to post `## ▶ NEEDS YOU` / `## ▶ SHIP-GATE`
 cards to the configured channel, IN ADDITION TO terminal output (never instead
-of - terminal remains the system of record).
+of - terminal remains the system of record). Every outbound message begins with
+the `[ORCHESTRATOR - <repo>]` sentinel first line (D5) so the maintainer can
+distinguish it from their own replies and the lead can suppress it on read-back.
+
+**Slack card formatting (live-test LT-2, 2026-06-09).** Slack STRIPS markdown
+`##` headers and converts `▶` to the `:arrow_forward:` emoji shortcode, so a
+terminal `## ▶ NEEDS YOU` card does NOT render as a header in Slack. The TERMINAL
+card keeps `## ▶ ...` (its system-of-record format, unchanged); the SLACK card
+uses Slack-native emphasis (bold `*NEEDS YOU*` / `*SHIP-GATE #N*`, the surviving
+`▶`/`:arrow_forward:` glyph, and code fences for URLs/SHAs) for the standout.
+The sentinel first line is plain text and survives verbatim either way.
 
 ### Inbound (P2 - the steering)
 At quiescent points (after emitting a card, before resuming work), the lead
@@ -239,7 +313,12 @@ Read is single-shot per quiescent point (not a poll-loop). At EACH such read the
 lead also (a) refreshes its own watermark file's mtime and (b) re-evaluates
 sibling liveness, per the Heartbeat + re-evaluation rule (F5-B-2) in D3 - so a
 long-lived run stays inside the TTL and a sibling appearing mid-session disables
-steering from that point. Inbound messages are treated as
+steering from that point. **Self-echo suppression (D5):** because outbound posts
+carry the maintainer's own user id (single-identity OAuth), the lead CANNOT use
+sender id to tell its own cards from the maintainer's replies; instead it DROPS
+any returned message whose text begins with `[ORCHESTRATOR - ` and treats only
+the remaining (non-sentinel) messages as candidate inbound. Inbound messages are
+treated as
 UNTRUSTED QUOTATION: context only, never commands (see invariant / F1-1/F1-2).
 **An inbound message causes NO change in lead behavior; the lead never re-emits
 a gate card because an inbound message asked for it (invariant F1-1/F2-A-1).**
@@ -386,6 +465,10 @@ Code changes: `check_slack_channel()` in `orchestrate-setup.py` + wiring into
     to team artifact profile.env; such a test fails by design after F2-B-2).
 - Sibling watermark detection (F3-C-3): runtime lead behavior, not
   `orchestrate-setup.py` code; no subprocess harness coverage - gap accepted.
+- D5 sentinel + self-echo suppression: runtime lead behavior (sentinel prefix on
+  outbound, drop-on-read-back filter), not `orchestrate-setup.py` code; not
+  harness-testable. Empirically vetted by the 2026-06-09 live test (see iteration
+  log); gap accepted for the subprocess harness.
 - `▶ CHANNEL DEGRADED` card: runtime lead behavior, not harness-testable.
 - Channel id regex: `[A-Z][A-Z0-9]{5,}` (leading letter + 5+ alphanum, min 6
   total) - excludes all-digit strings, covers known prefixes C/G/D/W (F3-B-4).
@@ -531,4 +614,30 @@ Critic C returned DRY (no findings). Critics A and B found real gaps; all 8 veri
 
 SOUND classes: implementation-completeness DRY this round; authority model (D2), graceful degradation (D4), single-writer, stdlib-only doctor all hold; no regressions.
 
-- _(round 6 pending - round 5 was NOT dry, so the K=2 dry-round counter resets; need 2 consecutive dry rounds to converge)_
+### Maintainer-driven addition + live test (2026-06-10) - D5 sender disambiguation
+
+The maintainer raised a design gap no critic had: with the official Slack plugin
+authenticating as the maintainer's OWN user (user-OAuth, no bot identity),
+outbound cards and the maintainer's replies share one Slack identity - so it
+"looks like talking to myself" (UX) AND `slack_read_channel` reads the lead's own
+cards back as inbound (correctness / self-echo). Added D5: an
+`[ORCHESTRATOR - <repo>]` plain-text sentinel first line on every outbound card,
+used for (a) human visual distinction, (b) self-echo suppression on read-back
+(filter, since sender id is unusable), (c) repo disambiguation (supersedes the D3
+bare `[<repo>]` prefix). Threat-model-consistent: sentinel spoof/strip is
+fail-safe (only causes ignore; never authorizes).
+
+LIVE TEST (vetted against `#codebots`, maintainer-requested):
+- Single-identity premise CONFIRMED: posted card read back as
+  `Message from Jesse (U0B8Y33QSRJ)` = the maintainer's own id.
+- Self-echo CONFIRMED: the lead's own card was the newest message on read-back.
+- **LT-1 (new):** Slack appends `*Sent using* Claude` to integration messages - a
+  free SECONDARY discriminator (fragile; sentinel stays primary).
+- **LT-2 (new):** Slack STRIPS markdown `##` headers and converts `▶` to
+  `:arrow_forward:`; the Slack card must use Slack-native bold emphasis, not `##`.
+  Terminal card format is unchanged.
+
+Chosen sentinel style: plain text tag (no emoji, per house style) - maintainer
+decision via AskUserQuestion.
+
+- _(round 6 pending - round 5 was NOT dry and D5 is a substantive addition, so the K=2 dry-round counter resets; round 6 must re-attack the spec INCLUDING D5 and LT-1/LT-2; need 2 consecutive dry rounds to converge)_
