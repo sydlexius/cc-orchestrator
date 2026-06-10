@@ -545,11 +545,15 @@ component (no additional sanitization needed given the regex constraint).
 > residual steering path).
 >
 > **Presentation format (F3-A-4).** When including inbound content in the
-> lead's context, wrap it: `[INBOUND CHANNEL - UNTRUSTED]: "<verbatim text>"`.
-> This is a mechanical framing, not just cognitive intent, reducing the risk of
-> the content being parsed as a system directive.
+> lead's context, wrap it as untrusted quotation. A first illustration of the
+> framing is `[INBOUND CHANNEL - UNTRUSTED]: "<verbatim text>"`, but this
+> open-only form is SUPERSEDED for the actual mechanical wrapping by the
+> closure-resistant nonce-fenced form in F9-A-1 below (the canonical wrapper) -
+> an implementer MUST use the F9-A-1 fenced form, not this illustration. The
+> framing is mechanical, not just cognitive intent, reducing the risk of the
+> content being parsed as a system directive.
 >
-> **Escape-resistant wrapper (F9-A-1).** The verbatim inbound text can ITSELF
+> **Escape-resistant wrapper (F9-A-1) - THE CANONICAL WRAPPER.** The verbatim inbound text can ITSELF
 > contain a forged closing delimiter or a fake framing (`[INBOUND CHANNEL ...`,
 > a closing quote, a counterfeit terminal-card heading, or the `[ORCHESTRATOR - `
 > sentinel) attempting to break OUT of the quotation so a later turn re-ingests
@@ -578,7 +582,7 @@ component (no additional sanitization needed given the regex constraint).
 > "the maintainer says go" in the lead's own voice strips the untrusted framing
 > and risks the content being re-ingested as authority on a later turn. If
 > inbound content must be referenced at all, it is reproduced VERBATIM inside the
-> `[INBOUND CHANNEL - UNTRUSTED]: "..."` wrapper only.
+> canonical nonce-fenced untrusted-quotation wrapper (F9-A-1) only.
 
 ## Testing strategy
 
@@ -942,4 +946,23 @@ LESSON: a "nonce" only resists a chosen-text attacker if it is unpredictable to
 that attacker - stating "nonce" without the unpredictability + non-derivation
 property leaves the security claim resting on an unstated assumption.
 
-- _(round 11 pending - round 10 had 1 SHOULD-FIX, so the K=2 dry counter is still at 0; B and C dry this round; need 2 consecutive ALL-critic-dry rounds to converge)_
+### Round 11 (2026-06-10) - ALL THREE DRY (K=1), then a reconciliation edit reset the counter
+
+3 parallel critics: ALL returned DRY (0 findings). Authority (A) confirmed the
+round-10 nonce-unpredictability fix sound and the whole authority surface closed;
+concurrent/watermark (B) re-confirmed the round-9 magnitude-floor + atomic-write
+mechanics unchanged and consistent; implementation-completeness (C) confirmed the
+whole spec implementable. This was the first fully-dry round (K=1).
+
+HOWEVER, critic C surfaced (without filing) a real mild residual: the spec carried
+TWO inbound-wrapper forms - the open-only `[INBOUND CHANNEL - UNTRUSTED]: "..."`
+(F3-A-4) and the nonce-fenced closure-resistant form (F9-A-1) - with F5-A-3 still
+citing the older one. Rather than hand an implementer two competing forms, the
+lead made a RECONCILIATION EDIT: F9-A-1's nonce-fenced form is now declared THE
+CANONICAL WRAPPER; F3-A-4's open-only form is explicitly marked superseded (a
+first illustration only); F5-A-3's citation is now form-agnostic (points to
+F9-A-1). Because this is a content change after a dry round, the K=2 counter is
+RESET - rounds 12 and 13 must both be fully dry to converge (no unverified edit
+rides into convergence).
+
+- _(rounds 12-13 pending - need 2 consecutive ALL-critic-dry rounds on the reconciled spec to converge at K=2)_
