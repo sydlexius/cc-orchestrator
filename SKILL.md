@@ -35,6 +35,7 @@ wall. Spawn each from its template charter.
 | implementer (1 per cluster) | issue hints, else Opus / medium; acceptEdits | edit OWN worktree, commit, run local tests, act on fix-instructions | push, any `gh`, see/know the PR or CR (PR-BLIND), merge, touch other worktrees | implementer-charter.md |
 | adversarial-prep | Sonnet / auto | run `/prep-pr` (tests, gate, generated-file + coverage), report pass/fail | push, edit code, reply, merge | adversarial-prep-charter.md |
 | adversarial-review | Sonnet or Opus / auto, READ-ONLY | run `/pr-review-toolkit:review-pr` in HOSTILE mode, draft findings | any mutation | adversarial-review-charter.md |
+| pr-prep (1-shot per PR) | Sonnet / auto | read branch diff, `gh issue view N`, draft title/body_file/closes-list, write body_file to /tmp/<team>/ | push, edit code, append to stack (lead is single-writer), see/act on CR, emit human prompts, merge | pr-prep-charter.md |
 | pr-shipper | Sonnet / auto | safe-push ANY stacked branch, `gh pr create`, background `pr-watch.sh`, rate-limit probe | MERGE, post-merge-cleanup, edit code | pr-shipper-brief.md |
 | pr-triage | Sonnet / auto, READ-ONLY | `/handle-review` MINUS mutations, draft to /tmp/<team>/pr-triage/, MERGE-READY verdict | apply/reply/resolve/push/MERGE | pr-triage-charter.md |
 
@@ -53,6 +54,7 @@ wall. Spawn each from its template charter.
 - SINGLE REF-ADVANCER. Exactly ONE agent advances a branch's ref: the implementer worktree (commits + any rebase happen THERE). The pr-shipper is PUSH-ONLY - it pushes the branch by name and NEVER rebases, amends, or otherwise rewrites history. Before any fix round, the respawned implementer asserts the worktree exists, its branch matches, and reconciles worktree-HEAD vs `origin/<branch>` (fast-forward or rebase locally in the worktree) BEFORE editing - so the one ref-advancer is always reconciled with the remote it is about to re-push.
 - SINGLE-WRITER STACK. Only the LEAD mutates the shipper stack (`/tmp/<team>/stack.json`): the lead appends entries and the lead removes them. The pr-shipper NEVER pops or rewrites the stack - it SIGNALS "shipped #N" (PR number + URL) back to the lead, and the lead does the removal. This keeps a single writer on the stack file so two agents never race it.
 - head_sha SHA-COMPARE (pr-shipper hard gate). Before `gh pr create`, the pr-shipper hard-compares the stack entry's `head_sha` to the actual pushed branch HEAD (`git rev-parse origin/<branch>`); on ANY mismatch it REFUSES to open the PR and messages the lead. This catches a stale or wrong stack entry before it becomes a PR.
+- PR-OPEN OWNERSHIP. Opening a PR (push + `gh pr create` + background `pr-watch`) is the pr-shipper's job BY DEFAULT - delegate to pr-shipper (see its role-table row) for any multi-PR drip or CR-paced cluster, which is what this pipeline exists for. For a single standalone PR, lead-direct push + `gh pr create` is the explicit EXCEPTION, not the default, and ONLY for that one branch. The exception skips ONLY the pr-shipper/pr-triage delegation bots - it NEVER skips adversarial-prep or adversarial-review (where warranted); those gates must be GREEN before any lead-direct push + `gh pr create`, regardless of whether a shipper bot is in use.
 
 ## Pipeline flow (per issue/cluster)
 ```
@@ -61,7 +63,8 @@ dispatch-map entry
   -> adversarial-prep gate (/prep-pr) -> fail loops back to implementer
   -> adversarial-review (hostile /pr-review-toolkit:review-pr) -> findings loop back
   -> lead gates SHIPPABLE (maintainer UAT: punch-list or AskUserQuestion + live URL)
-  -> lead vets body refs, appends to shipper stack, checkpoints the implementer + tears down the agent (worktree kept until PR merges)
+  -> lead spawns a short-lived pr-prep subagent -> produces title + body_file + closes-list into /tmp/<team>/
+  -> lead VETS that pr-prep output (vet, not author - see "lead vets EVERY PR body/title #N ref"), appends to shipper stack, checkpoints the implementer + tears down the agent (worktree kept until PR merges)
   -> pr-shipper: safe-push branch -> gh pr create -> background pr-watch -> rate-limit probe -> signal "shipped #N" to lead (lead removes the entry)
   -> pr-triage: background pr-watch -> on CR/Greptile, triage (/handle-review minus mutations) -> NOTIFY LEAD with one of two outcomes:
        * MERGE-READY (clean+mergeable) -> lead takes it straight to the maintainer to merge. SHORT-CIRCUIT: no re-review, no implementer respawn.
@@ -116,6 +119,7 @@ A Medium-effort Opus lead survives only a few hours before forced compaction, an
    The `stillwater` profile requires two env config vars up front (validated together; missing ones are reported in one error): `ORCHESTRATE_STILLWATER_KEYFILE` (path to the real 0600 encryption key) and `ORCHESTRATE_STILLWATER_MUSIC` (shared music library path). `ORCHESTRATE_STILLWATER_DB` (source DB to snapshot) is optional and only used by `--provision`; with `--provision` it is taken point-in-time via the SQLite backup API (live WAL folded in). Set these (e.g. source a per-session `profile.env`) before each allocate.
    This prints the lease JSON on STDOUT (machine-readable) and the eval-able `export KEY=VALUE` block on STDERR (by design - stdout stays pure JSON). The LEAD reads the STDERR block and exports those env vars into the teammate's tmux pane as REAL environment. This is the AUTHORITATIVE delivery: it wins over any `.env` file (per D6 precedence - dev-restart.sh already prioritizes exported env over .env). Ports and data dirs are collision-free leases; never hand-pick fixed values. The written `lease.env_file` is a durable fallback record only.
    Then spawn implementers from the map (charter + build task only). Spawn pr-shipper + pr-triage from their charters when the first branch nears shippable.
+   - ACKNOWLEDGE THE PR BOTS. Before running the pipeline, explicitly note that the pr-prep, pr-shipper, and pr-triage roles exist and WILL be used for the PR-open path (pr-prep drafts title/body/closes -> lead vets -> stack -> pr-shipper opens). This is a deliberate cue against forgetting them mid-run and defaulting to manual PR work (lead-direct is the narrow exception, not the default - see "PR-OPEN OWNERSHIP").
 7. Run the pipeline. Maintain the checkpoint block (`templates/SESSION-STATE.checkpoint.md`) continuously.
 
 ## Checkpoint / resume / teardown
