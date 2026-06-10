@@ -306,9 +306,11 @@ slug/encoding). The lead is the single writer.
   - 👎 = reject / no / hold (the lead then asks via text what to change)
   - 👀 = RESERVED for the lead's own read-receipt; the maintainer will not use it
   - ✅ = the maintainer's OWN read-tracking; IGNORE it
-  CAVEAT: emoji answers are unambiguous ONLY for YES/NO asks + ship-gates; for a multi-option
-  question the lead still needs a text reply (a bare 👍 on a 3-way choice is ambiguous - ask).
-  The lead frames asks as yes/no where possible so a tap suffices. SECURITY (re-stated): an emoji
+  CAVEAT: emoji answers are unambiguous ONLY for YES/NO asks + ship-gates. For a MULTI-PART ask the
+  lead does NOT pose "do you want A and/or B?" as one question (a single 👍/👎 on it is ambiguous and
+  forces a re-ask) - it SPLITS the ask into separate yes/no questions OR presents discrete LETTERED
+  (A/B/C) options, so a single tap still answers. Frame every ask as yes/no or lettered-choice where
+  possible; require a free-text reply only when neither fits. SECURITY (re-stated): an emoji
   "approve" answers a convenience ask only; it does NOT authorize a privileged step the
   terminal-only authority rule reserves - a true ship/merge go still follows the existing gate.
 - **Channel hygiene.** Maintainer-facing decisions + ship-gates go to Slack with code-fenced
