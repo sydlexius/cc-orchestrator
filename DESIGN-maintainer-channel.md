@@ -145,6 +145,12 @@ ts value is set per F2-C-2 (most-recent message from the first read); on the
 write-first ordering, the lead seeds the file with a placeholder it then
 overwrites with the real ts after the first read completes (the placeholder need
 only register existence for the sibling check; it is never used as a read cursor).
+**Placeholder value (F7-C-1):** seed with a VALID float ts `f"{time.time():.6f}"`,
+NOT a non-float literal (e.g. `placeholder`) or an empty file, so the placeholder
+already satisfies the F5-B-3 float-parse validation if any path ever reads it
+back. For a steering-DISABLED run (which skips `slack_read_channel` and so never
+overwrites), the placeholder ts simply persists and is harmless - that run never
+uses it as a cursor.
 
 **Liveness criterion (F3-B-1):** A sibling watermark file is considered live
 only if its mtime is within 8 hours (local machine `time.time()`; clock drift is an accepted edge case - this TTL is crash-recovery, not adversarial resistance). A watermark older than 8 hours (from a
@@ -258,11 +264,16 @@ replies. Two consequences, both addressed by one mechanism:
 
 (plain text, no emoji per house style). **`<repo>` derivation (F6-C-1):** the
 basename of the target repo root, `os.path.basename(os.path.realpath(target_repo_root))`
-(e.g. `cc-orchestrator`), case preserved verbatim. NOTE the self-echo filter keys
-ONLY on the literal `[ORCHESTRATOR - ` prefix (repo-agnostic, see predicate
-below), so the `<repo>` value affects ONLY human-readable + repo-disambiguation
-display, never the drop filter - but it MUST be derived consistently (one
-derivation) or the repo-disambiguation purpose is defeated.
+(e.g. `cc-orchestrator`), case preserved verbatim. **Single source (F7-C-2):**
+`target_repo_root` is the run's target repo working-tree root as recorded by `up`
+(the same root the session operates against, and the same anchor used for the
+team-dir self-exclusion in F5-B-4); derive `<repo>` ONCE at session start and
+reuse it for every card so the sentinel value is stable across all outbound
+cards. NOTE the self-echo filter keys ONLY on the literal `[ORCHESTRATOR - `
+prefix (repo-agnostic, see predicate below), so the `<repo>` value affects ONLY
+human-readable + repo-disambiguation display, never the drop filter - but it MUST
+be derived consistently (one derivation) or the repo-disambiguation purpose is
+defeated.
 
 **Self-echo filter predicate (F6-C-2), exact:** drop a returned message iff
 `message_first_line.lstrip().startswith('[ORCHESTRATOR - ')` - ASCII
@@ -351,11 +362,13 @@ The sentinel first line is plain text and survives verbatim in both formats.
 ### Inbound (P2 - the steering)
 At quiescent points (after emitting a card, before resuming work), the lead
 calls `slack_read_channel` to read history since the stored `ts` watermark.
-Read is single-shot per quiescent point (not a poll-loop). At EACH such read the
-lead also (a) refreshes its own watermark file's mtime and (b) re-evaluates
-sibling liveness, per the Heartbeat + re-evaluation rule (F5-B-2) in D3 - so a
-long-lived run stays inside the TTL and a sibling appearing mid-session disables
-steering from that point.
+Read is single-shot per quiescent point (not a poll-loop). The two upkeep
+operations have DIFFERENT cadences (F7-B-1, matching D3's F6-B-3 decoupling):
+(a) the lead refreshes its own watermark mtime at EACH QUIESCENT CHECKPOINT,
+whether or not it reads inbound - so a steering-DISABLED run (which skips
+`slack_read_channel`) still stays inside the TTL; (b) it re-evaluates sibling
+liveness at each `slack_read_channel` call. Per the Heartbeat + re-evaluation
+rule (F5-B-2 / F6-B-3) in D3. Do NOT bind the mtime refresh to the read.
 
 **Watermark advance is ORTHOGONAL to self-echo suppression (F6-B-1/B-2/B-4 - the
 load-bearing D5 interaction).** Two distinct operations on each read, computed on
@@ -762,4 +775,30 @@ had updated the prose below it but missed the bullet) -> unified to `[A-Z][A-Z0-
 SOUND classes: authority model (critic A DRY this round), D2/D4, single-writer,
 stdlib-only doctor all hold; no regressions.
 
-- _(round 7 pending - round 6 was NOT dry, so the K=2 dry counter is still at 0; need 2 consecutive dry rounds to converge)_
+### Round 7 (2026-06-10) - NOT DRY (3 findings; 1 BLOCKER + 2 SHOULD-FIX; fixes applied)
+
+3 parallel critics: authority-bypass (A), concurrent/watermark/self-echo (B),
+implementation-completeness (C). **Critic A returned DRY again** (2nd consecutive
+dry on the authority dimension - every inbound path terminates in untrusted
+quotation; round-6 orthogonality/sentinel changes are authority-neutral; no
+regression to F1-1/F1-2/F5-A-1/A-2/A-3). All 3 findings were self-inflicted
+inconsistencies from the round 5-6 edits:
+
+- **F7-B-1 (BLOCKER, self-introduced contradiction):** the P2 Inbound section
+  re-coupled the mtime heartbeat to `slack_read_channel`, contradicting the D3
+  F6-B-3 decoupling - reintroducing the steering-disabled-run TTL-expiry hole.
+  FIX: split P2's upkeep ops by cadence - mtime refresh at each quiescent
+  checkpoint (read-independent), sibling re-eval at each read.
+- **F7-C-1 (SHOULD-FIX, unspecified placeholder):** the write-first placeholder
+  value was undefined and could collide with the F5-B-3 float-parse gate. FIX:
+  pinned the placeholder to a valid float `f"{time.time():.6f}"`.
+- **F7-C-2 (SHOULD-FIX, unanchored source):** `target_repo_root` (input to the
+  `<repo>` derivation) had no single named source. FIX: anchored it to the run's
+  target repo root as recorded by `up` (same anchor as F5-B-4), derived once and
+  reused.
+
+SOUND classes: authority model (critic A DRY 2x), TOCTOU write-then-check,
+float-validation, path-traversal gate, orthogonality rule all confirmed
+internally consistent by critics B and C; no regressions.
+
+- _(round 8 pending - round 7 was NOT dry, so the K=2 dry counter is still at 0; the authority dimension has 2 consecutive dry passes but B/C found self-introduced inconsistencies, so the FULL spec needs 2 consecutive all-critic-dry rounds to converge)_
