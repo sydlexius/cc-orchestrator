@@ -15,6 +15,7 @@
       "labels": { "type": "string", "description": "comma-separated labels for gh pr create --label" },
       "head_sha": { "type": "string", "pattern": "^[0-9a-f]{7,40}$", "description": "Pinned commit SHA the maintainer approved for this branch. pr-shipper hard-compares this to the pushed HEAD before gh pr create (enforcement: phase 3)." },
       "pushed_to_origin": { "type": "boolean", "description": "true if branch already on origin (push becomes a no-op)" },
+      "hold": { "type": "boolean", "description": "true = pr-shipper SKIPS this entry (not ready to open); absent/false = ready. Lead-only toggle; the shipper re-reads and honors it before the push AND again before gh pr create, and never reorders the stack itself." },
       "stacked_at": { "type": "string", "description": "human timestamp, Pacific" },
       "notes": { "type": "string", "description": "shippable rationale, gate state, caveats" }
     }

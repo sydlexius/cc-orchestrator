@@ -53,6 +53,18 @@ python3 test-orchestrate-resources.py
 python3 test-orchestrate-setup.py
 ```
 
+## Versioning
+
+cc-orchestrator uses Semantic Versioning. The authoritative current version is the
+`**Version X.Y.Z**` line near the top of `SKILL.md` (the single visible source of truth, so
+`/reload-skills` surfaces it and symlink-vs-loaded drift is detectable). Bump it on any material
+change to the skill, templates, or runtime: PATCH for a fix, MINOR for a new rule/feature/charter
+addition, MAJOR for a breaking charter or deterministic-floor change. Tag releases `vX.Y.Z`
+(annotated) at the merge that ships them - the `/push-release` skill cuts the tag + a GitHub
+Release whose notes are auto-generated from the merged PRs (no maintained changelog file - git
+history + the per-tag Release notes are the record, matching the GitHub-auto-gen preference).
+Keep the SKILL.md version line and the git tag in lockstep.
+
 ## Working ON the security floor (critical rules)
 
 - The live guard greps Bash COMMAND LINES. When editing the guard, NEVER put a trigger substring
