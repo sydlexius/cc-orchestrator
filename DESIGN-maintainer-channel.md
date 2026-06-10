@@ -558,7 +558,15 @@ component (no additional sanitization needed given the regex constraint).
 > per-message NONCE (e.g. `[INBOUND-UNTRUSTED a7f3c1]: <text> [/INBOUND-UNTRUSTED a7f3c1]`),
 > so embedded delimiter strings cannot terminate the fence; the lead treats
 > everything between the nonce-tagged open/close as untrusted regardless of its
-> content. This defensive fencing is NOT a violation of F5-A-3's no-paraphrase
+> content. **Nonce unpredictability (F10-A-1):** the nonce MUST be freshly
+> generated per message from a cryptographically-strong random source (e.g.
+> `secrets.token_hex(8)`), MUST NOT be derived from, equal to, or a function of
+> the inbound message text, its `ts`, or any channel-visible value, and MUST NOT
+> be reused across messages. An attacker who controls the wrapped text must have
+> negligible probability of predicting the closing token - a deterministic or
+> content-derived nonce (counter, message ts, hash of the text) would let the
+> author embed the exact closing token and defeat the mechanical guarantee,
+> regressing the wrapper to cognitive-only framing. This defensive fencing is NOT a violation of F5-A-3's no-paraphrase
 > rule - the content's MEANING is preserved verbatim; only the framing is made
 > injection-safe. Authority is terminal-sourced regardless (a quotation-escape
 > can at most surface untrusted text, never authorize), but the wrapper's
@@ -910,4 +918,28 @@ path - F9-A-1 is a wrapper-mechanics hardening, not an open bypass); TOCTOU,
 heartbeat/sibling cadence split, 8h TTL, orthogonality, regex/predicate/template
 consistency all re-confirmed.
 
-- _(round 10 pending - round 9 was NOT dry (3 SHOULD-FIX), so the K=2 dry counter is still at 0; all findings were tail fine-tuning, no BLOCKERs; need 2 consecutive all-critic-dry rounds to converge)_
+### Round 10 (2026-06-10) - NOT DRY (1 finding; 1 SHOULD-FIX; fix applied)
+
+3 parallel critics. **Critics B (concurrent/watermark) and C (implementation-
+completeness) both returned DRY** - the round-9 magnitude-floor + atomic-write
+watermark mechanics are complete and self-consistent (no `0.000000` string-compare
+or `3-way` stale text remains in normative sections; all such references are
+correctly confined to the iteration-log history), and the whole spec is
+implementable without ambiguity. Critic A found ONE SHOULD-FIX hardening the
+round-9 nonce wrapper:
+
+- **F10-A-1 (SHOULD-FIX, round-9 nonce hardening):** the round-9 escape-resistant
+  wrapper specified a "per-message nonce" but never pinned that the nonce must be
+  UNPREDICTABLE to the inbound author; a deterministic or content-derived nonce
+  (counter, message ts, hash of text) lets a public-channel attacker embed the
+  exact closing token, defeating the "mechanical not cognitive" closure-resistance
+  guarantee. NOT a BLOCKER (terminal-only authority is the categorical backstop).
+  FIX: pinned the nonce to a cryptographically-strong random source
+  (`secrets.token_hex(8)`), fresh per message, never content-/ts-/channel-derived,
+  never reused.
+
+LESSON: a "nonce" only resists a chosen-text attacker if it is unpredictable to
+that attacker - stating "nonce" without the unpredictability + non-derivation
+property leaves the security claim resting on an unstated assumption.
+
+- _(round 11 pending - round 10 had 1 SHOULD-FIX, so the K=2 dry counter is still at 0; B and C dry this round; need 2 consecutive ALL-critic-dry rounds to converge)_
