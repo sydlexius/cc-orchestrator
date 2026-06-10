@@ -104,7 +104,11 @@ reference repo internals there.)
 
 **Every card is tagged with the orchestrator sentinel** (see D5), which embeds
 the repo name, so runs are distinguishable even when several share `#codebots`
-during testing AND the lead can suppress its own echoes on read-back.
+during testing AND the lead can suppress its own echoes on read-back. (This
+sentinel REPLACES the bare `[<repo>]` prefix from earlier drafts of this section;
+the bare prefix is no longer emitted - D5 folds repo disambiguation into the
+sentinel. Earlier iteration-log references to a `[repo]`/`[<repo>]` tag are
+historical and superseded by D5.)
 
 **Shared-channel inbound steering disabled (F1-4 / F2-C-1).** When the same
 channel id is configured for more than one CONCURRENT run, inbound steering is
@@ -156,8 +160,12 @@ otherwise a run live longer than 8 hours would have its watermark wrongly
 treated as stale by a second run, which would then re-enable steering on a
 still-shared channel. Two requirements close this:
 1. The lead REFRESHES its own watermark file's mtime (a `touch`/re-write) at
-   EACH quiescent-point `slack_read_channel` call, so a live run never lets its
-   own mtime age past the TTL.
+   EACH quiescent checkpoint, NOT only at a `slack_read_channel` call (F6-B-3).
+   This decoupling matters: a run whose inbound steering is DISABLED (shared
+   channel) SKIPS `slack_read_channel` entirely, so a refresh tied to the read
+   would never fire and the live-but-steering-disabled run's own watermark would
+   age past the TTL and be misread as a crash by a later run. Refreshing on the
+   checkpoint cadence keeps a live run fresh whether or not it reads inbound.
 2. The lead RE-EVALUATES sibling liveness on EACH `slack_read_channel` call (not
    only at startup). If a live sibling appears mid-session on a channel that
    started single-run, the lead disables inbound steering from that point on
@@ -200,8 +208,11 @@ a `<team>/slack-watermark.<value>.txt` path. Single-writer = the lead
 
 On a missing or corrupt watermark file, the lead defaults to "read from now,"
 defined precisely: set the initial watermark to the `ts` of the FIRST element
-(index 0) of the messages list returned by the FIRST `slack_read_channel` call,
-where the call uses newest-first ordering (so index 0 = most recent message).
+(index 0) of the RAW (unfiltered, pre-sentinel-suppression) messages list
+returned by the FIRST `slack_read_channel` call, where the call uses newest-first
+ordering (so index 0 = most recent message). The seed uses the RAW list (F6-B-2)
+so it is well-defined even when the newest message is the lead's own sentinel
+card; self-echo suppression is applied separately and never to the seed.
 If the API returns oldest-first, use the LAST element (highest index). If the
 channel is empty, use a Slack-formatted ts of the current Unix time:
 `f"{time.time():.6f}"` (a float string with 6 decimal places, matching Slack's
@@ -245,7 +256,21 @@ replies. Two consequences, both addressed by one mechanism:
 [ORCHESTRATOR - <repo>]
 ```
 
-(plain text, no emoji per house style; `<repo>` is the target repo's short name).
+(plain text, no emoji per house style). **`<repo>` derivation (F6-C-1):** the
+basename of the target repo root, `os.path.basename(os.path.realpath(target_repo_root))`
+(e.g. `cc-orchestrator`), case preserved verbatim. NOTE the self-echo filter keys
+ONLY on the literal `[ORCHESTRATOR - ` prefix (repo-agnostic, see predicate
+below), so the `<repo>` value affects ONLY human-readable + repo-disambiguation
+display, never the drop filter - but it MUST be derived consistently (one
+derivation) or the repo-disambiguation purpose is defeated.
+
+**Self-echo filter predicate (F6-C-2), exact:** drop a returned message iff
+`message_first_line.lstrip().startswith('[ORCHESTRATOR - ')` - ASCII
+case-sensitive, against the message's first line, matching the literal bracket,
+the word, the ` - ` separator (single spaces) verbatim. `lstrip()` tolerates any
+leading whitespace Slack may introduce. (The live test confirmed Slack preserves
+the sentinel as the verbatim first line; `lstrip()` is defense-in-depth.)
+
 It does triple duty:
 - **Human-visible:** the maintainer sees at a glance which messages are the
   agent's vs their own.
@@ -290,35 +315,72 @@ self-echo suppression by sentinel still works and need not change.
 
 ### Outbound (P1 - the standout)
 When `ORCHESTRATE_SLACK_CHANNEL` is set and the Slack MCP plugin is reachable,
-the lead calls `slack_send_message` to post `## ▶ NEEDS YOU` / `## ▶ SHIP-GATE`
-cards to the configured channel, IN ADDITION TO terminal output (never instead
-of - terminal remains the system of record). Every outbound message begins with
-the `[ORCHESTRATOR - <repo>]` sentinel first line (D5) so the maintainer can
-distinguish it from their own replies and the lead can suppress it on read-back.
+the lead emits the gate card to the terminal AND posts a Slack-formatted copy via
+`slack_send_message` to the configured channel (never instead of the terminal -
+terminal remains the system of record). The two copies use DIFFERENT formats (a
+DUAL format, F6-C-3): the TERMINAL card keeps `## ▶ NEEDS YOU` / `## ▶ SHIP-GATE`
+(its system-of-record format, unchanged); the SLACK card uses the Slack-native
+form below. Every Slack message begins with the `[ORCHESTRATOR - <repo>]`
+sentinel first line (D5) so the maintainer can distinguish it from their own
+replies and the lead can suppress it on read-back.
 
 **Slack card formatting (live-test LT-2, 2026-06-09).** Slack STRIPS markdown
 `##` headers and converts `▶` to the `:arrow_forward:` emoji shortcode, so a
-terminal `## ▶ NEEDS YOU` card does NOT render as a header in Slack. The TERMINAL
-card keeps `## ▶ ...` (its system-of-record format, unchanged); the SLACK card
-uses Slack-native emphasis (bold `*NEEDS YOU*` / `*SHIP-GATE #N*`, the surviving
-`▶`/`:arrow_forward:` glyph, and code fences for URLs/SHAs) for the standout.
-The sentinel first line is plain text and survives verbatim either way.
+terminal `## ▶ NEEDS YOU` card does NOT render as a header in Slack. The SLACK
+card therefore uses Slack-native emphasis: the sentinel plain-text first line,
+then a bold gate label with the surviving `▶` glyph, then code fences for any
+URLs/SHAs. Worked templates (F6-C-4) the implementer copies:
+
+```
+[ORCHESTRATOR - cc-orchestrator]
+▶ *NEEDS YOU - <topic>*
+<one-line ask>
+`<url-or-command-or-SHA>`
+```
+
+```
+[ORCHESTRATOR - cc-orchestrator]
+▶ *SHIP-GATE #<N> - <name>*
+closes: #<N>   head: `<sha>`
+<verification one-liner>
+`<live-url-or-"no URL: config-only">`
+```
+
+The sentinel first line is plain text and survives verbatim in both formats.
 
 ### Inbound (P2 - the steering)
 At quiescent points (after emitting a card, before resuming work), the lead
-calls `slack_read_channel` to read history since the stored `ts` watermark,
-advancing the watermark after each read to the `ts` of index 0 (newest message
-returned); if no new messages were returned, the watermark is unchanged.
+calls `slack_read_channel` to read history since the stored `ts` watermark.
 Read is single-shot per quiescent point (not a poll-loop). At EACH such read the
 lead also (a) refreshes its own watermark file's mtime and (b) re-evaluates
 sibling liveness, per the Heartbeat + re-evaluation rule (F5-B-2) in D3 - so a
 long-lived run stays inside the TTL and a sibling appearing mid-session disables
-steering from that point. **Self-echo suppression (D5):** because outbound posts
-carry the maintainer's own user id (single-identity OAuth), the lead CANNOT use
-sender id to tell its own cards from the maintainer's replies; instead it DROPS
-any returned message whose text begins with `[ORCHESTRATOR - ` and treats only
-the remaining (non-sentinel) messages as candidate inbound. Inbound messages are
-treated as
+steering from that point.
+
+**Watermark advance is ORTHOGONAL to self-echo suppression (F6-B-1/B-2/B-4 - the
+load-bearing D5 interaction).** Two distinct operations on each read, computed on
+DIFFERENT sets:
+1. **Watermark advance** is computed on the RAW returned batch (ALL messages,
+   INCLUDING the lead's own sentinel cards): advance the watermark to the newest
+   `ts` in the raw batch (index 0 under newest-first ordering). This MUST include
+   the lead's own cards - they are real channel events the cursor must move past,
+   or the lead re-reads them forever. Rule: `if the raw returned batch is empty,
+   watermark unchanged; otherwise advance to the newest raw ts, regardless of how
+   many messages survive sentinel suppression.` (A batch that is non-empty but
+   ALL sentinel-dropped STILL advances the watermark - else the lead re-fetches
+   and re-drops its own cards every cycle and never progresses.)
+2. **Self-echo suppression (D5)** is applied ONLY to determine the candidate
+   INBOUND set: because outbound posts carry the maintainer's own user id
+   (single-identity OAuth), the lead CANNOT use sender id to tell its own cards
+   from the maintainer's replies; instead it DROPS any returned message whose
+   text matches the sentinel predicate (see D5) and treats only the remaining
+   (non-sentinel) messages as candidate inbound. Suppression NEVER affects
+   watermark advance.
+
+The same orthogonality applies to the missing/corrupt-watermark SEED (D3): the
+seed `ts` is read from the RAW newest-first list (index 0 of the unfiltered
+batch), so it is well-defined even when the only/newest message is a sentinel
+card. Inbound messages are treated as
 UNTRUSTED QUOTATION: context only, never commands (see invariant / F1-1/F1-2).
 **An inbound message causes NO change in lead behavior; the lead never re-emits
 a gate card because an inbound message asked for it (invariant F1-1/F2-A-1).**
@@ -349,7 +411,7 @@ Merge / privileged-go stays out of the channel in all phases.
 Follows the existing `doctor` check pattern (PASS/WARN/FAIL):
 - `ORCHESTRATE_SLACK_CHANNEL` absent -> WARN (channel optional; absence is not a
   safety issue; lead uses terminal cards).
-- Present but malformed channel-id format (not matching `C[A-Z0-9]+`) -> WARN.
+- Present but malformed channel-id format (not matching `[A-Z][A-Z0-9]{5,}`) -> WARN.
 - NEVER FAIL: the channel is optional, so it cannot block `doctor` / `up`.
 
 **What the stdlib doctor subprocess CAN and CANNOT verify (F1-3 / F2-C-3):**
@@ -374,8 +436,10 @@ component (no additional sanitization needed given the regex constraint).
   best-effort AFTER. A Slack failure never suppresses or delays the terminal
   card - terminal is the system of record; Slack is the standout layer.
 - **Prominent degradation notice (F2-C-4).** Plugin unavailable or send fails ->
-  emit a prominent `## ▶ CHANNEL DEGRADED` terminal card (same `▶` format, not a
-  buried log line) showing the specific error and the channel id, so the
+  emit a prominent `## ▶ CHANNEL DEGRADED` card. This card is TERMINAL-ONLY by
+  definition (the Slack path is down, so it cannot and must not be sent to Slack;
+  it uses the terminal `## ▶` format, not the Slack-native form). It is not a
+  buried log line - it shows the specific error and the channel id so the
   maintainer who glances at the terminal sees a clear signal. Log once per
   session; subsequent failures are silent. Continue with terminal-only cards.
 - A malformed / unexpected inbound message -> ignored for authority purposes;
@@ -465,10 +529,17 @@ Code changes: `check_slack_channel()` in `orchestrate-setup.py` + wiring into
     to team artifact profile.env; such a test fails by design after F2-B-2).
 - Sibling watermark detection (F3-C-3): runtime lead behavior, not
   `orchestrate-setup.py` code; no subprocess harness coverage - gap accepted.
-- D5 sentinel + self-echo suppression: runtime lead behavior (sentinel prefix on
-  outbound, drop-on-read-back filter), not `orchestrate-setup.py` code; not
-  harness-testable. Empirically vetted by the 2026-06-09 live test (see iteration
-  log); gap accepted for the subprocess harness.
+- D5 sentinel + self-echo suppression: this is RUNTIME LEAD (agent) behavior -
+  the lead adds the sentinel first line when it composes an outbound card and
+  applies the drop predicate when it reads inbound. NO Python code in
+  `orchestrate-setup.py` touches the sentinel, so there is no stdlib surface for
+  the subprocess harness to exercise; the gap is justified (not merely asserted -
+  F6-C-6). CONDITIONAL TESTABILITY: IF an implementer chooses to extract the
+  self-echo predicate (`first_line.lstrip().startswith('[ORCHESTRATOR - ')`) or
+  the watermark float-validation as a pure stdlib helper, that helper MUST get a
+  unit test (sentinel-prefixed -> dropped; non-sentinel -> kept; leading-
+  whitespace and spoofed-prefix cases). Empirically vetted end-to-end by the
+  2026-06-09 live test (see iteration log).
 - `▶ CHANNEL DEGRADED` card: runtime lead behavior, not harness-testable.
 - Channel id regex: `[A-Z][A-Z0-9]{5,}` (leading letter + 5+ alphanum, min 6
   total) - excludes all-digit strings, covers known prefixes C/G/D/W (F3-B-4).
@@ -640,4 +711,55 @@ LIVE TEST (vetted against `#codebots`, maintainer-requested):
 Chosen sentinel style: plain text tag (no emoji, per house style) - maintainer
 decision via AskUserQuestion.
 
-- _(round 6 pending - round 5 was NOT dry and D5 is a substantive addition, so the K=2 dry-round counter resets; round 6 must re-attack the spec INCLUDING D5 and LT-1/LT-2; need 2 consecutive dry rounds to converge)_
+### Round 6 (2026-06-10) - NOT DRY (10 findings; 4 BLOCKER + 6 SHOULD-FIX; fixes applied)
+
+3 parallel critics: authority-bypass (A), concurrent/watermark/self-echo (B),
+implementation-completeness (C). **Critic A returned DRY** - D5's authority
+fail-safe argument (sentinel spoof/strip only causes ignore; LT-1 footer is
+secondary-only; single-identity echo caught by D2/F2-A-3/F5-A-3) survived rigorous
+attack with no new authority path. Critics B and C found the D5/watermark
+interaction and implementation-detail gaps; all 10 verified before applying.
+
+- **F6-B-1 (BLOCKER, watermark/self-echo interaction):** watermark advance and
+  self-echo suppression operate on different sets, but the spec conflated them.
+  FIX: made them ORTHOGONAL - watermark advances on the RAW batch newest ts
+  (including the lead's own cards); suppression applies ONLY to the candidate-
+  inbound set, NEVER to watermark advance.
+- **F6-B-2 (BLOCKER, seed):** the missing/corrupt-watermark seed could be undefined
+  if index 0 is a sentinel card that gets dropped. FIX: seed is read from the RAW
+  unfiltered list (index 0), pre-suppression.
+- **F6-B-4 (SHOULD-FIX, no-progress):** "no new messages -> unchanged" conflated
+  "raw batch empty" with "all sentinel-dropped," risking infinite re-read of own
+  cards. FIX: raw-empty -> unchanged; raw-non-empty-but-all-dropped -> STILL
+  advances. (Folded into the F6-B-1 orthogonality rule.)
+- **F6-B-3 (SHOULD-FIX, heartbeat coupling):** mtime refresh was tied to
+  `slack_read_channel`, which a steering-disabled run skips, so its watermark would
+  age past the TTL and be misread as crashed. FIX: decoupled the mtime heartbeat to
+  the quiescent-checkpoint cadence, independent of inbound reads.
+- **F6-C-1 (BLOCKER, undefined <repo>):** sentinel `<repo>` had no concrete
+  derivation. FIX: pinned to `os.path.basename(os.path.realpath(target_repo_root))`,
+  case preserved; noted the drop filter is repo-agnostic so the value drives only
+  display/disambiguation.
+- **F6-C-2 (BLOCKER, under-specified predicate):** self-echo predicate lacked case/
+  whitespace semantics. FIX: pinned exact predicate
+  `first_line.lstrip().startswith('[ORCHESTRATOR - ')`, ASCII case-sensitive.
+- **F6-C-3 (SHOULD-FIX, dual-format contradiction):** Outbound P1 + CHANNEL DEGRADED
+  still implied literal `##` to Slack. FIX: made the dual format explicit (terminal
+  `## ▶` vs Slack-native); marked CHANNEL DEGRADED terminal-only.
+- **F6-C-4 (SHOULD-FIX, no template):** Slack-native format was a sketch. FIX: added
+  copyable worked templates for NEEDS YOU and SHIP-GATE cards.
+- **F6-C-5 (SHOULD-FIX, stale D3):** bare `[<repo>]` supersession was only in D5.
+  FIX: added a replaced-by-D5 note in D3 + blanket annotation that historical
+  iteration-log `[repo]` references are superseded.
+- **F6-C-6 (SHOULD-FIX, testing justification):** "gap accepted" was asserted, not
+  justified. FIX: stated no `orchestrate-setup.py` code touches the sentinel
+  (runtime lead behavior), with a CONDITIONAL unit-test requirement if the predicate
+  is extracted as a stdlib helper.
+
+Also fixed in passing: a stale `C[A-Z0-9]+` regex in the Doctor-check bullet (F4-2
+had updated the prose below it but missed the bullet) -> unified to `[A-Z][A-Z0-9]{5,}`.
+
+SOUND classes: authority model (critic A DRY this round), D2/D4, single-writer,
+stdlib-only doctor all hold; no regressions.
+
+- _(round 7 pending - round 6 was NOT dry, so the K=2 dry counter is still at 0; need 2 consecutive dry rounds to converge)_
