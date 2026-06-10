@@ -128,14 +128,25 @@ both write, both steer). If any live sibling watermark exists after this run's
 write, the lead logs once "shared channel detected, inbound steering disabled"
 and skips `slack_read_channel` for this run.
 
-Self-exclusion (F5-B-4): the lead derives its OWN team-dir path from the same
-source used to write the watermark (the team artifact dir created by `up`), and
-filters the glob results by excluding any path under that dir. Exact idiom:
-`[p for p in glob.glob('/tmp/*/slack-watermark.<channel>.txt') if not p.startswith(own_team_dir.rstrip('/') + '/')]`.
-Without this filter the lead would detect ITS OWN watermark as a sibling and
-disable inbound steering on every run. NOTE: This glob (`/tmp/*/`) matches only
-direct children of `/tmp/` - the current team-dir depth. If team-dir structure
-changes, update this glob.
+Self-exclusion (F5-B-4, hardened by F13-B-1): the lead derives its OWN team-dir
+path from the same source used to write the watermark (the team artifact dir
+created by `up`), and filters the glob results by excluding its own watermark.
+**Both sides MUST be reduced to the same canonical form before comparison
+(F13-B-1)** - a naive `p.startswith(own_team_dir + '/')` SILENTLY FAILS on macOS
+because `/tmp` is a symlink to `/private/tmp`: `os.path.realpath(own_team_dir)`
+yields `/private/tmp/<team>/...` while `glob.glob('/tmp/*/...')` returns the
+UNRESOLVED `/tmp/<team>/...`, so the prefix never matches and the run detects its
+OWN watermark as a sibling, disabling inbound steering on every single-run
+session. Compare by CANONICAL DIR IDENTITY, not string prefix. Exact idiom:
+```python
+own = os.path.realpath(own_team_dir)
+siblings = [p for p in glob.glob('/tmp/*/slack-watermark.<channel>.txt')
+            if os.path.realpath(os.path.dirname(p)) != own]
+```
+Without this normalization the lead would detect ITS OWN watermark as a sibling
+and disable inbound steering on every run. NOTE: This glob (`/tmp/*/`) matches
+only direct children of `/tmp/` - the current team-dir depth. If team-dir
+structure changes, update this glob.
 
 **Watermark written FIRST, before the first `slack_read_channel` call (F3-B-2 /
 F5-B-1)**, not deferred to first outbound send. This ensures every run is
@@ -978,4 +989,31 @@ normative section still directs the old open-only wrapper, and that regex,
 floor, placeholder, predicate, templates, and watermark cadence all align across
 the DESIGN normative text and Testing strategy. K=1 (clean, no edits made).
 
-- _(round 13 pending - one more ALL-critic-dry round converges the spec at K=2)_
+### Round 13 (2026-06-10) - NOT DRY (1 finding; 1 SHOULD-FIX; fix applied; K reset)
+
+3 parallel critics. **Critics A (authority) and C (implementation-completeness)
+both returned DRY** (A's 5th dry pass overall - genuine final attack on every
+bypass path, all closed; C confirmed full implementability). Critic B found ONE
+genuine SHOULD-FIX that NO prior round (1-12) had surfaced, empirically verified
+on this machine:
+
+- **F13-B-1 (SHOULD-FIX, macOS symlink correctness):** the F5-B-4 self-exclusion
+  idiom used `p.startswith(own_team_dir + '/')`, but on darwin `/tmp` is a symlink
+  to `/private/tmp`. `os.path.realpath(own_team_dir)` (the anchor F6-C-1/F7-C-2
+  pin via realpath) yields `/private/tmp/<team>/...` while `glob.glob('/tmp/*/...')`
+  returns the UNRESOLVED `/tmp/<team>/...`, so the prefix never matches - the run
+  detects its OWN watermark as a sibling and DISABLES inbound steering on every
+  single-run session (the exact bug F5-B-4 was meant to prevent, reintroduced via
+  path-normalization mismatch). FIX: compare by CANONICAL DIR IDENTITY, not string
+  prefix - `own = os.path.realpath(own_team_dir);` keep `p` iff
+  `os.path.realpath(os.path.dirname(p)) != own`. Both sides reduced to the same
+  canonical form.
+
+LESSON: F5-B-4 fixed the `+ '/'` prefix-collision but assumed string-prefix
+comparison; it never normalized for symlinks. realpath on ONE side of a
+string-prefix test is a latent mismatch on any platform with a symlinked temp
+dir (macOS being the documented target). Identity comparison of canonicalized
+dirs is the robust form. Because this is a content change, the K=2 counter RESETS;
+rounds 14 and 15 must both be fully dry to converge.
+
+- _(rounds 14-15 pending - need 2 consecutive ALL-critic-dry rounds to converge at K=2)_
