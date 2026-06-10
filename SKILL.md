@@ -47,7 +47,7 @@ wall. Spawn each from its template charter.
 
 ## Hard invariants (never violate)
 - NO bot ever merges. Merge + post-merge-cleanup are the maintainer's/lead's only.
-- LEAD-NO-IMPLEMENT. The lead never writes, edits, or fixes code in the target repo; EVERY build/edit/fix is delegated to a PR-blind implementer (see the Lead operating contract near the top). The lead's hands are for decisions, gates, git/PR/merge-go, and the checkpoint - never target-repo code. Self-check: about to Edit/Write code or run a fix? STOP and dispatch an implementer.
+- LEAD-NO-IMPLEMENT. The lead never writes/edits/fixes target-repo code; ALL build work delegates to a PR-blind implementer. (Hard-invariant restatement of the Lead operating contract near the top, which carries the full rule + the at-the-keyboard self-check.)
 - Per-PR human go at STACK time: a branch is appended to the shipper stack only after the maintainer deems it shippable (UAT punch-list or AskUserQuestion + live URL).
 - Lead vets EVERY PR body/title `#N` ref against `gh issue view N` before stacking (small TaskList IDs collide with old issues).
 - RESOLVE issue->PR before dispatching pr-triage. The lead never assumes issue number == PR number. Before it dispatches pr-triage (or backgrounds a `pr-watch`) for a piece of work, it resolves the actual open PR via `gh pr list --head <branch> --state open` (or the recorded stack-entry -> shipped-`#N` mapping) and triages THAT PR number. Dispatching triage against a guessed/unresolved number just makes `pr-watch` exit 2 (could-not-look), never a real review.
@@ -64,9 +64,6 @@ wall. Spawn each from its template charter.
 - SINGLE-WRITER STACK. Only the LEAD mutates the shipper stack (`/tmp/<team>/stack.json`): the lead appends entries and the lead removes them. The pr-shipper NEVER pops or rewrites the stack - it SIGNALS "shipped #N" (PR number + URL) back to the lead, and the lead does the removal. This keeps a single writer on the stack file so two agents never race it.
 - head_sha SHA-COMPARE (pr-shipper hard gate). Before `gh pr create`, the pr-shipper hard-compares the stack entry's `head_sha` to the actual pushed branch HEAD (`git rev-parse origin/<branch>`); on ANY mismatch it REFUSES to open the PR and messages the lead. This catches a stale or wrong stack entry before it becomes a PR.
 - PR-OPEN OWNERSHIP. Opening a PR (push + `gh pr create` + background `pr-watch`) is the pr-shipper's job BY DEFAULT - delegate to pr-shipper (see its role-table row) for any multi-PR drip or CR-paced cluster, which is what this pipeline exists for. For a single standalone PR, lead-direct push + `gh pr create` is the explicit EXCEPTION, not the default, and ONLY for that one branch. The exception skips ONLY the pr-shipper/pr-triage delegation bots - it NEVER skips adversarial-prep or adversarial-review (where warranted); those gates must be GREEN before any lead-direct push + `gh pr create`, regardless of whether a shipper bot is in use.
-
-## Delegation reflex (work appears -> dispatch, don't do)
-The standing reflex for EVERY unit of build work, stated once so it is not buried in the setup steps: a concrete code task appears (a new cluster, or a fix-list from review/triage) -> the lead spawns a PR-blind implementer pointed at the right worktree, hands it ONLY the build task / numbered fix-list + its charter (never PR/CR context), lets it commit, then tears it down. The lead's job on that task is to DISPATCH, then VERIFY (diff the branch against the fix-list in COMMITTED code), then route onward - never to write the change itself. Same loop whether it is the first build or the Nth fix round; respawn fresh each time (PR-blind + self-contained per fix-list, so a fresh copy loses nothing).
 
 ## Pipeline flow (per issue/cluster)
 ```
