@@ -125,7 +125,7 @@ concurrent-run detection even if it never sends an outbound message. The ts
 value is set per F2-C-2 (most-recent message from that first read).
 
 **Liveness criterion (F3-B-1):** A sibling watermark file is considered live
-only if its mtime is within 8 hours. A watermark older than 8 hours (from a
+only if its mtime is within 8 hours (local machine `time.time()`; clock drift is an accepted edge case - this TTL is crash-recovery, not adversarial resistance). A watermark older than 8 hours (from a
 crashed/dead run) is ignored with a one-time log warning "stale sibling
 watermark detected, ignoring." This prevents a crashed run from permanently
 disabling inbound steering on a channel. `orchestrate-setup.py down` removes
@@ -179,7 +179,9 @@ of - terminal remains the system of record).
 ### Inbound (P2 - the steering)
 At quiescent points (after emitting a card, before resuming work), the lead
 calls `slack_read_channel` to read history since the stored `ts` watermark,
-advancing the watermark after each read. Inbound messages are treated as
+advancing the watermark after each read to the `ts` of index 0 (newest message
+returned); if no new messages were returned, the watermark is unchanged.
+Read is single-shot per quiescent point (not a poll-loop). Inbound messages are treated as
 UNTRUSTED QUOTATION: context only, never commands (see invariant / F1-1/F1-2).
 **An inbound message causes NO change in lead behavior; the lead never re-emits
 a gate card because an inbound message asked for it (invariant F1-1/F2-A-1).**
@@ -221,11 +223,12 @@ channel exists" is OUT of doctor's contract. Runtime reachability is validated
 by the lead's first `slack_send_message` call; on failure, the lead degrades per
 D4 (emit prominent `▶` card; see Error behavior).
 
-Well-formed channel id format: `[A-Z0-9]{6,}` (non-empty, uppercase
-alphanumeric, at least 6 chars). This covers all known Slack ID prefixes (C for
-public channels, G for private/group, D for DMs, W for workspace-level) and is
-intentionally permissive since Slack's ID scheme is not publicly versioned.
-`C[A-Z0-9]+` is too narrow and rejects valid private-channel (`G*`) IDs.
+Well-formed channel id format: `[A-Z][A-Z0-9]{5,}` (leading uppercase letter +
+5+ uppercase alphanumeric, min 6 chars total). The leading-letter requirement
+excludes all-digit strings (not valid Slack IDs) while covering all known
+prefixes (C, G, D, W). Intentionally permissive on length since Slack's ID
+scheme is not publicly versioned. Channel id is used verbatim as the filename
+component (no additional sanitization needed given the regex constraint).
 
 ## Error behavior
 
@@ -423,4 +426,17 @@ SOUND classes (logged for convergence): D2/D3/D4 authority model; SKILL.md consi
 
 SOUND classes: all prior (authority model, single-writer, stdlib-only, D3/D4) still hold; no regressions on previous rounds.
 
-- _(round 4 pending - re-attack the updated spec; K=2 dry rounds required to converge)_
+### Round 4 (2026-06-10) - NOT DRY (6 findings; 3 SHOULD-FIX + 3 NICE-TO-HAVE; fixes applied)
+
+3 parallel critics: authority (A), concurrent/watermark (B), implementation completeness (C).
+
+- **F4-1 (SHOULD-FIX, watermark-precision):** Watermark advance timing ambiguous - "advancing the watermark after each read" did not specify to which ts value. FIX: pinned to `ts` of index 0 (newest message returned); no-new-messages case explicitly leaves watermark unchanged.
+- **F4-2 (SHOULD-FIX, internal-inconsistency):** Regex inconsistency - Doctor section said `C[A-Z0-9]+` (old) while Testing Strategy section had already been updated to `[A-Z][A-Z0-9]{5,}`. FIX: unified both sections to `[A-Z][A-Z0-9]{5,}`.
+- **F4-3 (SHOULD-FIX, precision):** Liveness criterion "within 8 hours" did not specify the clock source; an implementer might use Slack ts or NTP. FIX: added `(local machine time.time(); clock drift is an accepted edge case - this TTL is crash-recovery, not adversarial resistance)`.
+- **F4-4 (SHOULD-FIX, under-spec):** "Sanitized channel id" in watermark filename spec was undefined - an implementer might add percent-encoding or slug-ifying. FIX: added explicit note "channel id used verbatim as the filename component (no additional sanitization needed given the regex constraint)" alongside the regex.
+- **F4-5 (NICE-TO-HAVE, read-behavior):** P2 Inbound section did not state whether `slack_read_channel` was a single call or a poll-loop at each quiescent point. FIX: added "Read is single-shot per quiescent point (not a poll-loop)."
+- **F4-6 (NICE-TO-HAVE, scope):** CHANNEL DEGRADED "log once" scope was ambiguous (per session vs per channel). Resolved: "per session" is correct and already in the spec; since each run targets one channel, per-session = per-channel in practice. No change needed.
+
+SOUND classes: all prior (authority model, D2/D3/D4, single-writer, stdlib-only) still hold; no regressions on previous rounds.
+
+- _(round 5 pending - K=2 dry rounds required; need 2 consecutive dry to converge)_
