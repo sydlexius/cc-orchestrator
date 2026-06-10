@@ -1,7 +1,7 @@
 # Design: bidirectional maintainer channel (Slack via official MCP plugin)
 
 Date: 2026-06-09
-Status: SPEC (pre-implementation); pending engage-ralph-loop adversarial pass (K=2 dry)
+Status: CONVERGED (2026-06-10, K=2 dry at rounds 14-15); ready for implementation
 Issue: #10
 Companion: `SKILL.md` (LEAD SIGNAL DISCIPLINE), `orchestrate-setup.py` (`doctor`),
 `engage-ralph-loop.md` (the adversarial pass this spec must survive)
@@ -1028,4 +1028,21 @@ internally consistent with the glob pattern, the `<channel>` placeholder, and th
 `.tmp` atomic-write file (which correctly does not match the `.txt` glob), with no
 stale text or drift. K=1 (clean, no edits).
 
-- _(round 15 pending - one more ALL-critic-dry round converges the spec at K=2)_
+### Round 15 (2026-06-10) - ALL THREE DRY -> K=2 CONVERGED
+
+3 parallel critics: ALL DRY (0 findings), each an explicit honest-dry verdict on a
+genuine final pass. Rounds 14 AND 15 both fully dry with NO spec change between
+them -> the K=2 convergence criterion is met. **The spec is CONVERGED and ready
+for implementation.**
+
+Honest retrospective on the round count (15 is a lot; recorded so the next spec
+runs leaner): the high-value rounds were 5-6 (D5 single-identity interaction + the
+first watermark BLOCKERs), 9 (magnitude-floor generalization), and 13 (the macOS
+`/tmp` symlink self-exclusion bug - a real production-failure defect). Rounds 7-8
+and 10 were largely the loop surfacing inconsistencies that the PRIOR round's own
+fix had introduced (heartbeat coupling, placeholder-as-cursor, nonce
+predictability) - real but self-inflicted, the classic adversarial-loop tail.
+Two K-counter resets (round 11 wrapper reconciliation, round 13 symlink fix) added
+confirmation rounds. LESSON for future specs: batch the tail fix-ups and re-verify
+once, rather than one-finding-per-round; and treat a fix's own new edge as part of
+the same round where practical, to avoid inflating the round count.
