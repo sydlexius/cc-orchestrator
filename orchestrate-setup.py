@@ -446,13 +446,36 @@ def check_merge_gate_shadows():
     return FAIL
 
 
+# Well-formed Slack channel-id format: a leading uppercase letter + 5+ uppercase
+# alphanumeric chars (min 6 total). The leading-letter requirement excludes
+# all-digit strings while covering all known prefixes (C, G, D, W). See
+# DESIGN-maintainer-channel.md (doctor check, F3-B-4).
+SLACK_CHANNEL_RE = re.compile(r"[A-Z][A-Z0-9]{5,}")
+
+
+def check_slack_channel():
+    """Doctor check (WARN-level, optional): the maintainer Slack channel is
+    optional and FORMAT-only. The stdlib doctor subprocess cannot reach MCP
+    tools, so reachability is OUT of scope (validated at runtime by the lead's
+    first slack_send_message; degrades per D4). This NEVER returns FAIL - the
+    channel is optional and must not block doctor/up. See
+    DESIGN-maintainer-channel.md (check_slack_channel, F1-3 / F2-C-3)."""
+    channel = os.environ.get("ORCHESTRATE_SLACK_CHANNEL", "")
+    if not channel:
+        return _emit(WARN, "ORCHESTRATE_SLACK_CHANNEL not set (channel optional; terminal-only mode)")
+    if not SLACK_CHANNEL_RE.fullmatch(channel):
+        return _emit(WARN, f"ORCHESTRATE_SLACK_CHANNEL={channel!r} is not a well-formed Slack channel id "
+                           "(expected [A-Z][A-Z0-9]{5,}); terminal-only mode")
+    return _emit(PASS, f"ORCHESTRATE_SLACK_CHANNEL={channel} is a well-formed Slack channel id")
+
+
 def cmd_doctor(args):
     settings = _load_settings()
     repo_status, _head = check_repo_main(getattr(args, "repo", None))
     results = [check_agent_teams(settings), check_tmux(),
                check_guard_wired(settings), check_guard_healthy(),
                repo_status, check_allowlist(settings),
-               check_merge_gate_shadows()]
+               check_merge_gate_shadows(), check_slack_channel()]
     hard_fail = any(s == FAIL for s in results)
     print()
     print("doctor: HARD-FAIL (fix the FAIL lines above before `up`)" if hard_fail else "doctor: ok (no hard fail)")
