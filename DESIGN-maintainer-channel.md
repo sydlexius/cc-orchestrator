@@ -145,12 +145,21 @@ ts value is set per F2-C-2 (most-recent message from the first read); on the
 write-first ordering, the lead seeds the file with a placeholder it then
 overwrites with the real ts after the first read completes (the placeholder need
 only register existence for the sibling check; it is never used as a read cursor).
-**Placeholder value (F7-C-1):** seed with a VALID float ts `f"{time.time():.6f}"`,
-NOT a non-float literal (e.g. `placeholder`) or an empty file, so the placeholder
-already satisfies the F5-B-3 float-parse validation if any path ever reads it
-back. For a steering-DISABLED run (which skips `slack_read_channel` and so never
-overwrites), the placeholder ts simply persists and is harmless - that run never
-uses it as a cursor.
+**Placeholder value (F7-C-1, corrected by F8-B-1):** seed with the RESERVED
+SENTINEL float `0.000000` - NOT `f"{time.time():.6f}"` (the round-7 wall-clock
+value was a defect: it is indistinguishable from a real cursor, so the F5-B-3
+"parses as float -> use as cursor" gate would feed it to `slack_read_channel`,
+returning only messages newer than now and silently dropping any reply already in
+the channel at session start). `0.000000` is chosen because it (a) parses as a
+float (so it is not mistaken for a CORRUPT file), yet (b) is recognizably NOT a
+real Slack ts (real ts are large positive numbers ~1.7e9), so the read-back path
+special-cases it as "unseeded -> seed from raw index 0" (see F5-B-3 below). This
+preserves the guarantee that the placeholder is NEVER used as a read cursor. For
+a steering-DISABLED run (which skips `slack_read_channel` and so never
+overwrites), the `0.000000` placeholder simply persists and is harmless - that
+run never reads inbound. Cross-session: a run that crashes BEFORE its first read
+leaves `0.000000` (a restart correctly re-seeds from now); a run that advanced
+leaves a real ts (a restart correctly resumes from it).
 
 **Liveness criterion (F3-B-1):** A sibling watermark file is considered live
 only if its mtime is within 8 hours (local machine `time.time()`; clock drift is an accepted edge case - this TTL is crash-recovery, not adversarial resistance). A watermark older than 8 hours (from a
@@ -212,7 +221,8 @@ site, not merely an advisory doctor warning - a malformed value can never reach
 a `<team>/slack-watermark.<value>.txt` path. Single-writer = the lead
 (consistent with SINGLE-WRITER STACK).
 
-On a missing or corrupt watermark file, the lead defaults to "read from now,"
+On a missing, corrupt, OR placeholder-sentinel (`0.000000`) watermark file, the
+lead defaults to "read from now,"
 defined precisely: set the initial watermark to the `ts` of the FIRST element
 (index 0) of the RAW (unfiltered, pre-sentinel-suppression) messages list
 returned by the FIRST `slack_read_channel` call, where the call uses newest-first
@@ -226,12 +236,22 @@ channel is empty, use a Slack-formatted ts of the current Unix time:
 string. Never use the machine clock as a proxy for Slack ts on a non-empty
 channel.
 
-**Corrupt-watermark validation on read-back (F5-B-3).** When the lead reads the
-stored watermark file, it MUST validate that the content parses as a float
-(`float(value)` succeeds). A value that does not parse (truncated write, manual
-edit, wrong format) is treated as CORRUPT and triggers the "read from now"
-default above - never passed to `slack_read_channel` as a cursor, since a
-malformed cursor risks the API returning all history from epoch.
+**Watermark read-back classification (F5-B-3, extended by F8-B-1).** When the
+lead reads the stored watermark file, it classifies the content into exactly one
+of three branches BEFORE using it:
+1. **Does not parse as float** (`float(value)` raises) - truncated write, manual
+   edit, wrong format -> CORRUPT -> "read from now" (seed from raw index 0).
+2. **Parses as float AND equals the placeholder sentinel `0.000000`** -> UNSEEDED
+   -> "read from now" (seed from raw index 0). This is the branch that prevents
+   the round-7 placeholder defect (F8-B-1): the placeholder is recognized and
+   NEVER passed as a cursor.
+3. **Parses as float AND is a plausible real ts** (i.e. not the placeholder) ->
+   VALID CURSOR -> passed to `slack_read_channel` as the `oldest` cursor (a normal
+   resume).
+Only branch 3 uses the stored value as a cursor; branches 1 and 2 both seed from
+raw index 0. This guarantees a malformed OR placeholder value never reaches the
+API as a cursor (which would risk returning all history from epoch, or dropping
+pre-session inbound).
 
 ### D4 - Optional + graceful degradation
 
@@ -801,4 +821,31 @@ SOUND classes: authority model (critic A DRY 2x), TOCTOU write-then-check,
 float-validation, path-traversal gate, orthogonality rule all confirmed
 internally consistent by critics B and C; no regressions.
 
-- _(round 8 pending - round 7 was NOT dry, so the K=2 dry counter is still at 0; the authority dimension has 2 consecutive dry passes but B/C found self-introduced inconsistencies, so the FULL spec needs 2 consecutive all-critic-dry rounds to converge)_
+### Round 8 (2026-06-10) - NOT DRY (1 finding; 1 BLOCKER; fix applied)
+
+3 parallel critics. **Critics A (authority) and C (implementation-completeness)
+both returned DRY** - A for the 3rd consecutive round (every inbound path
+terminates in untrusted quotation; categorical "no change in lead behavior"
+universal holds), C confirming every cross-reference, regex, predicate, and
+code-surface claim is internally consistent and implementable. Critic B found ONE
+BLOCKER - a defect the round-7 placeholder fix (F7-C-1) introduced:
+
+- **F8-B-1 (BLOCKER, round-7 regression):** the valid-float placeholder
+  `f"{time.time():.6f}"` was indistinguishable from a real persisted cursor, so
+  the F5-B-3 "parses as float -> use as cursor" read-back gate would feed the
+  placeholder to `slack_read_channel`, returning only messages newer than now and
+  silently dropping any maintainer reply already in the channel at session start -
+  contradicting the "placeholder never used as a read cursor" guarantee. FIX:
+  changed the placeholder to the RESERVED SENTINEL `0.000000` (parses as float, so
+  not mistaken for corrupt; but recognizably not a real ts ~1.7e9), and rewrote
+  the read-back as a 3-way classification: (1) unparseable -> corrupt -> seed from
+  now; (2) == `0.000000` -> unseeded -> seed from now; (3) plausible real float ->
+  use as cursor. Only branch 3 uses the stored value as a cursor. Cross-session
+  crash recovery is correct under all three.
+
+LESSON: the round-7 "make the placeholder a valid float" fix traded one gap for
+another - a valid float collides with the cursor-vs-corrupt classifier. The
+reserved-sentinel approach satisfies BOTH constraints (float-parseable yet
+recognizably-not-a-cursor) without a magic threshold.
+
+- _(round 9 pending - round 8 was NOT dry, so the K=2 dry counter is still at 0; A is dry 3x and C dry 1x, but the single-writer/watermark mechanics needed one more correction, so the FULL spec still needs 2 consecutive all-critic-dry rounds)_
