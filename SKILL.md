@@ -5,7 +5,7 @@ description: Use when scaffolding and running a lead-orchestrated multi-agent se
 
 # Orchestrate: lead-run multi-agent PR pipeline
 
-**Version 0.5.2** (semver; releases tagged `vX.Y.Z`). Bump on any material change to this skill, its templates, or the runtime - PATCH for a fix, MINOR for a new rule/feature, MAJOR for a breaking charter or deterministic-floor change - so `/reload-skills` surfaces the new number and drift between the symlinked repo and the loaded skill is visible. History: `git log` + the GitHub Release notes cut at each `vX.Y.Z` tag.
+**Version 0.6.0** (semver; releases tagged `vX.Y.Z`). Bump on any material change to this skill, its templates, or the runtime - PATCH for a fix, MINOR for a new rule/feature, MAJOR for a breaking charter or deterministic-floor change - so `/reload-skills` surfaces the new number and drift between the symlinked repo and the loaded skill is visible. History: `git log` + the GitHub Release notes cut at each `vX.Y.Z` tag.
 
 You are the LEAD (orchestrator). You delegate building and the mechanical PR
 lifecycle to single-purpose teammates, and you keep for yourself the decisions
@@ -142,7 +142,7 @@ A Medium-effort Opus lead survives only a few hours before forced compaction, an
 
 ## Checkpoint / resume / teardown
 - Keep a living checkpoint at the TOP of the session-state/plan doc using `templates/SESSION-STATE.checkpoint.md`. Update it as PRs ship and decisions land. Mirror any /tmp-only artifact (triage findings) into the durable doc - /tmp clears on reboot.
-- Teardown: `shutdown_request` each teammate -> WAIT for the "terminated" notice -> only then `TeamDelete` (it refuses while a member is alive). Keep every worktree until its PR MERGES (the keep-until-merge rule above) - never remove a worktree whose PR is still open. Then run `orchestrate-setup.py down --team <team>` to best-effort release the session's resource leases (non-fatal on failure).
+- Teardown: `shutdown_request` each teammate -> WAIT for the "terminated" notice -> only then `TeamDelete` (it refuses while a member is alive). Keep every worktree until its PR MERGES (the keep-until-merge rule above) - never remove a worktree whose PR is still open. Then run `orchestrate-setup.py down --team <team>` to best-effort release the session's resource leases (non-fatal on failure). `down` runs a pre-teardown scan and WARNS (it never refuses - teardown stays best-effort) if any worktree of the recorded repo has uncommitted work, so you commit before `make remove-worktree` rather than destroying it; a worktree kept for an open PR is expected and you leave it. It does NOT compare HEAD to the arm-time SHA (the team commits freely, so HEAD is meant to advance).
 - Resume: read the checkpoint block FIRST, then re-spawn only what is needed.
 
 ## Session feedback log (standing rule)
