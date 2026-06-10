@@ -53,7 +53,12 @@ def run(args, *, env_overrides=None, tmux=True):
     env = dict(os.environ)
     env.pop("TOOL_INPUT", None)
     if tmux:
-        env["TMUX"] = env.get("TMUX") or "/tmp/tmux-test,1,0"
+        # Force the fixture TMUX unconditionally (not `env.get("TMUX") or ...`): when the
+        # harness itself runs INSIDE a real tmux (e.g. a teammate pane), inheriting the
+        # ambient $TMUX would key the floor marker to a value other than TEST_TMUX and the
+        # marker-arming checks would spuriously fail. Pin it so the harness is deterministic
+        # regardless of the ambient tmux.
+        env["TMUX"] = TEST_TMUX
     else:
         env.pop("TMUX", None)
     if env_overrides:
@@ -218,6 +223,59 @@ def main():
             pe_ov3.pop(k, None)
         rc, out = run(["up", "--team", "noenv", "--repo", repo], env_overrides=pe_ov3)
         check("up with no stillwater env still succeeds (rc0)", rc == 0 and "SESSION ARMED" in out)
+
+        # #10: check_slack_channel() is a FORMAT-only, WARN-level, optional doctor check.
+        # It reads ORCHESTRATE_SLACK_CHANNEL from env; it NEVER returns FAIL (the channel is
+        # optional and must not block doctor/up). The healthy wired+guard fixture means doctor
+        # overall is rc0, so the per-line status is what we assert. The slack line is identified
+        # by the ORCHESTRATE_SLACK_CHANNEL token the _emit message carries.
+        def slack_line(out):
+            for ln in out.splitlines():
+                if "ORCHESTRATE_SLACK_CHANNEL" in ln and ln.lstrip().startswith("["):
+                    return ln
+            return ""
+
+        sov = {"ORCHESTRATE_SETTINGS": wired, "ORCHESTRATE_GUARD": guard}
+        # Absent (empty -> treated as unset) -> WARN, terminal-only, doctor still rc0.
+        rc, out = run(["doctor"], env_overrides={**sov, "ORCHESTRATE_SLACK_CHANNEL": ""})
+        ln = slack_line(out)
+        check("slack: absent -> WARN", "[WARN" in ln and "terminal-only" in ln)
+        check("slack: absent -> doctor not hard-fail (rc0)", rc == 0)
+        # F3-C-4 wiring: with the var absent, a slack WARN line MUST appear in doctor output -
+        # proves check_slack_channel() is actually wired into cmd_doctor.
+        check("slack: cmd_doctor wiring -> WARN line present when absent", ln != "")
+        # Malformed ids (fail [A-Z][A-Z0-9]{5,}) -> WARN, never FAIL.
+        for bad in ("123", "abc", "C12", "c0b8y401qr2", "C0B8Y/01QR2", "C0B8 401QR2"):
+            rc, out = run(["doctor"], env_overrides={**sov, "ORCHESTRATE_SLACK_CHANNEL": bad})
+            ln = slack_line(out)
+            check(f"slack: malformed {bad!r} -> WARN", "[WARN" in ln and "well-formed" in ln)
+            check(f"slack: malformed {bad!r} -> never FAIL", "[FAIL" not in ln and rc == 0)
+        # Well-formed ids -> PASS.
+        for good in ("C0B8Y401QR2", "G12345", "D0ABCDE", "W0B8Y401"):
+            rc, out = run(["doctor"], env_overrides={**sov, "ORCHESTRATE_SLACK_CHANNEL": good})
+            ln = slack_line(out)
+            check(f"slack: well-formed {good!r} -> PASS", "[PASS" in ln)
+            check(f"slack: well-formed {good!r} -> rc0", rc == 0)
+        # Never FAIL regardless of value: no slack line ever emits a FAIL status.
+        for val in ("", "x", "123", "C0B8Y401QR2"):
+            rc, out = run(["doctor"], env_overrides={**sov, "ORCHESTRATE_SLACK_CHANNEL": val})
+            check(f"slack: value {val!r} -> slack check never FAIL", "[FAIL" not in slack_line(out))
+
+        # F2-B-2: ORCHESTRATE_SLACK_CHANNEL is NOT in PROFILE_ENV_KEYS, so `up` must NOT
+        # write it to the team artifact dir's profile.env. Set it (and a stillwater key so
+        # profile.env is actually written) then inspect the file content.
+        marker_slack = os.path.join(floor_dir, _key(TEST_TMUX))
+        if os.path.exists(marker_slack):
+            os.remove(marker_slack)
+        slack_up_ov = dict(upov)
+        slack_up_ov.update({"ORCHESTRATE_STILLWATER_KEYFILE": swkey,
+                            "ORCHESTRATE_SLACK_CHANNEL": "C0B8Y401QR2"})
+        rc, out = run(["up", "--team", "slackteam", "--repo", repo], env_overrides=slack_up_ov)
+        slack_prof = os.path.join(art, "slackteam", "profile.env")
+        slack_prof_body = open(slack_prof).read() if os.path.isfile(slack_prof) else ""
+        check("slack: up succeeded with channel set (rc0)", rc == 0 and os.path.isfile(slack_prof))
+        check("slack: ORCHESTRATE_SLACK_CHANNEL NOT written to team profile.env (F2-B-2)",
+              "ORCHESTRATE_SLACK_CHANNEL" not in slack_prof_body and "C0B8Y401QR2" not in slack_prof_body)
 
         # P3-A: an invalid --team (path-escape / separators) is rejected cleanly, no dir made.
         rc, out = run(["up", "--team", "a/b", "--repo", repo], env_overrides=upov)
