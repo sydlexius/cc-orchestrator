@@ -6,3 +6,6 @@ __pycache__/
 # session-scoped and follow the "no ephemeral docs in git" convention)
 SESSION-STATE.md
 CRITIQUE-*.md
+
+# Playwright MCP scratch (UAT screenshots land here; never commit)
+.playwright-mcp/
