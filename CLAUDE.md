@@ -35,6 +35,9 @@ Runtime (symlinked into `~/.claude/scripts/`; canonical source is this repo):
   the encryption key is a 0600 file beside the DB, NEVER in env/.env.
 - `orchestrate-setup.py` - doctor / up / down, marker lifecycle, and a settings-cascade scan that
   FAILS LOUDLY if any allow-rule shadows the merge gate.
+- `uat-autobuild.sh` - repo-agnostic UAT auto-rebuild watcher: polls a branch HEAD, runs a
+  parameterized `--build-cmd` on a new commit, and swaps only that port's LISTEN-pid (lease-safe)
+  to the fresh binary. Keeps the leased UAT binary current (the SKILL.md "UAT EVERGREEN" mandate).
 - `test-orchestrate-{guard,resources,setup}.py` - the proof harnesses.
 
 Skill definition (symlinked into `~/.claude/skills/orchestrate/`): `SKILL.md` (lead playbook) +

@@ -46,9 +46,9 @@ jobs:
         run: pip install ruff
 
       # Platform-independent lint: run once, on Linux. (jq is preinstalled on both runners.)
-      - name: shellcheck (security guard)
+      - name: shellcheck (security guard + runtime scripts)
         if: runner.os == 'Linux'
-        run: shellcheck orchestrate-guard.sh
+        run: shellcheck orchestrate-guard.sh uat-autobuild.sh
 
       - name: ruff (F,E741)
         if: runner.os == 'Linux'
