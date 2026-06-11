@@ -85,19 +85,34 @@ def check_tmux():
     return _emit(PASS, "tmux installed and lead is inside it")
 
 
-GUARD_HOOK_JSON = """  Add this to ~/.claude/settings.json under hooks.PreToolUse (verify-and-print; this
-  script never writes settings.json):
-    { "matcher": "Bash", "hooks": [ { "type": "command",
-      "command": "bash \\"$HOME/.claude/scripts/orchestrate-guard.sh\\"" } ] }"""
+# The deterministic-floor hook block, wired into settings.json under hooks.PreToolUse.
+# The command points at the STABLE ~/.claude/scripts path (NOT a plugin-relative path):
+# the floor is an always-on safety guard, so it must survive plugin enable/disable/update
+# (see DESIGN: floor stays settings.json-resident, not plugin-gated). `configure` writes
+# this; doctor only verifies + prints it.
+GUARD_HOOK_BLOCK = {
+    "matcher": "Bash",
+    "hooks": [{"type": "command",
+               "command": 'bash "$HOME/.claude/scripts/orchestrate-guard.sh"'}],
+}
+GUARD_HOOK_JSON = ("  Add this to ~/.claude/settings.json under hooks.PreToolUse (doctor only\n"
+                   "  verifies + prints; `orchestrate-setup.py configure --apply` writes it for you):\n"
+                   "    " + json.dumps(GUARD_HOOK_BLOCK))
 
 
-def check_guard_wired(settings):
-    hooks = (settings or {}).get("hooks", {}).get("PreToolUse", [])
-    for block in hooks:
+def _guard_hook_present(settings):
+    """True if the deterministic-floor Bash hook is already wired in settings.json."""
+    for block in (settings or {}).get("hooks", {}).get("PreToolUse", []):
         if block.get("matcher") == "Bash":
             for h in block.get("hooks", []):
                 if "orchestrate-guard.sh" in h.get("command", ""):
-                    return _emit(PASS, "guard wired as the PreToolUse Bash hook")
+                    return True
+    return False
+
+
+def check_guard_wired(settings):
+    if _guard_hook_present(settings):
+        return _emit(PASS, "guard wired as the PreToolUse Bash hook")
     _emit(FAIL, "guard NOT wired as a PreToolUse Bash hook")
     print(GUARD_HOOK_JSON)
     return FAIL
@@ -138,35 +153,43 @@ def _normalize_allow_entry(entry):
     return re.sub(r'\(//([^)]+)\)', r'(/\1)', entry)
 
 
-def check_allowlist(settings):
+def _missing_allow_entries(settings):
+    """Compute the allow-list entries documented in required-permissions.md that are
+    ABSENT from settings.json. Returns a sorted list (possibly empty), or None if the
+    required-permissions section cannot be read (file missing or no section). Shared by
+    `doctor` (check_allowlist) and `configure` so both see the same diff."""
     import re
-    allow_raw = (settings or {}).get("permissions", {}).get("allow", [])
-    # Normalize settings entries the same way so comparisons are apples-to-apples.
-    allow = set(_normalize_allow_entry(e) for e in allow_raw)
+    allow = set(_normalize_allow_entry(e) for e in (settings or {}).get("permissions", {}).get("allow", []))
     req_file = os.path.join(TEMPLATES, "required-permissions.md")
     try:
         text = open(req_file).read()
     except OSError:
-        return _emit(WARN, f"required-permissions.md not found at {req_file}; skipping allow-list diff")
+        return None
     # Extract only the "## Needed allow-list entries" section (stop at the next ## heading).
     section_match = re.search(r'^## Needed allow-list entries[^\n]*\n(.*?)(?=^## |\Z)',
                                text, re.MULTILINE | re.DOTALL)
     if not section_match:
-        return _emit(WARN, "required-permissions.md has no '## Needed allow-list entries' section; skipping diff")
-    section = section_match.group(1)
+        return None
     needed = set()
-    for line in section.splitlines():
+    for line in section_match.group(1).splitlines():
         # Skip lines that are commentary/notes (not prescriptive allow-list items).
         if "NOTE:" in line:
             continue
         for entry in re.findall(r"`(Bash\([^`]+\)|Write\([^`]+\)|Edit\([^`]+\)|Read\([^`]+\))`", line):
             needed.add(_normalize_allow_entry(entry))
-    missing = sorted(n for n in needed if n not in allow)
+    return sorted(n for n in needed if n not in allow)
+
+
+def check_allowlist(settings):
+    missing = _missing_allow_entries(settings)
+    if missing is None:
+        return _emit(WARN, "required-permissions.md missing or has no '## Needed allow-list entries' section; skipping allow-list diff")
     if not missing:
         return _emit(PASS, "allow-list covers the documented bot entries")
     _emit(WARN, f"{len(missing)} allow-list entries from required-permissions.md are MISSING:")
     for m in missing:
         print(f"         {m}")
+    print("         (run `orchestrate-setup.py configure --apply` to add these + the floor hook with consent)")
     return WARN
 
 
@@ -659,6 +682,98 @@ def cmd_down(args):
     return 0
 
 
+def _load_settings_for_write():
+    """Read SETTINGS for a write-merge. Returns (settings_dict_or_None, status):
+      'ok'          - parsed JSON dict
+      'missing'     - file absent; returns {} (configure may create it)
+      'unparseable' - file present but invalid JSON; returns None (NEVER clobber)
+      'unreadable'  - OSError; returns None
+    Distinguishing 'missing' from 'unparseable' is the safety property: configure
+    creates a fresh settings.json but refuses to overwrite an unparseable one."""
+    try:
+        with open(SETTINGS) as f:
+            return json.load(f), "ok"
+    except FileNotFoundError:
+        return {}, "missing"
+    except json.JSONDecodeError:
+        return None, "unparseable"
+    except OSError:
+        return None, "unreadable"
+
+
+def cmd_configure(args):
+    """Consent-based settings.json wiring: ADD the deterministic-floor hook + any missing
+    documented allow-list entries. Shows the exact diff; writes only with --apply, and only
+    after a y/N confirmation (skipped with --yes). Backs up settings.json before writing and
+    NEVER clobbers an unparseable file. This is the only path that writes settings.json -
+    doctor stays read-only - so 'permissions are the user's to grant' is preserved (the user
+    runs configure and approves every addition)."""
+    settings, status = _load_settings_for_write()
+    if status in ("unparseable", "unreadable"):
+        print(f"configure: {SETTINGS} is {status} - refusing to touch it (fix it by hand first).", file=sys.stderr)
+        return 1
+
+    add_hook = not _guard_hook_present(settings)
+    missing_allow = _missing_allow_entries(settings)
+    if missing_allow is None:
+        print(f"configure: cannot read the allow-list section of required-permissions.md "
+              f"(at {TEMPLATES}); skipping allow-list changes.", file=sys.stderr)
+        missing_allow = []
+
+    if not add_hook and not missing_allow:
+        print(f"configure: {SETTINGS} already has the floor hook + all documented allow-list entries. "
+              "Nothing to do.")
+        return 0
+
+    print(f"configure will ADD to {SETTINGS}:")
+    if add_hook:
+        print(f"  hooks.PreToolUse += {json.dumps(GUARD_HOOK_BLOCK)}")
+        print("    (the always-on deterministic security floor)")
+    for m in missing_allow:
+        print(f"  permissions.allow += {m}")
+
+    if not args.apply:
+        print("\n(preview only; re-run with --apply to write. settings.json is backed up first, "
+              "and an unparseable file is never overwritten.)")
+        return 0
+
+    if not args.yes:
+        try:
+            resp = input("\nApply these changes to settings.json? [y/N] ").strip().lower()
+        except EOFError:
+            resp = ""
+        if resp not in ("y", "yes"):
+            print("configure: aborted; no changes written.")
+            return 1
+
+    if status == "ok":
+        try:
+            shutil.copy2(SETTINGS, SETTINGS + ".bak")
+        except OSError as e:
+            print(f"configure: could not back up {SETTINGS} ({e}); aborting before any write.", file=sys.stderr)
+            return 1
+
+    if add_hook:
+        settings.setdefault("hooks", {}).setdefault("PreToolUse", []).append(GUARD_HOOK_BLOCK)
+    if missing_allow:
+        settings.setdefault("permissions", {}).setdefault("allow", []).extend(missing_allow)
+
+    try:
+        os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
+        with open(SETTINGS, "w") as f:
+            json.dump(settings, f, indent=2)
+            f.write("\n")
+    except OSError as e:
+        print(f"configure: FAILED to write {SETTINGS}: {e}", file=sys.stderr)
+        return 1
+
+    backup_note = f" (backup: {SETTINGS}.bak)" if status == "ok" else ""
+    print(f"configure: wrote {SETTINGS}{backup_note}.")
+    if add_hook:
+        print("RESTART the Claude Code session for the floor hook to load (PreToolUse hooks load at session start).")
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(prog="orchestrate-setup.py")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -675,8 +790,16 @@ def main():
     w = sub.add_parser("down")
     w.add_argument("--team")
 
+    c = sub.add_parser("configure",
+                       help="wire the floor hook + allow-list into settings.json (consent-based)")
+    c.add_argument("--apply", action="store_true",
+                   help="write the changes (default is a dry-run preview)")
+    c.add_argument("--yes", action="store_true",
+                   help="skip the y/N confirmation (for non-interactive setup)")
+
     args = p.parse_args()
-    return {"doctor": cmd_doctor, "up": cmd_up, "down": cmd_down}[args.cmd](args)
+    return {"doctor": cmd_doctor, "up": cmd_up, "down": cmd_down,
+            "configure": cmd_configure}[args.cmd](args)
 
 
 if __name__ == "__main__":

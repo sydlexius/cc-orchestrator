@@ -609,6 +609,34 @@ def main():
             label = f"key-contract: bash==python for {sample!r} (LC_ALL={locale_env.get('LC_ALL','ambient')})"
             check(label, bash_key == _key(sample))
 
+    # configure: consent-based settings.json wiring (floor hook + missing allow-list entries)
+    with tempfile.TemporaryDirectory() as td:
+        ctpl = os.path.join(td, "templates"); os.makedirs(ctpl)
+        open(os.path.join(ctpl, "required-permissions.md"), "w").write(
+            "## Needed allow-list entries\n- `Bash(gh pr view *)`\n- `Bash(go test *)`\n"
+            "## Guardrails\n- NOTE: `Bash(go *)` not prescribed\n")
+        cs = os.path.join(td, "settings.json")
+        json.dump({"permissions": {"allow": ["Bash(gh pr view *)"]}}, open(cs, "w"))
+        cov = {"ORCHESTRATE_SETTINGS": cs, "ORCHESTRATE_TEMPLATES_DIR": ctpl}
+        rc, out = run(["configure"], env_overrides=cov)
+        check("configure dry-run previews hook + missing entry, writes NOTHING",
+              rc == 0 and "PreToolUse" in out and "Bash(go test *)" in out
+              and json.load(open(cs)).get("hooks") is None)
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=cov)
+        s = json.load(open(cs))
+        hookok = any(b.get("matcher") == "Bash" and any("orchestrate-guard.sh" in h.get("command", "")
+                     for h in b.get("hooks", [])) for b in s.get("hooks", {}).get("PreToolUse", []))
+        check("configure --apply wires the floor hook + backs up", rc == 0 and hookok and os.path.exists(cs + ".bak"))
+        check("configure --apply adds the missing allow entry + keeps the existing one",
+              "Bash(go test *)" in s["permissions"]["allow"] and "Bash(gh pr view *)" in s["permissions"]["allow"])
+        check("configure does NOT add NOTE: lines as allow entries", "Bash(go *)" not in s["permissions"]["allow"])
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=cov)
+        check("configure is idempotent (Nothing to do once configured)", rc == 0 and "Nothing to do" in out)
+        open(cs, "w").write("{not json")
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=cov)
+        check("configure REFUSES to overwrite an unparseable settings.json (no clobber)",
+              rc == 1 and "refusing to touch" in out and open(cs).read().startswith("{not"))
+
     print()
     if FAILS:
         print(f"{len(FAILS)} FAILED:")
