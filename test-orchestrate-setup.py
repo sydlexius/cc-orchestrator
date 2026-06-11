@@ -362,6 +362,36 @@ def main():
         check("misconfig: up with file-FLOOR_DIR aborts clean (no traceback)",
               rc == 1 and "Traceback" not in out and "cannot arm the floor marker" in out)
 
+        # #25: pre-teardown dirty-worktree scan (WARN-and-proceed, never refuse). A marker
+        # that records a `repo:` makes `down` scan every worktree of that repo and warn on
+        # uncommitted work, so the lead does not `make remove-worktree` over it. The HEAD-vs-
+        # arm-SHA gate from the original issue is INTENTIONALLY absent (HEAD is meant to
+        # advance; a SHA-equality gate would refuse every legitimate teardown).
+        os.makedirs(floor_dir, exist_ok=True)
+        # Use a DEDICATED fresh repo (NOT the shared `repo`, which an earlier test dirtied
+        # with an untracked dirt.txt): the scan covers the primary worktree too, so the
+        # clean-case fixture must have EVERY worktree clean.
+        repo25 = os.path.join(td, "repo25"); os.makedirs(repo25)
+        subprocess.run(["git", "-C", repo25, "init", "-q"], check=True)
+        subprocess.run(["git", "-C", repo25, "-c", "user.email=t@t", "-c", "user.name=t",
+                        "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+        wt = os.path.join(td, "wt-feat25")
+        subprocess.run(["git", "-C", repo25, "worktree", "add", "-q", "-b", "feat25", wt], check=True)
+        repo_marker = (f"orchestrate session\nteam: demo\nrepo: {repo25}\nhead: dead123\n")
+        open(marker, "w").write(repo_marker)
+        rc, out = run(["down"], env_overrides={"ORCHESTRATE_FLOOR_DIR": floor_dir})
+        check("#25 down: clean worktrees -> no dirty-worktree WARNING, proceeds (rc0)",
+              rc == 0 and "uncommitted work in these worktrees" not in out and not os.path.exists(marker))
+        # Dirty the worktree, re-arm the marker, tear down again: WARN names it, still proceeds.
+        open(os.path.join(wt, "stray.txt"), "w").write("uncommitted")
+        open(marker, "w").write(repo_marker)
+        rc, out = run(["down"], env_overrides={"ORCHESTRATE_FLOOR_DIR": floor_dir})
+        check("#25 down: dirty worktree -> WARNS naming it, still proceeds (rc0, marker removed)",
+              rc == 0 and "uncommitted work in these worktrees" in out and wt in out
+              and not os.path.exists(marker) and "Traceback" not in out)
+        subprocess.run(["git", "-C", repo25, "worktree", "remove", "--force", wt],
+                       capture_output=True)
+
     # P3-G: doctor scans the settings cascade for merge-gate SHADOW rules. The Tier-2
     # merge gate works by OMITTING the squash-merge command from the allow-list so CC
     # prompts the human; CC UNIONS the allow-list across the cascade, so a single blanket

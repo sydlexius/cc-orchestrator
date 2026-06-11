@@ -539,7 +539,8 @@ Team teardown is the lead's job (tool calls, not this script):
   1. SendMessage shutdown_request to EACH teammate.
   2. WAIT for each "terminated" notice.
   3. THEN TeamDelete (it refuses while a member is alive).
-  4. LEAVE worktrees that still have open PRs; clean the rest with `make remove-worktree`."""
+  4. LEAVE worktrees that still have open PRs; clean the rest with `make remove-worktree`.
+     (down WARNS above about any worktree with uncommitted work - commit before removing it.)"""
 
 
 def _gc_stale_tombstones():
@@ -576,9 +577,69 @@ def _release_session_resources(team):
         pass  # teardown hygiene must never crash down
 
 
+def _marker_repo(path):
+    """Read the `repo:` path recorded in this session's marker. None on any problem
+    (no marker, unreadable, or no repo line) - teardown must never crash to read it."""
+    try:
+        with open(path) as f:
+            for line in f:
+                if line.startswith("repo:"):
+                    return line.split(":", 1)[1].strip() or None
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _dirty_worktrees(repo):
+    """Pre-teardown safety scan (#25): list (path, n_uncommitted) for every worktree of
+    `repo` (the primary checkout AND each linked worktree) that has uncommitted work.
+    Best-effort and FAIL-OPEN: returns [] on a missing repo or ANY git error, so the
+    scan can never crash `down` (which keeps its 'best-effort teardown' contract - the
+    maintainer chose WARN-and-proceed over a hard refuse, #25). HEAD is intentionally NOT
+    compared to the marker's arm-time SHA: the team commits freely, so HEAD is designed
+    to advance, and a SHA-equality gate would fire on every legitimate teardown."""
+    if not repo:
+        return []
+    try:
+        wl = subprocess.run(["git", "-C", repo, "worktree", "list", "--porcelain"],
+                            capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if wl.returncode != 0:
+        return []
+    paths = [ln[len("worktree "):].strip()
+             for ln in wl.stdout.splitlines() if ln.startswith("worktree ")]
+    dirty = []
+    for p in paths:
+        try:
+            st = subprocess.run(["git", "-C", p, "status", "--porcelain"],
+                                capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            continue  # a vanished/unreadable worktree is not our teardown's problem
+        if st.returncode == 0 and st.stdout.strip():
+            dirty.append((p, len(st.stdout.strip().splitlines())))
+    return dirty
+
+
+def _warn_dirty_worktrees(repo):
+    """Emit a prominent WARN (never a refusal) listing worktrees with uncommitted work,
+    so the lead does NOT `make remove-worktree` them before committing."""
+    dirty = _dirty_worktrees(repo)
+    if not dirty:
+        return
+    print("\ndown: WARNING - uncommitted work in these worktrees; commit it BEFORE "
+          "`make remove-worktree` (a worktree kept for an open PR is expected - leave it):",
+          file=sys.stderr)
+    for p, n in dirty:
+        print(f"         {p}  ({n} uncommitted path(s))", file=sys.stderr)
+
+
 def cmd_down(args):
     path = _marker_path()
     existed = bool(path) and os.path.exists(path)
+    # Read the repo BEFORE removing the marker; scan its worktrees so a dirty tree is
+    # surfaced before the lead cleans worktrees (#25, warn-and-proceed).
+    repo = _marker_repo(path) if existed else None
     if path:
         try:
             os.remove(path)
@@ -588,6 +649,7 @@ def cmd_down(args):
             pass
     _gc_stale_tombstones()
     _release_session_resources(getattr(args, "team", None))
+    _warn_dirty_worktrees(repo)
     if existed:
         print(TEARDOWN_CHECKLIST)
     else:
