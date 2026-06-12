@@ -449,9 +449,22 @@ while true; do
     # Brief pause to let the port fully release before the new process binds.
     sleep 1
     start_server
-    wait_healthy || true   # Log the warning but do not abort -- the server may still come up.
-    echo "$current_sha" >"$LAST_BUILT_SHA_FILE"
-    last_built_sha="$current_sha"
+    # Persist the SHA only when the server comes up healthy.  A failed health
+    # check leaves last_built_sha unchanged so the next poll cycle retries the
+    # swap rather than treating this commit as already-successfully-deployed.
+    #
+    # SIGKILL rebuttal (CR #54 finding): the SIGKILL escalation in stop_server
+    # is intentional and correct.  The header (lines 14-23) documents the
+    # TERM-then-KILL strategy; the kill is scoped to the exact LISTEN-socket PID
+    # (never TCP clients), and force-killing is necessary to free the port so the
+    # new binary can bind.  There is no "no -9 contract" in this script; CR's
+    # finding misread the lsof lease-safety note as a SIGKILL prohibition.
+    if wait_healthy; then
+      echo "$current_sha" >"$LAST_BUILT_SHA_FILE"
+      last_built_sha="$current_sha"
+    else
+      echo "[uat-autobuild] WARNING: health check failed after swap -- server may be unhealthy; sha $current_sha will be re-attempted on next poll"
+    fi
   else
     # Build failed -- leave the existing server running.
     echo "[uat-autobuild] build failed at $current_sha -- keeping server on ${last_built_sha:-<none>}"
