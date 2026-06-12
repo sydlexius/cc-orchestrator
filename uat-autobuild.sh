@@ -460,8 +460,13 @@ while true; do
     # new binary can bind.  There is no "no -9 contract" in this script; CR's
     # finding misread the lsof lease-safety note as a SIGKILL prohibition.
     if wait_healthy; then
-      echo "$current_sha" >"$LAST_BUILT_SHA_FILE"
-      last_built_sha="$current_sha"
+      tmpfile="$(mktemp "${LAST_BUILT_SHA_FILE}.tmp.XXXXXX")"
+      if printf '%s' "$current_sha" >"$tmpfile" && mv "$tmpfile" "$LAST_BUILT_SHA_FILE"; then
+        last_built_sha="$current_sha"
+      else
+        rm -f "$tmpfile"
+        echo "[uat-autobuild] ERROR: failed to persist sha $current_sha; in-memory state unchanged, will retry next poll" >&2
+      fi
     else
       echo "[uat-autobuild] WARNING: health check failed after swap -- server may be unhealthy; sha $current_sha will be re-attempted on next poll"
     fi
