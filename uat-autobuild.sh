@@ -449,16 +449,12 @@ while true; do
     # Brief pause to let the port fully release before the new process binds.
     sleep 1
     start_server
-    # Persist the SHA only when the server comes up healthy.  A failed health
-    # check leaves last_built_sha unchanged so the next poll cycle retries the
-    # swap rather than treating this commit as already-successfully-deployed.
+    # Persist the SHA only when the server comes up healthy (atomic write below);
+    # a failed health check leaves last_built_sha unchanged so the next poll retries.
     #
-    # SIGKILL rebuttal (CR #54 finding): the SIGKILL escalation in stop_server
-    # is intentional and correct.  The header (lines 14-23) documents the
-    # TERM-then-KILL strategy; the kill is scoped to the exact LISTEN-socket PID
-    # (never TCP clients), and force-killing is necessary to free the port so the
-    # new binary can bind.  There is no "no -9 contract" in this script; CR's
-    # finding misread the lsof lease-safety note as a SIGKILL prohibition.
+    # SIGKILL (CR #54): the TERM-then-KILL in stop_server is intentional and
+    # lease-safe -- scoped to the exact LISTEN-socket PID (header lines 14-23),
+    # and required to free the port for the new binary.  Not a -9 prohibition.
     if wait_healthy; then
       tmpfile="$(mktemp "${LAST_BUILT_SHA_FILE}.tmp.XXXXXX")"
       if printf '%s' "$current_sha" >"$tmpfile" && mv "$tmpfile" "$LAST_BUILT_SHA_FILE"; then
