@@ -449,9 +449,23 @@ while true; do
     # Brief pause to let the port fully release before the new process binds.
     sleep 1
     start_server
-    wait_healthy || true   # Log the warning but do not abort -- the server may still come up.
-    echo "$current_sha" >"$LAST_BUILT_SHA_FILE"
-    last_built_sha="$current_sha"
+    # Persist the SHA only when the server comes up healthy (atomic write below);
+    # a failed health check leaves last_built_sha unchanged so the next poll retries.
+    #
+    # SIGKILL (CR #54): the TERM-then-KILL in stop_server is intentional and
+    # lease-safe -- scoped to the exact LISTEN-socket PID (header lines 14-23),
+    # and required to free the port for the new binary.  Not a -9 prohibition.
+    if wait_healthy; then
+      tmpfile="$(mktemp "${LAST_BUILT_SHA_FILE}.tmp.XXXXXX")"
+      if printf '%s' "$current_sha" >"$tmpfile" && mv "$tmpfile" "$LAST_BUILT_SHA_FILE"; then
+        last_built_sha="$current_sha"
+      else
+        rm -f "$tmpfile"
+        echo "[uat-autobuild] ERROR: failed to persist sha $current_sha; in-memory state unchanged, will retry next poll" >&2
+      fi
+    else
+      echo "[uat-autobuild] WARNING: health check failed after swap -- server may be unhealthy; sha $current_sha will be re-attempted on next poll"
+    fi
   else
     # Build failed -- leave the existing server running.
     echo "[uat-autobuild] build failed at $current_sha -- keeping server on ${last_built_sha:-<none>}"
