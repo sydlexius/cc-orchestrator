@@ -232,11 +232,15 @@ a comms transport, NOT an authority bypass.
 The official plugin authenticates as the maintainer's OWN Slack user (user-OAuth, no bot
 identity), so outbound cards post under the same username/avatar as the maintainer's replies -
 sender id CANNOT disambiguate them. The fix is a content marker the lead controls: every
-outbound card begins with the plain-text first line `[ORCHESTRATOR - <repo>]`.
+outbound message (cards, thread replies, one-liners - no exceptions for brevity) begins with
+the plain-text first line `[ORCHESTRATOR - <repo>]`. This is load-bearing for two reasons:
+(a) authenticity - without it the message is indistinguishable from the maintainer's own; and
+(b) self-echo filtering - an unheadered lead message is NOT dropped by F6-C-2 and would be
+re-ingested as maintainer inbound.
 - `<repo>` derivation (F6-C-1): `os.path.basename(os.path.realpath(target_repo_root))` where
   `target_repo_root` is the run's target repo root as recorded by `up` (the same anchor as the
   watermark self-exclusion); case preserved, derived ONCE at session start and reused on every
-  card so the value is stable.
+  message so the value is stable.
 - Self-echo predicate (F6-C-2), exact: on each read, DROP a returned message iff
   `first_line.lstrip().startswith('[ORCHESTRATOR - ')` - ASCII case-sensitive, literal bracket /
   word / ` - ` separator. The filter keys ONLY on that literal prefix (repo-agnostic), so the
