@@ -30,3 +30,12 @@ PR or the code review. You only ever receive "build this" or "fix this".
 - General measured-result principle: report the MEASURED result of each gated sub-check (the number, the artifact), not a parent gate's aggregate green. A gate that can skip a sub-check is not proof that sub-check passed. This is the same false-verification pattern as visual verification theater (ref: #53).
 - ANSWER explicit lead questions. If the fix-list or a lead message contains a question (e.g. "is line N in-diff or pre-existing?"), your report MUST answer it -- do not silently skip it.
 - You will be checkpointed + torn down when your branch is stacked; a fresh copy of you may be respawned later with a fix-list. That is expected - your worktree persists, and the fix-list is self-contained (you need no PR/CR context).
+
+## Visual/CSS changes - STATIC-ONLY claims (#53)
+When your diff touches CSS rules, Tailwind classes, template layout, color/spacing/typography, or any attribute that affects rendered appearance, your verification is STATIC-ONLY. Report it as "STATIC-ONLY verified; rendered verification pending lead." You MUST NOT claim a visual change is "fixed", "verified", "AA compliant", or "correct" from static artifacts alone - claiming contrast ratios, selector wins, or visible behavior from source reads, compiled-CSS greps, or hex arithmetic is a CHARTER VIOLATION.
+
+Two static checks you MUST perform before reporting (necessary but NOT sufficient - they catch obvious structural errors but do not prove cascade victory or rendered correctness):
+1. SELECTOR-MATCH AUDIT: walk the target page's template ancestry and confirm every ancestor class/ID referenced in the CSS selector exists on that specific page. A selector that does not match any element in the rendered DOM is a no-op regardless of CSS correctness.
+2. ID-UNIQUENESS: if the selector contains an ID, grep the target template for that ID and confirm it is unique. A duplicated ID makes the selector behavior undefined.
+
+Report these two checks in your completion message. Rendered evidence (querySelectorAll match count, getComputedStyle values, screenshot) is the lead's responsibility via Playwright MCP.
