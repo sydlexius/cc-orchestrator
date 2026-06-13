@@ -5,7 +5,7 @@ description: Use when scaffolding and running a lead-orchestrated multi-agent se
 
 # Orchestrate: lead-run multi-agent PR pipeline
 
-**Version 0.13.1** (semver; releases tagged `vX.Y.Z`). Bump on any material change to this skill, its templates, or the runtime - PATCH for a fix, MINOR for a new rule/feature, MAJOR for a breaking charter or deterministic-floor change - so `/reload-skills` surfaces the new number and drift between the symlinked repo and the loaded skill is visible. History: `git log` + the GitHub Release notes cut at each `vX.Y.Z` tag.
+**Version 0.14.0** (semver; releases tagged `vX.Y.Z`). Bump on any material change to this skill, its templates, or the runtime - PATCH for a fix, MINOR for a new rule/feature, MAJOR for a breaking charter or deterministic-floor change - so `/reload-skills` surfaces the new number and drift between the symlinked repo and the loaded skill is visible. History: `git log` + the GitHub Release notes cut at each `vX.Y.Z` tag.
 
 You are the LEAD (orchestrator). You delegate building and the mechanical PR
 lifecycle to single-purpose teammates, and you keep for yourself the decisions
@@ -78,7 +78,7 @@ dispatch-map entry
   -> adversarial-review (hostile /pr-review-toolkit:review-pr) -> findings loop back
   -> lead gates SHIPPABLE (maintainer UAT: punch-list or AskUserQuestion + live URL)
   -> lead spawns a short-lived pr-prep subagent -> produces title + body_file + closes-list into /tmp/<team>/
-  -> lead VETS that pr-prep output (vet, not author - see "lead vets EVERY PR body/title #N ref"), appends to shipper stack, checkpoints the implementer + tears down the agent (worktree kept until PR merges)
+  -> lead VETS that pr-prep output (vet, not author - see "lead vets EVERY PR body/title #N ref"), appends to shipper stack with `prep_ok: true` (lead attestation that adversarial-prep gate is GREEN or an explicit lead gate run passed - mirrors the `review_handled` pattern for fix-rounds; the pr-shipper appends `# prep-pr-ok` to its safe-push ONLY when this field is true), checkpoints the implementer + tears down the agent (worktree kept until PR merges)
   -> pr-shipper: safe-push branch -> gh pr create -> background pr-watch -> rate-limit probe -> signal "shipped #N" to lead (lead removes the entry)
   -> pr-triage: background pr-watch -> on CR/Greptile, triage (/handle-review minus mutations) -> NOTIFY LEAD with one of two outcomes:
        * MERGE-READY (clean+mergeable) -> lead takes it straight to the maintainer to merge. SHORT-CIRCUIT: no re-review, no implementer respawn.
