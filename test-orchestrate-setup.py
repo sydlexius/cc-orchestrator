@@ -692,6 +692,11 @@ def main():
         check("#71: configure --apply narrows the blanket (merge omitted)", narrowed_ok)
         check("#71: configure --apply backs up the file before narrowing",
               os.path.exists(ncfg + ".bak"))
+        # Atomic write (CR #72): the temp file is os.replace'd onto the target and never left
+        # behind, and the target is always complete/parseable (no truncate-then-write window).
+        leftover_tmp = [f for f in os.listdir(td) if f.startswith(".orch-tmp-")]
+        check("#71: atomic narrow leaves no temp file behind + target stays valid JSON",
+              not leftover_tmp and isinstance(json.load(open(ncfg)), dict))
         # bak preserves the pre-narrow blanket.
         check("#71: backup retains the original blanket",
               blanket in json.load(open(ncfg + ".bak"))["permissions"]["allow"])

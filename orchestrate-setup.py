@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -244,6 +245,34 @@ def write_profile_env(team_dir):
             f.write(f"export {k}={v}\n")
     os.chmod(path, 0o600)  # enforce even if it pre-existed with looser perms
     return path
+
+
+def _atomic_write_json(path, data):
+    """Serialize `data` to `path` atomically: write a temp file in the SAME directory, fsync it,
+    then os.replace (an atomic same-filesystem rename on POSIX). A partial/failed write can never
+    leave `path` truncated - a reader or a crash sees either the prior complete file or the new
+    complete one. Preserves the existing file mode when `path` already exists. Callers still back
+    up first; this is the durability guarantee on top of that. Raises OSError on failure (the temp
+    file is cleaned up first), so existing `except OSError` write-error handling still applies."""
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".orch-tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp, os.stat(path).st_mode & 0o777)
+        except OSError:
+            pass  # path may not exist yet (first write); mkstemp's 0600 is acceptable then
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # First char must be alphanumeric: blocks path-escape (`.`/`..`/`/`) AND leading-dash
@@ -806,9 +835,7 @@ def _narrow_shadow_file(path, apply, assume_yes):
         return "write-error"
     data["permissions"]["allow"] = new_allow
     try:
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-            f.write("\n")
+        _atomic_write_json(path, data)
     except OSError as e:
         print(f"configure: FAILED to write {path}: {e}", file=sys.stderr)
         return "write-error"
@@ -921,9 +948,7 @@ def cmd_configure(args):
 
     try:
         os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
-        with open(SETTINGS, "w") as f:
-            json.dump(settings, f, indent=2)
-            f.write("\n")
+        _atomic_write_json(SETTINGS, settings)
     except OSError as e:
         print(f"configure: FAILED to write {SETTINGS}: {e}", file=sys.stderr)
         return 1
