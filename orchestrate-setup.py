@@ -531,7 +531,10 @@ def _narrow_allow_list(allow):
     untouched rules and de-duplicating the added entries. Returns (new_allow, changed):
     `changed` is False when nothing was narrowable (so the caller writes nothing)."""
     out, changed = [], False
-    existing = set(allow)
+    # Filter to strings before hashing into a set: a settings file may carry a non-string
+    # (e.g. a dict) in permissions.allow, and set() over it raises TypeError: unhashable type.
+    # Mirrors the downstream isinstance(rule, str) gate so configure safe-skips, never crashes.
+    existing = {r for r in allow if isinstance(r, str)}
     added = set()
     for rule in allow:
         if isinstance(rule, str) and _shadow_is_narrowable(rule):
