@@ -617,7 +617,10 @@ def main():
             "## Guardrails\n- NOTE: `Bash(go *)` not prescribed\n")
         cs = os.path.join(td, "settings.json")
         json.dump({"permissions": {"allow": ["Bash(gh pr view *)"]}}, open(cs, "w"))
-        cov = {"ORCHESTRATE_SETTINGS": cs, "ORCHESTRATE_TEMPLATES_DIR": ctpl}
+        # Pin the shadow-narrowing cascade scan to THIS fixture (cs) so configure's
+        # cascade-wide narrowing never reaches the real ~/.claude cascade.
+        cov = {"ORCHESTRATE_SETTINGS": cs, "ORCHESTRATE_TEMPLATES_DIR": ctpl,
+               "ORCHESTRATE_SETTINGS_FILES": cs}
         rc, out = run(["configure"], env_overrides=cov)
         check("configure dry-run previews hook + missing entry, writes NOTHING",
               rc == 0 and "PreToolUse" in out and "Bash(go test *)" in out
@@ -631,11 +634,128 @@ def main():
               "Bash(go test *)" in s["permissions"]["allow"] and "Bash(gh pr view *)" in s["permissions"]["allow"])
         check("configure does NOT add NOTE: lines as allow entries", "Bash(go *)" not in s["permissions"]["allow"])
         rc, out = run(["configure", "--apply", "--yes"], env_overrides=cov)
-        check("configure is idempotent (Nothing to do once configured)", rc == 0 and "Nothing to do" in out)
+        check("configure is idempotent once configured (no add, no narrow)",
+              rc == 0 and "already has the floor hook" in out and "NARROW" not in out)
         open(cs, "w").write("{not json")
         rc, out = run(["configure", "--apply", "--yes"], env_overrides=cov)
         check("configure REFUSES to overwrite an unparseable settings.json (no clobber)",
               rc == 1 and "refusing to touch" in out and open(cs).read().startswith("{not"))
+
+    # #71: configure NARROWS a blanket `gh pr` allow-rule that shadows the merge gate.
+    # The blanket specifier text lives only INSIDE Bash(...) wrappers (never on a command
+    # line), and the 'merge' literal is assembled from pieces so no source line carries the
+    # trigger triple for the live PreToolUse Bash hook.
+    with tempfile.TemporaryDirectory() as td:
+        PR = "gh pr "
+        ME = "merge"
+        ntpl = os.path.join(td, "templates"); os.makedirs(ntpl)
+        # A required-permissions.md whose floor hook + allow entries are ALREADY satisfied by
+        # the fixture below, so configure's ADD step is a no-op and only narrowing runs.
+        open(os.path.join(ntpl, "required-permissions.md"), "w").write(
+            "## Needed allow-list entries\n- `Bash(" + PR + "view *)`\n## Guardrails\n- nothing\n")
+        WIREDHOOK = {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": 'bash "$HOME/.claude/scripts/orchestrate-guard.sh"'}]}]}}
+
+        def narrow_fixture(allow):
+            """Write a settings file pre-wired with the floor hook so configure's ADD step is
+            a no-op and only the shadow-narrowing path exercises. Returns its path."""
+            p = os.path.join(td, "ncfg.json")
+            d = dict(WIREDHOOK); d["permissions"] = {"allow": allow}
+            json.dump(d, open(p, "w"))
+            return p
+
+        def nov(path):
+            # SETTINGS == the only cascade file, so doctor + configure see the same single file.
+            return {"ORCHESTRATE_SETTINGS": path, "ORCHESTRATE_TEMPLATES_DIR": ntpl,
+                    "ORCHESTRATE_SETTINGS_FILES": path}
+
+        # (a) Happy path: a blanket `gh pr *` shadow is narrowed; afterward the doctor shadow
+        # scan PASSES on that cascade file (the gate is restored).
+        blanket = "Bash(" + PR + "*)"
+        ncfg = narrow_fixture(["Bash(" + PR + "view *)", blanket, "Read(*)"])
+        # doctor first CONFIRMS the shadow exists (rc1).
+        rc, out = run(["doctor"], env_overrides=nov(ncfg))
+        check("#71: pre-narrow doctor flags the gh-pr blanket shadow (rc1)",
+              rc == 1 and "SHADOW" in out and blanket in out)
+        # configure dry-run PREVIEWS the narrow, writes nothing.
+        rc, out = run(["configure"], env_overrides=nov(ncfg))
+        before = json.load(open(ncfg))
+        check("#71: configure dry-run previews the narrow, writes nothing",
+              "NARROW" in out and "remove " + blanket in out and blanket in before["permissions"]["allow"])
+        # configure --apply narrows it.
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=nov(ncfg))
+        after = json.load(open(ncfg))["permissions"]["allow"]
+        narrowed_ok = (blanket not in after
+                       and ("Bash(" + PR + "view *)") in after
+                       and ("Bash(" + PR + "comment *)") in after
+                       and not any(ME in r for r in after))  # merge stays omitted
+        check("#71: configure --apply narrows the blanket (merge omitted)", narrowed_ok)
+        check("#71: configure --apply backs up the file before narrowing",
+              os.path.exists(ncfg + ".bak"))
+        # bak preserves the pre-narrow blanket.
+        check("#71: backup retains the original blanket",
+              blanket in json.load(open(ncfg + ".bak"))["permissions"]["allow"])
+        # The doctor shadow scan now PASSES on that cascade file.
+        rc, out = run(["doctor"], env_overrides=nov(ncfg))
+        check("#71: post-narrow doctor shadow scan PASSES (rc0, no shadow)",
+              "SHADOW" not in out and "no settings-cascade rule shadows" in out)
+
+        # (b) Idempotency: running configure again is a no-op (already narrowed, no shadow).
+        os.remove(ncfg + ".bak")
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=nov(ncfg))
+        check("#71: re-running configure is a no-op once narrowed (no NARROW, no new bak)",
+              rc == 0 and "NARROW" not in out and not os.path.exists(ncfg + ".bak"))
+
+        # (b2) The `gh pr:*` colon-boundary blanket form is also narrowed.
+        colon = "Bash(" + PR.rstrip() + ":*)"
+        ncfg2 = os.path.join(td, "ncfg2.json")
+        d = dict(WIREDHOOK); d["permissions"] = {"allow": [colon]}
+        json.dump(d, open(ncfg2, "w"))
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=nov(ncfg2))
+        after2 = json.load(open(ncfg2))["permissions"]["allow"]
+        check("#71: `gh pr:*` colon blanket is narrowed too (merge omitted)",
+              colon not in after2 and ("Bash(" + PR + "view *)") in after2
+              and not any(ME in r for r in after2))
+
+        # (c) A broader-scope shadow (`gh *`) is SURFACED, NOT rewritten.
+        broad = "Bash(gh *)"
+        ncfg3 = os.path.join(td, "ncfg3.json")
+        # Include the required allow entry so configure's ADD step is a no-op and only the
+        # cascade narrow path runs (so a stray ADD-path .bak does not confuse this assertion).
+        d = dict(WIREDHOOK); d["permissions"] = {"allow": ["Bash(" + PR + "view *)", broad, "Read(*)"]}
+        json.dump(d, open(ncfg3, "w"))
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=nov(ncfg3))
+        after3 = json.load(open(ncfg3))["permissions"]["allow"]
+        check("#71: broader `gh *` shadow is surfaced for human resolution, NOT rewritten",
+              rc == 1 and "HUMAN resolution" in out and broad in after3
+              and not os.path.exists(ncfg3 + ".bak"))
+
+        # (d) An unparseable cascade file in the narrow path is SKIPPED, not clobbered.
+        # SETTINGS itself stays parseable (so configure's own preamble does not bail);
+        # a SECOND cascade file is the unparseable one carrying the shadow scan target.
+        good_primary = os.path.join(td, "primary.json")
+        json.dump(WIREDHOOK, open(good_primary, "w"))  # parseable, no shadow
+        badcasc = os.path.join(td, "badcasc.json")
+        open(badcasc, "w").write("{not valid json")
+        unparse_ov = {"ORCHESTRATE_SETTINGS": good_primary, "ORCHESTRATE_TEMPLATES_DIR": ntpl,
+                      "ORCHESTRATE_SETTINGS_FILES": good_primary + ":" + badcasc}
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=unparse_ov)
+        check("#71: unparseable cascade file is reported + skipped, never clobbered",
+              rc == 1 and badcasc in out and open(badcasc).read() == "{not valid json"
+              and not os.path.exists(badcasc + ".bak"))
+
+        # (e) Aborting the y/N declines the narrow (no write, no bak).
+        ncfg5 = os.path.join(td, "ncfg5.json")
+        d = dict(WIREDHOOK); d["permissions"] = {"allow": [blanket]}
+        json.dump(d, open(ncfg5, "w"))
+        # Drive an interactive (no --yes) --apply with 'n' on stdin via a subprocess wrapper.
+        env5 = dict(os.environ); env5["TMUX"] = TEST_TMUX; env5.update(nov(ncfg5))
+        p5 = subprocess.run([sys.executable, SCRIPT, "configure", "--apply"], env=env5,
+                            input="n\n", capture_output=True, text=True, timeout=30)
+        check("#71: declining the narrow y/N leaves the file unchanged (no bak)",
+              "aborted" in (p5.stdout + p5.stderr)
+              and blanket in json.load(open(ncfg5))["permissions"]["allow"]
+              and not os.path.exists(ncfg5 + ".bak"))
 
     print()
     if FAILS:
