@@ -71,13 +71,40 @@ Chosen over the originally-listed self-hosted options. **This WAIVES the earlier
   clean but license NONE / v0.0.1 / bus-factor 1 / runtime `npm install`.
   Usable only as a pinned fork - more risk and ops than the official Slack plugin.
 
-### D2 - Authority model: CONSERVATIVE (non-negotiable)
+### D2 - Authority model: TIERED (conservative default; private-channel relaxation) (#67)
 
-Inbound Slack text is UNTRUSTED and NEVER authorizes a privileged/outward
-action. The deterministic floor + human-executed merge remain the SOLE
-authority. This matters MORE now that the channel is third-party SaaS (and the
-target channel is public), not self-hosted. Full-parity (allowlisted-sender ==
-terminal go) is explicitly rejected.
+Inbound Slack text is UNTRUSTED by default. Whether it can authorize a
+privileged/outward action is governed by two tiers:
+
+- **ULTRACODE / `effort:max` steps: TERMINAL-ONLY, always.** Slack NEVER authorizes
+  these (the break-glass stays at the keyboard). This closes the gap noted in
+  REVIEW-FINDINGS.md by integrating ultracode as a carveout of the unified rule.
+- **All other (non-ultracode) privileged steps (push, PR-create, the merge GO):
+  Slack-eligible, but ONLY when ALL three hold** - (i) the configured channel is
+  **PRIVATE / access-controlled** (membership IS the access control); (ii) the
+  inbound sender's Slack `user_id` matches the configured maintainer id; (iii) the
+  message passes the existing validation chain (per-channel watermark dedup,
+  sentinel self-echo suppression, configured-channel match). On a **PUBLIC** channel
+  (e.g. `#codebots`) inbound stays authority-**NULL** - the original conservative
+  rule - because a public channel cannot authenticate the sender (any member, or a
+  compromised account, could post a plausible "go").
+
+What does NOT change: the deterministic floor + human-executed MERGE remain the
+authority over **execution**. Slack authorizes the *instruction* to proceed; the
+floor still governs the irreversible act (it withholds `gh pr merge` from the
+allow-list and denies the merge-by-API path while the marker is active). Pipeline
+STATE (gate pass/fail, SHA, MERGE-READY) still comes ONLY from the lead's own tool
+calls, never from inbound (F2-A-3 unchanged). Inbound is still reproduced only inside
+the nonce-fenced untrusted-quotation wrapper for any relay (F9/F10 unchanged). The
+earlier blanket "full-parity explicitly rejected" is REPLACED by this tiered model:
+rejected for ultracode and on public channels; accepted for non-ultracode on a
+private, sender-matched channel.
+
+> NOTE (#67 strengthens the auto-generated plan): the CodeRabbit issue plan's
+> Design Choice 1 ("existing filters suffice") is INSUFFICIENT alone - the nonce
+> wrapper, sentinel, and watermark do NOT authenticate the SENDER. The private-channel
+> precondition + the `user_id` sender match are the load-bearing authentication; without
+> them the relaxation would reopen exactly the public-channel impersonation threat F1-2 was built to stop.
 
 ### D3 - Target: ONE channel PER REPO, with `#codebots` as the shared fallback
 
