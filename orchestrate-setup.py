@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -246,6 +247,34 @@ def write_profile_env(team_dir):
     return path
 
 
+def _atomic_write_json(path, data):
+    """Serialize `data` to `path` atomically: write a temp file in the SAME directory, fsync it,
+    then os.replace (an atomic same-filesystem rename on POSIX). A partial/failed write can never
+    leave `path` truncated - a reader or a crash sees either the prior complete file or the new
+    complete one. Preserves the existing file mode when `path` already exists. Callers still back
+    up first; this is the durability guarantee on top of that. Raises OSError on failure (the temp
+    file is cleaned up first), so existing `except OSError` write-error handling still applies."""
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".orch-tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp, os.stat(path).st_mode & 0o777)
+        except OSError:
+            pass  # path may not exist yet (first write); mkstemp's 0600 is acceptable then
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 # First char must be alphanumeric: blocks path-escape (`.`/`..`/`/`) AND leading-dash
 # names like `-rf` that would later be mis-parsed as flags by shell tools touching the dir.
 TEAM_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
@@ -467,6 +496,56 @@ def check_merge_gate_shadows():
         print(f"         Fix: narrow each to the non-merge subcommands (e.g. {MERGE_TARGET.rsplit(' ',1)[0]} "
               "view/diff/checks/create/list), never a blanket prefix that covers 'merge'.")
     return FAIL
+
+
+# The non-merge `gh pr` subcommands a narrowed blanket is replaced WITH. `merge` is
+# DELIBERATELY OMITTED so Claude Code keeps prompting the human (the merge gate). The
+# entry FORMS mirror required-permissions.md exactly: `Bash(gh pr <sub> *)`. The `gh pr`
+# stem is assembled from MERGE_TARGET so this source line carries no trigger string for
+# the live PreToolUse Bash hook. Keep this list in lockstep with required-permissions.md.
+_GH_PR_STEM = MERGE_TARGET.rsplit(" ", 1)[0]  # "gh pr" (no 'merge'), built off MERGE_TARGET
+_NON_MERGE_GH_PR_SUBCOMMANDS = ("view", "diff", "checks", "create", "list",
+                                "status", "edit", "ready", "comment")
+_NARROWED_GH_PR_ENTRIES = [f"Bash({_GH_PR_STEM} {sub} *)" for sub in _NON_MERGE_GH_PR_SUBCOMMANDS]
+
+# The exact blanket specifiers (inner part of `Bash(<spec>)`) that scope the WHOLE `gh pr`
+# space and are therefore safe to narrow to the enumerated non-merge subcommands without
+# changing scope outside `gh pr`. A broader shadow (`gh *`, `gh:*`, `*`, or anything else)
+# is NOT auto-narrowed - narrowing whole-`gh` to `gh pr` would silently drop unrelated
+# scope, so configure SURFACES those for explicit human resolution instead.
+_NARROWABLE_GH_PR_SPECS = frozenset({_GH_PR_STEM + " *", _GH_PR_STEM + ":*"})
+
+
+def _shadow_is_narrowable(rule):
+    """Is this `Bash(...)` shadow rule a blanket scoped exactly to the `gh pr` space
+    (`Bash(gh pr *)` / `Bash(gh pr:*)`) that we may safely narrow to the enumerated
+    non-merge subcommands? Any other shadow (broader `gh *`/`gh:*`/`*`, an exact merge
+    rule, a glob) is NOT narrowable and must be surfaced for human resolution."""
+    m = re.fullmatch(r"Bash\((.*)\)", rule)
+    return bool(m) and m.group(1) in _NARROWABLE_GH_PR_SPECS
+
+
+def _narrow_allow_list(allow):
+    """Return a NEW allow-list with every narrowable `gh pr` blanket replaced by the
+    enumerated non-merge subcommands (merge omitted), preserving the order of the
+    untouched rules and de-duplicating the added entries. Returns (new_allow, changed):
+    `changed` is False when nothing was narrowable (so the caller writes nothing)."""
+    out, changed = [], False
+    # Filter to strings before hashing into a set: a settings file may carry a non-string
+    # (e.g. a dict) in permissions.allow, and set() over it raises TypeError: unhashable type.
+    # Mirrors the downstream isinstance(rule, str) gate so configure safe-skips, never crashes.
+    existing = {r for r in allow if isinstance(r, str)}
+    added = set()
+    for rule in allow:
+        if isinstance(rule, str) and _shadow_is_narrowable(rule):
+            changed = True
+            for entry in _NARROWED_GH_PR_ENTRIES:
+                # add each enumerated subcommand once, skipping any already present
+                if entry not in existing and entry not in added:
+                    out.append(entry); added.add(entry)
+            continue  # drop the blanket itself
+        out.append(rule)
+    return out, changed
 
 
 # Well-formed Slack channel-id format: a leading uppercase letter + 5+ uppercase
@@ -701,13 +780,122 @@ def _load_settings_for_write():
         return None, "unreadable"
 
 
+def _narrow_shadow_file(path, apply, assume_yes):
+    """Narrow every narrowable `gh pr` blanket shadow in ONE cascade file, using configure's
+    consent model verbatim: show the diff, write only with --apply + a y/N (skipped by --yes),
+    back up the file first, and NEVER clobber an unparseable/unreadable file. Returns one of:
+      'noop'        - file has no narrowable shadow (nothing to do here)
+      'preview'     - a narrow was previewed (dry-run; nothing written)
+      'narrowed'    - the file was rewritten with the blanket narrowed
+      'aborted'     - the user declined the y/N (nothing written)
+      'skipped'     - file unparseable/unreadable - refused to touch it
+      'write-error' - the write failed
+    This is the per-file remediation; doctor stays read-only and only configure narrows."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return "noop"  # disappeared since the scan; nothing to narrow
+    except json.JSONDecodeError:
+        print(f"configure: {path} is unparseable - refusing to narrow it (fix it by hand first).", file=sys.stderr)
+        return "skipped"
+    except OSError as e:
+        print(f"configure: {path} is unreadable ({e}) - refusing to narrow it.", file=sys.stderr)
+        return "skipped"
+    if not isinstance(data, dict) or not isinstance(data.get("permissions"), dict):
+        return "noop"
+    allow = data["permissions"].get("allow")
+    if not isinstance(allow, list):
+        return "noop"
+    new_allow, changed = _narrow_allow_list(allow)
+    if not changed:
+        return "noop"
+
+    blankets = [r for r in allow if isinstance(r, str) and _shadow_is_narrowable(r)]
+    print(f"configure will NARROW the {MERGE_TARGET!r}-shadowing blanket(s) in {path}:")
+    for b in blankets:
+        print(f"  - remove {b}")
+    for entry in _NARROWED_GH_PR_ENTRIES:
+        if entry not in allow:
+            print(f"  + add    {entry}")
+    print(f"    ({MERGE_TARGET!r} stays OMITTED so the human is still prompted - the merge gate.)")
+
+    if not apply:
+        print("(preview only; re-run with --apply to write. the file is backed up first.)")
+        return "preview"
+    if not assume_yes:
+        try:
+            resp = input(f"\nNarrow the blanket(s) in {path}? [y/N] ").strip().lower()
+        except EOFError:
+            resp = ""
+        if resp not in ("y", "yes"):
+            print(f"configure: aborted; left {path} unchanged.")
+            return "aborted"
+    try:
+        shutil.copy2(path, path + ".bak")
+    except OSError as e:
+        print(f"configure: could not back up {path} ({e}); aborting before any write.", file=sys.stderr)
+        return "write-error"
+    data["permissions"]["allow"] = new_allow
+    try:
+        _atomic_write_json(path, data)
+    except OSError as e:
+        print(f"configure: FAILED to write {path}: {e}", file=sys.stderr)
+        return "write-error"
+    print(f"configure: narrowed {path} (backup: {path}.bak).")
+    return "narrowed"
+
+
+def _narrow_merge_gate_shadows(apply, assume_yes):
+    """Configure's remediation for merge-gate shadows across the whole settings cascade.
+    Reuses the SINGLE doctor matcher (`_scan_merge_gate_shadows`, the P3-G source of truth)
+    - it never re-derives shadow detection. Narrowable `gh pr` blankets are narrowed per
+    cascade file (consent-gated); broader-scope shadows (`gh *`/`gh:*`/`*`) are SURFACED for
+    explicit human resolution, never auto-rewritten. Returns an exit-code delta: 0 normally,
+    1 if a broader shadow remains unresolved or a per-file write/skip needs the human's eye."""
+    shadows, errors = _scan_merge_gate_shadows()
+    if not shadows and not errors:
+        return 0
+    rc = 0
+    # Group narrowable shadows by file so each file is rewritten once.
+    narrowable_files, broader = [], []
+    seen = set()
+    for path, rule in shadows:
+        if _shadow_is_narrowable(rule):
+            if path not in seen:
+                narrowable_files.append(path); seen.add(path)
+        else:
+            broader.append((path, rule))
+    for path in narrowable_files:
+        outcome = _narrow_shadow_file(path, apply, assume_yes)
+        if outcome in ("preview", "aborted", "skipped", "write-error"):
+            rc = 1
+    if broader:
+        print(f"configure: {len(broader)} broader-scope shadow(s) need HUMAN resolution "
+              "(NOT auto-narrowed - narrowing a whole-'gh' or '*' rule would silently drop "
+              "unrelated scope):", file=sys.stderr)
+        for path, rule in broader:
+            print(f"  {rule}   in {path}", file=sys.stderr)
+        print(f"  Fix by hand: remove the rule, or replace it with the enumerated non-merge "
+              f"{_GH_PR_STEM} subcommands (view/diff/checks/create/list/status/edit/ready/comment), "
+              f"never a blanket covering 'merge'.", file=sys.stderr)
+        rc = 1
+    if errors:
+        for path, msg in errors:
+            print(f"configure: cascade file could not be scanned: {path} ({msg}) - "
+                  "not narrowed (fix it by hand).", file=sys.stderr)
+        rc = 1
+    return rc
+
+
 def cmd_configure(args):
     """Consent-based settings.json wiring: ADD the deterministic-floor hook + any missing
-    documented allow-list entries. Shows the exact diff; writes only with --apply, and only
-    after a y/N confirmation (skipped with --yes). Backs up settings.json before writing and
-    NEVER clobbers an unparseable file. This is the only path that writes settings.json -
-    doctor stays read-only - so 'permissions are the user's to grant' is preserved (the user
-    runs configure and approves every addition)."""
+    documented allow-list entries, and NARROW any blanket `gh pr` allow-rule that shadows the
+    merge gate down to the enumerated non-merge subcommands. Shows the exact diff; writes only
+    with --apply, and only after a y/N confirmation (skipped with --yes). Backs up each file
+    before writing and NEVER clobbers an unparseable file. This is the only path that writes
+    settings - doctor stays read-only - so 'permissions are the user's to grant' is preserved
+    (the user runs configure and approves every change)."""
     settings, status = _load_settings_for_write()
     if status in ("unparseable", "unreadable"):
         print(f"configure: {SETTINGS} is {status} - refusing to touch it (fix it by hand first).", file=sys.stderr)
@@ -720,10 +908,13 @@ def cmd_configure(args):
               f"(at {TEMPLATES}); skipping allow-list changes.", file=sys.stderr)
         missing_allow = []
 
+    # SETTINGS additions (hook + missing allow entries) are applied to the primary settings
+    # file. Shadow NARROWING is a separate, cascade-wide remediation handled below (it may
+    # touch any cascade file, not just SETTINGS), driven by the SINGLE doctor matcher.
     if not add_hook and not missing_allow:
-        print(f"configure: {SETTINGS} already has the floor hook + all documented allow-list entries. "
-              "Nothing to do.")
-        return 0
+        print(f"configure: {SETTINGS} already has the floor hook + all documented allow-list entries.")
+        # Still run the cascade-wide shadow narrowing; it has its own scan + diff + consent.
+        return _narrow_merge_gate_shadows(args.apply, args.yes)
 
     print(f"configure will ADD to {SETTINGS}:")
     if add_hook:
@@ -735,7 +926,7 @@ def cmd_configure(args):
     if not args.apply:
         print("\n(preview only; re-run with --apply to write. settings.json is backed up first, "
               "and an unparseable file is never overwritten.)")
-        return 0
+        return _narrow_merge_gate_shadows(args.apply, args.yes)
 
     if not args.yes:
         try:
@@ -760,9 +951,7 @@ def cmd_configure(args):
 
     try:
         os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
-        with open(SETTINGS, "w") as f:
-            json.dump(settings, f, indent=2)
-            f.write("\n")
+        _atomic_write_json(SETTINGS, settings)
     except OSError as e:
         print(f"configure: FAILED to write {SETTINGS}: {e}", file=sys.stderr)
         return 1
@@ -771,7 +960,9 @@ def cmd_configure(args):
     print(f"configure: wrote {SETTINGS}{backup_note}.")
     if add_hook:
         print("RESTART the Claude Code session for the floor hook to load (PreToolUse hooks load at session start).")
-    return 0
+    # After applying the SETTINGS additions, narrow any cascade shadow (own scan/diff/consent).
+    narrow_rc = _narrow_merge_gate_shadows(args.apply, args.yes)
+    return narrow_rc
 
 
 def main():

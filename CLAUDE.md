@@ -36,7 +36,10 @@ Runtime (symlinked into `~/.claude/scripts/`; canonical source is this repo):
 - `orchestrate-setup.py` - doctor / up / down / configure, marker lifecycle, and a settings-cascade
   scan that FAILS LOUDLY if any allow-rule shadows the merge gate. `configure [--apply]` is the
   consent-based path that wires the floor hook + missing allow-list entries into settings.json
-  (shows the diff, writes only with --apply + a y/N, backs up, never clobbers an unparseable file);
+  AND narrows any blanket `gh pr` allow-rule (`Bash(gh pr *)`/`Bash(gh pr:*)`) that shadows the
+  merge gate down to the enumerated non-merge subcommands (broader `gh *`/`*` shadows are surfaced
+  for human resolution, never auto-rewritten); it shows the diff, writes only with --apply + a y/N,
+  backs up, never clobbers an unparseable file, and reuses doctor's single shadow matcher.
   doctor stays read-only so "permissions are the user's to grant" holds.
 - `uat-autobuild.sh` - repo-agnostic UAT auto-rebuild watcher: polls a branch HEAD, runs a
   parameterized `--build-cmd` on a new commit, and swaps only that port's LISTEN-pid (lease-safe)
