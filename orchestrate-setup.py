@@ -194,6 +194,51 @@ def check_allowlist(settings):
     return WARN
 
 
+def _derive_repo_slug(repo):
+    """Derive the owner/name slug from the repo path's git remote origin URL.
+
+    Handles both SSH and HTTPS GitHub remote forms:
+      git@github.com:owner/name.git  ->  owner/name
+      https://github.com/owner/name.git  ->  owner/name
+      https://github.com/owner/name     ->  owner/name
+
+    Raises SystemExit with a clear error if the remote cannot be resolved or
+    parsed (never silently renders a filesystem path into the brief).
+    """
+    try:
+        p = subprocess.run(["git", "-C", repo, "remote", "get-url", "origin"],
+                           capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise SystemExit(f"scaffold_artifacts: ABORT - cannot run git to resolve remote "
+                         f"for {repo}: {e}") from e
+    if p.returncode != 0:
+        raise SystemExit(
+            f"scaffold_artifacts: ABORT - cannot derive owner/name slug for the pr-shipper brief.\n"
+            f"  repo path: {repo}\n"
+            f"  `git -C {repo} remote get-url origin` failed (rc={p.returncode}).\n"
+            f"  The brief's <REPO> placeholder requires an owner/name slug (e.g. 'owner/repo'), "
+            f"not a filesystem path.\n"
+            f"  Fix: add an 'origin' remote pointing to the GitHub repo, then re-run `up`."
+        )
+    url = p.stdout.strip()
+    # SSH: git@github.com:owner/name.git or git@github.com:owner/name
+    m = re.match(r"git@[^:]+:([^/]+/[^/]+?)(?:\.git)?$", url)
+    if m:
+        return m.group(1)
+    # HTTPS: https://github.com/owner/name.git or https://github.com/owner/name
+    m = re.match(r"https?://[^/]+/([^/]+/[^/]+?)(?:\.git)?$", url)
+    if m:
+        return m.group(1)
+    raise SystemExit(
+        f"scaffold_artifacts: ABORT - cannot parse owner/name slug from remote URL.\n"
+        f"  repo path: {repo}\n"
+        f"  remote origin URL: {url!r}\n"
+        f"  Expected SSH (git@github.com:owner/name.git) or HTTPS "
+        f"(https://github.com/owner/name) form.\n"
+        f"  Fix: set origin to a GitHub SSH or HTTPS URL, then re-run `up`."
+    )
+
+
 def scaffold_artifacts(team, repo, spacing):
     # P3-A: all artifacts live under a per-team dir so parallel teams don't clobber each
     # other (stack drops its <team>- prefix - the dir now carries the team identity).
@@ -211,12 +256,16 @@ def scaffold_artifacts(team, repo, spacing):
         body = open(src).read()
     except OSError:
         body = "# pr-shipper brief\n(template not found; fill manually)\n"
+    # Derive the owner/name slug from the repo's git remote - the brief's <REPO> placeholders
+    # require a slug (gh + pr-watch.sh both reject a filesystem path). Fail loudly if the
+    # remote cannot be resolved so the operator never gets a silently-broken brief.
+    slug = _derive_repo_slug(repo)
     # Substitute the real template tokens: <REPO>, <STACK>, <SPACING_MIN>.
     # The team is captured in the injected header comment; the template has no team token.
-    body = (body.replace("<REPO>", repo)
+    body = (body.replace("<REPO>", slug)
                 .replace("<STACK>", stack)
                 .replace("<SPACING_MIN>", str(spacing)))
-    header = f"<!-- rendered by orchestrate-setup.py: team={team} repo={repo} spacing={spacing}min stack={stack} -->\n"
+    header = f"<!-- rendered by orchestrate-setup.py: team={team} repo={repo} slug={slug} spacing={spacing}min stack={stack} -->\n"
     with open(brief_out, "w") as f:
         f.write(header + body)
     return stack, triage, brief_out

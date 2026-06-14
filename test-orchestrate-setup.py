@@ -150,6 +150,9 @@ def main():
         open(os.path.join(tpl, "pr-shipper-brief.md"), "w").write(
             "Stack: <STACK>\nRepo: <REPO>\nPacing: <SPACING_MIN> minutes\n")
         floor_dir = os.path.join(td, "floor.d")
+        # Add a GitHub remote to the repo fixture so scaffold_artifacts can derive the slug.
+        subprocess.run(["git", "-C", repo, "remote", "add", "origin",
+                        "https://github.com/testowner/testrepo.git"], check=True)
         upov = dict(ov); upov.update({"ORCHESTRATE_ARTIFACT_DIR": art, "ORCHESTRATE_FLOOR_DIR": floor_dir})
         rc, out = run(["up", "--team", "demo", "--repo", repo], env_overrides=upov)
         # P3-A /tmp-namespacing: all artifacts live under ARTIFACTS/<team>/ (per-team dir),
@@ -160,13 +163,18 @@ def main():
         check("up creates <team>/pr-triage dir", os.path.isdir(os.path.join(team_dir, "pr-triage")))
         check("up creates <team>/adv-review dir", os.path.isdir(os.path.join(team_dir, "adv-review")))
         brief = open(os.path.join(team_dir, "pr-shipper-brief.md")).read()
-        # Verify the real values were substituted AND none of the literal tokens remain.
+        # Verify: brief body contains the owner/name SLUG (derived from the remote), not the
+        # raw path. The header comment records the path for diagnostics, so we check the
+        # body lines (everything after the first line) for the slug and absence of raw path.
+        brief_body = "\n".join(brief.splitlines()[1:])
         check("brief substitutions rendered",
-              repo in brief and
-              stack in brief and
-              "<REPO>" not in brief and
-              "<STACK>" not in brief and
-              "<SPACING_MIN>" not in brief)
+              "testowner/testrepo" in brief_body and
+              stack in brief_body and
+              "<REPO>" not in brief_body and
+              "<STACK>" not in brief_body and
+              "<SPACING_MIN>" not in brief_body)
+        check("brief body contains slug not raw path",
+              "testowner/testrepo" in brief_body and repo not in brief_body)
 
         # P3-A: two parallel teams must NOT clobber each other (disjoint per-team dirs).
         rc, out = run(["up", "--team", "beta", "--repo", repo], env_overrides=upov)
@@ -761,6 +769,84 @@ def main():
               "aborted" in (p5.stdout + p5.stderr)
               and blanket in json.load(open(ncfg5))["permissions"]["allow"]
               and not os.path.exists(ncfg5 + ".bak"))
+
+    # #68: slug derivation - _derive_repo_slug parses both SSH and HTTPS remote URL forms
+    # and scaffold_artifacts renders the slug (not the raw path) into the brief's <REPO>.
+    # Import the function directly from the module (no subprocess) to test the parser in
+    # isolation without environment side-effects.
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location("orchestrate_setup", SCRIPT)
+    _mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+
+    # SSH form: git@github.com:owner/name.git -> owner/name
+    with tempfile.TemporaryDirectory() as td68:
+        r_ssh = os.path.join(td68, "ssh-repo"); os.makedirs(r_ssh)
+        subprocess.run(["git", "-C", r_ssh, "init", "-q"], check=True)
+        subprocess.run(["git", "-C", r_ssh, "remote", "add", "origin",
+                        "git@github.com:acme/widget.git"], check=True)
+        slug = _mod._derive_repo_slug(r_ssh)
+        check("#68 slug: SSH git@github.com:owner/name.git -> owner/name",
+              slug == "acme/widget")
+
+        # SSH form without .git suffix: git@github.com:owner/name -> owner/name
+        subprocess.run(["git", "-C", r_ssh, "remote", "set-url", "origin",
+                        "git@github.com:acme/widget"], check=True)
+        slug = _mod._derive_repo_slug(r_ssh)
+        check("#68 slug: SSH git@github.com:owner/name (no .git) -> owner/name",
+              slug == "acme/widget")
+
+        # HTTPS form: https://github.com/owner/name.git -> owner/name
+        subprocess.run(["git", "-C", r_ssh, "remote", "set-url", "origin",
+                        "https://github.com/acme/widget.git"], check=True)
+        slug = _mod._derive_repo_slug(r_ssh)
+        check("#68 slug: HTTPS https://github.com/owner/name.git -> owner/name",
+              slug == "acme/widget")
+
+        # HTTPS form without .git suffix: https://github.com/owner/name -> owner/name
+        subprocess.run(["git", "-C", r_ssh, "remote", "set-url", "origin",
+                        "https://github.com/acme/widget"], check=True)
+        slug = _mod._derive_repo_slug(r_ssh)
+        check("#68 slug: HTTPS https://github.com/owner/name (no .git) -> owner/name",
+              slug == "acme/widget")
+
+        # No remote -> SystemExit with a clear error message (never silently renders a path).
+        r_noremote = os.path.join(td68, "noremote"); os.makedirs(r_noremote)
+        subprocess.run(["git", "-C", r_noremote, "init", "-q"], check=True)
+        try:
+            _mod._derive_repo_slug(r_noremote)
+            check("#68 slug: no remote -> SystemExit (error not raised)", False)
+        except SystemExit as e:
+            msg = str(e)
+            check("#68 slug: no remote -> SystemExit with clear message",
+                  "owner/name" in msg or "origin" in msg or "slug" in msg)
+
+        # scaffold_artifacts renders the slug into the brief's body, not the raw repo path.
+        # Wire a minimal fixture: templates dir with a pr-shipper-brief template.
+        art68 = os.path.join(td68, "art"); os.makedirs(art68)
+        tpl68 = os.path.join(td68, "templates"); os.makedirs(tpl68)
+        open(os.path.join(tpl68, "pr-shipper-brief.md"), "w").write(
+            "Repo: <REPO>\nStack: <STACK>\nPacing: <SPACING_MIN> minutes\n")
+        # Set a fresh HTTPS remote for this scaffold test.
+        subprocess.run(["git", "-C", r_ssh, "remote", "set-url", "origin",
+                        "https://github.com/myorg/myrepo.git"], check=True)
+        orig_artifacts = _mod.ARTIFACTS
+        orig_templates = _mod.TEMPLATES
+        _mod.ARTIFACTS = art68
+        _mod.TEMPLATES = tpl68
+        try:
+            stack68, _triage68, brief68_path = _mod.scaffold_artifacts("t68", r_ssh, 12)
+        finally:
+            _mod.ARTIFACTS = orig_artifacts
+            _mod.TEMPLATES = orig_templates
+        brief68 = open(brief68_path).read()
+        brief68_body = "\n".join(brief68.splitlines()[1:])  # skip header comment
+        check("#68 scaffold: brief body contains slug not raw path",
+              "myorg/myrepo" in brief68_body and r_ssh not in brief68_body)
+        check("#68 scaffold: brief body has no <REPO> placeholder remaining",
+              "<REPO>" not in brief68_body)
+        check("#68 scaffold: brief body has no <STACK> placeholder remaining",
+              "<STACK>" not in brief68_body)
 
     print()
     if FAILS:
