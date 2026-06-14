@@ -67,13 +67,19 @@ def main():
     order = size_flags({"z": {"changed_lines": 500, "files": 1}, "a": {"changed_lines": 500, "files": 1}})
     check("#11 sizing: deterministic order by branch", [f["branches"][0] for f in order] == ["a", "z"])
 
-    # robustness: string/negative stats + partial budget must not raise (review hardening)
+    # robustness: non-numeric/float-like/negative stats + partial/string budget must not raise
     check("#11 sizing: numeric-string stats coerced (over budget still flags)",
           [f["branches"][0] for f in size_flags({"s": {"changed_lines": "500", "files": "1"}})] == ["s"])
+    check("#11 sizing: float-like string stat coerced (over budget still flags)",
+          [f["branches"][0] for f in size_flags({"fl": {"changed_lines": "500.0", "files": "1"}})] == ["fl"])
+    check("#11 sizing: non-numeric stat treated as 0 (no flag, no raise)",
+          size_flags({"na": {"changed_lines": "N/A", "files": "x"}}) == [])
     check("#11 sizing: negative stat clamped to 0 (no flag, no raise)",
           size_flags({"n": {"changed_lines": -5, "files": -2}}) == [])
     check("#11 sizing: partial budget dict uses default for the missing bound (no raise)",
           [f["branches"][0] for f in size_flags({"b": {"changed_lines": 500, "files": 1}}, budget={"files": 999})] == ["b"])
+    check("#11 sizing: string-typed budget value coerced (no raise)",
+          [f["branches"][0] for f in size_flags({"b": {"changed_lines": 500, "files": 1}}, budget={"files": "999"})] == ["b"])
 
     # --- artifact shape vs templates/proposed.schema.json (structural, stdlib-only) ---
     with open(SCHEMA) as f:

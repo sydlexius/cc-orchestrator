@@ -55,6 +55,15 @@ def find_overlaps(branch_files):
     return flags
 
 
+def _nonneg_int(value):
+    """Coerce a stat/budget value to a non-negative int; any non-numeric or
+    missing value becomes 0 so comparisons never raise."""
+    try:
+        return max(0, int(float(value)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def size_flags(branch_stats, budget=None):
     """Given {branch: {"changed_lines": N, "files": M}} (from `git diff --stat`), return a
     `sizing` flag for each branch exceeding EITHER bound of `budget` (default SIZING_BUDGET).
@@ -63,14 +72,15 @@ def size_flags(branch_stats, budget=None):
     if budget is None:
         budget = SIZING_BUDGET
     # Tolerate a partial budget dict (fall back to the default bound per key) and
-    # coerce stats to non-negative ints, so a string or negative value from
-    # upstream parsing never raises on the `>` compare or slips through.
-    budget = {**SIZING_BUDGET, **budget}
+    # coerce every stat and budget value to a non-negative int, so a non-numeric,
+    # float-like, negative, or missing value becomes 0 and never raises on the
+    # `>` compare or slips through.
+    budget = {k: _nonneg_int(v) for k, v in {**SIZING_BUDGET, **budget}.items()}
     flags = []
     for branch in sorted(branch_stats):
         st = branch_stats[branch]
-        lines = max(0, int(st.get("changed_lines", 0) or 0))
-        files = max(0, int(st.get("files", 0) or 0))
+        lines = _nonneg_int(st.get("changed_lines", 0))
+        files = _nonneg_int(st.get("files", 0))
         if lines > budget["changed_lines"] or files > budget["files"]:
             flags.append({
                 "kind": "sizing",
