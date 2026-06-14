@@ -250,6 +250,12 @@ def scaffold_artifacts(team, repo, spacing):
     triage = os.path.join(team_dir, "pr-triage")
     os.makedirs(triage, exist_ok=True)
     os.makedirs(os.path.join(team_dir, "adv-review"), exist_ok=True)
+    # Planner (lookahead) role artifact (#11): the read-only planner overwrites this DRAFT
+    # proposal; the lead ratifies. Seed it empty so a consumer always finds valid JSON.
+    planner_dir = os.path.join(team_dir, "planner")
+    os.makedirs(planner_dir, exist_ok=True)
+    with open(os.path.join(planner_dir, "proposed.json"), "w") as f:
+        json.dump({"flags": []}, f)
     brief_out = os.path.join(team_dir, "pr-shipper-brief.md")
     src = os.path.join(TEMPLATES, "pr-shipper-brief.md")
     try:
@@ -620,13 +626,28 @@ def check_slack_channel():
     return _emit(PASS, f"ORCHESTRATE_SLACK_CHANNEL={channel} is a well-formed Slack channel id")
 
 
+def check_slack_bot_user_id():
+    """Doctor check (WARN-level, optional): the Slack SERVICE-IDENTITY bot user_id (#89).
+    When set, the lead's self-echo keys on author==<bot user_id> (F6-C-3, robust) instead
+    of the text sentinel. Optional + FORMAT-only (a Slack user id shares the channel id
+    shape [A-Z][A-Z0-9]{5,}); NEVER FAIL - unset is fine (text-sentinel fallback, F6-C-2).
+    Reachability/identity is validated at runtime by a rendered read-back, not here."""
+    bot = os.environ.get("ORCHESTRATE_SLACK_BOT_USER_ID", "")
+    if not bot:
+        return _emit(WARN, "ORCHESTRATE_SLACK_BOT_USER_ID not set (optional; self-echo uses the text sentinel)")
+    if not SLACK_CHANNEL_RE.fullmatch(bot):
+        return _emit(WARN, f"ORCHESTRATE_SLACK_BOT_USER_ID={bot!r} is not a well-formed Slack user id "
+                           "(expected [A-Z][A-Z0-9]{5,}); self-echo falls back to the text sentinel")
+    return _emit(PASS, f"ORCHESTRATE_SLACK_BOT_USER_ID={bot} is a well-formed Slack user id")
+
+
 def cmd_doctor(args):
     settings = _load_settings()
     repo_status, _head = check_repo_main(getattr(args, "repo", None))
     results = [check_agent_teams(settings), check_tmux(),
                check_guard_wired(settings), check_guard_healthy(),
                repo_status, check_allowlist(settings),
-               check_merge_gate_shadows(), check_slack_channel()]
+               check_merge_gate_shadows(), check_slack_channel(), check_slack_bot_user_id()]
     hard_fail = any(s == FAIL for s in results)
     print()
     print("doctor: HARD-FAIL (fix the FAIL lines above before `up`)" if hard_fail else "doctor: ok (no hard fail)")

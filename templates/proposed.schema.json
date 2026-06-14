@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "planner proposal",
+  "description": "Issue #11. The planner (lookahead) role's ADVISORY output, written read-only to /tmp/<team>/planner/proposed.json. It PROPOSES; the lead disposes (single-writer stack/map). PR-BLIND: references issues/clusters/branches only, NEVER a PR number or CR finding. Seed is {\"flags\": []}.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["flags"],
+  "properties": {
+    "flags": {
+      "type": "array",
+      "description": "Advisory flags. Empty array = nothing to propose (the seed state).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "proposal"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": ["overlap", "sizing", "next-tranche"],
+            "description": "overlap = >=2 live branches (and/or open PRs, #12) touch shared files; sizing = a branch exceeds the sizing budget; next-tranche = the now-unblocked clusters after a recorded merge."
+          },
+          "branches": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Branch names involved (overlap: the colliding set; sizing: the single oversized branch). PR-blind - branch names, never PR numbers."
+          },
+          "clusters": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Issue/cluster ids the proposal concerns (next-tranche: the proposed runnable set)."
+          },
+          "conflicting_paths": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "overlap only: the file paths shared across `branches` (the exact, diff-confirmed collision set)."
+          },
+          "stats": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "sizing only: the measured diff size that tripped the budget.",
+            "properties": {
+              "changed_lines": { "type": "integer" },
+              "files": { "type": "integer" }
+            }
+          },
+          "unblocked_by": {
+            "type": "string",
+            "description": "next-tranche only: the merged issue/cluster ref whose merge unblocked this tranche (recorded at the lead's checkpoint, not an unobservable on-merge hook)."
+          },
+          "proposal": {
+            "type": "string",
+            "description": "The advisory action for the lead to ratify or reject (e.g. serialize these branches, split this branch, dispatch these clusters)."
+          }
+        }
+      }
+    }
+  }
+}
