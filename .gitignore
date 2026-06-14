@@ -6,6 +6,12 @@ __pycache__/
 # session-scoped and follow the "no ephemeral docs in git" convention)
 SESSION-STATE.md
 CRITIQUE-*.md
+# The orchestrate feedback mailbox is a machine-local symlink into ~/.claude/ (the GitHub
+# ISSUE is the durable record); the mailbox + its dated archives are never committed.
+orchestrate-session-feedback.md
+orchestrate-session-feedback.archive-*.md
+# Per-team / resource scratch that can surface in the repo root
+profile.env
 
 # Playwright MCP scratch (UAT screenshots land here; never commit)
 .playwright-mcp/
