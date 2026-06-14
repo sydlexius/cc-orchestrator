@@ -162,6 +162,9 @@ def main():
         check("up scaffolds <team>/stack.json=[]", os.path.exists(stack) and json.load(open(stack)) == [])
         check("up creates <team>/pr-triage dir", os.path.isdir(os.path.join(team_dir, "pr-triage")))
         check("up creates <team>/adv-review dir", os.path.isdir(os.path.join(team_dir, "adv-review")))
+        planner_seed = os.path.join(team_dir, "planner", "proposed.json")
+        check("#11 up scaffolds <team>/planner/proposed.json={\"flags\": []}",
+              os.path.exists(planner_seed) and json.load(open(planner_seed)) == {"flags": []})
         brief = open(os.path.join(team_dir, "pr-shipper-brief.md")).read()
         # Verify: brief body contains the owner/name SLUG (derived from the remote), not the
         # raw path. The header comment records the path for diagnostics, so we check the
@@ -268,6 +271,26 @@ def main():
         for val in ("", "x", "123", "C0B8Y401QR2"):
             rc, out = run(["doctor"], env_overrides={**sov, "ORCHESTRATE_SLACK_CHANNEL": val})
             check(f"slack: value {val!r} -> slack check never FAIL", "[FAIL" not in slack_line(out))
+
+        # #89: check_slack_bot_user_id() mirrors the channel check - FORMAT-only, WARN-level,
+        # optional, NEVER FAIL. Its line is identified by the ORCHESTRATE_SLACK_BOT_USER_ID token.
+        def bot_line(out):
+            for ln in out.splitlines():
+                if "ORCHESTRATE_SLACK_BOT_USER_ID" in ln and ln.lstrip().startswith("["):
+                    return ln
+            return ""
+        rc, out = run(["doctor"], env_overrides={**sov, "ORCHESTRATE_SLACK_BOT_USER_ID": ""})
+        bln = bot_line(out)
+        check("#89 bot-id: absent -> WARN (text-sentinel fallback)", "[WARN" in bln and "text sentinel" in bln)
+        check("#89 bot-id: cmd_doctor wiring -> line present when absent", bln != "")
+        check("#89 bot-id: absent -> doctor rc0", rc == 0)
+        for bad in ("123", "abc", "U12", "u0bb8nueere", "U0BB/NUEERE", "U0BB NUEERE"):
+            rc, out = run(["doctor"], env_overrides={**sov, "ORCHESTRATE_SLACK_BOT_USER_ID": bad})
+            bln = bot_line(out)
+            check(f"#89 bot-id: malformed {bad!r} -> WARN, never FAIL", "[WARN" in bln and "[FAIL" not in bln and rc == 0)
+        for good in ("U0BB8NUEERE", "W0B8Y401", "U12345"):
+            rc, out = run(["doctor"], env_overrides={**sov, "ORCHESTRATE_SLACK_BOT_USER_ID": good})
+            check(f"#89 bot-id: well-formed {good!r} -> PASS", "[PASS" in bot_line(out) and rc == 0)
 
         # F2-B-2: ORCHESTRATE_SLACK_CHANNEL is NOT in PROFILE_ENV_KEYS, so `up` must NOT
         # write it to the team artifact dir's profile.env. Set it (and a stillwater key so

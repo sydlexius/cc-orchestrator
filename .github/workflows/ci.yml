@@ -52,7 +52,7 @@ jobs:
 
       - name: ruff (F,E741)
         if: runner.os == 'Linux'
-        run: ruff check --select F,E741 orchestrate-resources.py orchestrate-setup.py test-orchestrate-guard.py test-orchestrate-resources.py test-orchestrate-setup.py
+        run: ruff check --select F,E741 orchestrate-resources.py orchestrate-setup.py planner_classify.py test-orchestrate-guard.py test-orchestrate-resources.py test-orchestrate-setup.py test-planner-classify.py
 
       # Platform-sensitive: run on BOTH macOS (BSD stat) and Linux (GNU stat).
       # Must invoke via ./ so the self-test's "$0" re-invocation resolves
@@ -65,6 +65,10 @@ jobs:
 
       - name: harness - resources
         run: python3 test-orchestrate-resources.py
+
+      # Pure classification logic (planner role, #11) - platform-independent, runs on both.
+      - name: harness - planner-classify
+        run: python3 test-planner-classify.py
 
       # The setup/doctor harness exercises HOST-COUPLED wiring (settings cascade, tmux,
       # guard execution, git repo state). On a fresh macOS runner doctor behaves differently
