@@ -62,11 +62,15 @@ def size_flags(branch_stats, budget=None):
     """
     if budget is None:
         budget = SIZING_BUDGET
+    # Tolerate a partial budget dict (fall back to the default bound per key) and
+    # coerce stats to non-negative ints, so a string or negative value from
+    # upstream parsing never raises on the `>` compare or slips through.
+    budget = {**SIZING_BUDGET, **budget}
     flags = []
     for branch in sorted(branch_stats):
         st = branch_stats[branch]
-        lines = st.get("changed_lines", 0)
-        files = st.get("files", 0)
+        lines = max(0, int(st.get("changed_lines", 0) or 0))
+        files = max(0, int(st.get("files", 0) or 0))
         if lines > budget["changed_lines"] or files > budget["files"]:
             flags.append({
                 "kind": "sizing",

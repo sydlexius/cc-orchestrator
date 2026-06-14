@@ -67,8 +67,17 @@ def main():
     order = size_flags({"z": {"changed_lines": 500, "files": 1}, "a": {"changed_lines": 500, "files": 1}})
     check("#11 sizing: deterministic order by branch", [f["branches"][0] for f in order] == ["a", "z"])
 
+    # robustness: string/negative stats + partial budget must not raise (review hardening)
+    check("#11 sizing: numeric-string stats coerced (over budget still flags)",
+          [f["branches"][0] for f in size_flags({"s": {"changed_lines": "500", "files": "1"}})] == ["s"])
+    check("#11 sizing: negative stat clamped to 0 (no flag, no raise)",
+          size_flags({"n": {"changed_lines": -5, "files": -2}}) == [])
+    check("#11 sizing: partial budget dict uses default for the missing bound (no raise)",
+          [f["branches"][0] for f in size_flags({"b": {"changed_lines": 500, "files": 1}}, budget={"files": 999})] == ["b"])
+
     # --- artifact shape vs templates/proposed.schema.json (structural, stdlib-only) ---
-    schema = json.load(open(SCHEMA))
+    with open(SCHEMA) as f:
+        schema = json.load(f)
     allowed_kinds = set(schema["properties"]["flags"]["items"]["properties"]["kind"]["enum"])
     check("#11 schema: kinds enum is overlap/sizing/next-tranche",
           allowed_kinds == {"overlap", "sizing", "next-tranche"})
