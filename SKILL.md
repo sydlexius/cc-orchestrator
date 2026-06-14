@@ -5,7 +5,7 @@ description: Use when scaffolding and running a lead-orchestrated multi-agent se
 
 # Orchestrate: lead-run multi-agent PR pipeline
 
-**Version 0.19.1** (semver; releases tagged `vX.Y.Z`). Bump on any material change to this skill, its templates, or the runtime - PATCH for a fix, MINOR for a new rule/feature, MAJOR for a breaking charter or deterministic-floor change - so `/reload-skills` surfaces the new number and drift between the symlinked repo and the loaded skill is visible. History: `git log` + the GitHub Release notes cut at each `vX.Y.Z` tag.
+**Version 0.20.0** (semver; releases tagged `vX.Y.Z`). Bump on any material change to this skill, its templates, or the runtime - PATCH for a fix, MINOR for a new rule/feature, MAJOR for a breaking charter or deterministic-floor change - so `/reload-skills` surfaces the new number and drift between the symlinked repo and the loaded skill is visible. History: `git log` + the GitHub Release notes cut at each `vX.Y.Z` tag.
 
 You are the LEAD (orchestrator). You delegate building and the mechanical PR
 lifecycle to single-purpose teammates, and you keep for yourself the decisions
@@ -23,6 +23,15 @@ SELF-CHECK (at the moment of temptation): if you are about to use Edit/Write on 
 ## When NOT to use
 - A single PR or a quick fix. Use one `Agent` dispatch, or just do it inline.
 - Anything where a human is not available to approve merges (the pipeline deliberately stops at merge).
+
+## Lead-driven LITE mode (small server-less waves) (#82)
+For a SMALL wave of disjoint PRs on a server-less / non-stillwater repo (a CLI or library: no web UI, no UAT server, no encryption key), the full auto-bot pipeline (pr-shipper / pr-triage / adversarial-bot fleet + leases + UAT + shipper-brief/stack scaffold) is heavier than the work warrants. LITE mode is a sanctioned variant - a lead PRACTICE, not a separate tool:
+- The lead spawns PR-blind implementer teammates on disjoint worktrees but NO auto-mode bot fleet (no pr-shipper / pr-triage). The lead drives each PR through prep-gate -> adversarial review -> `gh pr create` -> CR/Codoki -> human-merge ITSELF (push via `safe-push.sh`, open via `gh pr create`).
+- Skip the pr-shipper-brief / stack scaffold (no shipper to consume them).
+- STILL REQUIRED, never skipped: adversarial-prep + adversarial-review on every PR; the maintainer's PR-go and the merge (merge stays human).
+- Resources: use the `generic` profile (the DEFAULT in `orchestrate-resources.py allocate`) - it leases a worktree path (+ optional port) with no key/music/UAT provisioning; or for a tiny wave skip leasing and hand-create the worktrees.
+- LEAST-PRIVILEGE / FLOOR-INTACT (non-negotiable): LITE mode changes ONLY which agents are spawned. It grants NO new permission and weakens NO security check. The deterministic floor is UNCHANGED (push-main / bare-force / `--no-verify` denies, merge-by-API hard-deny, `gh pr merge` withheld from the allow-list = human-merge). The doctor merge-gate SHADOW check STAYS a HARD-FAIL (it is floor/marker-driven, orthogonal to whether bots exist) - never downgrade it to make LITE setup convenient. With no bots spawned, the bot allow-list completeness check (already a WARN) is simply moot; that is the only check LITE mode renders irrelevant, and it needs no code change. LITE mode needs FEWER allow-list entries than the full pipeline, never more.
+- A dedicated `up --lead-driven` flag is OPTIONAL future work (a script change -> CR pass); LITE mode works today as this documented lead practice without it.
 
 ## Prerequisites (verify before launching anything)
 1. Agent Teams enabled: `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` + `teammateMode: "tmux"` in settings.json, tmux running.
