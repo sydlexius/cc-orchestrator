@@ -167,8 +167,18 @@ def _deploy_guard():
     already gated on --apply + consent. Returns (ok: bool, message: str)."""
     try:
         os.makedirs(os.path.dirname(GUARD), exist_ok=True)
-        shutil.copy2(BUNDLED_GUARD, GUARD)
-        os.chmod(GUARD, os.stat(GUARD).st_mode | 0o111)  # ensure u+g+o executable
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(GUARD), prefix=".orch-guard-")
+        os.close(fd)
+        try:
+            shutil.copy2(BUNDLED_GUARD, tmp)
+            os.chmod(tmp, os.stat(tmp).st_mode | 0o111)  # ensure u+g+o executable
+            os.replace(tmp, GUARD)  # atomic; replaces a symlink itself, never its target
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
         return True, f"deployed the floor guard -> {GUARD}"
     except OSError as e:
         return False, f"FAILED to deploy the floor guard to {GUARD}: {e}"

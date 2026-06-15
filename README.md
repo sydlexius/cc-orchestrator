@@ -42,6 +42,8 @@ ruff check --select F,E741 scripts/orchestrate-*.py scripts/planner_classify.py 
 python3 test-orchestrate-guard.py
 python3 test-orchestrate-resources.py
 python3 test-orchestrate-setup.py
+python3 test-planner-classify.py
+python3 test-gh-wrappers.py
 ```
 
 ## Deployment
