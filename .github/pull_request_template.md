@@ -12,9 +12,9 @@ Closes #
 
 ## Gates (run locally; CI enforces them on ubuntu + macOS)
 
-- [ ] `shellcheck orchestrate-guard.sh`
-- [ ] `ruff check --select F,E741 orchestrate-*.py test-orchestrate-*.py`
-- [ ] `./orchestrate-guard.sh --self-test` (must use `./` so the self-test's `$0` re-invocation resolves)
+- [ ] `shellcheck scripts/orchestrate-guard.sh`
+- [ ] `ruff check --select F,E741 scripts/orchestrate-*.py scripts/planner_classify.py test-*.py`
+- [ ] `./scripts/orchestrate-guard.sh --self-test` (must use `./` so the self-test's `$0` re-invocation resolves)
 - [ ] `python3 test-orchestrate-guard.py`
 - [ ] `python3 test-orchestrate-resources.py`
 - [ ] `python3 test-orchestrate-setup.py`
