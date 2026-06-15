@@ -42,6 +42,12 @@ FLOOR_DIR = os.environ.get("ORCHESTRATE_FLOOR_DIR", os.path.join(HOME, ".claude"
 # P3-A cross-session-disarm sin. Clamp back to the default instead.
 TTL_HOURS = _int_env("ORCHESTRATE_FLOOR_TTL_HOURS", 72, minimum=1)
 GUARD = os.environ.get("ORCHESTRATE_GUARD", os.path.join(HOME, ".claude", "scripts", "orchestrate-guard.sh"))
+# The BUNDLED guard ships beside this script (scripts/orchestrate-guard.sh). `configure` copies it
+# to the stable GUARD path so a fresh plugin install has a working floor at the path the
+# settings.json hook points at (Option A - the floor is settings-resident, never plugin-gated; see
+# DESIGN-plugin-floor-lifecycle.md). Env-overridable so the harness can point it at a fixture.
+BUNDLED_GUARD = os.environ.get("ORCHESTRATE_BUNDLED_GUARD",
+    os.path.join(os.path.dirname(os.path.realpath(__file__)), "orchestrate-guard.sh"))
 # Script-relative: under the plugin layout this script lives in scripts/ and the templates ship
 # beside the skill at skills/orchestrate/templates/, so resolve them relative to the script
 # (realpath resolves any ~/.claude/scripts deploy symlink to the real plugin/repo location). A
@@ -129,6 +135,57 @@ def check_guard_healthy():
     if p.returncode == 0:
         return _emit(PASS, "guard --self-test passes (not failing open)")
     return _emit(FAIL, f"guard --self-test FAILED (rc={p.returncode}); guard may be failing open")
+
+
+def _files_identical(a, b):
+    """Byte-compare two files. False if either is missing/unreadable (so a missing dest reads as
+    'not identical' -> needs deploy, and a missing source is handled by the caller)."""
+    try:
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            return fa.read() == fb.read()
+    except OSError:
+        return False
+
+
+def _guard_deploy_action():
+    """What `configure` must do to put the bundled floor guard at the stable GUARD path:
+      'missing-source' - the bundled guard is absent (cannot deploy - dev-layout problem);
+      'deploy'         - GUARD does not exist yet (fresh install);
+      'refresh'        - GUARD exists but differs from the bundled guard (post-update drift);
+      None             - GUARD is byte-identical to the bundled guard (nothing to do)."""
+    if not os.path.isfile(BUNDLED_GUARD):
+        return "missing-source"
+    if not os.path.exists(GUARD):
+        return "deploy"
+    if not _files_identical(BUNDLED_GUARD, GUARD):
+        return "refresh"
+    return None
+
+
+def _deploy_guard():
+    """Copy the bundled guard to the stable GUARD path and ensure it is executable. The caller has
+    already gated on --apply + consent. Returns (ok: bool, message: str)."""
+    try:
+        os.makedirs(os.path.dirname(GUARD), exist_ok=True)
+        shutil.copy2(BUNDLED_GUARD, GUARD)
+        os.chmod(GUARD, os.stat(GUARD).st_mode | 0o111)  # ensure u+g+o executable
+        return True, f"deployed the floor guard -> {GUARD}"
+    except OSError as e:
+        return False, f"FAILED to deploy the floor guard to {GUARD}: {e}"
+
+
+def check_guard_stale():
+    """Doctor check (WARN-level): the deployed guard should match the bundled plugin guard. A
+    difference is the post-plugin-update drift case (the bundled source moved ahead of the deployed
+    copy) - WARN, never FAIL, and point at `configure --apply`. 'deploy' (no deployed guard yet) is
+    already covered by check_guard_wired/healthy; 'missing-source' is a dev-layout issue, not drift."""
+    action = _guard_deploy_action()
+    if action == "refresh":
+        return _emit(WARN, f"deployed guard at {GUARD} is STALE vs the bundled plugin guard - run "
+                           "`orchestrate-setup.py configure --apply` to refresh it")
+    if action in ("deploy", "missing-source"):
+        return _emit(WARN, f"could not compare the deployed guard to the bundled guard ({action})")
+    return _emit(PASS, "deployed guard matches the bundled plugin guard")
 
 
 def check_repo_main(repo):
@@ -647,7 +704,7 @@ def cmd_doctor(args):
     settings = _load_settings()
     repo_status, _head = check_repo_main(getattr(args, "repo", None))
     results = [check_agent_teams(settings), check_tmux(),
-               check_guard_wired(settings), check_guard_healthy(),
+               check_guard_wired(settings), check_guard_healthy(), check_guard_stale(),
                repo_status, check_allowlist(settings),
                check_merge_gate_shadows(), check_slack_channel(), check_slack_bot_user_id()]
     hard_fail = any(s == FAIL for s in results)
@@ -980,20 +1037,36 @@ def cmd_configure(args):
               f"(at {TEMPLATES}); skipping allow-list changes.", file=sys.stderr)
         missing_allow = []
 
-    # SETTINGS additions (hook + missing allow entries) are applied to the primary settings
-    # file. Shadow NARROWING is a separate, cascade-wide remediation handled below (it may
-    # touch any cascade file, not just SETTINGS), driven by the SINGLE doctor matcher.
-    if not add_hook and not missing_allow:
-        print(f"configure: {SETTINGS} already has the floor hook + all documented allow-list entries.")
-        # Still run the cascade-wide shadow narrowing; it has its own scan + diff + consent.
+    # Two independent remediations gated by one --apply + one consent: (1) SETTINGS additions
+    # (hook + missing allow entries); (2) GUARD DEPLOY - copy the bundled guard to the stable GUARD
+    # path so a fresh plugin install has a working floor (Option A). Shadow NARROWING is a separate
+    # cascade-wide remediation handled below (its own scan/diff/consent), driven by the single matcher.
+    guard_action = _guard_deploy_action()           # 'deploy' | 'refresh' | 'missing-source' | None
+    deploy_needed = guard_action in ("deploy", "refresh")
+    settings_changes = add_hook or bool(missing_allow)
+
+    if not settings_changes and not deploy_needed:
+        print(f"configure: {SETTINGS} already has the floor hook + all documented allow-list entries, "
+              "and the deployed guard matches the bundled plugin guard.")
+        if guard_action == "missing-source":
+            print(f"  (note: the bundled guard {BUNDLED_GUARD} is missing; could not verify/deploy "
+                  "the floor guard.)", file=sys.stderr)
         return _narrow_merge_gate_shadows(args.apply, args.yes)
 
-    print(f"configure will ADD to {SETTINGS}:")
-    if add_hook:
-        print(f"  hooks.PreToolUse += {json.dumps(GUARD_HOOK_BLOCK)}")
-        print("    (the always-on deterministic security floor)")
-    for m in missing_allow:
-        print(f"  permissions.allow += {m}")
+    if settings_changes:
+        print(f"configure will ADD to {SETTINGS}:")
+        if add_hook:
+            print(f"  hooks.PreToolUse += {json.dumps(GUARD_HOOK_BLOCK)}")
+            print("    (the always-on deterministic security floor)")
+        for m in missing_allow:
+            print(f"  permissions.allow += {m}")
+    if deploy_needed:
+        verb = "DEPLOY" if guard_action == "deploy" else "REFRESH (stale)"
+        print(f"configure will {verb} the floor guard:")
+        print(f"  {BUNDLED_GUARD} -> {GUARD}")
+    if guard_action == "missing-source":
+        print(f"configure: WARNING - the bundled guard {BUNDLED_GUARD} is missing; cannot deploy "
+              "the floor guard (the rest still applies).", file=sys.stderr)
 
     if not args.apply:
         print("\n(preview only; re-run with --apply to write. settings.json is backed up first, "
@@ -1002,39 +1075,44 @@ def cmd_configure(args):
 
     if not args.yes:
         try:
-            resp = input("\nApply these changes to settings.json? [y/N] ").strip().lower()
+            resp = input("\nApply these changes? [y/N] ").strip().lower()
         except EOFError:
             resp = ""
         if resp not in ("y", "yes"):
             print("configure: aborted; no changes written.")
             return 1
 
-    if status == "ok":
+    if settings_changes:
+        if status == "ok":
+            try:
+                shutil.copy2(SETTINGS, SETTINGS + ".bak")
+            except OSError as e:
+                print(f"configure: could not back up {SETTINGS} ({e}); aborting before any write.", file=sys.stderr)
+                return 1
+        if add_hook:
+            settings.setdefault("hooks", {}).setdefault("PreToolUse", []).append(GUARD_HOOK_BLOCK)
+        if missing_allow:
+            settings.setdefault("permissions", {}).setdefault("allow", []).extend(missing_allow)
         try:
-            shutil.copy2(SETTINGS, SETTINGS + ".bak")
+            os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
+            _atomic_write_json(SETTINGS, settings)
         except OSError as e:
-            print(f"configure: could not back up {SETTINGS} ({e}); aborting before any write.", file=sys.stderr)
+            print(f"configure: FAILED to write {SETTINGS}: {e}", file=sys.stderr)
+            return 1
+        backup_note = f" (backup: {SETTINGS}.bak)" if status == "ok" else ""
+        print(f"configure: wrote {SETTINGS}{backup_note}.")
+        if add_hook:
+            print("RESTART the Claude Code session for the floor hook to load (PreToolUse hooks load at session start).")
+
+    # Guard deploy is a filesystem copy, independent of (and after) the settings write.
+    if deploy_needed:
+        ok, msg = _deploy_guard()
+        print(f"configure: {msg}")
+        if not ok:
             return 1
 
-    if add_hook:
-        settings.setdefault("hooks", {}).setdefault("PreToolUse", []).append(GUARD_HOOK_BLOCK)
-    if missing_allow:
-        settings.setdefault("permissions", {}).setdefault("allow", []).extend(missing_allow)
-
-    try:
-        os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
-        _atomic_write_json(SETTINGS, settings)
-    except OSError as e:
-        print(f"configure: FAILED to write {SETTINGS}: {e}", file=sys.stderr)
-        return 1
-
-    backup_note = f" (backup: {SETTINGS}.bak)" if status == "ok" else ""
-    print(f"configure: wrote {SETTINGS}{backup_note}.")
-    if add_hook:
-        print("RESTART the Claude Code session for the floor hook to load (PreToolUse hooks load at session start).")
-    # After applying the SETTINGS additions, narrow any cascade shadow (own scan/diff/consent).
-    narrow_rc = _narrow_merge_gate_shadows(args.apply, args.yes)
-    return narrow_rc
+    # After applying, narrow any cascade shadow (own scan/diff/consent).
+    return _narrow_merge_gate_shadows(args.apply, args.yes)
 
 
 def main():

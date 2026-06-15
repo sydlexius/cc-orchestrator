@@ -641,6 +641,7 @@ def main():
             check(label, bash_key == _key(sample))
 
     # configure: consent-based settings.json wiring (floor hook + missing allow-list entries)
+    # AND the #30 guard-deploy (copy the bundled guard to the stable GUARD path).
     with tempfile.TemporaryDirectory() as td:
         ctpl = os.path.join(td, "templates"); os.makedirs(ctpl)
         open(os.path.join(ctpl, "required-permissions.md"), "w").write(
@@ -648,14 +649,19 @@ def main():
             "## Guardrails\n- NOTE: `Bash(go *)` not prescribed\n")
         cs = os.path.join(td, "settings.json")
         json.dump({"permissions": {"allow": ["Bash(gh pr view *)"]}}, open(cs, "w"))
+        # #30 guard-deploy fixtures: a fake BUNDLED guard source + an (initially absent) dest, so
+        # configure's guard deploy operates on temp files, NEVER the real ~/.claude guard.
+        cbundle = os.path.join(td, "bundled-guard.sh"); write_stub_guard(cbundle)
+        cdest = os.path.join(td, "deployed", "orchestrate-guard.sh")
         # Pin the shadow-narrowing cascade scan to THIS fixture (cs) so configure's
         # cascade-wide narrowing never reaches the real ~/.claude cascade.
         cov = {"ORCHESTRATE_SETTINGS": cs, "ORCHESTRATE_TEMPLATES_DIR": ctpl,
-               "ORCHESTRATE_SETTINGS_FILES": cs}
+               "ORCHESTRATE_SETTINGS_FILES": cs,
+               "ORCHESTRATE_GUARD": cdest, "ORCHESTRATE_BUNDLED_GUARD": cbundle}
         rc, out = run(["configure"], env_overrides=cov)
-        check("configure dry-run previews hook + missing entry, writes NOTHING",
-              rc == 0 and "PreToolUse" in out and "Bash(go test *)" in out
-              and json.load(open(cs)).get("hooks") is None)
+        check("configure dry-run previews hook + missing entry + guard DEPLOY, writes NOTHING",
+              rc == 0 and "PreToolUse" in out and "Bash(go test *)" in out and "DEPLOY the floor guard" in out
+              and json.load(open(cs)).get("hooks") is None and not os.path.exists(cdest))
         rc, out = run(["configure", "--apply", "--yes"], env_overrides=cov)
         s = json.load(open(cs))
         hookok = any(b.get("matcher") == "Bash" and any("orchestrate-guard.sh" in h.get("command", "")
@@ -664,9 +670,32 @@ def main():
         check("configure --apply adds the missing allow entry + keeps the existing one",
               "Bash(go test *)" in s["permissions"]["allow"] and "Bash(gh pr view *)" in s["permissions"]["allow"])
         check("configure does NOT add NOTE: lines as allow entries", "Bash(go *)" not in s["permissions"]["allow"])
+        # #30: the bundled guard was DEPLOYED to the stable path, byte-identical + executable.
+        guard_deployed = (os.path.isfile(cdest)
+                          and open(cdest, "rb").read() == open(cbundle, "rb").read()
+                          and bool(os.stat(cdest).st_mode & 0o111))
+        check("#30: configure --apply deploys the bundled guard to the stable path (executable)", guard_deployed)
         rc, out = run(["configure", "--apply", "--yes"], env_overrides=cov)
-        check("configure is idempotent once configured (no add, no narrow)",
-              rc == 0 and "already has the floor hook" in out and "NARROW" not in out)
+        check("configure is idempotent once configured (no add, no narrow, guard matches)",
+              rc == 0 and "already has the floor hook" in out and "NARROW" not in out
+              and "DEPLOY the floor guard" not in out and "REFRESH" not in out)
+        # #30: a STALE deployed guard (differs from the bundle) is detected + REFRESHED on --apply.
+        open(cdest, "w").write("#!/bin/sh\nexit 1\n# drifted\n")
+        rc, out = run(["configure"], env_overrides=cov)
+        check("#30: configure detects a STALE deployed guard (REFRESH preview, no write)",
+              rc == 0 and "REFRESH" in out and open(cdest).read().startswith("#!/bin/sh\nexit 1"))
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=cov)
+        check("#30: configure --apply REFRESHES a stale deployed guard back to the bundle",
+              open(cdest, "rb").read() == open(cbundle, "rb").read())
+        # #30: a MISSING bundled source warns (does not crash); the rest of configure still runs.
+        covms = dict(cov); covms["ORCHESTRATE_BUNDLED_GUARD"] = os.path.join(td, "does-not-exist.sh")
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=covms)
+        check("#30: missing bundled guard -> warns, no crash", rc in (0, 1) and "missing" in out.lower())
+        # #30: doctor WARNs (never FAILs) on a stale deployed guard.
+        open(cdest, "w").write("#!/bin/sh\nexit 1\n# drifted again\n")
+        rc, out = run(["doctor"], env_overrides=cov, tmux=True)
+        check("#30: doctor WARNs on a stale deployed guard (not a hard fail)",
+              "STALE vs the bundled plugin guard" in out)
         open(cs, "w").write("{not json")
         rc, out = run(["configure", "--apply", "--yes"], env_overrides=cov)
         check("configure REFUSES to overwrite an unparseable settings.json (no clobber)",
