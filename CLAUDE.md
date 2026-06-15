@@ -94,8 +94,21 @@ Keep the SKILL.md version line and the git tag in lockstep.
 
 ## Operating model (lead-driven; distilled from prior orchestration sessions)
 
-- NO push / PR / merge without the maintainer's EXPLICIT "go". "Looks good"/"LGTM" is not merge
-  authorization. The outward publish step is always gated; commit locally freely.
+- AUTONOMY TIERS (maintainer directive 2026-06-14). Outward steps are gated BY TIER, not blanket-gated:
+  - NON-CR, well-shaped issue (no script-FUNCTION change - prose/doc/charter/SKILL.md/CLAUDE.md edits):
+    the lead carries it the ENTIRE cycle AUTONOMOUSLY (implement -> PR -> CI -> merge -> cleanup) with NO
+    per-step maintainer approval; the standing grant IS the "go".
+  - CR-REQUIRED PR (changes a script's FUNCTION: `.sh`/`.py`/`.mjs` logic): needs maintainer PERMISSION
+    TO OPEN the PR, and its MERGE stays human.
+  - GATES + hostile pre-push review are NEVER waived - autonomy waives the maintainer's APPROVAL, not the
+    rigor (build + prep + hostile review green before ANY PR; a CR-required PR still gets a triggered CR pass).
+  - SELF-IMPOSED CARVE-OUT: a change that edits the deterministic floor / merge-policy / operating-model
+    ITSELF routes for MAINTAINER MERGE even when it is "doc" (this file's operating-model + SKILL.md floor
+    invariants qualify).
+  - MECHANICAL: autonomous merge works only in a SOLO / non-marker session; a marker-active TEAM session
+    still has the floor withhold `gh pr merge` (+ deny merge-by-API), so there the lead SURFACES the merge
+    to the human. "Looks good"/"LGTM" is NEVER a merge authorization for the human-gated tiers; commit
+    locally freely regardless of tier.
 - The LEAD owns all privileged/outward steps (push, `gh pr create`, CR replies, merge) and is the
   SOLE human-facing channel. Teammates implement + test + commit in their OWN worktree and message
   the lead rather than prompting the human (AskUserQuestion/permission prompts from teammates clobber
