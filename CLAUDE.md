@@ -22,9 +22,15 @@ otherwise asks to continue. It supersedes any stale detail below it in that file
 
 ## Architecture
 
-Runtime (symlinked into `~/.claude/scripts/`; canonical source is this repo):
+The repo is structured as a Claude Code plugin (and its own single-plugin marketplace):
+`.claude-plugin/{plugin.json,marketplace.json}`, the skill under `skills/orchestrate/`, the runtime
+under `scripts/`. The deterministic floor is intentionally NOT a plugin hook - it stays a
+`settings.json` PreToolUse hook at the stable `~/.claude/scripts/orchestrate-guard.sh` path
+(Option A; see `DESIGN-plugin-floor-lifecycle.md`), so it survives plugin enable/disable/update.
 
-- `orchestrate-guard.sh` - the single PreToolUse Bash deny authority (deterministic floor).
+Runtime (`scripts/`; canonical source is this repo):
+
+- `scripts/orchestrate-guard.sh` - the single PreToolUse Bash deny authority (deterministic floor).
   Tier-1 = general bash-safety, MARKER-INDEPENDENT (every session): push-to-main/master, bare
   `--force`/`-f` (not `--force-with-lease`), `git ... --no-verify` (any accepting subcommand),
   `gh ... --admin` (admin-bypass on `pr merge`). Tier-2 = orchestrate-MARKER-GATED merge-by-API
@@ -33,22 +39,27 @@ Runtime (symlinked into `~/.claude/scripts/`; canonical source is this repo):
 - `orchestrate-resources.py` - cross-session port + data-dir lease allocator (flock-atomic JSON
   state). `stillwater` profile emits SW_* env (lease JSON on STDOUT, eval-able exports on STDERR);
   the encryption key is a 0600 file beside the DB, NEVER in env/.env.
-- `orchestrate-setup.py` - doctor / up / down / configure, marker lifecycle, and a settings-cascade
-  scan that FAILS LOUDLY if any allow-rule shadows the merge gate. `configure [--apply]` is the
-  consent-based path that wires the floor hook + missing allow-list entries into settings.json
+- `scripts/orchestrate-setup.py` - doctor / up / down / configure, marker lifecycle, and a
+  settings-cascade scan that FAILS LOUDLY if any allow-rule shadows the merge gate. `configure
+  [--apply]` is the consent-based path that wires the floor hook + missing allow-list entries into
+  settings.json, DEPLOYS the bundled guard to the stable `~/.claude/scripts/` path (so a fresh
+  plugin install has a working floor; idempotent, refreshes a stale copy, warns on a missing source),
   AND narrows any blanket `gh pr` allow-rule (`Bash(gh pr *)`/`Bash(gh pr:*)`) that shadows the
   merge gate down to the enumerated non-merge subcommands (broader `gh *`/`*` shadows are surfaced
   for human resolution, never auto-rewritten); it shows the diff, writes only with --apply + a y/N,
   backs up, never clobbers an unparseable file, and reuses doctor's single shadow matcher.
-  doctor stays read-only so "permissions are the user's to grant" holds.
+  doctor stays read-only (it WARNs on a stale deployed guard) so "permissions are the user's to grant" holds.
 - `uat-autobuild.sh` - repo-agnostic UAT auto-rebuild watcher: polls a branch HEAD, runs a
   parameterized `--build-cmd` on a new commit, and swaps only that port's LISTEN-pid (lease-safe)
   to the fresh binary. Keeps the leased UAT binary current (the SKILL.md "UAT EVERGREEN" mandate).
-- `test-orchestrate-{guard,resources,setup}.py` - the proof harnesses.
+- `scripts/planner_classify.py`, `scripts/uat-autobuild.sh`, `scripts/gh-*.sh` - the planner helper,
+  the UAT auto-rebuild watcher, and the least-privilege gh wrappers.
+- `test-orchestrate-{guard,resources,setup}.py`, `test-planner-classify.py`, `test-gh-wrappers.py` -
+  the proof harnesses (kept at repo root; dev tooling, not shipped in the skill).
 
-Skill definition (symlinked into `~/.claude/skills/orchestrate/`): `SKILL.md` (lead playbook) +
-`templates/` (per-role charters + schemas) + `engage-ralph-loop.md` (the adversarial-critic-loop
-brief; named to disambiguate from the `/ralph-loop` skill) + `DESIGN-*`/`PLAN-*`/`ROADMAP-*`.
+Skill definition (`skills/orchestrate/`): `SKILL.md` (lead playbook) + `templates/` (per-role
+charters + schemas) + `engage-ralph-loop.md` (the adversarial-critic-loop brief; named to
+disambiguate from the `/ralph-loop` skill) + `DESIGN-*`/`PLAN-*`/`ROADMAP-*` (repo root).
 
 ## Gates (run locally; CI enforces them)
 
@@ -125,10 +136,16 @@ Keep the SKILL.md version line and the git tag in lockstep.
 
 ## Deployment
 
-Canonical source is this repo. Runtime files deploy by SYMLINK into `~/.claude/scripts/` and the skill
-into `~/.claude/skills/orchestrate/` (never a copy, to avoid drift). The guard is wired as the global
-PreToolUse Bash hook in `~/.claude/settings.json`. The repo's `main` is the canonical history; the old
-claude-kit gist no longer carries these files.
+Canonical source is this repo, packaged as a Claude Code plugin: install via
+`/plugin marketplace add sydlexius/cc-orchestrator` + `/plugin install orchestrate@cc-orchestrator`,
+or `claude --plugin-dir <repo>` for development (`/reload-plugins` to pick up edits). The skill +
+commands + scripts are auto-discovered from the plugin layout; no symlinks needed. The deterministic
+floor stays a `settings.json` PreToolUse hook at the stable `~/.claude/scripts/orchestrate-guard.sh`
+path (Option A; never plugin-gated), and `orchestrate-setup.py configure --apply` deploys that guard
++ wires the hook with consent. The repo's `main` is the canonical history; the old claude-kit gist no
+longer carries these files. (CUTOVER from a legacy symlink install: install the plugin, run
+`configure --apply`, then retire the old `~/.claude/skills/orchestrate` + `~/.claude/scripts/orchestrate-*`
+symlinks; the settings.json floor hook + stable-path guard stay.)
 
 ## CI / security settings
 
