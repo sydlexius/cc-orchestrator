@@ -95,6 +95,48 @@ def main():
               rc != 0 and "no free port" in (out4 + err4).lower())
         s.close()
 
+        # --- #98: single-call lsof enumeration (not one lsof per port) ---
+        # A fake `lsof` on PATH records each invocation and reports ONE listener (n*:TARGET).
+        # allocate must (a) call lsof exactly ONCE for the whole scan (was ~101, one per port),
+        # and (b) still skip the reported listening port.
+        print("\n  [#98: single-call lsof scan]")
+        lsofdir = os.path.join(td, "lsofbin")
+        os.makedirs(lsofdir, exist_ok=True)
+        counter = os.path.join(td, "lsof-calls.log")
+        fake_lsof = os.path.join(lsofdir, "lsof")
+        with open(fake_lsof, "w") as f:
+            f.write('#!/bin/sh\n'
+                    'echo x >> "$LSOF_FAKE_COUNTER"\n'
+                    'printf "p1\\nn*:%s\\n" "$LSOF_FAKE_TARGET"\n')
+        os.chmod(fake_lsof, 0o755)
+        target = 2000
+        ov98 = dict(ov)
+        ov98["ORCHESTRATE_PORT_RANGE"] = f"{target}-{target + 1}"  # 2 ports; target is "listening"
+        ov98["PATH"] = lsofdir + os.pathsep + os.environ.get("PATH", "")
+        ov98["LSOF_FAKE_COUNTER"] = counter
+        ov98["LSOF_FAKE_TARGET"] = str(target)
+        rc, out98, err98 = run(["allocate", "--session", "S98", "--teammate", "t"], env_overrides=ov98)
+        check("#98: allocate exits 0 with fake single-call lsof", rc == 0)
+        if rc == 0:
+            check("#98: the lsof-reported LISTENing port is skipped",
+                  json.loads(out98)["resources"]["port"]["value"] == target + 1)
+        ncalls = sum(1 for _ in open(counter)) if os.path.exists(counter) else 0
+        check(f"#98: lsof invoked ONCE for the whole scan (not per-port); got {ncalls}", ncalls == 1)
+
+        # --- #98: lsof failure (or absence) does not block allocation ---
+        # A fake lsof that exits non-zero with no output -> empty snapshot -> allocate proceeds.
+        faildir = os.path.join(td, "lsoffail")
+        os.makedirs(faildir, exist_ok=True)
+        with open(os.path.join(faildir, "lsof"), "w") as f:
+            f.write("#!/bin/sh\nexit 1\n")
+        os.chmod(os.path.join(faildir, "lsof"), 0o755)
+        ovfail = dict(ov)
+        ovfail["ORCHESTRATE_PORT_RANGE"] = "2050-2051"
+        ovfail["PATH"] = faildir + os.pathsep + os.environ.get("PATH", "")
+        rc, outf, errf = run(["allocate", "--session", "S98f", "--teammate", "t"], env_overrides=ovfail)
+        check("#98: lsof failure does not block allocation (port still granted)",
+              rc == 0 and 2050 <= json.loads(outf)["resources"]["port"]["value"] <= 2051)
+
         # invalid session/teammate (slash) is rejected cleanly (no path nesting / id collision)
         rc, out, err = run(["allocate", "--session", "a/b", "--teammate", "x"], env_overrides=ov)
         check("allocate rejects '/' in session", rc != 0 and "invalid" in (out + err).lower())
