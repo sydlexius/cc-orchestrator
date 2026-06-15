@@ -1056,11 +1056,13 @@ def cmd_configure(args):
     settings_changes = add_hook or bool(missing_allow)
 
     if not settings_changes and not deploy_needed:
-        print(f"configure: {SETTINGS} already has the floor hook + all documented allow-list entries, "
-              "and the deployed guard matches the bundled plugin guard.")
         if guard_action == "missing-source":
+            print(f"configure: {SETTINGS} already has the floor hook + all documented allow-list entries.")
             print(f"  (note: the bundled guard {BUNDLED_GUARD} is missing; could not verify/deploy "
                   "the floor guard.)", file=sys.stderr)
+        else:
+            print(f"configure: {SETTINGS} already has the floor hook + all documented allow-list entries, "
+                  "and the deployed guard matches the bundled plugin guard.")
         return _narrow_merge_gate_shadows(args.apply, args.yes)
 
     if settings_changes:
