@@ -152,12 +152,28 @@ CASES = [
      'git commit -m "do not pr merge --admin"', False, "allow"),
     ("--force-with-lease allowed", "git push --force-with-lease origin feat # prep-pr-ok", False, "allow"),
     ("git clean --force allowed", "git clean --force", False, "allow"),
-    # `gh pr merge` is NOT hook-gated (allow-list + CC prompt handle it) -> plain allow,
-    # marker present or not. The hook must NOT block it and must NOT emit a decision.
-    ("gh pr merge (marker active) -> allow (allow-list/prompt gates it)", "gh pr merge 1868", True, "allow"),
-    ("gh pr merge --auto (active) -> allow", "gh pr merge --auto 1868", True, "allow"),
-    ("gh -R o/r pr merge (active) -> allow", "gh -R o/r pr merge 1868", True, "allow"),
-    ("gh pr merge (marker absent) -> allow", "gh pr merge 1868", False, "allow"),
+    # `gh pr merge` is MARKER-GATED DENIED (#105): marker active -> block (a bot cannot merge in a
+    # team session; the human merges from a SEPARATE terminal where no marker is present); marker
+    # absent (solo) -> allow, so the maintainer's /merge-pr just works prompt-free. The matcher keys
+    # on the adjacent `pr merge` SUBCOMMAND (not the word "merge" anywhere), so `gh pr comment`/
+    # `gh pr create` bodies mentioning merge are NOT blocked. `gh pr merge --admin` stays Tier-1.
+    ("gh pr merge (marker active) -> block (#105 floor gate)", "gh pr merge 1868", True, "block"),
+    ("gh pr merge --auto (active) -> block", "gh pr merge --auto 1868", True, "block"),
+    ("gh pr merge --squash (active) -> block (the /merge-pr form)", "gh pr merge --squash 101", True, "block"),
+    ("gh -R o/r pr merge (active) -> block (global flags before pr)", "gh -R o/r pr merge 1868", True, "block"),
+    ("gh pr merge (marker ABSENT/solo) -> allow (so /merge-pr just works)", "gh pr merge 1868", False, "allow"),
+    ("gh pr merge --squash (absent/solo) -> allow", "gh pr merge --squash 101", False, "allow"),
+    ("gh pr merge --admin (active) -> block (Tier-1 admin, always)", "gh pr merge --admin 5", True, "block"),
+    ("gh pr merge --admin (absent) -> block (Tier-1 admin, always)", "gh pr merge --admin 5", False, "block"),
+    # #105 false-positive guards: a `gh pr comment` whose BODY mentions merge must NOT be blocked.
+    ("gh pr comment body says merge (active) -> allow",
+     'gh pr comment 5 -b "ready to merge this"', True, "allow"),
+    ("gh pr comment body 'squash and merge' (active) -> allow",
+     'gh pr comment 5 -b "lets squash and merge it"', True, "allow"),
+    # ACCEPTED F30 false-positive (rare, documented): a body literally containing the ADJACENT
+    # phrase "pr merge" trips the whole-string matcher (no shell-quote parsing). Reword or use !.
+    ("gh pr comment body literally 'pr merge' (active) -> block (accepted F30 FP)",
+     'gh pr comment 5 -b "do the pr merge now"', True, "block"),
     # merge-by-API stays a marker-gated HARD DENY (gh api * is broadly allow-listed)
     ("merge-by-API PUT (active) -> block", "gh api -X PUT repos/o/r/pulls/1/merge", True, "block"),
     ("merge-by-API --method PUT (active) -> block", "gh api --method PUT repos/o/r/pulls/1/merge", True, "block"),
@@ -197,9 +213,12 @@ CASES = [
      "rm -f x.tmp && git push origin feat # prep-pr-ok", False, "allow"),
     ("compound: push main && ls still blocks (no per-clause bypass)",
      "git push origin main && ls", False, "block"),
-    # compound: `gh pr merge` is not hook-gated, so view && merge is plain allow...
-    ("compound: view && gh-pr-merge (active) -> allow (not hook-gated)",
-     "gh pr view 5 && gh pr merge 5", True, "allow"),
+    # compound: a `gh pr merge` clause is now marker-gated (#105), so view && merge BLOCKS
+    # per-clause when the marker is active; the same compound in a SOLO session is allowed.
+    ("compound: view && gh-pr-merge (active) -> block (#105 per-clause)",
+     "gh pr view 5 && gh pr merge 5", True, "block"),
+    ("compound: view && gh-pr-merge (absent/solo) -> allow",
+     "gh pr view 5 && gh pr merge 5", False, "allow"),
     # ...but a merge-by-API clause in a compound still hard-blocks (per-clause)
     ("compound: view && merge-by-API (active) -> block (per-clause)",
      "gh pr view 5 && gh api -X PUT repos/o/r/pulls/5/merge", True, "block"),
