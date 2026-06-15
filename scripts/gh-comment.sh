@@ -91,18 +91,29 @@ case "$sub" in
     pr="${1:-}"
     is_num "$pr" || die "inline: pr must be numeric (got: ${pr})"
     shift
-    file=""; line=""; side="RIGHT"; body=""
+    file=""; line=""; side="RIGHT"; body=""; body_set=0
     while [ $# -gt 0 ]; do
       case "$1" in
-        --file) file="${2:-}"; shift 2 ;;
+        # Separated-value flags: assert the operand is present BEFORE `shift 2`, so a missing
+        # value exits via the clean `die` path (rc 2) instead of a bare `set -e` shift failure.
+        --file) [ "$#" -ge 2 ] || die "inline: --file requires a value"; file="$2"; shift 2 ;;
         --file=*) file="${1#--file=}"; shift ;;
-        --line) line="${2:-}"; shift 2 ;;
+        --line) [ "$#" -ge 2 ] || die "inline: --line requires a value"; line="$2"; shift 2 ;;
         --line=*) line="${1#--line=}"; shift ;;
-        --side) side="${2:-}"; shift 2 ;;
+        --side) [ "$#" -ge 2 ] || die "inline: --side requires a value"; side="$2"; shift 2 ;;
         --side=*) side="${1#--side=}"; shift ;;
-        --) shift; body="${1:-}"; shift || true; break ;;
+        # `--` ends flags; the SINGLE following token is the body. Reject a duplicate body and
+        # any trailing tokens (a malformed call must fail, never silently post the wrong body).
+        --) shift
+            [ "$body_set" -eq 0 ] || die "inline: body given more than once"
+            [ "$#" -ge 1 ] || die "inline: -- requires a body argument"
+            body="$1"; body_set=1; shift
+            [ "$#" -eq 0 ] || die "inline: unexpected extra arguments after the body"
+            break ;;
         -*) die "inline: unknown flag ${1} (this wrapper accepts only --file/--line/--side)" ;;
-        *) body="$1"; shift ;;
+        # A second positional body token is an error, not a silent overwrite.
+        *) [ "$body_set" -eq 0 ] || die "inline: body given more than once (unexpected token: ${1})"
+           body="$1"; body_set=1; shift ;;
       esac
     done
     [ -n "$file" ] || die "inline: --file <path> is required"
