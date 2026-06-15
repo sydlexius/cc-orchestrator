@@ -5,10 +5,10 @@ the AC#5 disjointness behavior, not just schema shape. Also validates the propos
 shape against templates/proposed.schema.json (structural, stdlib-only)."""
 
 import json, os, sys
-from planner_classify import find_overlaps, size_flags, SIZING_BUDGET
-
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCHEMA = os.path.join(HERE, "templates", "proposed.schema.json")
+sys.path.insert(0, os.path.join(HERE, "scripts"))  # planner_classify.py ships under scripts/ (plugin layout)
+from planner_classify import find_overlaps, size_flags, SIZING_BUDGET
+SCHEMA = os.path.join(HERE, "skills", "orchestrate", "templates", "proposed.schema.json")
 FAILS = []
 
 

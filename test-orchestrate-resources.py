@@ -13,7 +13,7 @@ import tempfile
 def _nowish():
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "orchestrate-resources.py")
+SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "orchestrate-resources.py")
 FAILS = []
 
 

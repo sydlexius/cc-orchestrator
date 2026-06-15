@@ -23,7 +23,7 @@ import sys
 import tempfile
 import time
 
-GUARD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "orchestrate-guard.sh")
+GUARD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "orchestrate-guard.sh")
 
 
 # Fixed test $TMUX for the common single-session cases.

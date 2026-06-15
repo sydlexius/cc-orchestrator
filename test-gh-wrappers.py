@@ -45,7 +45,7 @@ def run_wrapper(wrapper, args, extra_env=None, grep_shim=False):
     if extra_env:
         env.update(extra_env)
     try:
-        p = subprocess.run(["bash", os.path.join(HERE, wrapper), *args],
+        p = subprocess.run(["bash", os.path.join(HERE, "scripts", wrapper), *args],
                            env=env, capture_output=True, text=True, timeout=15)
         rc = p.returncode
     except subprocess.TimeoutExpired:

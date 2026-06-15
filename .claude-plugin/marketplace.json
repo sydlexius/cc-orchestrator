@@ -1,0 +1,16 @@
+{
+  "name": "cc-orchestrator",
+  "owner": {
+    "name": "sydlexius"
+  },
+  "metadata": {
+    "description": "cc-orchestrator's own marketplace - the repo doubles as a single-plugin marketplace so `/plugin install orchestrate@cc-orchestrator` deploys the skill, commands, and runtime without local git/symlinks."
+  },
+  "plugins": [
+    {
+      "name": "orchestrate",
+      "source": "./",
+      "description": "The /orchestrate lead playbook + deterministic security floor + resource registry."
+    }
+  ]
+}

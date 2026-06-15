@@ -18,7 +18,7 @@ def _key(tmux):
 
 TEST_TMUX = "/tmp/tmux-test,1,0"
 
-SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "orchestrate-setup.py")
+SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "orchestrate-setup.py")
 FAILS = []
 
 
