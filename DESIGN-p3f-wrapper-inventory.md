@@ -75,10 +75,11 @@ allow-list, the bot has no path to merge-by-API through gh-api.
 
 ## Allow-list change (applied externally by the maintainer)
 
-Remove `Bash(gh api *)` from `~/.claude/settings.json`'s `permissions.allow`. The three
-wrappers are already permitted by the existing `Bash(~/.claude/scripts/*.sh *)` rule once
-symlinked. `required-permissions.md` is updated to document this (doctor reads it; permissions
-stay the maintainer's to grant).
+Remove `Bash(gh api *)` from `~/.claude/settings.json`'s `permissions.allow`. The six
+wrappers (`gh-api-get.sh`, `gh-codeql-dismiss.sh`, `gh-resolve-thread.sh`, `gh-comment.sh`,
+`gh-codeql-autofix.sh`, `gh-delete-branch.sh`) are already permitted by the existing
+`Bash(~/.claude/scripts/*.sh *)` rule once symlinked. `required-permissions.md` is updated to
+document this (doctor reads it; permissions stay the maintainer's to grant).
 
 ## Deployment
 

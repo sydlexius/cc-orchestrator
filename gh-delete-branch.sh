@@ -13,6 +13,10 @@ set -euo pipefail
 
 branch="${1:-}"
 repo_arg="${2:-}"
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+  echo "usage: gh-delete-branch.sh <branch-name> [repo]" >&2
+  exit 2
+fi
 
 if [ -z "$branch" ]; then
   echo "gh-delete-branch: branch name is required" >&2

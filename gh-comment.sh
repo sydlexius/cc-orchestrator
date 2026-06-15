@@ -61,6 +61,7 @@ shift
 
 case "$sub" in
   post)
+    [ "$#" -eq 2 ] || die "usage: gh-comment.sh post <pr> <body>"
     pr="${1:-}"; body="${2:-}"
     is_num "$pr" || die "post: pr must be numeric (got: ${pr})"
     [ -n "$body" ] || die "post: body is required"
@@ -69,6 +70,7 @@ case "$sub" in
     ;;
 
   reply)
+    [ "$#" -eq 3 ] || die "usage: gh-comment.sh reply <pr> <comment-id> <body>"
     pr="${1:-}"; cid="${2:-}"; body="${3:-}"
     is_num "$pr" || die "reply: pr must be numeric (got: ${pr})"
     is_num "$cid" || die "reply: comment-id must be numeric (got: ${cid})"
@@ -78,6 +80,7 @@ case "$sub" in
     ;;
 
   trigger-cr)
+    [ "$#" -eq 1 ] || die "usage: gh-comment.sh trigger-cr <pr>"
     pr="${1:-}"
     is_num "$pr" || die "trigger-cr: pr must be numeric (got: ${pr})"
     repo="$(resolve_repo)"

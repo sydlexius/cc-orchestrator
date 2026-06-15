@@ -10,6 +10,10 @@
 set -euo pipefail
 
 alert="${1:-}"
+if [ "$#" -lt 1 ] || [ "$#" -gt 3 ]; then
+  echo "usage: gh-codeql-dismiss.sh <alert-number> [reason] [comment]" >&2
+  exit 2
+fi
 # GitHub's dismissed_reason enum includes "won<apostrophe>t fix" (a literal apostrophe);
 # build it via a variable so no bare apostrophe sits in an ambiguous parser position.
 apos="'"

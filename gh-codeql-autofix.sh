@@ -11,6 +11,10 @@ set -euo pipefail
 
 alert="${1:-}"
 repo_arg="${2:-}"
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+  echo "usage: gh-codeql-autofix.sh <alert-number> [repo]" >&2
+  exit 2
+fi
 
 # Whole-string numeric check via a bash `case` glob (no external tool): rejects empty and
 # any non-digit, INCLUDING an embedded newline (newline is not 0-9, so it falls in the

@@ -10,6 +10,10 @@
 set -euo pipefail
 
 thread="${1:-}"
+if [ "$#" -ne 1 ]; then
+  echo "usage: gh-resolve-thread.sh <thread-id>" >&2
+  exit 2
+fi
 # Whole-string node-id check via a bash `case` glob (no external tool): GitHub node ids are
 # [A-Za-z0-9_=-]. Rejects empty and any out-of-charset char, INCLUDING an embedded newline,
 # so a value like $'PRRT_ok\n<smuggled>' cannot pass on its benign first line. This is
