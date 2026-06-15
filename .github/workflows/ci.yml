@@ -48,11 +48,11 @@ jobs:
       # Platform-independent lint: run once, on Linux. (jq is preinstalled on both runners.)
       - name: shellcheck (security guard + runtime scripts)
         if: runner.os == 'Linux'
-        run: shellcheck orchestrate-guard.sh uat-autobuild.sh
+        run: shellcheck orchestrate-guard.sh uat-autobuild.sh gh-api-get.sh gh-codeql-dismiss.sh gh-resolve-thread.sh gh-comment.sh gh-codeql-autofix.sh gh-delete-branch.sh
 
       - name: ruff (F,E741)
         if: runner.os == 'Linux'
-        run: ruff check --select F,E741 orchestrate-resources.py orchestrate-setup.py planner_classify.py test-orchestrate-guard.py test-orchestrate-resources.py test-orchestrate-setup.py test-planner-classify.py
+        run: ruff check --select F,E741 orchestrate-resources.py orchestrate-setup.py planner_classify.py test-orchestrate-guard.py test-orchestrate-resources.py test-orchestrate-setup.py test-planner-classify.py test-gh-wrappers.py
 
       # Platform-sensitive: run on BOTH macOS (BSD stat) and Linux (GNU stat).
       # Must invoke via ./ so the self-test's "$0" re-invocation resolves
@@ -69,6 +69,10 @@ jobs:
       # Pure classification logic (planner role, #11) - platform-independent, runs on both.
       - name: harness - planner-classify
         run: python3 test-planner-classify.py
+
+      # P3-F gh-* wrappers (#24): black-box, stubs gh via PATH - platform-independent.
+      - name: harness - gh-wrappers
+        run: python3 test-gh-wrappers.py
 
       # The setup/doctor harness exercises HOST-COUPLED wiring (settings cascade, tmux,
       # guard execution, git repo state). On a fresh macOS runner doctor behaves differently

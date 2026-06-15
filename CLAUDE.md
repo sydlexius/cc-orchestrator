@@ -53,14 +53,15 @@ brief; named to disambiguate from the `/ralph-loop` skill) + `DESIGN-*`/`PLAN-*`
 ## Gates (run locally; CI enforces them)
 
 ```sh
-shellcheck orchestrate-guard.sh
-ruff check --select F,E741 orchestrate-*.py planner_classify.py test-orchestrate-*.py test-planner-classify.py
+shellcheck orchestrate-guard.sh gh-api-get.sh gh-codeql-dismiss.sh gh-resolve-thread.sh gh-comment.sh gh-codeql-autofix.sh gh-delete-branch.sh
+ruff check --select F,E741 orchestrate-*.py planner_classify.py test-orchestrate-*.py test-planner-classify.py test-gh-wrappers.py
 ./orchestrate-guard.sh --self-test            # MUST use ./ - the self-test re-invokes "$0";
                                               # `bash orchestrate-guard.sh` makes $0 a bare name -> 127
 python3 test-orchestrate-guard.py
 python3 test-orchestrate-resources.py
 python3 test-orchestrate-setup.py
 python3 test-planner-classify.py
+python3 test-gh-wrappers.py
 ```
 
 ## Versioning
