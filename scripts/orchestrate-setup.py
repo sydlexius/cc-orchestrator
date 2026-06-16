@@ -297,7 +297,7 @@ def _derive_repo_slug(repo):
             f"  Fix: add an 'origin' remote pointing to the GitHub repo, then re-run `up`."
         )
     url = p.stdout.strip()
-    # SSH: git@github.com:owner/name.git or git@github.com:owner/name
+    # SCP-SSH: git@github.com:owner/name.git or git@github.com:owner/name
     m = re.match(r"git@[^:]+:([^/]+/[^/]+?)(?:\.git)?$", url)
     if m:
         return m.group(1)
@@ -305,17 +305,26 @@ def _derive_repo_slug(repo):
     m = re.match(r"https?://[^/]+/([^/]+/[^/]+?)(?:\.git)?$", url)
     if m:
         return m.group(1)
+    # ssh:// URL form: ssh://[user@]host[:port]/owner/name[.git]
+    # e.g. ssh://git@github.com/owner/name.git
+    #      ssh://git@ssh.github.com:443/owner/name.git
+    #      ssh://github.com/owner/name
+    m = re.match(r"^ssh://[^/]+/([^/]+/[^/]+?)(?:\.git)?$", url)
+    if m:
+        return m.group(1)
     raise SystemExit(
         f"scaffold_artifacts: ABORT - cannot parse owner/name slug from remote URL.\n"
         f"  repo path: {repo}\n"
         f"  remote origin URL: {url!r}\n"
-        f"  Expected SSH (git@github.com:owner/name.git) or HTTPS "
-        f"(https://github.com/owner/name) form.\n"
-        f"  Fix: set origin to a GitHub SSH or HTTPS URL, then re-run `up`."
+        f"  Expected SCP-SSH (git@github.com:owner/name.git), HTTPS "
+        f"(https://github.com/owner/name), or ssh:// "
+        f"(ssh://[user@]host[:port]/owner/name) form.\n"
+        f"  Fix: set origin to a GitHub SSH or HTTPS URL, then re-run `up`;\n"
+        f"  or use --slug owner/name to supply the slug directly."
     )
 
 
-def scaffold_artifacts(team, repo, spacing):
+def scaffold_artifacts(team, repo, spacing, slug=None):
     # P3-A: all artifacts live under a per-team dir so parallel teams don't clobber each
     # other (stack drops its <team>- prefix - the dir now carries the team identity).
     team_dir = os.path.join(ARTIFACTS, team)
@@ -341,7 +350,9 @@ def scaffold_artifacts(team, repo, spacing):
     # Derive the owner/name slug from the repo's git remote - the brief's <REPO> placeholders
     # require a slug (gh + pr-watch.sh both reject a filesystem path). Fail loudly if the
     # remote cannot be resolved so the operator never gets a silently-broken brief.
-    slug = _derive_repo_slug(repo)
+    # When a slug override is provided (via --slug on up), skip remote derivation entirely.
+    if slug is None:
+        slug = _derive_repo_slug(repo)
     # Substitute the real template tokens: <REPO>, <STACK>, <SPACING_MIN>.
     # The team is captured in the injected header comment; the template has no team token.
     body = (body.replace("<REPO>", slug)
@@ -810,6 +821,14 @@ def _check_stale_guard_at_up():
 
 def cmd_up(args):
     _validate_team(args.team)  # reject a path-unsafe team name before doing any work
+    # Validate --slug early (before doctor) so a typo exits immediately with a clear error.
+    slug_override = getattr(args, "slug", None)
+    if slug_override is not None:
+        if not re.match(r"^[^/]+/[^/]+$", slug_override):
+            print(f"up: ABORT - --slug must be in owner/name form (e.g. owner/name), "
+                  f"got: {slug_override!r}", file=sys.stderr)
+            return 1
+        print(f"up: using --slug override: {slug_override}")
     print("Pre-flight doctor:")
     rc = cmd_doctor(args)
     if rc != 0:
@@ -825,7 +844,8 @@ def cmd_up(args):
         head_result = subprocess.run(["git", "-C", args.repo, "rev-parse", "--short", "HEAD"],
                                      capture_output=True, text=True, timeout=15)
         head = head_result.stdout.strip() if head_result.returncode == 0 else "unknown"
-    stack, triage, brief = scaffold_artifacts(args.team, args.repo, args.spacing)
+    stack, triage, brief = scaffold_artifacts(args.team, args.repo, args.spacing,
+                                              slug=slug_override)
     # F2(c): capture the stillwater profile config from the env now so allocate can read it
     # from the team dir for the rest of the session (no re-exporting the 3 paths each time).
     write_profile_env(os.path.join(ARTIFACTS, args.team))
@@ -1231,6 +1251,9 @@ def main():
     u.add_argument("--repo", required=True)
     u.add_argument("--spacing", default="12",
                    help="approx minutes between pr-shipper pushes (default: 12)")
+    u.add_argument("--slug",
+                   help="owner/name slug override (belt-and-suspenders for unparseable remotes); "
+                        "bypasses remote URL derivation, no security check skipped")
 
     w = sub.add_parser("down")
     w.add_argument("--team")

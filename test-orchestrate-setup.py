@@ -954,6 +954,109 @@ def main():
         check("#68 scaffold: brief body has no <STACK> placeholder remaining",
               "<STACK>" not in brief68_body)
 
+    # #112: _derive_repo_slug parses the ssh:// URL form (additive; existing forms unchanged).
+    # Also exercises the --slug override on `up` for belt-and-suspenders fallback.
+    import importlib.util as _ilu112
+    _spec112 = _ilu112.spec_from_file_location("orchestrate_setup", SCRIPT)
+    _mod112 = _ilu112.module_from_spec(_spec112)
+    _spec112.loader.exec_module(_mod112)
+
+    with tempfile.TemporaryDirectory() as td112:
+        r112 = os.path.join(td112, "repo112"); os.makedirs(r112)
+        subprocess.run(["git", "-C", r112, "init", "-q"], check=True)
+
+        # 3a: all three URL forms produce the correct owner/name slug.
+        # --- SCP-SSH (existing form, unchanged) ---
+        subprocess.run(["git", "-C", r112, "remote", "add", "origin",
+                        "git@github.com:acme/widget.git"], check=True)
+        check("#112 slug: SCP git@github.com:owner/name.git -> owner/name",
+              _mod112._derive_repo_slug(r112) == "acme/widget")
+
+        # --- HTTPS (existing form, unchanged) ---
+        subprocess.run(["git", "-C", r112, "remote", "set-url", "origin",
+                        "https://github.com/acme/widget.git"], check=True)
+        check("#112 slug: HTTPS https://github.com/owner/name.git -> owner/name",
+              _mod112._derive_repo_slug(r112) == "acme/widget")
+
+        # --- ssh:// with port + .git ---
+        subprocess.run(["git", "-C", r112, "remote", "set-url", "origin",
+                        "ssh://git@ssh.github.com:443/acme/widget.git"], check=True)
+        check("#112 slug: ssh://user@host:port/owner/name.git -> owner/name",
+              _mod112._derive_repo_slug(r112) == "acme/widget")
+
+        # --- ssh:// without port, without .git ---
+        subprocess.run(["git", "-C", r112, "remote", "set-url", "origin",
+                        "ssh://git@github.com/acme/widget"], check=True)
+        check("#112 slug: ssh://user@host/owner/name (no port, no .git) -> owner/name",
+              _mod112._derive_repo_slug(r112) == "acme/widget")
+
+        # --- ssh:// without user@ ---
+        subprocess.run(["git", "-C", r112, "remote", "set-url", "origin",
+                        "ssh://github.com/acme/widget.git"], check=True)
+        check("#112 slug: ssh://host/owner/name.git (no user@) -> owner/name",
+              _mod112._derive_repo_slug(r112) == "acme/widget")
+
+        # 3b: rejection cases (malformed URLs) must return None / not match (raise SystemExit).
+
+        def _slug_or_none(url):
+            """Set the remote to url and attempt derivation; return slug or None on SystemExit."""
+            subprocess.run(["git", "-C", r112, "remote", "set-url", "origin", url], check=True)
+            try:
+                return _mod112._derive_repo_slug(r112)
+            except SystemExit:
+                return None
+
+        # Extra path segment: ssh://github.com/a/b/c -> must fail (not a two-part slug).
+        check("#112 reject: ssh://host/a/b/c (extra segment)",
+              _slug_or_none("ssh://github.com/a/b/c") is None)
+
+        # Missing name: ssh://github.com/owner (no second segment) -> must fail.
+        check("#112 reject: ssh://host/owner (missing name)",
+              _slug_or_none("ssh://github.com/owner") is None)
+
+        # Trailing slash: ssh://github.com/owner/name/ -> must fail.
+        check("#112 reject: ssh://host/owner/name/ (trailing slash)",
+              _slug_or_none("ssh://github.com/owner/name/") is None)
+
+        # 3c: --slug override - test via the imported module directly (avoids full up/doctor
+        # pipeline complexity) and via a quick CLI call for the malformed-slug fast path.
+
+        # Happy path: scaffold_artifacts with a slug override renders the override into the
+        # brief and never calls _derive_repo_slug (so an unparseable remote is irrelevant).
+        # Set the remote to an unparseable file:// URL to prove derivation is bypassed.
+        subprocess.run(["git", "-C", r112, "remote", "set-url", "origin",
+                        "file:///some/local/path"], check=True)
+        tmp_art112 = os.path.join(td112, "art112"); os.makedirs(tmp_art112)
+        tpl112 = os.path.join(td112, "tpl112"); os.makedirs(tpl112)
+        open(os.path.join(tpl112, "pr-shipper-brief.md"), "w").write(
+            "Repo: <REPO>\nStack: <STACK>\nPacing: <SPACING_MIN> minutes\n")
+        orig_a112 = _mod112.ARTIFACTS; orig_t112 = _mod112.TEMPLATES
+        _mod112.ARTIFACTS = tmp_art112; _mod112.TEMPLATES = tpl112
+        try:
+            _st112, _tr112, br112 = _mod112.scaffold_artifacts("t112", r112, 12,
+                                                                slug="myorg/myrepo")
+        finally:
+            _mod112.ARTIFACTS = orig_a112; _mod112.TEMPLATES = orig_t112
+        br112_body = "\n".join(open(br112).read().splitlines()[1:])
+        check("#112 --slug: brief rendered with override slug",
+              "myorg/myrepo" in br112_body)
+        check("#112 --slug: brief has no file:///some/local/path raw path",
+              "file:///some/local/path" not in br112_body)
+
+        # Malformed --slug fast path: the CLI must exit non-zero and print a clear error
+        # BEFORE running doctor (so no env wiring needed - _validate_team + slug check only).
+        # We set ORCHESTRATE_FLOOR_DIR to an existing dir so arm_marker never runs.
+        p_bad = subprocess.run(
+            [sys.executable, SCRIPT, "up", "--team", "t112", "--repo", r112,
+             "--slug", "notaslug"],
+            capture_output=True, text=True, env=dict(os.environ,
+                TMUX=TEST_TMUX,
+                ORCHESTRATE_FLOOR_DIR=td112,
+            )
+        )
+        check("#112 --slug: malformed slug (no slash) rejected with error",
+              p_bad.returncode != 0 and "owner/name" in (p_bad.stdout + p_bad.stderr))
+
     # #107: _missing_allow_entries harvester over-harvest guard (Option A: a deliberately
     # SIMPLE parser - every backticked Bash/Write/Edit/Read(...) token on a non-NOTE line in
     # the section is a prescribed entry - plus a DISCIPLINED doc, pinned by an exact-set test).
