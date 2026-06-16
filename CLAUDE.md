@@ -141,6 +141,25 @@ Keep the SKILL.md version line and the git tag in lockstep.
 - The lead delegates context-heavy work (UAT, RCA, log greps, hostile review) to short-lived subagents
   that return CONCLUSIONS, keeping its own window for decisions + the checkpoint; respawn fresh at task
   boundaries.
+- FEEDBACK-LOG DRAIN GATE (maintainer directive 2026-06-15; BINDING). This rule lives HERE in CLAUDE.md,
+  not only in SKILL.md, on purpose: the SKILL.md copy kept getting SKIPPED and does not reliably survive
+  context exhaustion / compaction, whereas CLAUDE.md is injected at every session start. A
+  `~/.claude/orchestrate-session-feedback.md` entry is DRAINED (removed from the log) ONLY after this EXACT
+  three-step ordering - never out of order, never collapsed into one pass, never skipped because an entry
+  "looks obviously right":
+  1. TASK A HOSTILE REVIEWER on the entry FIRST. Dispatch an ACTUAL adversarial reviewer (a subagent, or
+     the `engage-ralph-loop.md` brief) - the lead's own glance does NOT count. It REPRODUCES every empirical
+     claim (run it, never static-grep), pushes back on holes / over-reach / mis-scoping, and runs a
+     least-privilege check that the proposed change never weakens the deterministic floor or broadens an
+     allow-list. No tasked hostile review -> no issue, no drain.
+  2. THEN FILE THE ISSUE (only after step 1). A verified entry becomes a normal issue (template + agent
+     hints + immediate CR steering per the SKILL.md DRAIN PROCEDURE); an unreproducible claim is still filed,
+     framed as a KNOWLEDGE-GAP issue (never lose the signal); an entry the hostile review KILLS is dropped
+     with a one-line logged reason left IN the log.
+  3. THEN DRAIN THE ENTRY (only after step 2). The entry stays in the log until its issue number (or the
+     logged-drop reason) is recorded against it. NEVER drain before the issue exists; NEVER file before the
+     hostile review. This GATES the SKILL.md "TRIAGE RIGOR / DRAIN PROCEDURE"; if the two ever disagree, this
+     ordering wins.
 
 ## Deployment
 
