@@ -174,6 +174,16 @@ longer carries these files. (CUTOVER from a legacy symlink install: install the 
 `configure --apply`, then retire the old `~/.claude/skills/orchestrate` + `~/.claude/scripts/orchestrate-*`
 symlinks; the settings.json floor hook + stable-path guard stay.)
 
+Deploying a merged floor/guard change to OTHER sessions: a merged guard change does NOT
+auto-propagate to already-running sessions or other machines. Three steps: (1) update the plugin
+(`/plugin marketplace update` + reinstall, or `git pull` + `/reload-plugins` for a `--plugin-dir`
+dev install) to get the new bundled guard + doctor; (2) `orchestrate-setup.py configure --apply` to
+RE-DEPLOY the updated guard to the stable `~/.claude/scripts/` path (the PreToolUse hook runs the
+DEPLOYED copy, not the repo) and wire any sanctioned allow-list entry - this stays CONSENT-GATED and
+never silently edits settings.json; (3) RESTART each open Claude Code session (the PreToolUse hook
+loads the guard at SESSION START, so a running window keeps the old guard until it is relaunched -
+this is a session restart, NOT an OS reboot).
+
 ## CI / security settings
 
 GitHub Actions pinned to commit SHAs (with a `# vX.Y.Z` comment), `permissions: contents: read`,
