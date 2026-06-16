@@ -164,6 +164,7 @@ This record explains the 2026-06-06 interim design (allow-list-omission); see th
 next section for the #105 superseding design.
 
 ### Tier-2: #105 floor-gate supersedes allow-list-omission (2026-06-15)
+
 The 2026-06-06 allow-list-omission gate for `gh pr merge` had a structural weakness:
 a single "always allow" click regenerated a blanket `Bash(gh pr *)` rule in
 settings.local.json, silently re-opening the bot-merge hole. Doctor detected it on
@@ -234,8 +235,8 @@ Adopted design (#105 - what ships):
   is correct because every floor decision is now an exit-2 deny (the exit-0 `ask` branch
   was REMOVED - see "Tier-2: ask rejected, allow-list adopted" - so no decision can be
   pre-empted by an earlier clause). The `# prep-pr-ok` override is checked LAST and can
-  ONLY satisfy the advisory gate - it can NEVER reach a hard deny (so `git push main
-  # prep-pr-ok` stays blocked by step 1).
+  ONLY satisfy the advisory gate - it can NEVER reach a hard deny (so
+  `git push main # prep-pr-ok` stays blocked by step 1).
 - **Behavior detail:** preserves the existing `git push` -> require-prep-or-
   `# prep-pr-ok` gate; adds safe-push-to-main coverage, bare-force, no-verify
   (Tier 1); adds MUTATING merge-by-API (`pulls/{n}/merge` with a mutating
