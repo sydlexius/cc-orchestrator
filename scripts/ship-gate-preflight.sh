@@ -217,13 +217,23 @@ unreplied_out="$("$helper" "$pr" "$repo" 2>/dev/null)" || {
   exit 2
 }
 
-# Extract N from "Review-body comments with actionable findings: N". Absent line
-# => N=0 (clean). A present line with a non-numeric tail would leave findings
-# empty -> treat as 0 only if no line matched; if a line matched, require digits.
-findings="$(printf '%s\n' "$unreplied_out" \
-  | sed -n 's/.*Review-body comments with actionable findings: \([0-9][0-9]*\).*/\1/p' \
-  | tail -n1)"
-if [ -z "$findings" ]; then
+# The helper prints the "Review-body comments with actionable findings: N" line
+# ONLY when N>0, so three cases must be distinguished -- FAIL CLOSED on the third:
+#   - line ABSENT              -> N=0 (clean)
+#   - line present, NUMERIC N  -> that N (block if >0)
+#   - line present, NON-NUMERIC count (format change / tamper) -> BLOCK: a present
+#     but unparseable count means the review state cannot be verified.
+findings_line="$(printf '%s\n' "$unreplied_out" \
+  | grep -E 'Review-body comments with actionable findings:' | tail -n1 || true)"
+if [ -n "$findings_line" ]; then
+  findings="$(printf '%s\n' "$findings_line" \
+    | sed -n 's/.*Review-body comments with actionable findings:[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
+  if ! printf '%s' "$findings" | grep -Eq '^[0-9]+$'; then
+    echo "BLOCK: review-body findings line present but its count is non-numeric on #$pr (cannot verify review state)." >&2
+    echo "RESULT: BLOCK -- review gate unverifiable (non-numeric count). [#$pr $repo]" >&2
+    exit 2
+  fi
+else
   findings=0
 fi
 

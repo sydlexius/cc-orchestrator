@@ -65,7 +65,7 @@ def unknowntype(name, status="COMPLETED", conclusion="SUCCESS", typename="Unknow
 
 
 def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
-        unreplied_fail=False, unreplied_missing=False):
+        unreplied_fail=False, unreplied_missing=False, unreplied_raw=None):
     """Invoke the oracle with stubbed gh + pr-unreplied-comments.sh.
     Returns (exit_code, stdout, stderr)."""
     with tempfile.TemporaryDirectory() as td:
@@ -95,6 +95,12 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
                     "#!/usr/bin/env bash\n"
                     "set -eu\n"
                     "if [ -n \"${UNREPLIED_FAIL:-}\" ]; then echo 'helper: simulated failure' >&2; exit 2; fi\n"
+                    "# UNREPLIED_RAW prints the findings line with a RAW (possibly non-numeric)\n"
+                    "# count, to exercise the fail-closed-on-non-numeric path.\n"
+                    "if [ -n \"${UNREPLIED_RAW:-}\" ]; then\n"
+                    "  echo \"=== Review-body comments with actionable findings: ${UNREPLIED_RAW} ===\"\n"
+                    "  echo 'some other output line'; exit 0\n"
+                    "fi\n"
                     "n=\"${UNREPLIED_FINDINGS:-0}\"\n"
                     "# Real script prints the line ONLY when N>0.\n"
                     "if [ \"$n\" -gt 0 ]; then\n"
@@ -113,6 +119,8 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         env["UNREPLIED_FINDINGS"] = str(unreplied_findings)
         if unreplied_fail:
             env["UNREPLIED_FAIL"] = "1"
+        if unreplied_raw is not None:
+            env["UNREPLIED_RAW"] = unreplied_raw
 
         p = subprocess.run([ORACLE] + args, env=env, capture_output=True, text=True, timeout=15)
         return p.returncode, p.stdout, p.stderr
@@ -175,6 +183,13 @@ def main():
     check("pr-unreplied-comments.sh errors -> exit 2 (fail closed)", rc == 2)
     rc, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN, unreplied_missing=True)
     check("pr-unreplied-comments.sh missing -> exit 2 (fail closed)", rc == 2)
+    # Codoki #116: a findings line PRESENT but with a non-numeric count must BLOCK,
+    # not be silently read as N=0 (the fail-open the parse comment intended to prevent).
+    rc, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN, unreplied_raw="N/A")
+    check("review-body findings line present but NON-NUMERIC count -> exit 2 (fail closed)", rc == 2)
+    # Sanity: a numeric count embedded in a richer line is still parsed and blocks.
+    rc, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN, unreplied_raw="4 (2 major)")
+    check("review-body findings line with numeric-prefixed count (4 ...) -> exit 2", rc == 2)
 
     print("== FAIL-CLOSED: gh / json errors ==")
     rc, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN, gh_fail=True)
