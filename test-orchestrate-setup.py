@@ -27,9 +27,11 @@ def write_stub_guard(path, selftest_rc=0):
       - `--self-test` exits selftest_rc.
       - push-main payload -> Tier-1 HARD DENY (exit 2).
       - merge-by-API payload (`gh api ... pulls/N/merge`) -> Tier-2 HARD DENY (exit 2).
-      - anything else (incl. `gh pr merge`, which the allow-list gates) -> exit 0.
+      - `gh pr merge` CLI payload -> Tier-2 HARD DENY (exit 2, #105).
+      - anything else -> exit 0.
     Written in Python (not bash) to parse the stdin JSON properly - avoids the shell
     case-pattern quoting traps a bash stub is prone to."""
+    pr_merge = "gh pr " + "merge"   # assembled from pieces; no trigger string on this line
     with open(path, "w") as f:
         f.write(
             "#!/usr/bin/env python3\n"
@@ -43,6 +45,8 @@ def write_stub_guard(path, selftest_rc=0):
             "if 'git push origin main' in cmd:\n"
             "    sys.exit(2)\n"
             "if 'pulls/' in cmd and '/merge' in cmd:\n"
+            "    sys.exit(2)\n"
+            f"if {pr_merge!r} in cmd:\n"
             "    sys.exit(2)\n"
             "sys.exit(0)\n")
     os.chmod(path, 0o755)
@@ -456,23 +460,23 @@ def main():
         check("p3g: clean cascade -> doctor rc0", rc == 0)
         check("p3g: clean cascade -> no shadow reported", "SHADOW" not in out)
 
-        # MUST-FLAG: every one of these Bash allow-rule patterns DOES grant the merge
-        # command per Claude Code permission semantics, so each must make doctor FAIL
-        # (rc1) and name both the file and the offending rule. The 'merge' literal is
-        # assembled from MERGE_LITERAL pieces so no source line here carries the triple.
+        # MUST-FLAG: every one of these Bash allow-rule patterns grants the merge command
+        # via a BROADER grant (not merge-scoped), so each must make doctor FAIL (rc1) and
+        # name both the file and the offending rule. The 'merge' literal is assembled from
+        # MERGE_LITERAL pieces so no source line here carries the triple.
+        # NOTE: the merge-SCOPED patterns (exact `gh pr merge`, `gh pr merge *`,
+        # `gh pr merge:*`, `gh pr merge --squash`) are NOT in this list - they are the
+        # sanctioned allow-list entry and belong in must_not_flag below.
         ME = "merge"  # piece for assembling boundary/partial-word patterns off the triple
         must_flag = [
-            # exact
-            ("exact", MERGE_LITERAL),
-            ("exact --squash", MERGE_LITERAL + " --squash"),
-            # boundary wildcards (':*' and ' *' enforce a word/arg boundary)
-            ("merge:*", MERGE_LITERAL + ":*"),
-            ("merge *", MERGE_LITERAL + " *"),
+            # boundary wildcards broader than merge ('gh pr:*' / 'gh pr *' grant ALL subcommands)
             ("gh pr:*", "gh pr:*"),
             ("gh pr *", "gh pr *"),
             ("gh:*", "gh:*"),
             ("gh *", "gh *"),
-            # plain (no-space) prefix, including mid-word truncations
+            # plain (no-space) prefix, including mid-word truncations of 'merge':
+            # these use a plain glob that is NOT a recognised merge-scoped boundary tail,
+            # so they remain shadows even though they happen to match merge invocations.
             ("gh pr merg*", "gh pr " + ME[:-1] + "*"),
             ("gh pr mer*", "gh pr " + ME[:-2] + "*"),
             ("gh pr me*", "gh pr " + ME[:-3] + "*"),
@@ -481,6 +485,8 @@ def main():
             ("gh p*", "gh p*"),
             ("gh*", "gh*"),
             ("g*", "g*"),
+            # bare 'gh pr' prefix (no wildcard): grants all 'gh pr ...' subcommands, not merge-only
+            ("gh pr bare", "gh pr"),
             # leading / infix glob ('*' anywhere matches any run incl. spaces)
             ("star", "*"),
             ("* merge", "* " + ME),
@@ -506,13 +512,27 @@ def main():
         check("p3g: multi-file names the offending file (f2)", f2 in out)
         check("p3g: multi-file does NOT blame the clean file (f1)", f1 not in out)
 
-        # MUST-NOT-FLAG: none of these grant the merge command, so doctor must PASS (rc0)
-        # with NO shadow reported. These guard against false positives that would cripple
-        # legitimate allow-rules. Each is checked in isolation so a single false positive
-        # is pinpointed by its label.
+        # MUST-NOT-FLAG: none of these shadow the merge gate, so doctor must PASS (rc0)
+        # with NO shadow reported. This includes:
+        #   (a) rules that don't grant merge at all (different subcommands, non-Bash, etc.)
+        #   (b) merge-SCOPED rules: exact `gh pr merge`, `gh pr merge *`, `gh pr merge:*`,
+        #       and merge-specific invocations like `gh pr merge --squash`. These are the
+        #       new sanctioned allow-list entry - the floor deny backstops them in a marker
+        #       session, so they are NOT shadows. Each is checked in isolation so a single
+        #       false positive is pinpointed by its label.
         PR = "gh pr "
         must_not_flag = [
-            # different subcommand
+            # ---- merge-SCOPED: sanctioned allow-list entries (NEW #105 policy) ----
+            # exact bare merge target: grants merge or merge + any args
+            ("merge exact", MERGE_LITERAL),
+            # exact merge with merge-own flags: grants only that specific invocation
+            ("merge exact --squash", MERGE_LITERAL + " --squash"),
+            ("merge exact --rebase", MERGE_LITERAL + " --rebase"),
+            # boundary-star: grants merge + at least one arg (the /merge-pr working form)
+            ("merge *", MERGE_LITERAL + " *"),
+            # boundary-colon-star: alternate boundary form
+            ("merge:*", MERGE_LITERAL + ":*"),
+            # ---- non-merge subcommands: different or unrelated ----
             ("gh pr view:*", PR + "view:*"),
             ("gh pr comment:*", PR + "comment:*"),
             ("gh pr list", PR + "list"),
@@ -534,7 +554,7 @@ def main():
             ("leading-space", None),
             ("trailing-space", None),
         ]
-        # The four quoted/padded specifiers below embed the actual merge specifier text
+        # The quoted/padded specifiers below embed the actual merge specifier text
         # (assembled from pieces) INSIDE the Bash(...) wrapper, never on a command line.
         quoted_rules = {
             "quoted": 'Bash("' + PR + ME + '")',

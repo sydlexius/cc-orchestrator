@@ -5,8 +5,9 @@
 > `$TMUX`-keyed file `~/.claude/orchestrate-floor.d/<sanitized-$TMUX>` with a 72h
 > TTL, and an empty `$TMUX` is never gated. See
 > `DESIGN-phase3a-marker-refcounting.md`. The mentions below are kept as the
-> Phase-1 design record. (Tier-2 merge gating was also reworked: `gh pr merge` is
-> allow-list-gated, only merge-by-API stays a marker-gated hook deny.)
+> Phase-1 design record. (#105 update: `gh pr merge` is NOW also marker-gated on
+> the floor - see the "Tier-2: #105 floor-gate supersedes allow-list-omission"
+> section below; it supersedes the "allow-list-gated" record in this header.)
 
 Date: 2026-06-05
 Status: APPROVED (brainstorm), pre-implementation
@@ -54,7 +55,7 @@ the test "does the lead ever legitimately do this in a solo session?"
 | `git push` / `safe-push.sh` to `main`/`master` | never (branch protection) | 1 - always-on |
 | bare `--force` / `-f` (non-lease) push | never (lead uses `--force-with-lease`) | 1 - always-on |
 | `--no-verify` push (skips pre-push gate) | never | 1 - always-on |
-| `gh pr merge` (incl. `--auto`, `--admin`) | yes (`/merge-pr`) | 2 - session-gated |
+| `gh pr merge` (incl. `--auto`; `--admin` is also Tier-1) | yes (`/merge-pr`, solo) | 2 - session-gated (#105: now floor deny, not allow-list-omission) |
 | `gh api ... pulls/{n}/merge` MUTATING (`-X PUT/POST` or field flag; bare GET = status-check, allowed) | no, but it IS merge | 2 - session-gated |
 | generic `gh api -X POST\|PUT\|PATCH\|DELETE` (non-merge) | yes, MID-SESSION (CodeQL dismiss, `resolveReviewThread`) | NOT in the floor - charter-level (Finding F8) |
 | `--force-with-lease` | yes (rebased re-push) | allowed in both tiers |
@@ -121,19 +122,27 @@ conflate them):
    by the human via the `! ` prefix (their own shell) or the GitHub UI if genuinely
    needed - that path is for the human, not the agent. Tier 1 -> "never allowed
    from Claude; human runs it via `! ` if intended."
-1b. **Tier-2 merge: `gh pr merge` via the ALLOW-LIST, merge-by-API via a hook deny**
-   (REVISED TWICE; final 2026-06-06). History: (i) originally a hook hard-deny on all
-   merge - but the `!` bang command IS hooked on this CC, so it blocked the human's
-   OWN `! gh pr merge` too, and the hook payload has no field to tell a human `!` from
-   an agent Bash call. (ii) Tried emitting `permissionDecision:"ask"` to PROMPT instead
-   - a LIVE TEST proved this CC IGNORES a hook `ask` (it ran the command), while still
-   honoring a hook exit-2 deny. So a hook cannot prompt here. (iii) FINAL: split the
-   gate. `gh pr merge` is gated by the ALLOW-LIST (settings.json omits a `gh pr merge`
-   entry -> CC's normal permission PROMPT fires; a human approves, an auto-mode bot
-   stalls). The merge-by-API path (`gh api ... pulls/N/merge` mutating) stays a
-   marker-gated hook HARD DENY, because `gh api *` is broadly allow-listed so the
-   allow-list cannot gate it and only a bot would take that obscure path. See
-   "Tier-2: ask rejected, allow-list adopted" below.
+1b. **Tier-2 merge: both `gh pr merge` CLI and merge-by-API are now MARKER-GATED FLOOR DENIES**
+   (#105, supersedes the 2026-06-06 allow-list-omission design). History: (i) originally a
+   hook hard-deny on all merge - but the `!` bang command IS hooked on this CC, so it
+   blocked the human's OWN `! gh pr merge` too, and the hook payload has no field to tell
+   a human `!` from an agent Bash call. (ii) Tried emitting `permissionDecision:"ask"` to
+   PROMPT instead - a LIVE TEST proved this CC IGNORES a hook `ask` (it ran the command),
+   while still honoring a hook exit-2 deny. So a hook cannot prompt here. (iii) 2026-06-06
+   interim: split the gate - `gh pr merge` omitted from the allow-list (CC prompts human;
+   bot stalls); merge-by-API (`gh api ... pulls/N/merge`) stays a hook hard-deny. Problem:
+   the "allow once" -> "always allow" click re-granted a blanket `gh pr *` rule in
+   settings.local.json, re-opening the bot-merge hole (recurring doctor shadow FAIL). (iv)
+   FINAL (#105): `gh pr merge` CLI is now MARKER-GATED on the FLOOR (`is_pr_merge`, exit
+   2 when marker active), mirroring `is_merge_api`. The floor deny OUTRANKS the allow-list,
+   so a blanket shadow can no longer defeat it. Simultaneously, `gh pr merge *` (and its
+   `:*`/bare forms) IS NOW the SANCTIONED allow-list entry - so a SOLO/non-marker session
+   (the maintainer's own `/merge-pr`) runs prompt-free. A marker-active team session's floor
+   blocks bot merge regardless of the allow-list. See "Tier-2: #105 floor-gate supersedes
+   allow-list-omission" below. Doctor reconciliation (`_is_merge_scoped`): an explicit
+   merge-scoped allow-rule (`Bash(gh pr merge *)`, `Bash(gh pr merge:*)`, `Bash(gh pr merge)`)
+   is ACCEPTED (not a shadow) because the floor backstops it in a marker session. A broader
+   rule (`Bash(gh pr *)`, `Bash(gh pr:*)`, etc.) still hard-fails doctor.
 2. **The `prep-pr-ok` advisory gate** (ordinary feature-branch pushes). This is
    NOT a floor deny and is NOT what we are securing - pr-shipper is MEANT to push
    feature branches. It is the existing lead-ergonomics gate ("run /prep-pr
@@ -151,23 +160,41 @@ JSON); the gap is CC-side: **this CC honors a hook exit-2 DENY but ignores a hoo
 `ask`/structured `permissionDecision`.** So a PreToolUse hook here can only allow or
 deny - it cannot PROMPT.
 
-Adopted design (what actually ships):
-- **`gh pr merge` -> prompt via the ALLOW-LIST.** The human-approval prompt comes from
-  CC's normal permission flow, NOT the hook. settings.json's `permissions.allow` lists
-  the non-merge `gh pr` subcommands (`view/diff/checks/create/list/status/edit/ready/
-  comment`) but OMITS `merge`, so any `gh pr merge` is un-approved -> CC prompts. A human
-  approves; an auto-mode bot cannot answer -> stalls (never merges). Do NOT re-add
-  `Bash(gh pr *)` or `Bash(gh pr merge *)` (the former auto-approves merge; the latter
-  hard-denies it, re-tying the human's hands).
-- **merge-by-API -> marker-gated hook HARD DENY.** `gh api ... pulls/N/merge` mutating
-  stays an exit-2 deny in the guard, because `gh api *` is broadly allow-listed (the
-  allow-list cannot express the merge-path exception) and only a bot would take that
-  path. The human merges via `gh pr merge` (prompt), never the API.
-- **Backstop:** server-side branch protection (required review + status checks) gates
-  the real merge regardless, so even a settings regression cannot land un-reviewed code
-  on `main`.
-- **TODO if ever wanted:** a hook-driven prompt would need a CC that honors
-  `permissionDecision:ask` for PreToolUse; revisit if a future CC supports it.
+This record explains the 2026-06-06 interim design (allow-list-omission); see the
+next section for the #105 superseding design.
+
+### Tier-2: #105 floor-gate supersedes allow-list-omission (2026-06-15)
+
+The 2026-06-06 allow-list-omission gate for `gh pr merge` had a structural weakness:
+a single "always allow" click regenerated a blanket `Bash(gh pr *)` rule in
+settings.local.json, silently re-opening the bot-merge hole. Doctor detected it on
+every `orchestrate up`, but the root fix needed to be at the floor, not in user
+discipline.
+
+Adopted design (#105 - what ships):
+- **`gh pr merge` CLI -> MARKER-GATED FLOOR DENY (`is_pr_merge`).** The guard now
+  matches `gh pr merge` (and forms with global flags between `pr` and `merge`, e.g. `gh
+  pr -R owner/repo merge 5`, `gh pr --repo owner/repo merge 5`) and exits 2 (block) when
+  THIS session's marker is active - mirroring `is_merge_api` and the tolerant `pr ...
+  merge` ordering that `is_gh_admin` already uses. A floor deny OUTRANKS the allow-list,
+  so a blanket shadow (`gh pr *`) can never defeat it even if "always allow" re-grants it.
+- **`gh pr merge` CLI + EXPLICIT ALLOW-LIST ENTRY (the sanctioned form).** Because the
+  floor is MARKER-GATED (solo/non-marker sessions are never denied), `Bash(gh pr merge *)`,
+  `Bash(gh pr merge:*)`, or `Bash(gh pr merge)` can now be ADDED to the allow-list as the
+  SANCTIONED entry. This means the maintainer's own `/merge-pr` in a solo session runs
+  prompt-free (no more per-merge approval prompt), while a marker-active team session's
+  floor blocks any bot attempt regardless of the allow-list.
+- **merge-by-API -> marker-gated hook HARD DENY (unchanged).** `gh api ... pulls/N/merge`
+  mutating stays an exit-2 deny in the guard.
+- **Doctor reconciliation (`_is_merge_scoped`).** `orchestrate-setup.py`'s
+  `_merge_rule_shadows` now calls `_is_merge_scoped` first: a merge-SCOPED allow-rule
+  (one whose language is a subset of the merge family - `Bash(gh pr merge)`,
+  `Bash(gh pr merge *)`, `Bash(gh pr merge:*)`, or `Bash(gh pr merge --flag)`) is ACCEPTED
+  (not a shadow) because the floor backstops it in a marker session. Any broader rule
+  (`Bash(gh pr *)`, `Bash(gh pr:*)`, `Bash(gh *)`, etc.) still hard-fails doctor.
+- **Backstop (unchanged):** server-side branch protection (required review + status checks)
+  gates the real merge regardless, so even a settings regression cannot land un-reviewed
+  code on `main`.
 
 ## Components (each unit: purpose / interface / deps)
 
@@ -201,21 +228,22 @@ Adopted design (what actually ships):
   per-call latency must stay ~5ms, not ~50ms python startup.
 - **Evaluation order (Finding F18):** the override must never bypass a hard deny. The
   guard evaluates PER CLAUSE in a SINGLE first-match loop, returning exit 2 on the first
-  hard deny: (1) Tier-1 (push to main/master, bare force, no-verify) - ALWAYS; (2) Tier-2
-  merge-by-API (`gh api ... pulls/N/merge` mutating) - IF the marker is active; (3) ONLY
+  hard deny: (1) Tier-1 (push to main/master, bare force, no-verify, `--admin`) - ALWAYS;
+  (2) Tier-2 merge-by-API (`gh api ... pulls/N/merge` mutating) - IF the marker is active;
+  (3) Tier-2 `gh pr merge` CLI (`is_pr_merge`) - IF the marker is active (#105); (4) ONLY
   THEN the `prep-pr-ok` advisory gate for remaining feature-branch pushes. A single loop
   is correct because every floor decision is now an exit-2 deny (the exit-0 `ask` branch
   was REMOVED - see "Tier-2: ask rejected, allow-list adopted" - so no decision can be
-  pre-empted by an earlier clause; the brief two-pass structure that the ask required is
-  gone). `gh pr merge` is NOT evaluated here at all (it is allow-list-gated). The
-  `# prep-pr-ok` override is checked LAST and can ONLY satisfy the advisory gate - it can
-  NEVER reach a hard deny (so `git push main # prep-pr-ok` stays blocked by step 1).
+  pre-empted by an earlier clause). The `# prep-pr-ok` override is checked LAST and can
+  ONLY satisfy the advisory gate - it can NEVER reach a hard deny (so
+  `git push main # prep-pr-ok` stays blocked by step 1).
 - **Behavior detail:** preserves the existing `git push` -> require-prep-or-
   `# prep-pr-ok` gate; adds safe-push-to-main coverage, bare-force, no-verify
   (Tier 1); adds MUTATING merge-by-API (`pulls/{n}/merge` with a mutating
-  method/field) as Tier 2 (marker-gated). `gh pr merge` is NOT matched by the hook
-  (allow-list-gated; see "Tier-2: ask rejected"). Generic `gh api -X` is NOT matched
-  (Finding F8).
+  method/field) as Tier 2 (marker-gated); adds `gh pr merge` CLI as Tier 2
+  (marker-gated, `is_pr_merge`, #105 - see "Tier-2: #105 floor-gate supersedes
+  allow-list-omission"). Generic `gh api -X` is NOT matched (Finding F8).
+  `gh pr merge --admin` is Tier-1 (is_gh_admin), denied even in a solo session.
   Matching rules the implementer MUST honor:
   - `--force` / `-f` is matched as a WHOLE WORD and ONLY when NOT immediately
     followed by `-with-lease` (Finding F9: `--force-with-lease` contains the
@@ -227,9 +255,16 @@ Adopted design (what actually ships):
     uses `git -C <worktree>` routinely.
   - **gh global flags between `gh` and the subcommand are tolerated** (Finding
     F12): `gh -R owner/repo pr merge`, `gh --repo ... api ...` must still match.
-  - merge is matched on the `pr merge` SUBCOMMAND token sequence, NOT the word
-    "merge" as a substring (Finding F13: else `gh pr create --title 'merge auth'`
-    false-positives).
+  - **gh global flags between `pr` and `merge` are also tolerated** (the #105
+    adversarial finding): `gh pr -R owner/repo merge 5` and `gh pr --repo
+    owner/repo merge 5` are valid gh CLI spellings and must be caught alongside
+    the simple adjacent form. The `is_pr_merge` clause 2 regex allows zero or more
+    flag groups (each starting with `-`) between `pr` and `merge`, mirroring the
+    tolerant `pr` ... `merge` ordering already used in `is_gh_admin`.
+  - merge is matched on the `pr` ... `merge` SUBCOMMAND token sequence (with
+    optional flags), NOT the word "merge" as a substring (Finding F13: else
+    `gh pr create --title 'merge auth'` false-positives; the regex requires
+    `merge` as a whole word immediately following only flag-groups after `pr`).
   - merge-by-API is `gh api` whose path contains `pulls/<digits>/merge` AND that
     is MUTATING - i.e. has `-X|--method PUT|POST` OR a field flag
     (`-f|--field|-F|--input|--raw-field`) which implies POST (Finding F6). A bare
@@ -252,12 +287,13 @@ Adopted design (what actually ships):
   needed (Finding F20).
 - **Scope (Finding F21 - global, documented):** the marker is per-USER, not
   per-session or per-repo. While ANY orchestrate session holds it, EVERY session -
-  including unrelated solo work in other repos - has Tier-2 (`gh pr merge`) gated
-  until teardown. Accepted for the honest-path, single-operator model: during that
-  window the human merges via `! ` / the GitHub UI. Per-repo scoping (guard
-  compares cwd to a repo recorded in the marker) is deliberately NOT done - the
-  lead and its teammates span multiple worktrees of the same repo, so cwd is not a
-  clean discriminator (the same reason per-teammate scoping was rejected).
+  including unrelated solo work in other repos - has Tier-2 (both `gh pr merge` CLI and
+  merge-by-API) gated until teardown. Accepted for the honest-path, single-operator
+  model: during that window the human merges from a SEPARATE plain terminal (no marker
+  there) or via the GitHub UI. Per-repo scoping (guard compares cwd to a repo recorded
+  in the marker) is deliberately NOT done - the lead and its teammates span multiple
+  worktrees of the same repo, so cwd is not a clean discriminator (the same reason
+  per-teammate scoping was rejected).
 - **Deps:** none. Created/removed by the setup/teardown script (phase 2) or by
   hand (`touch` / `rm`) for testing.
 
@@ -277,13 +313,12 @@ Adopted design (what actually ships):
   - blocks always: `git push origin main`, `git -C ../wt push origin main`
     (F11), `git push origin HEAD:main` (refspec destination), `scripts/safe-push.sh main`,
     `git push --force` (bare), `safe-push.sh feat --force`, `git push --no-verify`
-  - BLOCKS when marker active (merge-by-API ONLY -> exit 2):
+  - BLOCKS when marker active (merge-by-API AND `gh pr merge` CLI -> exit 2) (#105):
     `gh api -X PUT repos/o/r/pulls/1/merge`, `gh api --method PUT .../pulls/1/merge`,
-    `gh api repos/o/r/pulls/1/merge -f merge_method=squash` (POST via field, no `-X`).
-  - ALLOWS when marker active (NOT hook-gated; the allow-list + CC prompt gate these):
-    `gh pr merge 1868`, `gh pr merge --auto 1868`, `gh -R o/r pr merge 1868` (F12). The
-    harness also asserts the guard emits NO `permissionDecision` on any path (the `ask`
-    approach was removed after the live test).
+    `gh api repos/o/r/pulls/1/merge -f merge_method=squash` (POST via field, no `-X`);
+    `gh pr merge 1868`, `gh pr merge --auto 1868`, `gh -R o/r pr merge 1868` (F12).
+  - The harness also asserts the guard emits NO `permissionDecision` on any path (the
+    `ask` approach was removed after the live test).
   - allows ALWAYS (proves no false-positive on legit lead work, incl. mid-session):
     `gh pr view 1868`, `gh pr create --title "merge auth refactor"` (F13 - not a
     merge), `safe-push.sh feat`, `git push --force-with-lease origin feat`,
@@ -298,7 +333,8 @@ Adopted design (what actually ships):
     `# prep-pr-ok` to the push cases (`safe-push.sh feat`, `--force-with-lease`,
     `maintenance`/`domain`) to assert exit 0 once the override is present. Non-push
     (`gh ...`) entries exit 0 directly.
-  - allows when marker ABSENT: `gh pr merge 1868`, `gh api -X PUT .../pulls/1/merge`
+  - allows when marker ABSENT: `gh pr merge 1868` (solo/non-marker -> floor not active),
+    `gh api -X PUT .../pulls/1/merge` (solo/non-marker -> floor not active)
   - regression: no block message contains a string that would re-enable the
     blocked action (no taught bypass).
 - **Deps:** python3 (run occasionally, latency irrelevant), the guard script.
@@ -307,9 +343,18 @@ Adopted design (what actually ships):
 - Replace the current inline `PreToolUse.Bash` push hook with a single
   `command` invoking `~/.claude/scripts/orchestrate-guard.sh`. Keep the existing
   Write/Edit secret-file hooks (real deterministic guards - unchanged). KEEP the
-  PostToolUse `gh pr merge` print (Finding F16): `gh pr merge` is not hook-gated
-  (allow-list prompts the human), so this print is reached on any human-APPROVED
-  `gh pr merge` - in-session or solo - where its post-merge-cleanup reminder is still wanted.
+  PostToolUse `gh pr merge` print (Finding F16): since `gh pr merge` is now
+  FLOOR-GATED (marker-gated deny in a team session), this print is only reached in a
+  SOLO/non-marker session where the human or solo lead ran a merge - the
+  post-merge-cleanup reminder is still wanted there.
+- **Sanctioned `gh pr merge` allow-list entry (#105):** add `Bash(gh pr merge *)`
+  (or `Bash(gh pr merge:*)`) to settings.json's `permissions.allow`. This replaces the
+  old "omit merge from the allow-list" posture. The floor deny makes the explicit entry
+  safe: in a marker-active team session the floor blocks bot merge regardless; in a solo
+  session the entry lets the maintainer's `/merge-pr` run prompt-free. Do NOT use a
+  blanket `Bash(gh pr *)` - that still hard-fails doctor because it grants more than the
+  merge family. The exact sanctioned forms doctor accepts: `Bash(gh pr merge)`,
+  `Bash(gh pr merge *)`, `Bash(gh pr merge:*)`, or a specific-flag form.
 - **User-approved edit (Finding F27):** editing `~/.claude/settings.json` is a
   user-approved step per the standing rule "never edit settings.json silently."
   Present the exact diff for approval; do not write it unattended. Note the
@@ -328,10 +373,18 @@ Adopted design (what actually ships):
   (teams env, tmux, clean main, allow-list diff), idempotent guard install into
   settings.json (only if absent), `touch` marker with header, then run the guard
   SELF-TEST (Finding F25): assert a Tier-1 push-main payload blocks (exit 2) AND - now
-  that the marker exists - a Tier-2 merge-by-API payload blocks (exit 2) too; abort
-  setup if either fails open. (`gh pr merge` is allow-list-gated, not asserted here.)
+  that the marker exists - a Tier-2 merge-by-API payload blocks (exit 2) AND a Tier-2
+  `gh pr merge` CLI payload blocks (exit 2) too (#105); abort setup if any fails open.
   Teardown -> `rm` marker + the team-teardown checklist. Subjected to
   its own review pass.
+- **Doctor shadow check / merge-gate reconciliation (#105):** `check_merge_gate_shadows`
+  calls `_merge_rule_shadows` for each allow-rule; `_merge_rule_shadows` now calls
+  `_is_merge_scoped` first. A merge-SCOPED allow-rule (`Bash(gh pr merge *)`,
+  `Bash(gh pr merge:*)`, `Bash(gh pr merge)`, or a specific-flag form like
+  `Bash(gh pr merge --squash)`) is ACCEPTED - it no longer triggers a shadow FAIL,
+  because the floor deny backstops it in a marker session and allows it in a solo
+  session as intended. Any broader rule (`Bash(gh pr *)`, `Bash(gh pr:*)`, `Bash(gh *)`,
+  `Bash(*)`) still hard-fails doctor unchanged.
 
 ## Compose change (separate, smaller)
 

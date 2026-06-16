@@ -33,9 +33,10 @@ Runtime (`scripts/`; canonical source is this repo):
 - `scripts/orchestrate-guard.sh` - the single PreToolUse Bash deny authority (deterministic floor).
   Tier-1 = general bash-safety, MARKER-INDEPENDENT (every session): push-to-main/master, bare
   `--force`/`-f` (not `--force-with-lease`), `git ... --no-verify` (any accepting subcommand),
-  `gh ... --admin` (admin-bypass on `pr merge`). Tier-2 = orchestrate-MARKER-GATED merge-by-API
-  (`gh api ... pulls/N/merge`). Fails OPEN on any internal error. Threat model = honest bot on the
-  obvious path, NOT adversarial evasion (it is a guardrail, not a sandbox).
+  `gh ... --admin` (admin-bypass on `pr merge`). Tier-2 = orchestrate-MARKER-GATED merge: BOTH
+  the `gh pr merge` CLI (`is_pr_merge`, #105) AND merge-by-API (`gh api ... pulls/N/merge`);
+  a SOLO/non-marker session is never Tier-2-gated. Fails OPEN on any internal error. Threat model
+  = honest bot on the obvious path, NOT adversarial evasion (it is a guardrail, not a sandbox).
 - `orchestrate-resources.py` - cross-session port + data-dir lease allocator (flock-atomic JSON
   state). `stillwater` profile emits SW_* env (lease JSON on STDOUT, eval-able exports on STDERR);
   the encryption key is a 0600 file beside the DB, NEVER in env/.env.
@@ -44,10 +45,14 @@ Runtime (`scripts/`; canonical source is this repo):
   [--apply]` is the consent-based path that wires the floor hook + missing allow-list entries into
   settings.json, DEPLOYS the bundled guard to the stable `~/.claude/scripts/` path (so a fresh
   plugin install has a working floor; idempotent, refreshes a stale copy, warns on a missing source),
-  AND narrows any blanket `gh pr` allow-rule (`Bash(gh pr *)`/`Bash(gh pr:*)`) that shadows the
-  merge gate down to the enumerated non-merge subcommands (broader `gh *`/`*` shadows are surfaced
-  for human resolution, never auto-rewritten); it shows the diff, writes only with --apply + a y/N,
-  backs up, never clobbers an unparseable file, and reuses doctor's single shadow matcher.
+  AND (via two SEPARATE paths) (a) narrows any blanket `gh pr` allow-rule
+  (`Bash(gh pr *)`/`Bash(gh pr:*)`) that shadows the merge gate down to the enumerated
+  non-merge subcommands only (broader `gh *`/`*` shadows are surfaced for human resolution,
+  never auto-rewritten), and (b) adds the explicit merge-scoped entry `Bash(gh pr merge *)`
+  via the missing-allow path (parsed from required-permissions.md); doctor's `_is_merge_scoped`
+  helper accepts an explicit merge-scoped rule as NOT a shadow (the floor backstops it); it
+  shows the diff, writes only with --apply + a y/N, backs up, never clobbers an unparseable
+  file, and reuses doctor's single shadow matcher.
   doctor stays read-only (it WARNs on a stale deployed guard) so "permissions are the user's to grant" holds.
 - `uat-autobuild.sh` - repo-agnostic UAT auto-rebuild watcher: polls a branch HEAD, runs a
   parameterized `--build-cmd` on a new commit, and swaps only that port's LISTEN-pid (lease-safe)
@@ -117,15 +122,18 @@ Keep the SKILL.md version line and the git tag in lockstep.
     ITSELF routes for MAINTAINER MERGE even when it is "doc" (this file's operating-model + SKILL.md floor
     invariants qualify).
   - MECHANICAL: autonomous merge works only in a SOLO / non-marker session; a marker-active TEAM session
-    still has the floor withhold `gh pr merge` (+ deny merge-by-API), so there the lead SURFACES the merge
-    to the human. "Looks good"/"LGTM" is NEVER a merge authorization for the human-gated tiers; commit
-    locally freely regardless of tier.
+    has the floor hard-deny `gh pr merge` CLI (is_pr_merge, #105) and deny merge-by-API, so there the lead
+    SURFACES the merge to the human (who merges from a SEPARATE plain terminal). "Looks good"/"LGTM" is
+    NEVER a merge authorization for the human-gated tiers; commit locally freely regardless of tier.
 - The LEAD owns all privileged/outward steps (push, `gh pr create`, CR replies, merge) and is the
   SOLE human-facing channel. Teammates implement + test + commit in their OWN worktree and message
   the lead rather than prompting the human (AskUserQuestion/permission prompts from teammates clobber
   the human's input box).
 - The merge (the one irreversible step) stays human-executed: in a marker-active session the floor
-  denies the merge-by-API path and withholds `gh pr merge` from the allow-list, so the human runs it.
+  hard-denies the `gh pr merge` CLI (is_pr_merge, #105) and the merge-by-API path, so the human
+  runs it from a SEPARATE plain terminal (no marker there) or the GitHub UI. The allow-list now
+  carries an EXPLICIT merge-scoped entry (`Bash(gh pr merge *)`) - safe because the floor deny
+  outranks it in a marker session, and it enables prompt-free solo merge for the maintainer.
 - Default to PARALLEL subagents for independent work, but only when DISJOINT (different files / git
   index): split by the resource being mutated, not just by logical task. FOREGROUND for anything that
   writes/commits; BACKGROUND only for provably-zero-prompt read-only work (the standing background-agent

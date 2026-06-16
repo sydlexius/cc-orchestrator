@@ -454,16 +454,18 @@ def _feed_guard(command):
 
 
 def armed_self_test():
-    """With the marker armed, the guard must HARD-DENY (exit 2) BOTH:
+    """With the marker armed, the guard must HARD-DENY (exit 2) ALL THREE:
       - Tier-1 push-main, AND
-      - Tier-2 merge-by-API (`gh api ... pulls/N/merge` mutating).
-    `gh pr merge` is intentionally NOT hook-gated (the allow-list + a Claude Code prompt
-    gate it, because a PreToolUse hook on this CC honors a deny but ignores `ask`), so it
-    is not asserted here. Payloads are built here and fed on stdin, so the live hook never
-    sees a trigger on the command line (the orchestrate test-driving rule)."""
+      - Tier-2 merge-by-API (`gh api ... pulls/N/merge` mutating), AND
+      - Tier-2 `gh pr merge` CLI (`is_pr_merge`, #105).
+    All payloads are built here and fed on stdin, so the live hook never sees a trigger
+    on the command line (the orchestrate test-driving rule). DESIGN-deterministic-floor.md
+    (section 'Cases (minimum)') claims this assertion for all three paths -- the code
+    matches the doc."""
     t1 = _feed_guard("git push origin main")
     t2 = _feed_guard("gh api -X PUT repos/o/r/pulls/5/merge")
-    return t1 == 2 and t2 == 2
+    t3 = _feed_guard("gh pr " + "merge 5")
+    return t1 == 2 and t2 == 2 and t3 == 2
 
 
 # The literal command the Tier-2 merge gate keeps OUT of the allow-list so Claude Code
@@ -507,20 +509,52 @@ def _rule_to_regex(pattern):
     return re.escape(pattern) + r"(\s.*)?"
 
 
-def _merge_rule_shadows(pattern):
-    """Does this Bash allow PATTERN grant ANY command in the merge family (the bare
-    `gh pr merge` or any merge invocation with args)? If so it silently re-grants merge and
-    defeats the human-in-the-loop gate, so the doctor must FAIL.
+def _is_merge_scoped(pattern):
+    """True iff the specifier's language is a SUBSET of the merge family - i.e. it grants
+    only `gh pr merge` and its own args/flags, nothing broader.
 
-    Sound test: the rule shadows iff the language of commands it grants INTERSECTS the merge
-    family. Both languages have the shape `literal-stem` + (glob / boundary tail), so the
-    intersection is non-empty iff one side's regex matches a minimal concrete member of the
-    other. We probe both directions:
+    The three sanctioned forms (and their wildcard-free with-args variants) are accepted:
+      - exact bare:          `gh pr merge`        (grants merge or merge + args)
+      - boundary-star:       `gh pr merge *`      (grants merge + at least one arg)
+      - boundary-colon-star: `gh pr merge:*`      (same, colon boundary form)
+      - exact with args:     `gh pr merge --flag` (grants only that one invocation)
+
+    Any other form - a plain-glob prefix like `gh pr merg*`, a broader boundary like
+    `gh pr:*`, or anything with a wildcard not in the recognised tail positions - is NOT
+    merge-scoped and is left to the intersection check in _merge_rule_shadows."""
+    if pattern == MERGE_TARGET:
+        return True
+    if pattern.endswith(" *") or pattern.endswith(":*"):
+        return pattern[:-2] == MERGE_TARGET
+    # wildcard-free specifier longer than the bare target: merge-specific args are fine
+    if "*" not in pattern:
+        return pattern.startswith(MERGE_TARGET + " ")
+    # any other wildcard form (plain-glob, infix, leading) - not merge-scoped
+    return False
+
+
+def _merge_rule_shadows(pattern):
+    """Does this Bash allow PATTERN shadow the merge gate?
+
+    A pattern shadows iff:
+      (a) its language INTERSECTS the merge family (it can grant some merge invocation), AND
+      (b) its language is NOT a SUBSET of the merge family (it grants more than merge).
+
+    Condition (b) is the new reconciliation: a merge-SCOPED rule (one that grants merge and
+    nothing beyond merge's own args) is NO LONGER a shadow. Rationale: the floor deny
+    outranks it while the orchestrate marker is active (bot still cannot merge), and in a
+    solo/no-marker session it is the human's own /merge-pr working as intended. Broader
+    rules - `gh pr *`, `gh pr:*`, `gh *`, plain-glob prefixes, etc. - still shadow because
+    they over-grant every other subcommand and are the always-allow footgun.
+
+    Intersection test (sound, both directions):
       - the rule's regex matches the bare target, or the target with one trailing arg
         (catches every prefix/boundary/glob rule that grants merge-with-args), AND
-      - the family regex matches the rule's literal stem (its specifier with globs emptied)
-        (catches a rule LONGER than the target, e.g. `gh pr merge --squash`, which grants
-        only a specific merge invocation that the family still covers)."""
+      - the family regex matches the rule's literal stem (globs emptied) - catches a
+        rule LONGER than the target, e.g. `gh pr merge --squash` (more specific merge
+        invocation that the family still covers)."""
+    if _is_merge_scoped(pattern):
+        return False
     rule_re = re.compile("^" + _rule_to_regex(pattern) + "$", re.DOTALL)
     if rule_re.match(MERGE_TARGET) or rule_re.match(MERGE_TARGET + " x"):
         return True
@@ -614,16 +648,23 @@ def check_merge_gate_shadows():
             _emit(FAIL, f"settings file in cascade could not be scanned: {path} ({msg})")
     if shadows:
         _emit(FAIL, f"{len(shadows)} allow-rule(s) SHADOW the {MERGE_TARGET!r} gate "
-                    "(any one silently re-grants merge - remove/narrow them):")
+                    "(any one silently re-grants merge via a BROADER grant - remove/narrow them):")
         for path, rule in shadows:
             print(f"         {rule}   in {path}")
-        print(f"         Fix: narrow each to the non-merge subcommands (e.g. {MERGE_TARGET.rsplit(' ',1)[0]} "
+        _GH_PR = MERGE_TARGET.rsplit(" ", 1)[0]
+        print(f"         Fix: narrow each to the non-merge subcommands (e.g. {_GH_PR} "
               "view/diff/checks/create/list), never a blanket prefix that covers 'merge'.")
+        print(f"         Note: an explicit merge-only entry (Bash({MERGE_TARGET}), "
+              f"Bash({MERGE_TARGET} *), or Bash({MERGE_TARGET}:*)) is the SANCTIONED form "
+              "and is NOT a shadow -- the floor deny backstops it in a marker session.")
     return FAIL
 
 
 # The non-merge `gh pr` subcommands a narrowed blanket is replaced WITH. `merge` is
-# DELIBERATELY OMITTED so Claude Code keeps prompting the human (the merge gate). The
+# DELIBERATELY OMITTED here because the explicit merge-scoped entry (`Bash(gh pr merge *)`)
+# comes via a SEPARATE path: _missing_allow_entries parses it from required-permissions.md
+# and configure adds it alongside the other missing allow-list entries (not via this narrow
+# path). The `gh pr merge` CLI is gated by the FLOOR (marker-gated hard-deny, #105). The
 # entry FORMS mirror required-permissions.md exactly: `Bash(gh pr <sub> *)`. The `gh pr`
 # stem is assembled from MERGE_TARGET so this source line carries no trigger string for
 # the live PreToolUse Bash hook. Keep this list in lockstep with required-permissions.md.
@@ -764,8 +805,9 @@ def cmd_up(args):
         # a marker file, so they cannot trigger any floor action - and they are useful for
         # post-mortem debugging of why the self-test failed.
         print("\nup: ABORT - armed self-test FAILED: with the marker armed the guard did not "
-              "hard-deny push-main and/or merge-by-API (both must exit 2). The floor is failing "
-              "open. Marker REMOVED. Fix the guard before standing up a session.", file=sys.stderr)
+              "hard-deny ALL of: push-main, merge-by-API, and the gh pr merge CLI (all must exit 2). "
+              "The floor is failing open. Marker REMOVED. Fix the guard before standing up a "
+              "session.", file=sys.stderr)
         return 1
     print(f"\nup: SESSION ARMED."
           f"\n  marker:   {marker_path}"
@@ -957,7 +999,9 @@ def _narrow_shadow_file(path, apply, assume_yes):
     for entry in _NARROWED_GH_PR_ENTRIES:
         if entry not in allow:
             print(f"  + add    {entry}")
-    print(f"    ({MERGE_TARGET!r} stays OMITTED so the human is still prompted - the merge gate.)")
+    print(f"    (least-privilege: blanket narrowed to non-merge subcommands; the explicit"
+          f" {MERGE_TARGET!r} * entry comes via the missing-allow path from required-permissions.md,"
+          f" and the {MERGE_TARGET!r} CLI is gated by the FLOOR (marker-gated hard-deny, #105).)")
 
     if not apply:
         print("(preview only; re-run with --apply to write. the file is backed up first.)")

@@ -8,8 +8,10 @@
 #            `git ... --no-verify` (any git subcommand, skips git hooks), and
 #            `gh ... --admin` (admin-bypass over branch protection / required reviews).
 #            None of these is ever legitimate from Claude, so deny is always free.
-#   Tier-2 = orchestrate-marker-gated MERGE only (merge-by-API: `gh api ... pulls/N/merge`
-#            mutating). Fires ONLY when THIS session's marker is present and fresh.
+#   Tier-2 = orchestrate-marker-gated MERGE: the `gh pr merge` CLI (#105) AND merge-by-API
+#            (`gh api ... pulls/N/merge` mutating). Fires ONLY when THIS session's marker is
+#            present and fresh - so a SOLO session (no marker) can merge (the maintainer's
+#            /merge-pr), while a marker-active team session blocks a bot from merging.
 #
 # Spec: ~/.claude/skills/orchestrate/DESIGN-deterministic-floor.md
 # NO `set -e`: a grep no-match returns 1 and is normal control flow here.
@@ -147,12 +149,16 @@ is_gh_admin() {
   printf '%s' "$cmd" | grep -Eq '(^|[[:space:]])--admin([[:space:]=]|$)'
 }
 
-# NOTE: `gh pr merge` is intentionally NOT matched/gated by this hook (REVISED
-# 2026-06-06). The hook cannot PROMPT on this Claude Code (it honors a hard deny but
-# ignores `permissionDecision:"ask"`), so the human-approval prompt for `gh pr merge`
-# is produced by the ALLOW-LIST instead (settings.json lists the non-merge `gh pr`
-# subcommands but NOT `merge`, so CC prompts; a human approves, an auto-mode bot
-# stalls). Only the merge-by-API path below stays hook-gated. See DESIGN.
+# NOTE (#105, supersedes the 2026-06-06 allow-list-omission gate): `gh pr merge` is now
+# MARKER-GATED here (is_pr_merge, below), like merge-by-API. Rationale: the old gate omitted
+# `gh pr merge` from the allow-list so CC PROMPTED the human - but that prompt drove "always
+# allow" clicks that re-granted a blanket `gh pr *` rule (re-opening bot-merge; the recurring
+# doctor shadow FAIL). Moving the gate to the FLOOR fixes that at the root: a deny OUTRANKS the
+# allow-list, so a blanket shadow can no longer defeat it, AND `gh pr merge` can be allow-listed
+# so a SOLO/non-marker session (the maintainer's own /merge-pr) runs prompt-free. The original
+# objection (a deny blocks the human's own merge) is moot: the deny is MARKER-GATED (solo is not
+# denied) and in a marker-active team session the human already merges from a SEPARATE terminal
+# (no marker there). See DESIGN-deterministic-floor.md + #105.
 
 # merge-by-API: gh + api + a pulls/<n>/merge path AND a mutating method/field.
 # A bare GET (no method, no field) is a merge-STATUS check and is allowed.
@@ -167,6 +173,25 @@ is_merge_api() {
   printf '%s' "$cmd" | grep -Eq '(--method[[:space:]=]+|-X[[:space:]=]*)(PUT|POST)' && return 0
   printf '%s' "$cmd" | grep -Eq '(^|[[:space:]])(--(field|input|raw-field)[[:space:]=]|-[fF][[:space:]=]?[^[:space:]])' && return 0
   return 1
+}
+
+# gh pr merge (the CLI squash/merge), marker-gated (#105). Matches gh + `pr` followed by `merge`,
+# tolerating global FLAGS (and their values) between `pr` and `merge` - so `gh pr -R owner/repo
+# merge 5` and `gh pr --repo owner/repo merge 5` are caught alongside the simple adjacent form.
+# NOT the word "merge" anywhere in a different subcommand - `gh pr comment`/`gh pr create`/`gh pr
+# view` bodies mentioning merge are NOT matched because the regex requires `merge` as a whole word
+# immediately after optional flag groups (each starting with `-`), not any token sequence.
+# Global flags before `pr` (e.g. `gh -R o/r pr merge`) are already handled by clause 1 (the `gh`
+# word match) and clause 2 finds `merge` after `pr` even with global flags between them. Same
+# motivation is_gh_admin documents (gh accepts `-R`/flags between `pr` and `merge`), but clause 2
+# uses a TIGHTER flag-group regex - not is_gh_admin's independent-word greps - because this path
+# lacks the `--admin` narrowing and must NOT match `pr <subcommand> ... merge` (e.g. comment bodies).
+# `--admin` forms are already Tier-1 (is_gh_admin, always denied); this is the marker-gated path.
+# Accepted F30 limitation: a body literally containing the phrase "pr merge" (with only flags
+# between them) trips it (whole-string grep, no shell-quote parsing) - rare, reword or use `!`.
+is_pr_merge() {
+  printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-])gh([[:space:]]|$)' || return 1
+  printf '%s' "$cmd" | grep -Eq '(^|[[:space:]])pr([[:space:]]+-[^[:space:]]+([[:space:]]+[^-[:space:]][^[:space:]]*)?)*[[:space:]]+merge([[:space:]]|$)'
 }
 
 # THIS session's marker present AND fresh. Keyed by $TMUX (sanitized) so one
@@ -211,11 +236,11 @@ marker_active() {
 # inside the merge branch). `$orig_cmd` is restored afterwards for the advisory gate.
 # Process substitution (not a pipe) so `exit 2` exits the script, not a subshell.
 #
-# Tier-2 is the merge-by-API path ONLY (`gh api ... pulls/N/merge` mutating). Both
-# Tier-1 and Tier-2 are exit-2 HARD denies, so a single first-match per-clause loop is
-# correct (no exit-0 branch to be pre-empted). `gh pr merge` is NOT gated here - the
-# allow-list makes Claude Code prompt the human for it (the hook cannot prompt on this
-# CC). REVISED 2026-06-06 after a live test proved CC ignores `permissionDecision:ask`.
+# Tier-2 covers BOTH the merge-by-API path (`gh api ... pulls/N/merge` mutating) AND the
+# `gh pr merge` CLI (`is_pr_merge`, #105). Both Tier-1 and Tier-2 are exit-2 HARD denies,
+# so a single first-match per-clause loop is correct (no exit-0 branch to be pre-empted).
+# History: the allow-list-omission approach (prompting the human) was tried but an "always
+# allow" click re-opened the bot-merge hole; REVISED to floor-gated deny (2026-06-15, #105).
 orig_cmd="$cmd"
 # Tracks whether ANY clause is a real push INVOCATION (command-position anchored), for the
 # advisory gate after the loop. Initialized here so it is always defined under `set -u`.
@@ -244,11 +269,20 @@ if printf '%s' "$orig_cmd" | grep -Eq 'push|--no-verify|--admin|(^|[^[:alnum:]_-
       echo "BLOCKED: refusing 'gh ... --admin'. It overrides branch protection and required reviews and is not part of this workflow; satisfy the requirement (land the reviews/checks) instead of bypassing it." >&2
       exit 2
     fi
-    # Tier-2 (marker-gated): ONLY the merge-by-API path. `gh pr merge` is deliberately
-    # NOT matched - it is gated by the allow-list (-> CC prompts the human), since a
-    # PreToolUse hook on this CC can hard-deny but cannot prompt.
+    # Tier-2 (marker-gated): the merge-by-API path AND (#105) the `gh pr merge` CLI. Both are
+    # allowed in a solo/non-marker session and HARD-DENIED while THIS session's marker is fresh.
     if is_merge_api && marker_active; then
-      echo "BLOCKED: merge-by-API is not allowed from Claude during an orchestrate session. Merge via 'gh pr merge' (it prompts you for approval) or the GitHub UI." >&2
+      echo "BLOCKED: merge-by-API is not allowed from Claude during an orchestrate session. The maintainer merges from a separate plain terminal or the GitHub UI." >&2
+      exit 2
+    fi
+    # #105: the `gh pr merge` CLI, marker-gated. SOLO/non-marker -> allowed (so the maintainer's
+    # /merge-pr just works prompt-free); marker active -> denied (a bot cannot merge in a team
+    # session; the human merges from a SEPARATE terminal where no marker is present). A floor DENY
+    # outranks the allow-list, so this stays robust even if an "always allow" click re-grants a
+    # blanket gh-pr rule - the recurring shadow can no longer defeat the gate. `gh pr merge --admin`
+    # is already Tier-1 (is_gh_admin) above, denied even solo.
+    if is_pr_merge && marker_active; then
+      echo "BLOCKED: 'gh pr merge' is not allowed from Claude during an orchestrate session (marker active). The maintainer merges from a SEPARATE plain terminal or the GitHub UI; in a solo session this command is allowed." >&2
       exit 2
     fi
     # Record a real push INVOCATION in THIS clause (command-position anchored) for the
