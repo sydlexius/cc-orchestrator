@@ -240,6 +240,13 @@ def _missing_allow_entries(settings):
                                text, re.MULTILINE | re.DOTALL)
     if not section_match:
         return None
+    # DOC CONTRACT (issue #107): every backticked Bash/Write/Edit/Read(...) token in this
+    # section that is NOT on a NOTE: line is a PRESCRIBED allow-list entry. Prose that merely
+    # NAMES a rule it does NOT prescribe (e.g. "REMOVE any broad `gh api` allow-rule") MUST
+    # NOT wrap that rule as a backticked Perm token, or it becomes a phantom "needed" entry
+    # that configure --apply would write and doctor would WARN as "missing". The parser stays
+    # deliberately simple; the doc honours the contract; test-orchestrate-setup.py pins the
+    # exact harvested set so a reintroduced phantom (or a dropped real entry) fails CI.
     needed = set()
     for line in section_match.group(1).splitlines():
         # Skip lines that are commentary/notes (not prescriptive allow-list items).
