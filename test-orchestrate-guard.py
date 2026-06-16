@@ -167,6 +167,7 @@ CASES = [
     ("gh pr -R owner/repo merge 5 (active) -> block (flag between pr+merge, the bug)", "gh pr -R owner/repo merge 5", True, "block"),
     ("gh pr --repo owner/repo merge 5 (active) -> block (long-flag between pr+merge)", "gh pr --repo owner/repo merge 5", True, "block"),
     ("gh pr --repo owner/repo merge --auto (active) -> block (flag+value then merge)", "gh pr --repo owner/repo merge --auto", True, "block"),
+    ("gh pr --repo=owner/repo merge 5 (active) -> block (=-form, no-space flag assignment)", "gh pr --repo=owner/repo merge 5", True, "block"),
     # marker ABSENT (solo) -> must allow (so /merge-pr just works prompt-free)
     ("gh pr merge (marker ABSENT/solo) -> allow (so /merge-pr just works)", "gh pr merge 1868", False, "allow"),
     ("gh pr merge --squash (absent/solo) -> allow", "gh pr merge --squash 101", False, "allow"),
