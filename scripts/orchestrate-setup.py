@@ -771,6 +771,43 @@ def cmd_doctor(args):
     return 1 if hard_fail else 0
 
 
+def _check_stale_guard_at_up():
+    """Emit a prominent, visually-distinct warning block to stderr when the deployed guard
+    is STALE ('refresh') or uncomparable vs the bundled guard. Reuses _guard_deploy_action()
+    so the comparison logic is NOT duplicated.
+
+    Design choice: LOUD but NON-FATAL - `up` continues; exit code is unchanged.
+    Alternatives considered:
+      - Non-zero exit / abort: would block legitimate solo work when the deployed guard is
+        merely stale (still functional) and the operator just hasn't run configure yet.
+        Rejected: too aggressive for a runtime that fails OPEN by design.
+      - Require --allow-stale-guard flag to acknowledge: adds friction without adding safety
+        (the guard is still functional; the stale case is a post-update drift, not a security
+        gap; the floor's OPEN-fail posture means a broken deployed guard is survivable).
+        Rejected: over-engineering for a loud advisory.
+    Chosen: loud-non-fatal - the operator sees the remedy and can decide to run configure
+    before arming, but `up` is not bricked by a stale-but-functional guard."""
+    action = _guard_deploy_action()
+    if action not in ("refresh", "missing-source"):
+        return  # guard is current (None) or simply not yet deployed (doctor already caught 'deploy')
+    if action == "refresh":
+        detail = f"deployed guard at {GUARD!r} differs from the bundled plugin guard"
+    else:
+        detail = f"cannot compare: bundled guard source not found at {BUNDLED_GUARD!r}"
+    border = "=" * 70
+    print(file=sys.stderr)
+    print(border, file=sys.stderr)
+    print("WARNING: STALE FLOOR GUARD", file=sys.stderr)
+    print(f"  {detail}.", file=sys.stderr)
+    print("  The session will still arm, but the deployed guard may be out of date.", file=sys.stderr)
+    print("  REMEDY (in order):", file=sys.stderr)
+    print("    1. Run:    orchestrate-setup.py configure --apply", file=sys.stderr)
+    print("    2. RESTART each open Claude Code session (the PreToolUse hook loads the", file=sys.stderr)
+    print("               guard at session start; a restart is required, not a reboot).", file=sys.stderr)
+    print(border, file=sys.stderr)
+    print(file=sys.stderr)
+
+
 def cmd_up(args):
     _validate_team(args.team)  # reject a path-unsafe team name before doing any work
     print("Pre-flight doctor:")
@@ -778,6 +815,10 @@ def cmd_up(args):
     if rc != 0:
         print("\nup: ABORT - doctor reported a hard failure; fix it and re-run.", file=sys.stderr)
         return rc
+    # Loud (non-fatal) warning when the deployed guard is stale vs the bundled plugin guard.
+    # doctor already WARNs at check_guard_stale(); this adds a more prominent block with the
+    # specific remedy so the operator cannot miss it at `up` time.
+    _check_stale_guard_at_up()
     # Reuse HEAD from doctor's check_repo_main; add timeout + empty-tolerant fallback.
     _repo_status, head = check_repo_main(args.repo)
     if not head:

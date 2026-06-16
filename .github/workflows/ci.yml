@@ -52,7 +52,7 @@ jobs:
 
       - name: ruff (F,E741)
         if: runner.os == 'Linux'
-        run: ruff check --select F,E741 scripts/orchestrate-resources.py scripts/orchestrate-setup.py scripts/planner_classify.py test-orchestrate-guard.py test-orchestrate-resources.py test-orchestrate-setup.py test-planner-classify.py test-gh-wrappers.py test-ship-gate-preflight.py
+        run: ruff check --select F,E741 scripts/orchestrate-resources.py scripts/orchestrate-setup.py scripts/planner_classify.py test-orchestrate-guard.py test-orchestrate-resources.py test-orchestrate-setup.py test-planner-classify.py test-gh-wrappers.py test-ship-gate-preflight.py test-version-lockstep.py
 
       # Platform-sensitive: run on BOTH macOS (BSD stat) and Linux (GNU stat).
       # Must invoke via ./ so the self-test's "$0" re-invocation resolves
@@ -88,3 +88,7 @@ jobs:
       - name: harness - setup
         if: runner.os == 'Linux'
         run: python3 test-orchestrate-setup.py
+
+      # Version lockstep: SKILL.md **Version** == plugin.json "version". Platform-independent.
+      - name: harness - version-lockstep
+        run: python3 test-version-lockstep.py
