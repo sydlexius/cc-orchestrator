@@ -24,7 +24,8 @@
 #                              --codoki-only mode (default: "Codoki PR Review").
 #   Exit codes:
 #     0  PASS  - all gates green (full mode: every check terminal+acceptable AND
-#               0 actionable review-body findings; codoki-only: Codoki settled OK).
+#               0 actionable review-body findings AND reviewDecision not an active
+#               CHANGES_REQUESTED; codoki-only: Codoki settled OK).
 #     1  USAGE - bad/missing arguments.
 #     2  BLOCK - a gate failed, OR any lookup/parse error (gh/jq/helper failure).
 #               BLOCK is the fail-closed code: an unknown state is ALWAYS a block.
@@ -46,6 +47,26 @@
 #   line. N>0 BLOCKS. A missing/erroring helper BLOCKS (fail closed). The line is
 #   only PRINTED when N>0, so its ABSENCE on a clean (exit-0) helper run means
 #   N==0 and PASSES. The full gate = all checks green AND N==0.
+#
+# FULL-MODE REVIEW-DECISION GATE (#117; couples GitHub's `reviewDecision` with the
+#   actionable-findings count above - it is NOT an independent veto):
+#   GitHub's reviewDecision is one of APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED
+#   / null. It is deliberately NOT a standalone block because it reads STALE: after
+#   a fix-push that the reviewer (e.g. CodeRabbit) has not yet re-reviewed it stays
+#   CHANGES_REQUESTED even though every finding is addressed. Blocking on it alone
+#   would wrongly fail an already-fixed PR. The two signals are coupled by ORDERING:
+#   the findings>0 gate runs FIRST and blocks unconditionally, so an ACTIVE
+#   CHANGES_REQUESTED - which by definition still carries unaddressed actionable
+#   findings (N>0) - is already caught there. Any CHANGES_REQUESTED that survives to
+#   the review-decision gate therefore has N==0: it is SUPERSEDED/resolved and
+#   PASSES. Net effect: an active CHANGES_REQUESTED is caught (via its findings); a
+#   superseded one is never blocked. The review-decision gate's own block is the
+#   FAIL-CLOSED case only: an UNRECOGNIZED reviewDecision value (not in the
+#   APPROVED/CHANGES_REQUESTED/REVIEW_REQUIRED/null set) is ambiguous and BLOCKS,
+#   mirroring the unknown-__typename posture above. (Documented trade-off of the
+#   coupling: a CHANGES_REQUESTED with NO helper-recognized actionable findings -
+#   e.g. a bare human "request changes" with no inline findings - reads as N==0 and
+#   PASSES; the authoritative unreplied-comments check is the backstop there.)
 #
 # FOLLOW-UP (required; the oracle alone does NOT close the dogfood gap mxlrcgo-svc
 #   #261): the EXTERNAL callers must INVOKE this oracle. (a) pr-watch.sh should
@@ -97,7 +118,7 @@ if [ -z "$repo" ]; then
 fi
 
 # FAIL CLOSED: any gh failure -> BLOCK.
-json="$(gh pr view "$pr" --repo "$repo" --json statusCheckRollup 2>/dev/null)" || {
+json="$(gh pr view "$pr" --repo "$repo" --json statusCheckRollup,reviewDecision 2>/dev/null)" || {
   echo "BLOCK: 'gh pr view' failed for #$pr in $repo" >&2
   exit 2
 }
@@ -243,5 +264,26 @@ if [ "$findings" -gt 0 ]; then
   exit 2
 fi
 
-echo "RESULT: PASS -- all checks green AND 0 actionable review-body findings. [#$pr $repo]"
+# --- REVIEW-DECISION GATE (#117) -------------------------------------------
+# Reached only with all checks green AND findings==0 (the findings>0 gate above
+# already exited). Couple GitHub's reviewDecision with that count: a
+# CHANGES_REQUESTED surviving to here is SUPERSEDED (its findings are addressed)
+# and PASSES; an active CHANGES_REQUESTED was already blocked via its findings.
+# FAIL CLOSED on an unrecognized value (mirrors the unknown-__typename posture):
+# GitHub emits only APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED / null, so
+# anything else is ambiguous and BLOCKS. null/absent -> "" (no active decision).
+review_decision="$(jq -r '(.reviewDecision // "") | ascii_upcase' <<<"$json")" || {
+  echo "BLOCK: jq parse of reviewDecision failed (#$pr)" >&2
+  echo "RESULT: BLOCK -- reviewDecision unverifiable. [#$pr $repo]" >&2
+  exit 2
+}
+case "$review_decision" in
+  ""|APPROVED|REVIEW_REQUIRED|CHANGES_REQUESTED) : ;;
+  *)
+    echo "BLOCK: unrecognized reviewDecision '$review_decision' on #$pr (cannot verify review state)." >&2
+    echo "RESULT: BLOCK -- reviewDecision unverifiable. [#$pr $repo]" >&2
+    exit 2 ;;
+esac
+
+echo "RESULT: PASS -- all checks green, 0 actionable review-body findings, reviewDecision=${review_decision:-<none>} (not an active CHANGES_REQUESTED). [#$pr $repo]"
 exit 0

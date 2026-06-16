@@ -40,9 +40,17 @@ def check(label, ok):
         FAILS.append(label)
 
 
-def rollup(*contexts):
-    """Build a statusCheckRollup JSON document from context dicts."""
-    return json.dumps({"statusCheckRollup": list(contexts)})
+def rollup(*contexts, review_decision="__OMIT__"):
+    """Build a statusCheckRollup JSON document from context dicts.
+
+    review_decision: when supplied, add a top-level `reviewDecision` field (the
+    #117 gate). Use None to emit an explicit JSON null; leave at the "__OMIT__"
+    sentinel to omit the field entirely (mirrors a gh response that carries only
+    statusCheckRollup). Both null and absent must read as 'no active decision'."""
+    doc = {"statusCheckRollup": list(contexts)}
+    if review_decision != "__OMIT__":
+        doc["reviewDecision"] = review_decision
+    return json.dumps(doc)
 
 
 def checkrun(name, status, conclusion):
@@ -245,6 +253,57 @@ def main():
     rc, _, _ = run(["1", "owner/repo", "--codoki-only"],
                    fixture_json=rollup(statusctx("Codoki PR Review", "SUCCESS")))
     check("--codoki-only: StatusContext Codoki SUCCESS -> exit 0", rc == 0)
+
+    print("== FULL MODE: reviewDecision gate (#117, coupled with findings) ==")
+    green_ctx = (checkrun("ci", "COMPLETED", "SUCCESS"), statusctx("buildkite", "SUCCESS"))
+    # 2a. ACTIVE CHANGES_REQUESTED (reviewDecision set AND actionable findings>0)
+    #     -> BLOCK. The findings>0 gate catches it (the coupling by ordering).
+    rc, _, _ = run(["1", "owner/repo"],
+                   fixture_json=rollup(*green_ctx, review_decision="CHANGES_REQUESTED"),
+                   unreplied_findings=3)
+    check("CHANGES_REQUESTED + 3 actionable findings (active) -> exit 2 (block)", rc == 2)
+    # 2b. APPROVED with 0 findings -> PASS.
+    rc, _, _ = run(["1", "owner/repo"],
+                   fixture_json=rollup(*green_ctx, review_decision="APPROVED"),
+                   unreplied_findings=0)
+    check("reviewDecision=APPROVED + 0 findings -> exit 0 (pass)", rc == 0)
+    # 2c. REVIEW_REQUIRED and explicit null with 0 findings -> PASS (no active decision).
+    rc, _, _ = run(["1", "owner/repo"],
+                   fixture_json=rollup(*green_ctx, review_decision="REVIEW_REQUIRED"),
+                   unreplied_findings=0)
+    check("reviewDecision=REVIEW_REQUIRED + 0 findings -> exit 0 (pass)", rc == 0)
+    rc, _, _ = run(["1", "owner/repo"],
+                   fixture_json=rollup(*green_ctx, review_decision=None),
+                   unreplied_findings=0)
+    check("reviewDecision=null + 0 findings -> exit 0 (pass)", rc == 0)
+    rc, _, _ = run(["1", "owner/repo"],
+                   fixture_json=rollup(*green_ctx),  # field omitted entirely
+                   unreplied_findings=0)
+    check("reviewDecision absent + 0 findings -> exit 0 (pass)", rc == 0)
+    # 2d. SUPERSEDED CHANGES_REQUESTED: reviewDecision still CHANGES_REQUESTED but
+    #     the fix landed so 0 actionable findings remain -> STAYS PASS. This is the
+    #     key regression: the gate must NEVER block a stale/superseded review.
+    rc, _, _ = run(["1", "owner/repo"],
+                   fixture_json=rollup(*green_ctx, review_decision="CHANGES_REQUESTED"),
+                   unreplied_findings=0)
+    check("SUPERSEDED CHANGES_REQUESTED (0 findings) -> exit 0 (pass, no regression)", rc == 0)
+    # 2e. UNRECOGNIZED reviewDecision value -> FAIL CLOSED (exit 2), mirroring the
+    #     unknown-__typename posture (even with all checks green and 0 findings).
+    rc, _, _ = run(["1", "owner/repo"],
+                   fixture_json=rollup(*green_ctx, review_decision="WEIRD_STATE"),
+                   unreplied_findings=0)
+    check("unrecognized reviewDecision 'WEIRD_STATE' -> exit 2 (fail closed)", rc == 2)
+    # ... and case-insensitively normalized: a lowercased known value still passes.
+    rc, _, _ = run(["1", "owner/repo"],
+                   fixture_json=rollup(*green_ctx, review_decision="approved"),
+                   unreplied_findings=0)
+    check("reviewDecision='approved' (lowercase) normalizes -> exit 0 (pass)", rc == 0)
+    # codoki-only must NOT consult reviewDecision: a CHANGES_REQUESTED settles fine
+    # so long as the Codoki check is green (the gate is full-mode only).
+    rc, _, _ = run(["1", "owner/repo", "--codoki-only"],
+                   fixture_json=rollup(checkrun("Codoki PR Review", "COMPLETED", "SUCCESS"),
+                                       review_decision="CHANGES_REQUESTED"))
+    check("--codoki-only ignores reviewDecision=CHANGES_REQUESTED -> exit 0", rc == 0)
 
     print("== USAGE ==")
     rc, _, _ = run([], fixture_json=ALL_GREEN)
