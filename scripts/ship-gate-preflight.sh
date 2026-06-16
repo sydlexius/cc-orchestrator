@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# ship-gate-preflight.sh <pr> [owner/repo]
+#
+# DETERMINISTIC merge-readiness ORACLE (#110). The single source of truth for
+# whether a PR may be presented as a ship-gate or declared MERGE-READY. It reads
+# GitHub's statusCheckRollup (the same rollup the merge button respects) plus the
+# authoritative unreplied-comments check, and FAILS CLOSED on every ambiguous or
+# unknown state. There is NO "required vs non-required" distinction on purpose: a
+# red or still-running check is a block. This exists because a lead once declared
+# a PR "merge-ready" while a non-required check was red and rationalized it away
+# (mxlrcgo-svc #261, 2026-06-15). The fix is a gate that cannot be reasoned
+# around, not a promise.
+#
+# CONTRACT
+#   Positional args:
+#     <pr>          PR number (required).
+#     [owner/repo]  Repo slug (optional; resolved from `gh repo view` if omitted).
+#   Flags:
+#     --codoki-only            Settlement mode for pr-watch.sh: check ONLY whether
+#                              the Codoki check has COMPLETED with an acceptable
+#                              conclusion. Skips the full enumeration AND skips
+#                              pr-unreplied-comments.sh.
+#     --codoki-pattern <name>  Override the Codoki check name to match in
+#                              --codoki-only mode (default: "Codoki PR Review").
+#   Exit codes:
+#     0  PASS  - all gates green (full mode: every check terminal+acceptable AND
+#               0 actionable review-body findings; codoki-only: Codoki settled OK).
+#     1  USAGE - bad/missing arguments.
+#     2  BLOCK - a gate failed, OR any lookup/parse error (gh/jq/helper failure).
+#               BLOCK is the fail-closed code: an unknown state is ALWAYS a block.
+#
+# CHECK ACCEPTANCE (statusCheckRollup contexts, both rollup shapes):
+#   CheckRun     (__typename == "CheckRun"):     PASS requires status == COMPLETED
+#                AND conclusion in {SUCCESS, NEUTRAL, SKIPPED}. Anything else
+#                (IN_PROGRESS, QUEUED, PENDING, FAILURE, CANCELLED, TIMED_OUT,
+#                ACTION_REQUIRED, STARTUP_FAILURE, STALE, null/empty, or any
+#                status != COMPLETED) BLOCKS.
+#   StatusContext(__typename == "StatusContext"): PASS requires state == SUCCESS
+#                ONLY. Any other state (PENDING, EXPECTED, ERROR, FAILURE) BLOCKS.
+#   EMPTY rollup (no checks at all): BLOCKS in full mode. A PR with no checks is
+#                NOT "verified" - we do not vacuously pass an unverified PR.
+#
+# FULL-MODE REVIEW GATE (default; not in --codoki-only):
+#   After every check passes, run `~/.claude/scripts/pr-unreplied-comments.sh
+#   <pr> <repo>` and parse its `Review-body comments with actionable findings: N`
+#   line. N>0 BLOCKS. A missing/erroring helper BLOCKS (fail closed). The line is
+#   only PRINTED when N>0, so its ABSENCE on a clean (exit-0) helper run means
+#   N==0 and PASSES. The full gate = all checks green AND N==0.
+#
+# FOLLOW-UP (required; the oracle alone does NOT close the dogfood gap mxlrcgo-svc
+#   #261): the EXTERNAL callers must INVOKE this oracle. (a) pr-watch.sh should
+#   read the `Codoki PR Review` check via `--codoki-only` off statusCheckRollup
+#   instead of the reviews API (and only block on CR when CR was actually
+#   triggered, per #34). (b) /merge-pr Step 1 should call this oracle as its
+#   merge-readiness gate. Those callers are user-level today; wiring them is a
+#   tracked follow-up that becomes in-repo once #30 PR B brings the
+#   commands+helpers into the plugin. "Oracle created" is NOT "gap closed".
+set -euo pipefail
+
+# Acceptable CheckRun conclusions (terminal + green-enough).
+ACCEPTABLE_CONCLUSIONS='["SUCCESS","NEUTRAL","SKIPPED"]'
+
+codoki_only=false
+codoki_pattern="Codoki PR Review"
+args=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --codoki-only) codoki_only=true; shift ;;
+    --codoki-pattern)
+      if [ "$#" -lt 2 ]; then
+        echo "usage: ship-gate-preflight.sh: --codoki-pattern requires a value" >&2
+        exit 1
+      fi
+      codoki_pattern="$2"; shift 2 ;;
+    --) shift; while [ "$#" -gt 0 ]; do args+=("$1"); shift; done ;;
+    -*) echo "usage: ship-gate-preflight.sh: unknown flag '$1'" >&2; exit 1 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+
+pr="${args[0]:-}"
+repo="${args[1]:-}"
+if [ -z "$pr" ]; then
+  echo "usage: ship-gate-preflight.sh <pr> [owner/repo] [--codoki-only] [--codoki-pattern <name>]" >&2
+  exit 1
+fi
+
+if [ -z "$repo" ]; then
+  repo="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null)" || {
+    echo "BLOCK: could not resolve repo (pass owner/repo explicitly)" >&2
+    exit 2
+  }
+  if [ -z "$repo" ]; then
+    echo "BLOCK: could not resolve repo (pass owner/repo explicitly)" >&2
+    exit 2
+  fi
+fi
+
+# FAIL CLOSED: any gh failure -> BLOCK.
+json="$(gh pr view "$pr" --repo "$repo" --json statusCheckRollup 2>/dev/null)" || {
+  echo "BLOCK: 'gh pr view' failed for #$pr in $repo" >&2
+  exit 2
+}
+
+# FAIL CLOSED: malformed JSON -> BLOCK. Validate before any field access.
+if ! jq -e . >/dev/null 2>&1 <<<"$json"; then
+  echo "BLOCK: malformed JSON from 'gh pr view' for #$pr in $repo" >&2
+  exit 2
+fi
+
+if [ "$codoki_only" = true ]; then
+  # Settlement mode: ONLY the Codoki check must be COMPLETED with an acceptable
+  # conclusion. Missing / incomplete / failed -> BLOCK. (StatusContext-shaped
+  # Codoki entries are also accepted via the same name/state mapping.)
+  verdict="$(jq -r --arg pat "$codoki_pattern" --argjson ok "$ACCEPTABLE_CONCLUSIONS" '
+    [ (.statusCheckRollup // [])[]
+      | { name: (.name // .context // "unknown"),
+          known: ((.__typename // "") | (. == "CheckRun" or . == "StatusContext")),
+          status: (.status // "COMPLETED" | ascii_upcase),
+          result: ((.conclusion // .state // "") | ascii_upcase) }
+      | select(.name == $pat) ] as $matches
+    | if ($matches | length) == 0 then "MISSING"
+      elif ($matches | map(select(.known and .status == "COMPLETED" and (.result as $r | $ok | index($r)))) | length) == ($matches | length)
+        then "OK"
+      else "BAD:" + ($matches | map("\(.name) known=\(.known) status=\(.status) result=\(.result)") | join("; "))
+      end
+  ' <<<"$json")" || {
+    echo "BLOCK: jq parse of statusCheckRollup failed (#$pr)" >&2
+    exit 2
+  }
+  case "$verdict" in
+    OK)
+      echo "RESULT: PASS -- Codoki check '$codoki_pattern' settled (COMPLETED, acceptable conclusion). [#$pr $repo]"
+      exit 0 ;;
+    MISSING)
+      echo "BLOCK: Codoki check '$codoki_pattern' not found in statusCheckRollup (#$pr). Not settled." >&2
+      echo "RESULT: BLOCK -- Codoki not settled. [#$pr $repo]" >&2
+      exit 2 ;;
+    *)
+      echo "BLOCK: Codoki check not settled: ${verdict#BAD:} (#$pr)" >&2
+      echo "RESULT: BLOCK -- Codoki not settled. [#$pr $repo]" >&2
+      exit 2 ;;
+  esac
+fi
+
+# --- FULL MODE -------------------------------------------------------------
+
+# Count of checks (empty rollup -> 0 -> BLOCK below).
+count="$(jq -r '(.statusCheckRollup // []) | length' <<<"$json")" || {
+  echo "BLOCK: jq parse of statusCheckRollup failed (#$pr)" >&2
+  exit 2
+}
+if [ "$count" -eq 0 ]; then
+  echo "BLOCK: no checks on #$pr (empty statusCheckRollup). An unverified PR is not merge-ready." >&2
+  echo "RESULT: BLOCK -- no checks. [#$pr $repo]" >&2
+  exit 2
+fi
+
+# A context is BAD if it is not terminal-and-acceptable. CheckRun: status must be
+# COMPLETED and conclusion in the acceptable set. StatusContext: state must be
+# SUCCESS (it has no .status, so default-COMPLETED makes only .state decide, and
+# SUCCESS is the only acceptable state). Discriminate on __typename so a
+# StatusContext is never wrongly treated as a (possibly-conclusion-bearing)
+# CheckRun. Anything not matching the per-shape PASS rule blocks (fail closed).
+bad="$(jq -r --argjson ok "$ACCEPTABLE_CONCLUSIONS" '
+  (.statusCheckRollup // [])[]
+  | (.__typename // "") as $t
+  | if $t == "StatusContext" then
+      { name: (.context // "unknown"),
+        kind: "StatusContext",
+        status: "-",
+        result: ((.state // "") | ascii_upcase),
+        bad: (((.state // "") | ascii_upcase) != "SUCCESS") }
+    elif $t == "CheckRun" then
+      { name: (.name // .context // "unknown"),
+        kind: "CheckRun",
+        status: ((.status // "") | ascii_upcase),
+        result: ((.conclusion // "") | ascii_upcase) }
+      | .bad = ( (.status != "COMPLETED") or ((.result | IN($ok[])) | not) )
+    else
+      # FAIL CLOSED: an unknown or absent __typename is ambiguous - the check
+      # shape cannot be verified, so it BLOCKS rather than falling through to the
+      # CheckRun pass-path (gh always emits __typename to discriminate the union).
+      { name: (.name // .context // "unknown"),
+        kind: (if $t == "" then "UNKNOWN-TYPE" else $t end),
+        status: "-",
+        result: "UNKNOWN-TYPE",
+        bad: true }
+    end
+  | select(.bad)
+  | "  - \(.name) [\(.kind)]: status=\(.status) result=\(.result)"
+' <<<"$json")" || {
+  echo "BLOCK: jq parse of statusCheckRollup failed (#$pr)" >&2
+  exit 2
+}
+
+if [ -n "$bad" ]; then
+  echo "BLOCK: red / incomplete checks on #$pr (every one blocks, required or not):" >&2
+  echo "$bad" >&2
+  echo "RESULT: BLOCK -- checks not all green. [#$pr $repo]" >&2
+  exit 2
+fi
+
+# All checks green. Now the authoritative review-body gate. FAIL CLOSED on a
+# missing/erroring helper. The helper only prints the count line when N>0, so a
+# clean (exit-0) run with no line means N==0.
+helper="${HOME}/.claude/scripts/pr-unreplied-comments.sh"
+if [ ! -x "$helper" ]; then
+  echo "BLOCK: pr-unreplied-comments.sh not found/executable at $helper (cannot verify review state)." >&2
+  echo "RESULT: BLOCK -- review gate unverifiable. [#$pr $repo]" >&2
+  exit 2
+fi
+
+unreplied_out="$("$helper" "$pr" "$repo" 2>/dev/null)" || {
+  echo "BLOCK: pr-unreplied-comments.sh failed for #$pr (cannot verify review state)." >&2
+  echo "RESULT: BLOCK -- review gate unverifiable. [#$pr $repo]" >&2
+  exit 2
+}
+
+# Extract N from "Review-body comments with actionable findings: N". Absent line
+# => N=0 (clean). A present line with a non-numeric tail would leave findings
+# empty -> treat as 0 only if no line matched; if a line matched, require digits.
+findings="$(printf '%s\n' "$unreplied_out" \
+  | sed -n 's/.*Review-body comments with actionable findings: \([0-9][0-9]*\).*/\1/p' \
+  | tail -n1)"
+if [ -z "$findings" ]; then
+  findings=0
+fi
+
+if [ "$findings" -gt 0 ]; then
+  echo "BLOCK: $findings actionable review-body finding(s) unaddressed on #$pr." >&2
+  echo "RESULT: BLOCK -- $findings actionable review-body finding(s). [#$pr $repo]" >&2
+  exit 2
+fi
+
+echo "RESULT: PASS -- all checks green AND 0 actionable review-body findings. [#$pr $repo]"
+exit 0
