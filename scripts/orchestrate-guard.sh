@@ -182,8 +182,10 @@ is_merge_api() {
 # view` bodies mentioning merge are NOT matched because the regex requires `merge` as a whole word
 # immediately after optional flag groups (each starting with `-`), not any token sequence.
 # Global flags before `pr` (e.g. `gh -R o/r pr merge`) are already handled by clause 1 (the `gh`
-# word match) and clause 2's pr-to-merge check finds `pr` wherever it sits. Mirrors is_gh_admin's
-# tolerant `pr` ... `merge` ordering check for the same reason: gh accepts `-R`/flags between them.
+# word match) and clause 2 finds `merge` after `pr` even with global flags between them. Same
+# motivation is_gh_admin documents (gh accepts `-R`/flags between `pr` and `merge`), but clause 2
+# uses a TIGHTER flag-group regex - not is_gh_admin's independent-word greps - because this path
+# lacks the `--admin` narrowing and must NOT match `pr <subcommand> ... merge` (e.g. comment bodies).
 # `--admin` forms are already Tier-1 (is_gh_admin, always denied); this is the marker-gated path.
 # Accepted F30 limitation: a body literally containing the phrase "pr merge" (with only flags
 # between them) trips it (whole-string grep, no shell-quote parsing) - rare, reword or use `!`.
