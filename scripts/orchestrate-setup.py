@@ -5,7 +5,7 @@
   up --team NAME --repo PATH [--spacing SEC]    arm a session (scaffold + marker + armed self-test)
   down [--team NAME]                            disarm (rm marker + print teardown checklist)
 
-Design: ~/.claude/skills/orchestrate/DESIGN-phase2-setup.md
+Design: ~/.claude/skills/orchestrate/design/DESIGN-phase2-setup.md
 All real paths come from env vars (see below) so the harness drives temp fixtures.
 """
 import argparse
@@ -45,7 +45,7 @@ GUARD = os.environ.get("ORCHESTRATE_GUARD", os.path.join(HOME, ".claude", "scrip
 # The BUNDLED guard ships beside this script (scripts/orchestrate-guard.sh). `configure` copies it
 # to the stable GUARD path so a fresh plugin install has a working floor at the path the
 # settings.json hook points at (Option A - the floor is settings-resident, never plugin-gated; see
-# DESIGN-plugin-floor-lifecycle.md). Env-overridable so the harness can point it at a fixture.
+# skills/orchestrate/design/DESIGN-plugin-floor-lifecycle.md). Env-overridable so the harness can point it at a fixture.
 BUNDLED_GUARD = os.environ.get("ORCHESTRATE_BUNDLED_GUARD",
     os.path.join(os.path.dirname(os.path.realpath(__file__)), "orchestrate-guard.sh"))
 # Script-relative: under the plugin layout this script lives in scripts/ and the templates ship
@@ -466,7 +466,7 @@ def armed_self_test():
       - Tier-2 merge-by-API (`gh api ... pulls/N/merge` mutating), AND
       - Tier-2 `gh pr merge` CLI (`is_pr_merge`, #105).
     All payloads are built here and fed on stdin, so the live hook never sees a trigger
-    on the command line (the orchestrate test-driving rule). DESIGN-deterministic-floor.md
+    on the command line (the orchestrate test-driving rule). skills/orchestrate/design/DESIGN-deterministic-floor.md
     (section 'Cases (minimum)') claims this assertion for all three paths -- the code
     matches the doc."""
     t1 = _feed_guard("git push origin main")
@@ -723,7 +723,7 @@ def _narrow_allow_list(allow):
 # Well-formed Slack channel-id format: a leading uppercase letter + 5+ uppercase
 # alphanumeric chars (min 6 total). The leading-letter requirement excludes
 # all-digit strings while covering all known prefixes (C, G, D, W). See
-# DESIGN-maintainer-channel.md (doctor check, F3-B-4).
+# skills/orchestrate/design/DESIGN-maintainer-channel.md (doctor check, F3-B-4).
 SLACK_CHANNEL_RE = re.compile(r"[A-Z][A-Z0-9]{5,}")
 
 
@@ -733,7 +733,7 @@ def check_slack_channel():
     tools, so reachability is OUT of scope (validated at runtime by the lead's
     first slack_send_message; degrades per D4). This NEVER returns FAIL - the
     channel is optional and must not block doctor/up. See
-    DESIGN-maintainer-channel.md (check_slack_channel, F1-3 / F2-C-3)."""
+    skills/orchestrate/design/DESIGN-maintainer-channel.md (check_slack_channel, F1-3 / F2-C-3)."""
     channel = os.environ.get("ORCHESTRATE_SLACK_CHANNEL", "")
     if not channel:
         return _emit(WARN, "ORCHESTRATE_SLACK_CHANNEL not set (channel optional; terminal-only mode)")

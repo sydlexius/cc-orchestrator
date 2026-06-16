@@ -26,7 +26,7 @@ The repo is structured as a Claude Code plugin (and its own single-plugin market
 `.claude-plugin/{plugin.json,marketplace.json}`, the skill under `skills/orchestrate/`, the runtime
 under `scripts/`. The deterministic floor is intentionally NOT a plugin hook - it stays a
 `settings.json` PreToolUse hook at the stable `~/.claude/scripts/orchestrate-guard.sh` path
-(Option A; see `DESIGN-plugin-floor-lifecycle.md`), so it survives plugin enable/disable/update.
+(Option A; see `skills/orchestrate/design/DESIGN-plugin-floor-lifecycle.md`), so it survives plugin enable/disable/update.
 
 Runtime (`scripts/`; canonical source is this repo):
 
@@ -64,7 +64,7 @@ Runtime (`scripts/`; canonical source is this repo):
 
 Skill definition (`skills/orchestrate/`): `SKILL.md` (lead playbook) + `templates/` (per-role
 charters + schemas) + `engage-ralph-loop.md` (the adversarial-critic-loop brief; named to
-disambiguate from the `/ralph-loop` skill) + `DESIGN-*`/`PLAN-*`/`ROADMAP-*` (repo root).
+disambiguate from the `/ralph-loop` skill) + `DESIGN-*`/`PLAN-*`/`ROADMAP-*` (under `skills/orchestrate/design/`).
 
 ## Gates (run locally; CI enforces them)
 
@@ -104,7 +104,7 @@ Keep the SKILL.md version line and the git tag in lockstep.
 - Accepted false-positive limitations (documented, do not chase without shell-quote parsing): a
   flag token quoted inside an accepting (sub)command's argument, e.g. `git commit -m "...--no-verify..."`
   or a `gh pr comment` body quoting the literal merge command. Rare, recoverable by rewording or the
-  human `!` shell escape. See DESIGN-deterministic-floor.md (F30).
+  human `!` shell escape. See skills/orchestrate/design/DESIGN-deterministic-floor.md (F30).
 - Security-floor changes get full rigor: TDD harness cases + an independent adversarial critic pass
   (the `engage-ralph-loop.md` brief), converging at K=2 dry rounds with all gates green.
 

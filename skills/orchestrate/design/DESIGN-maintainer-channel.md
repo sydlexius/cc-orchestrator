@@ -1,7 +1,7 @@
 # Design: bidirectional maintainer channel (Slack via official MCP plugin)
 
 Date: 2026-06-09
-Status: CONVERGED (2026-06-10, K=2 dry at rounds 14-15); ready for implementation
+Status: SHIPPED (implemented; was CONVERGED (2026-06-10, K=2 dry at rounds 14-15), ready for implementation)
 Issue: #10
 Companion: `SKILL.md` (LEAD SIGNAL DISCIPLINE), `orchestrate-setup.py` (`doctor`),
 `engage-ralph-loop.md` (the adversarial pass this spec must survive)

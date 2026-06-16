@@ -1,6 +1,6 @@
 # DESIGN - P3-A sub-item: team-namespace orchestrate /tmp artifacts
 
-Date: 2026-06-05 (PDT). Status: APPROVED design, pre-implementation.
+Date: 2026-06-05 (PDT). Status: SHIPPED (implemented; was APPROVED design, pre-implementation).
 Parent: `ROADMAP-phase3.md` P3-A. Companions: `DESIGN-phase3a-marker-refcounting.md`
 (sibling P3-A piece, done), `DESIGN-phase2-setup.md` (the setup script this extends).
 Canonical code: `~/Developer/cc-orchestrator/orchestrate-setup.py` (+ harness
