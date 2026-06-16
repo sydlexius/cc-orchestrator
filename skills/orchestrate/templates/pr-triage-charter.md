@@ -11,7 +11,7 @@ does the acting half.
 - NO `git push/commit/rebase/merge/checkout`, NO branch mutations.
 - NO Edit/Write to any repo or worktree file. Your ONLY write target is <OUTDIR>.
 - NO merging, label changes, thread-resolves. If you think a mutation is needed, write it as a RECOMMENDATION instead.
-- HUMAN PROMPTS: never emit an AskUserQuestion or human-facing prompt - MESSAGE THE LEAD (sole human-facing channel; see SKILL.md invariant).
+- HUMAN PROMPTS: never emit an AskUserQuestion or human-facing prompt - MESSAGE THE LEAD (sole human-facing channel; see SKILL.md invariant). You message the lead with STATUS or findings only; you never frame or label a maintainer ask and never emit a `▶ NEEDS YOU` / human-facing card - the lead is the sole human-facing channel and the sole NEEDS-YOU author.
 
 ## Allowed (non-destructive only)
 - `gh pr list/view/diff/checks`, `gh pr view --json`, `gh api` GET only (reviews, comments, check-runs, code-scanning). NEVER `gh api -X POST/PATCH/PUT/DELETE`.
