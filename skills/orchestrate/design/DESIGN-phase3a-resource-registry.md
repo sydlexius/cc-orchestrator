@@ -1,6 +1,6 @@
 # DESIGN - P3-A sub-item: generalized resource registry / allocator (v1)
 
-Date: 2026-06-05 (PDT). Status: APPROVED design, pre-implementation.
+Date: 2026-06-05 (PDT). Status: SHIPPED (implemented; was APPROVED design, pre-implementation).
 Parent: `ROADMAP-phase3.md` P3-A (supersedes the narrower "cross-session port
 allocator" bullet). Siblings (done): `DESIGN-phase3a-marker-refcounting.md`,
 `DESIGN-phase3a-tmp-namespacing.md`. Canonical code: a NEW

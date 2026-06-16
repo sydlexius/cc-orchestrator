@@ -13,7 +13,7 @@
 #            present and fresh - so a SOLO session (no marker) can merge (the maintainer's
 #            /merge-pr), while a marker-active team session blocks a bot from merging.
 #
-# Spec: ~/.claude/skills/orchestrate/DESIGN-deterministic-floor.md
+# Spec: ~/.claude/skills/orchestrate/design/DESIGN-deterministic-floor.md
 # NO `set -e`: a grep no-match returns 1 and is normal control flow here.
 set -u
 
@@ -158,7 +158,7 @@ is_gh_admin() {
 # so a SOLO/non-marker session (the maintainer's own /merge-pr) runs prompt-free. The original
 # objection (a deny blocks the human's own merge) is moot: the deny is MARKER-GATED (solo is not
 # denied) and in a marker-active team session the human already merges from a SEPARATE terminal
-# (no marker there). See DESIGN-deterministic-floor.md + #105.
+# (no marker there). See skills/orchestrate/design/DESIGN-deterministic-floor.md + #105.
 
 # merge-by-API: gh + api + a pulls/<n>/merge path AND a mutating method/field.
 # A bare GET (no method, no field) is a merge-STATUS check and is allowed.

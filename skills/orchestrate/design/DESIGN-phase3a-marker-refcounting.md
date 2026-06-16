@@ -1,6 +1,6 @@
 # DESIGN - Phase 3A: per-session marker refcounting (orchestrate floor)
 
-Date: 2026-06-05 (PDT). Status: APPROVED design, pre-implementation.
+Date: 2026-06-05 (PDT). Status: SHIPPED (implemented; was APPROVED design, pre-implementation).
 Companions (read for style/context): `DESIGN-deterministic-floor.md` (Phase 1),
 `DESIGN-phase2-setup.md` (Phase 2), `ROADMAP-phase3.md` (P3-A item),
 `REVIEW-FINDINGS.md`. Canonical code lives in `~/Developer/claude-kit/`

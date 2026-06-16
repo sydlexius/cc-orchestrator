@@ -1,7 +1,7 @@
 # Design: `orchestrate-setup.py` (Phase 2 - bootstrap + teardown)
 
 Date: 2026-06-05
-Status: APPROVED (brainstorm), pre-implementation
+Status: SHIPPED (implemented; was APPROVED (brainstorm), pre-implementation)
 Companion: `DESIGN-deterministic-floor.md` (Phase 1, the guard this script arms),
 `REVIEW-FINDINGS.md` (the Phase-3 lifecycle tranche this script deliberately does NOT do),
 `SKILL.md` (the setup sequence this script automates).

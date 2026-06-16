@@ -31,7 +31,7 @@ Skill definition (`skills/orchestrate/`):
 - `SKILL.md` + `templates/` (the lead playbook + the per-role charters and schemas).
 - `engage-ralph-loop.md` - the reusable adversarial-critic-loop brief (point `/ralph-loop` or any
   iterate-until-done harness at it; named to disambiguate from the `/ralph-loop` skill itself).
-- `DESIGN-*.md` / `PLAN-*.md` / `ROADMAP-phase3.md` - the design corpus (repo root).
+- `DESIGN-*.md` / `PLAN-*.md` / `ROADMAP-phase3.md` - the design corpus (under `skills/orchestrate/design/`).
 
 ## Gates (run locally; enforced in CI)
 
@@ -54,7 +54,7 @@ single-plugin marketplace) so it can be installed without local git/symlinks - v
 or `claude --plugin-dir <repo>` for development. The deterministic floor is intentionally NOT a
 plugin hook: it stays a `settings.json` PreToolUse hook at the stable path
 `~/.claude/scripts/orchestrate-guard.sh`, wired with consent by `orchestrate-setup.py configure`,
-so it survives plugin enable/disable/update (see `DESIGN-plugin-floor-lifecycle.md`, Option A).
+so it survives plugin enable/disable/update (see `skills/orchestrate/design/DESIGN-plugin-floor-lifecycle.md`, Option A).
 
 The plugin packaging lands across #30 (the `configure` guard-deploy step, the symlink-retirement
 cutover, and the bundled commands follow in the same effort); until that cutover, an existing

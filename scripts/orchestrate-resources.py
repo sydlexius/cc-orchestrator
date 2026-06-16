@@ -8,7 +8,7 @@
 
 State: $ORCHESTRATE_RESOURCES_FILE (default ~/.claude/orchestrate-resources.json),
 mutated under an exclusive flock with an atomic temp+replace write.
-Design: ~/.claude/skills/orchestrate/DESIGN-phase3a-resource-registry.md
+Design: ~/.claude/skills/orchestrate/design/DESIGN-phase3a-resource-registry.md
 """
 import argparse
 import datetime
