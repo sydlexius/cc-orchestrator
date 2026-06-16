@@ -70,7 +70,7 @@ disambiguate from the `/ralph-loop` skill) + `DESIGN-*`/`PLAN-*`/`ROADMAP-*` (un
 
 ```sh
 shellcheck scripts/orchestrate-guard.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh
-ruff check --select F,E741 scripts/orchestrate-*.py scripts/planner_classify.py test-orchestrate-*.py test-planner-classify.py test-gh-wrappers.py
+ruff check --select F,E741 scripts/orchestrate-*.py scripts/planner_classify.py test-orchestrate-*.py test-planner-classify.py test-gh-wrappers.py test-version-lockstep.py
 ./scripts/orchestrate-guard.sh --self-test    # MUST use ./ - the self-test re-invokes "$0";
                                               # `bash scripts/orchestrate-guard.sh` makes $0 a bare name -> 127
 python3 test-orchestrate-guard.py
@@ -79,6 +79,7 @@ python3 test-orchestrate-setup.py
 python3 test-planner-classify.py
 python3 test-gh-wrappers.py
 python3 test-ship-gate-preflight.py
+python3 test-version-lockstep.py
 ```
 
 ## Versioning
@@ -92,6 +93,11 @@ addition, MAJOR for a breaking charter or deterministic-floor change. Tag releas
 Release whose notes are auto-generated from the merged PRs (no maintained changelog file - git
 history + the per-tag Release notes are the record, matching the GitHub-auto-gen preference).
 Keep the SKILL.md version line and the git tag in lockstep.
+
+LOCKSTEP RULE: `.claude-plugin/plugin.json` "version" MUST move in lockstep with the
+SKILL.md `**Version**` line on every bump. SKILL.md is the human source of truth; plugin.json
+drives `/plugin marketplace` update-detection, so they must never diverge. The CI
+`test-version-lockstep.py` harness enforces this: a drift fails the gate.
 
 ## Working ON the security floor (critical rules)
 

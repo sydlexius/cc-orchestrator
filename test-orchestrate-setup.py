@@ -239,6 +239,40 @@ def main():
         rc, out = run(["up", "--team", "noenv", "--repo", repo], env_overrides=pe_ov3)
         check("up with no stillwater env still succeeds (rc0)", rc == 0 and "SESSION ARMED" in out)
 
+        # #123: up emits a loud stale-guard WARNING when ORCHESTRATE_BUNDLED_GUARD differs
+        # from the deployed ORCHESTRATE_GUARD, but still exits 0 (loud-non-fatal design).
+        # When they match, up is quiet (no WARNING block).
+        #
+        # Approach: use ORCHESTRATE_BUNDLED_GUARD to point at an alternate file, and
+        # ORCHESTRATE_GUARD at the existing stub guard (`guard`). A stale "bundle" (different
+        # content) triggers the warning; an identical "bundle" (copy of the deployed) does not.
+        stale_bundle = os.path.join(td, "stale_bundle.sh")
+        open(stale_bundle, "w").write("#!/bin/sh\n# stale bundled guard (different)\nexit 0\n")
+        os.chmod(stale_bundle, 0o755)
+        fresh_bundle = os.path.join(td, "fresh_bundle.sh")
+        import shutil as _shutil
+        _shutil.copy2(guard, fresh_bundle)
+
+        marker_demo = os.path.join(floor_dir, _key(TEST_TMUX))
+        if os.path.exists(marker_demo):
+            os.remove(marker_demo)
+        stale_ov = dict(upov); stale_ov["ORCHESTRATE_BUNDLED_GUARD"] = stale_bundle
+        rc, out = run(["up", "--team", "stale_guard_team", "--repo", repo], env_overrides=stale_ov)
+        check("#123: up warns (stale bundle) - loud WARNING block in output", "WARNING: STALE FLOOR GUARD" in out)
+        check("#123: up warns (stale bundle) - names the configure remedy", "configure --apply" in out)
+        check("#123: up warns (stale bundle) - names restart remedy", "RESTART" in out)
+        check("#123: up warns (stale bundle) - still exits 0 (non-fatal)", rc == 0)
+        check("#123: up warns (stale bundle) - still arms session (SESSION ARMED)", "SESSION ARMED" in out)
+
+        marker_demo = os.path.join(floor_dir, _key(TEST_TMUX))
+        if os.path.exists(marker_demo):
+            os.remove(marker_demo)
+        fresh_ov = dict(upov); fresh_ov["ORCHESTRATE_BUNDLED_GUARD"] = fresh_bundle
+        rc, out = run(["up", "--team", "fresh_guard_team", "--repo", repo], env_overrides=fresh_ov)
+        check("#123: up quiet (matching bundle) - no WARNING block", "WARNING: STALE FLOOR GUARD" not in out)
+        check("#123: up quiet (matching bundle) - exits 0", rc == 0)
+        check("#123: up quiet (matching bundle) - arms session", "SESSION ARMED" in out)
+
         # #10: check_slack_channel() is a FORMAT-only, WARN-level, optional doctor check.
         # It reads ORCHESTRATE_SLACK_CHANNEL from env; it NEVER returns FAIL (the channel is
         # optional and must not block doctor/up). The healthy wired+guard fixture means doctor

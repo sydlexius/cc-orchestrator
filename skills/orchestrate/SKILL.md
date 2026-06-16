@@ -5,7 +5,7 @@ description: Use when scaffolding and running a lead-orchestrated multi-agent se
 
 # Orchestrate: lead-run multi-agent PR pipeline
 
-**Version 0.29.0** (semver; releases tagged `vX.Y.Z`). Bump on any material change to this skill, its templates, or the runtime - PATCH for a fix, MINOR for a new rule/feature, MAJOR for a breaking charter or deterministic-floor change - so `/reload-skills` surfaces the new number and drift between the symlinked repo and the loaded skill is visible. History: `git log` + the GitHub Release notes cut at each `vX.Y.Z` tag.
+**Version 0.30.0** (semver; releases tagged `vX.Y.Z`). Bump on any material change to this skill, its templates, or the runtime - PATCH for a fix, MINOR for a new rule/feature, MAJOR for a breaking charter or deterministic-floor change - so `/reload-skills` surfaces the new number and drift between the symlinked repo and the loaded skill is visible. History: `git log` + the GitHub Release notes cut at each `vX.Y.Z` tag.
 
 You are the LEAD (orchestrator). You delegate building and the mechanical PR
 lifecycle to single-purpose teammates, and you keep for yourself the decisions
@@ -99,6 +99,20 @@ dispatch-map entry
 ```
 
 MERGE HANDOFF (#9 - the human-merge path that actually works). When a PR is MERGE-READY and the maintainer gives the go, the merge is HUMAN-run - but NOT via a `!`-bang inside the IDE/session shell. A `! gh pr merge <n> --squash` fails SILENTLY in the IDE-hosted Claude Code shell (it errors and the PR is NOT merged - recurring dogfood friction). The lead hands off the WORKING path instead: "run `gh pr merge <n> --squash --delete-branch` in a SEPARATE plain terminal OUTSIDE the IDE, or click 'Squash and merge' in the GitHub UI". The lead then VERIFIES merged state (`gh pr view <n> --json state,mergeCommit` -> `MERGED` + a real mergeCommit) BEFORE any post-merge cleanup - never assume the merge happened from a "go". Merge stays human-executed; the deterministic floor and the merge gate are unchanged.
+
+`gh pr` - WHAT TO DO (decision index, #124; pointers into the canonical floor/merge-policy prose above):
+- PROMPT-FREE subcommands (allow-listed via `Bash(gh pr <sub> *)`): `view`, `diff`, `checks`,
+  `create`, `list`, `status`, `edit`, `ready`, `comment`. These run without a permission prompt.
+- `gh pr merge`: allow-listed as `Bash(gh pr merge *)` for SOLO/non-marker sessions - the
+  maintainer's `/merge-pr` runs prompt-free there. In a MARKER-ACTIVE team session the floor
+  HARD-DENIES it (Tier-2; see DETERMINISTIC FLOOR above) - a bot cannot merge. In that case
+  the lead SURFACES the merge to the human (see MERGE HANDOFF above and the `!`-bang gotcha).
+- `gh pr merge` IDE SILENT-FAIL GOTCHA: `! gh pr merge <n>` inside the IDE-hosted shell fails
+  silently (no error shown, PR not merged). Cross-ref MERGE HANDOFF above for the working path.
+- If a `gh pr` command ACTUALLY PROMPTS: the allow-list or deployed guard is stale, or the
+  command is out-of-policy. DO NOT "always allow" the blanket `Bash(gh pr *)` - doctor treats
+  that as a merge-gate shadow and hard-fails. Fix the deploy (`configure --apply` + session
+  restart) or use the narrow per-subcommand entry.
 
 ### Lead PR tooling (helper scripts) (#94)
 The lead's privileged PR-lifecycle steps (reply, resolve, read review bodies, watch, cleanup) have PURPOSE-BUILT helper scripts - USE THEM, do NOT hand-roll `gh api .../comments/{id}/replies` or GraphQL `resolveReviewThread` from scratch each time (verbose, error-prone, inconsistent; observed live before a lead discovered them via `ls`). Reference them BY NAME in NEW playbook prose so it survives the #30 plugin relayout (the helpers live in `~/.claude/scripts/` today and the lead invokes them from there; `configure`/the plugin path-resolves them going forward - the existing path-based references stay until #30, just do not add NEW hard-coded paths):
