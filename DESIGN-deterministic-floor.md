@@ -172,9 +172,11 @@ discipline.
 
 Adopted design (#105 - what ships):
 - **`gh pr merge` CLI -> MARKER-GATED FLOOR DENY (`is_pr_merge`).** The guard now
-  matches the `gh pr merge` subcommand sequence and exits 2 (block) when THIS session's
-  marker is active - mirroring `is_merge_api`. A floor deny OUTRANKS the allow-list, so
-  a blanket shadow (`gh pr *`) can never defeat it even if "always allow" re-grants it.
+  matches `gh pr merge` (and forms with global flags between `pr` and `merge`, e.g. `gh
+  pr -R owner/repo merge 5`, `gh pr --repo owner/repo merge 5`) and exits 2 (block) when
+  THIS session's marker is active - mirroring `is_merge_api` and the tolerant `pr ...
+  merge` ordering that `is_gh_admin` already uses. A floor deny OUTRANKS the allow-list,
+  so a blanket shadow (`gh pr *`) can never defeat it even if "always allow" re-grants it.
 - **`gh pr merge` CLI + EXPLICIT ALLOW-LIST ENTRY (the sanctioned form).** Because the
   floor is MARKER-GATED (solo/non-marker sessions are never denied), `Bash(gh pr merge *)`,
   `Bash(gh pr merge:*)`, or `Bash(gh pr merge)` can now be ADDED to the allow-list as the
@@ -252,9 +254,16 @@ Adopted design (#105 - what ships):
     uses `git -C <worktree>` routinely.
   - **gh global flags between `gh` and the subcommand are tolerated** (Finding
     F12): `gh -R owner/repo pr merge`, `gh --repo ... api ...` must still match.
-  - merge is matched on the `pr merge` SUBCOMMAND token sequence, NOT the word
-    "merge" as a substring (Finding F13: else `gh pr create --title 'merge auth'`
-    false-positives).
+  - **gh global flags between `pr` and `merge` are also tolerated** (the #105
+    adversarial finding): `gh pr -R owner/repo merge 5` and `gh pr --repo
+    owner/repo merge 5` are valid gh CLI spellings and must be caught alongside
+    the simple adjacent form. The `is_pr_merge` clause 2 regex allows zero or more
+    flag groups (each starting with `-`) between `pr` and `merge`, mirroring the
+    tolerant `pr` ... `merge` ordering already used in `is_gh_admin`.
+  - merge is matched on the `pr` ... `merge` SUBCOMMAND token sequence (with
+    optional flags), NOT the word "merge" as a substring (Finding F13: else
+    `gh pr create --title 'merge auth'` false-positives; the regex requires
+    `merge` as a whole word immediately following only flag-groups after `pr`).
   - merge-by-API is `gh api` whose path contains `pulls/<digits>/merge` AND that
     is MUTATING - i.e. has `-X|--method PUT|POST` OR a field flag
     (`-f|--field|-F|--input|--raw-field`) which implies POST (Finding F6). A bare

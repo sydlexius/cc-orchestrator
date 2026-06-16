@@ -175,16 +175,21 @@ is_merge_api() {
   return 1
 }
 
-# gh pr merge (the CLI squash/merge), marker-gated (#105). Matches gh + the ADJACENT `pr merge`
-# subcommand (pr immediately followed by the whole word merge) - NOT the word "merge" anywhere -
-# so a `gh pr comment`/`gh pr create` body that merely mentions merge is not a false-positive.
-# Global flags before `pr` (e.g. `gh -R o/r pr merge`) keep pr+merge adjacent, so they still match.
+# gh pr merge (the CLI squash/merge), marker-gated (#105). Matches gh + `pr` followed by `merge`,
+# tolerating global FLAGS (and their values) between `pr` and `merge` - so `gh pr -R owner/repo
+# merge 5` and `gh pr --repo owner/repo merge 5` are caught alongside the simple adjacent form.
+# NOT the word "merge" anywhere in a different subcommand - `gh pr comment`/`gh pr create`/`gh pr
+# view` bodies mentioning merge are NOT matched because the regex requires `merge` as a whole word
+# immediately after optional flag groups (each starting with `-`), not any token sequence.
+# Global flags before `pr` (e.g. `gh -R o/r pr merge`) are already handled by clause 1 (the `gh`
+# word match) and clause 2's pr-to-merge check finds `pr` wherever it sits. Mirrors is_gh_admin's
+# tolerant `pr` ... `merge` ordering check for the same reason: gh accepts `-R`/flags between them.
 # `--admin` forms are already Tier-1 (is_gh_admin, always denied); this is the marker-gated path.
-# Accepted F30 limitation: a body literally containing the adjacent phrase "pr merge" trips it
-# (whole-string grep, no shell-quote parsing) - rare, reword or use the human `!` escape.
+# Accepted F30 limitation: a body literally containing the phrase "pr merge" (with only flags
+# between them) trips it (whole-string grep, no shell-quote parsing) - rare, reword or use `!`.
 is_pr_merge() {
   printf '%s' "$cmd" | grep -Eq '(^|[^[:alnum:]_-])gh([[:space:]]|$)' || return 1
-  printf '%s' "$cmd" | grep -Eq '(^|[[:space:]])pr[[:space:]]+merge([[:space:]]|$)'
+  printf '%s' "$cmd" | grep -Eq '(^|[[:space:]])pr([[:space:]]+-[^[:space:]]+([[:space:]]+[^-[:space:]][^[:space:]]*)?)*[[:space:]]+merge([[:space:]]|$)'
 }
 
 # THIS session's marker present AND fresh. Keyed by $TMUX (sanitized) so one
@@ -229,11 +234,11 @@ marker_active() {
 # inside the merge branch). `$orig_cmd` is restored afterwards for the advisory gate.
 # Process substitution (not a pipe) so `exit 2` exits the script, not a subshell.
 #
-# Tier-2 is the merge-by-API path ONLY (`gh api ... pulls/N/merge` mutating). Both
-# Tier-1 and Tier-2 are exit-2 HARD denies, so a single first-match per-clause loop is
-# correct (no exit-0 branch to be pre-empted). `gh pr merge` is NOT gated here - the
-# allow-list makes Claude Code prompt the human for it (the hook cannot prompt on this
-# CC). REVISED 2026-06-06 after a live test proved CC ignores `permissionDecision:ask`.
+# Tier-2 covers BOTH the merge-by-API path (`gh api ... pulls/N/merge` mutating) AND the
+# `gh pr merge` CLI (`is_pr_merge`, #105). Both Tier-1 and Tier-2 are exit-2 HARD denies,
+# so a single first-match per-clause loop is correct (no exit-0 branch to be pre-empted).
+# History: the allow-list-omission approach (prompting the human) was tried but an "always
+# allow" click re-opened the bot-merge hole; REVISED to floor-gated deny (2026-06-15, #105).
 orig_cmd="$cmd"
 # Tracks whether ANY clause is a real push INVOCATION (command-position anchored), for the
 # advisory gate after the loop. Initialized here so it is always defined under `set -u`.

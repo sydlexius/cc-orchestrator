@@ -6,13 +6,13 @@ specified marker state, asserting the guard's decision:
   - "block": exit 2 (hard deny, stderr reason).
   - "allow": exit 0 with NO permissionDecision on stdout (plain pass-through).
 
-MERGE GATING (revised 2026-06-06): `gh pr merge` is NOT gated by this hook - it is gated
-by the allow-list (settings.json omits a `gh pr merge` entry, so Claude Code PROMPTS the
-human; an auto-mode bot stalls). A PreToolUse hook on this CC honors a hard deny but
-IGNORES `permissionDecision:"ask"`, so the hook cannot prompt - hence `gh pr merge` is a
-plain "allow" here, and ONLY the merge-by-API path (`gh api ... pulls/N/merge` mutating)
-stays a marker-gated hook deny (because `gh api *` is broadly allow-listed). The harness
-also asserts the guard NEVER emits a permissionDecision anymore.
+MERGE GATING (#105, 2026-06-15): BOTH `gh pr merge` CLI (is_pr_merge) AND merge-by-API
+(`gh api ... pulls/N/merge` mutating) are MARKER-GATED FLOOR DENIES (exit 2 when the
+session marker is active). A solo/non-marker session is never Tier-2-gated, so the
+maintainer's /merge-pr just works prompt-free. `gh pr -R owner/repo merge` and other
+global-flag forms between `pr` and `merge` are also matched (adversarial hardening).
+The harness also asserts the guard NEVER emits a permissionDecision (the allow-list
+`ask` approach was rejected after a live test proved CC ignores hook `ask` output).
 Run: python3 test-orchestrate-guard.py
 """
 import json
@@ -154,24 +154,41 @@ CASES = [
     ("git clean --force allowed", "git clean --force", False, "allow"),
     # `gh pr merge` is MARKER-GATED DENIED (#105): marker active -> block (a bot cannot merge in a
     # team session; the human merges from a SEPARATE terminal where no marker is present); marker
-    # absent (solo) -> allow, so the maintainer's /merge-pr just works prompt-free. The matcher keys
-    # on the adjacent `pr merge` SUBCOMMAND (not the word "merge" anywhere), so `gh pr comment`/
-    # `gh pr create` bodies mentioning merge are NOT blocked. `gh pr merge --admin` stays Tier-1.
+    # absent (solo) -> allow, so the maintainer's /merge-pr just works prompt-free. The matcher
+    # tolerates global FLAGS (and their values) between `pr` and `merge` - so `gh pr -R o/r merge`
+    # and `gh pr --repo o/r merge` are caught in addition to the simple adjacent form - while NOT
+    # matching a different `gh pr` subcommand (comment/create/view) whose body mentions merge.
+    # `gh pr merge --admin` stays Tier-1 (is_gh_admin, always denied regardless of marker).
     ("gh pr merge (marker active) -> block (#105 floor gate)", "gh pr merge 1868", True, "block"),
     ("gh pr merge --auto (active) -> block", "gh pr merge --auto 1868", True, "block"),
     ("gh pr merge --squash (active) -> block (the /merge-pr form)", "gh pr merge --squash 101", True, "block"),
     ("gh -R o/r pr merge (active) -> block (global flags before pr)", "gh -R o/r pr merge 1868", True, "block"),
+    # #105 adversarial fix: global flags BETWEEN pr and merge must also be caught
+    ("gh pr -R owner/repo merge 5 (active) -> block (flag between pr+merge, the bug)", "gh pr -R owner/repo merge 5", True, "block"),
+    ("gh pr --repo owner/repo merge 5 (active) -> block (long-flag between pr+merge)", "gh pr --repo owner/repo merge 5", True, "block"),
+    ("gh pr --repo owner/repo merge --auto (active) -> block (flag+value then merge)", "gh pr --repo owner/repo merge --auto", True, "block"),
+    # marker ABSENT (solo) -> must allow (so /merge-pr just works prompt-free)
     ("gh pr merge (marker ABSENT/solo) -> allow (so /merge-pr just works)", "gh pr merge 1868", False, "allow"),
     ("gh pr merge --squash (absent/solo) -> allow", "gh pr merge --squash 101", False, "allow"),
+    ("gh pr -R owner/repo merge 5 (absent/solo) -> allow", "gh pr -R owner/repo merge 5", False, "allow"),
     ("gh pr merge --admin (active) -> block (Tier-1 admin, always)", "gh pr merge --admin 5", True, "block"),
     ("gh pr merge --admin (absent) -> block (Tier-1 admin, always)", "gh pr merge --admin 5", False, "block"),
-    # #105 false-positive guards: a `gh pr comment` whose BODY mentions merge must NOT be blocked.
+    # #105 false-positive guards: a `gh pr <other-subcommand>` whose BODY mentions merge must NOT be blocked.
     ("gh pr comment body says merge (active) -> allow",
      'gh pr comment 5 -b "ready to merge this"', True, "allow"),
     ("gh pr comment body 'squash and merge' (active) -> allow",
      'gh pr comment 5 -b "lets squash and merge it"', True, "allow"),
-    # ACCEPTED F30 false-positive (rare, documented): a body literally containing the ADJACENT
-    # phrase "pr merge" trips the whole-string matcher (no shell-quote parsing). Reword or use !.
+    ("gh pr edit --add-label merge (active) -> allow",
+     'gh pr edit 5 --add-label merge', True, "allow"),
+    ("gh pr view --json mergeable (active) -> allow",
+     'gh pr view 5 --json mergeable', True, "allow"),
+    ("git merge main (active) -> allow (a git merge, no gh)",
+     'git merge main', True, "allow"),
+    ("gh pr create -t 'pr merge gate' (active) -> allow (pr not followed by flags-then-merge)",
+     'gh pr create -t "pr merge gate"', True, "allow"),
+    # ACCEPTED F30 false-positive (rare, documented): a body literally containing the phrase
+    # "pr merge" (with optional flags between) trips the whole-string matcher (no shell-quote
+    # parsing). Reword or use the human `!` escape.
     ("gh pr comment body literally 'pr merge' (active) -> block (accepted F30 FP)",
      'gh pr comment 5 -b "do the pr merge now"', True, "block"),
     # merge-by-API stays a marker-gated HARD DENY (gh api * is broadly allow-listed)
