@@ -48,11 +48,11 @@ jobs:
       # Platform-independent lint: run once, on Linux. (jq is preinstalled on both runners.)
       - name: shellcheck (security guard + runtime scripts)
         if: runner.os == 'Linux'
-        run: shellcheck scripts/orchestrate-guard.sh scripts/uat-autobuild.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh
+        run: shellcheck scripts/orchestrate-guard.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh
 
       - name: ruff (F,E741)
         if: runner.os == 'Linux'
-        run: ruff check --select F,E741 scripts/orchestrate-resources.py scripts/orchestrate-setup.py scripts/planner_classify.py test-orchestrate-guard.py test-orchestrate-resources.py test-orchestrate-setup.py test-planner-classify.py test-gh-wrappers.py
+        run: ruff check --select F,E741 scripts/orchestrate-resources.py scripts/orchestrate-setup.py scripts/planner_classify.py test-orchestrate-guard.py test-orchestrate-resources.py test-orchestrate-setup.py test-planner-classify.py test-gh-wrappers.py test-ship-gate-preflight.py
 
       # Platform-sensitive: run on BOTH macOS (BSD stat) and Linux (GNU stat).
       # Must invoke via ./ so the self-test's "$0" re-invocation resolves
@@ -73,6 +73,11 @@ jobs:
       # P3-F gh-* wrappers (#24): black-box, stubs gh via PATH - platform-independent.
       - name: harness - gh-wrappers
         run: python3 test-gh-wrappers.py
+
+      # Ship-gate oracle (#110): stubs gh + pr-unreplied-comments.sh via PATH/$HOME -
+      # deterministic, host-independent, platform-independent. Runs on both.
+      - name: harness - ship-gate-preflight
+        run: python3 test-ship-gate-preflight.py
 
       # The setup/doctor harness exercises HOST-COUPLED wiring (settings cascade, tmux,
       # guard execution, git repo state). On a fresh macOS runner doctor behaves differently
