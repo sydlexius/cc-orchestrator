@@ -13,12 +13,12 @@ otherwise asks to continue. It supersedes any stale detail below it in that file
 
 ## Style and conventions
 
-- No emoji in code, commits, comments, or docs. No em-dashes in any user-facing output (use
-  regular dashes, commas, parentheses). User-facing times in US Pacific, labeled.
+(Style basics - no emoji, no em-dashes, Pacific-labeled times, TOML over YAML - are in the
+user-global CLAUDE.md; not repeated here. Repo-specific deltas only:)
+
 - Python: stdlib only, hand-rolled subprocess-driven test harnesses (no pytest). Lint gate is
   `ruff check --select F,E741` (E702 semicolons are the intentional harness style; do NOT "fix"
   them). Shell: `shellcheck` clean.
-- Config: prefer TOML over YAML where there is a choice.
 
 ## Architecture
 
