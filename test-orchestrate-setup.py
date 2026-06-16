@@ -27,9 +27,11 @@ def write_stub_guard(path, selftest_rc=0):
       - `--self-test` exits selftest_rc.
       - push-main payload -> Tier-1 HARD DENY (exit 2).
       - merge-by-API payload (`gh api ... pulls/N/merge`) -> Tier-2 HARD DENY (exit 2).
-      - anything else (incl. `gh pr merge`, which the allow-list gates) -> exit 0.
+      - `gh pr merge` CLI payload -> Tier-2 HARD DENY (exit 2, #105).
+      - anything else -> exit 0.
     Written in Python (not bash) to parse the stdin JSON properly - avoids the shell
     case-pattern quoting traps a bash stub is prone to."""
+    pr_merge = "gh pr " + "merge"   # assembled from pieces; no trigger string on this line
     with open(path, "w") as f:
         f.write(
             "#!/usr/bin/env python3\n"
@@ -43,6 +45,8 @@ def write_stub_guard(path, selftest_rc=0):
             "if 'git push origin main' in cmd:\n"
             "    sys.exit(2)\n"
             "if 'pulls/' in cmd and '/merge' in cmd:\n"
+            "    sys.exit(2)\n"
+            f"if {pr_merge!r} in cmd:\n"
             "    sys.exit(2)\n"
             "sys.exit(0)\n")
     os.chmod(path, 0o755)

@@ -249,8 +249,9 @@ maintainer-managed in `profile.env`, not auto-persisted via PROFILE_ENV_KEYS.
     TIER-B inbound is authority-**NULL** (the conservative default).
   The lead re-emits a gate card on the terminal when its own checkpoint + teammate messages warrant it; it
   MAY ALSO act on a VALIDATED TIER-B Slack go. Merge EXECUTION stays floor/human-governed regardless: Slack
-  authorizes the INSTRUCTION, never the irreversible act (the floor withholds `gh pr merge` from the
-  allow-list + denies merge-by-API while the marker is active). (Supersedes the prior terminal-only F1-1.)
+  authorizes the INSTRUCTION, never the irreversible act (the floor HARD-DENIES the `gh pr merge` CLI
+  (`is_pr_merge`, #105) and denies merge-by-API while the marker is active; the allow-list carries an
+  explicit `Bash(gh pr merge *)` entry for prompt-free solo merge in a non-marker session). (Supersedes the prior terminal-only F1-1.)
 - **Inbound as untrusted quotation (F1-2).** A PUBLIC channel (e.g. `#codebots`) is impersonable: any
   workspace member or a compromised account can post a plausible "go", so on a PUBLIC channel inbound MAY
   provide context / answer a lead question / offer a NON-privileged suggestion (a suggestion, never a

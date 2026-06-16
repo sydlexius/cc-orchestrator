@@ -45,12 +45,14 @@ Runtime (`scripts/`; canonical source is this repo):
   [--apply]` is the consent-based path that wires the floor hook + missing allow-list entries into
   settings.json, DEPLOYS the bundled guard to the stable `~/.claude/scripts/` path (so a fresh
   plugin install has a working floor; idempotent, refreshes a stale copy, warns on a missing source),
-  AND narrows any blanket `gh pr` allow-rule (`Bash(gh pr *)`/`Bash(gh pr:*)`) that shadows the
-  merge gate down to the enumerated non-merge subcommands + the explicit merge-scoped entry
-  `Bash(gh pr merge *)` (broader `gh *`/`*` shadows are surfaced for human resolution, never
-  auto-rewritten); doctor's `_is_merge_scoped` helper accepts an explicit merge-scoped rule as
-  NOT a shadow (the floor backstops it); it shows the diff, writes only with --apply + a y/N,
-  backs up, never clobbers an unparseable file, and reuses doctor's single shadow matcher.
+  AND (via two SEPARATE paths) (a) narrows any blanket `gh pr` allow-rule
+  (`Bash(gh pr *)`/`Bash(gh pr:*)`) that shadows the merge gate down to the enumerated
+  non-merge subcommands only (broader `gh *`/`*` shadows are surfaced for human resolution,
+  never auto-rewritten), and (b) adds the explicit merge-scoped entry `Bash(gh pr merge *)`
+  via the missing-allow path (parsed from required-permissions.md); doctor's `_is_merge_scoped`
+  helper accepts an explicit merge-scoped rule as NOT a shadow (the floor backstops it); it
+  shows the diff, writes only with --apply + a y/N, backs up, never clobbers an unparseable
+  file, and reuses doctor's single shadow matcher.
   doctor stays read-only (it WARNs on a stale deployed guard) so "permissions are the user's to grant" holds.
 - `uat-autobuild.sh` - repo-agnostic UAT auto-rebuild watcher: polls a branch HEAD, runs a
   parameterized `--build-cmd` on a new commit, and swaps only that port's LISTEN-pid (lease-safe)
