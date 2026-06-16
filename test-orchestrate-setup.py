@@ -920,6 +920,93 @@ def main():
         check("#68 scaffold: brief body has no <STACK> placeholder remaining",
               "<STACK>" not in brief68_body)
 
+    # #107: _missing_allow_entries harvester over-harvest guard (Option A: a deliberately
+    # SIMPLE parser - every backticked Bash/Write/Edit/Read(...) token on a non-NOTE line in
+    # the section is a prescribed entry - plus a DISCIPLINED doc, pinned by an exact-set test).
+    # Verify: (a) a de-backticked prose Perm mention is NOT harvested; (b) THE bbef7e3
+    # REGRESSION - a bullet with a prose intro + colon then several comma-separated entries
+    # harvests ALL of them (the gh-pr-subcommand line bbef7e3 silently dropped); (c) NOTE:
+    # lines are skipped; (d) non-Perm backticked tokens (e.g. `gh pr`) are ignored; and (e)
+    # the REAL required-permissions.md harvests EXACTLY the prescribed set - no phantom added
+    # (esp. the security-relevant Bash(gh api *) that #24 removed), no real entry dropped.
+    import importlib.util as _ilu
+    _spec107 = _ilu.spec_from_file_location("orchestrate_setup", SCRIPT)
+    _mod107 = _ilu.module_from_spec(_spec107)
+    _spec107.loader.exec_module(_mod107)
+
+    def _harvest(md_text):
+        """Call _missing_allow_entries with an empty allow-list against a fixture md."""
+        import tempfile, os as _os
+        with tempfile.TemporaryDirectory() as _td:
+            _tpl = _os.path.join(_td, "templates"); _os.makedirs(_tpl)
+            open(_os.path.join(_tpl, "required-permissions.md"), "w").write(md_text)
+            orig = _mod107.TEMPLATES; _mod107.TEMPLATES = _tpl
+            try:
+                return _mod107._missing_allow_entries({}) or []
+            finally:
+                _mod107.TEMPLATES = orig
+
+    # (a) A prose mention written WITHOUT a backtick-Perm wrapper (the doc-discipline fix)
+    # is invisible to the harvester - this is how the security-relevant gh-api phantom is
+    # kept out under Option A.
+    prose_md = (
+        "## Needed allow-list entries\n"
+        "- gh-api access via WRAPPERS, NOT a broad gh-api allow-rule (Bash(gh api *) form) - issue #24\n"
+    )
+    check("#107 de-backticked prose Perm mention is NOT harvested", _harvest(prose_md) == [])
+
+    # (b) THE bbef7e3 REGRESSION GUARD: a bullet with a prose intro + colon then several
+    # comma-separated backticked entries must harvest EVERY entry (bbef7e3's list-item guard
+    # required the first backtick to sit immediately after `- `, so it dropped this whole line
+    # and lost the 9 non-merge gh-pr subcommands).
+    enum_md = (
+        "## Needed allow-list entries\n"
+        "- The NON-MERGE `gh pr` subcommands, ENUMERATED (never a blanket `gh pr *`): "
+        "`Bash(gh pr view *)`, `Bash(gh pr diff *)`, `Bash(gh pr merge *)`.\n"
+    )
+    check("#107 prose-intro enumeration bullet: ALL entries harvested (the bbef7e3 regression)",
+          set(_harvest(enum_md)) == {"Bash(gh pr view *)", "Bash(gh pr diff *)", "Bash(gh pr merge *)"})
+
+    # (c) NOTE: lines are commentary, never prescriptive - their backticked tokens are skipped.
+    note_md = (
+        "## Needed allow-list entries\n"
+        "- the go subcommands. NOTE: settings usually has `Bash(go build *)` already\n"
+    )
+    check("#107 NOTE: line tokens are not harvested", _harvest(note_md) == [])
+
+    # (d) A backticked token that is NOT a Bash/Write/Edit/Read Perm (e.g. `gh pr`) is ignored.
+    nonperm_md = (
+        "## Needed allow-list entries\n"
+        "- `gh pr` family, the entry is `Bash(gh issue *)`\n"
+    )
+    check("#107 non-Perm backticked token ignored, real Perm harvested",
+          _harvest(nonperm_md) == ["Bash(gh issue *)"])
+
+    # (e) EXACT-SET pin on the REAL required-permissions.md: this is the durable guard - it
+    # fails CI if any future prose mention re-introduces a phantom OR any real entry is dropped.
+    EXPECTED_107 = {
+        "Bash(scripts/safe-push.sh *)", "Bash(scripts/safe-push.sh)",
+        "Bash(gh pr view *)", "Bash(gh pr diff *)", "Bash(gh pr checks *)",
+        "Bash(gh pr create *)", "Bash(gh pr list *)", "Bash(gh pr status *)",
+        "Bash(gh pr edit *)", "Bash(gh pr ready *)", "Bash(gh pr comment *)",
+        "Bash(gh pr merge *)", "Bash(gh issue *)", "Bash(git *)",
+        "Write(/tmp/**)", "Edit(/tmp/**)", "Read(/tmp/**)",
+        "Bash(make *)", "Bash(golangci-lint run *)", "Bash(govulncheck *)",
+        "Bash(~/.claude/scripts/*.sh *)",
+    }
+    real_req = os.path.join(os.path.dirname(os.path.abspath(SCRIPT)),
+                            "..", "skills", "orchestrate", "templates", "required-permissions.md")
+    if os.path.isfile(real_req):
+        real_got = set(_harvest(open(real_req).read()))
+        check("#107 real required-permissions.md: harvested set EXACTLY matches prescribed entries",
+              real_got == EXPECTED_107)
+        check("#107 real required-permissions.md: no Bash(gh api *) phantom (the #24 least-privilege regression)",
+              not any("gh api" in e for e in real_got))
+        check("#107 real required-permissions.md: all 9 non-merge gh-pr subcommands present",
+              sum(1 for e in real_got if e.startswith("Bash(gh pr ") and "merge" not in e) == 9)
+    else:
+        check("#107 real required-permissions.md: file accessible for regression check", False)
+
     print()
     if FAILS:
         print(f"{len(FAILS)} FAILED:")
