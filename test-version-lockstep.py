@@ -13,7 +13,8 @@ PLUGIN_JSON = os.path.join(ROOT, ".claude-plugin", "plugin.json")
 
 def skill_version():
     try:
-        text = open(SKILL_MD).read()
+        with open(SKILL_MD, encoding="utf-8") as f:
+            text = f.read()
     except OSError as e:
         sys.exit(f"FAIL: cannot read {SKILL_MD}: {e}")
     m = re.search(r'^\*\*Version\s+(\S+)\*\*', text, re.MULTILINE)
@@ -24,7 +25,8 @@ def skill_version():
 
 def plugin_version():
     try:
-        data = json.load(open(PLUGIN_JSON))
+        with open(PLUGIN_JSON, encoding="utf-8") as f:
+            data = json.load(f)
     except OSError as e:
         sys.exit(f"FAIL: cannot read {PLUGIN_JSON}: {e}")
     except json.JSONDecodeError as e:
