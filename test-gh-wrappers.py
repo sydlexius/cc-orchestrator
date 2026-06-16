@@ -175,6 +175,21 @@ def main():
           "/merge" not in " ".join(invoked) and "--admin" not in " ".join(invoked))
     rc, invoked = run_wrapper("gh-comment.sh", ["inline", "12", "--file", "a.py", "--line", "5", "--side", "LEFT", "x"], env)
     check("gh-comment inline honors --side LEFT", rc == 0 and "side=LEFT" in " ".join(invoked))
+    # #100: harden inline arg parsing - a missing operand exits via die (rc2, clean) NOT a bare
+    # `set -e` shift failure (which would be rc1), and extra/duplicate body tokens are rejected
+    # rather than silently overwriting the body. rc==2 proves the clean die path specifically.
+    for bad in (["inline", "12", "--line", "3", "--file"],                            # --file missing value
+                ["inline", "12", "--file", "a.py", "--line"],                         # --line missing value
+                ["inline", "12", "--file", "a.py", "--line", "3", "--side"],          # --side missing value
+                ["inline", "12", "--file", "a.py", "--line", "3", "b1", "b2"],        # duplicate positional body
+                ["inline", "12", "--file", "a.py", "--line", "3", "--", "b1", "b2"],  # extra token after -- body
+                ["inline", "12", "--file", "a.py", "--line", "3", "body", "--", "x"]):  # body then -- duplicate
+        rc, invoked = run_wrapper("gh-comment.sh", bad, env)
+        check(f"#100: gh-comment inline rejects malformed {bad!r} via die (rc2, no gh call)",
+              rc == 2 and invoked == [])
+    rc, invoked = run_wrapper("gh-comment.sh", ["inline", "12", "--file", "a.py", "--line", "7", "--", "body via dashdash"], env)
+    check("#100: inline `-- <body>` posts the single body correctly",
+          rc == 0 and "body=body via dashdash" in " ".join(invoked) and "line=7" in " ".join(invoked))
 
     # --- gh-codeql-autofix.sh: numeric validation + construction guarantee ---
     env = {"GITHUB_REPOSITORY": "o/r"}
