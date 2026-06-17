@@ -48,7 +48,7 @@ jobs:
       # Platform-independent lint: run once, on Linux. (jq is preinstalled on both runners.)
       - name: shellcheck (security guard + runtime scripts)
         if: runner.os == 'Linux'
-        run: shellcheck scripts/orchestrate-guard.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh
+        run: shellcheck scripts/orchestrate-guard.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/pr-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh
 
       - name: ruff (F,E741)
         if: runner.os == 'Linux'
