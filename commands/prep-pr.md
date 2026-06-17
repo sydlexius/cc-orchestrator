@@ -127,7 +127,7 @@ hard-coded excludes needed here:
 
 ```bash
 COVER_OUT=/tmp/stillwater-cover.out \
-  bash ${CLAUDE_PLUGIN_ROOT}/scripts/patch-coverage.sh
+  bash "${CLAUDE_PLUGIN_ROOT}/scripts/patch-coverage.sh"
 gate_status=$?
 rm -f /tmp/stillwater-cover.out
 ```
@@ -154,9 +154,11 @@ description. An explicit env var always wins over the `codecov.yml` value.
   stderr, and stop. Do not silently skip.
 
 **If the script is missing** (`${CLAUDE_PLUGIN_ROOT}/scripts/patch-coverage.sh` not found),
-treat as a `2` configuration error: stop and tell the user to install it from
-the gist (`ff73bb5142ea2be2acfc6ae025576c15`). Do NOT fall back to the old
-0%-function check -- that gate is what let this regress in the first place.
+treat as a `2` configuration error: stop and tell the user to reinstall or update
+the plugin so the bundled, versioned helper is present at that path (do not source
+it from anywhere else -- an out-of-band copy risks drifting from the running
+release). Do NOT fall back to the old 0%-function check -- that gate is what let
+this regress in the first place.
 
 **Excluding files from patch coverage:** the script already reads the repo's
 `codecov.yml` `ignore:` list, so generated files and pure-CLI entry points that
@@ -520,7 +522,7 @@ the pipe-swallow silent-failure mode), so the "no upstream yet" case needs no
 separate command:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh "$(git branch --show-current)"
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh" "$(git branch --show-current)"
 ```
 
 Report the push result. If it fails (non-fast-forward, auth error, the remote

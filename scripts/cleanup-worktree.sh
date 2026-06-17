@@ -87,7 +87,12 @@ pattern="^${esc_prefix}(-m[0-9.]+)?-${esc_suffix}$"
 # worktree is branch-backed or detached.
 # Tab-delimit the awk output (and split on tab) so a worktree path containing
 # spaces is not truncated by the read.
-IFS=$'\t' read -r worktree_path branch < <(
+# Capture the awk match into a variable FIRST, then conditionally read it. A
+# direct `read < <(awk ...)` aborts under `set -e` when awk emits nothing (no
+# matching worktree), short-circuiting the no-match diagnostic below.
+worktree_path=""
+branch=""
+match=$(
   git worktree list --porcelain \
     | awk -v p="$pattern" 'BEGIN { RS="" }
         {
@@ -99,6 +104,9 @@ IFS=$'\t' read -r worktree_path branch < <(
           if (base ~ p) { print wt "\t" br; exit }
         }'
 )
+if [ -n "$match" ]; then
+  IFS=$'\t' read -r worktree_path branch <<<"$match"
+fi
 
 if [ -z "$worktree_path" ]; then
   echo "No worktree found matching pattern: $pattern"

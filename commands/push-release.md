@@ -43,7 +43,8 @@ The user may provide:
    If no tags exist, get the first commit: `git rev-list --max-parents=0 HEAD`.
    Then list merged PRs since that point, **including each PR's closing issues**:
    `gh pr list --state merged --base main --search "merged:>={date}" --limit 200 --json number,title,labels,closingIssuesReferences`
-   where `{date}` is the tag's date (`git log -1 --format=%aI {tag}`). The
+   where `{date}` is the tag's date trimmed to `YYYY-MM-DD` (`git log -1 --format=%aI {tag} | cut -d'T' -f1`);
+   GitHub's `merged:>={date}` search requires the bare date, not the full ISO 8601 timestamp with offset. The
    `closingIssuesReferences` field is what makes step 6's issue-preferred
    linking possible without parsing PR bodies.
 

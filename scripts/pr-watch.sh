@@ -114,8 +114,10 @@ count_bot_activity() {
   local rev_n inline_n issue_n
   rev_n=$(echo "$reviews_json" | jq "[.[] | select($QUIET_AUTHORS_JQ)] | length")
   inline_n=$(gh api --paginate "repos/$repo/pulls/$pr/comments" 2>/dev/null \
+    | jq -s 'add // []' \
     | jq "[.[] | select($QUIET_AUTHORS_JQ)] | length" 2>/dev/null || echo 0)
   issue_n=$(gh api --paginate "repos/$repo/issues/$pr/comments" 2>/dev/null \
+    | jq -s 'add // []' \
     | jq "[.[] | select($QUIET_AUTHORS_JQ)] | length" 2>/dev/null || echo 0)
   echo $(( rev_n + inline_n + issue_n ))
 }
@@ -150,7 +152,7 @@ while true; do
   fi
   api_fail_count=0
 
-  reviews_json=$(gh api --paginate "repos/$repo/pulls/$pr/reviews" 2>/dev/null || echo '[]')
+  reviews_json=$(gh api --paginate "repos/$repo/pulls/$pr/reviews" 2>/dev/null | jq -s 'add // []' || echo '[]')
 
   # Get the HEAD commit's committer date. This is the authoritative "when did
   # the current PR state come into existence" timestamp. We use it instead of
