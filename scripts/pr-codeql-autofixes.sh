@@ -45,8 +45,10 @@ fi
 
 ref="refs/pull/${pr}/merge"
 
-# Numbers of open code-scanning alerts on the PR merge ref.
-nums=$(gh api "repos/$repo/code-scanning/alerts?ref=${ref}&state=open&per_page=100" \
+# Numbers of open code-scanning alerts on the PR merge ref. --paginate walks
+# every page so a PR with >100 open alerts is fully enumerated (the per_page=100
+# cap alone would otherwise silently truncate the list).
+nums=$(gh api --paginate "repos/$repo/code-scanning/alerts?ref=${ref}&state=open&per_page=100" \
         --jq '.[].number' 2>/dev/null)
 api_rc=$?
 

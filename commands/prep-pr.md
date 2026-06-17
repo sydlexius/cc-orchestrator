@@ -514,20 +514,17 @@ PR.
 
 ## Step 7 -- Push
 
-Then push:
+Then push via the safe-push wrapper bundled with this plugin. It always pushes
+with `-u origin <branch>` and verifies the remote ref actually moved (guarding
+the pipe-swallow silent-failure mode), so the "no upstream yet" case needs no
+separate command:
 
 ```bash
-git push origin $(git branch --show-current) 2>&1
+${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh "$(git branch --show-current)"
 ```
 
-If the branch has no upstream yet, use `-u`:
-
-```bash
-git push -u origin $(git branch --show-current) 2>&1
-```
-
-Report the push result. If it fails (non-fast-forward, auth error, etc.), stop and
-explain -- do not retry automatically.
+Report the push result. If it fails (non-fast-forward, auth error, the remote
+ref did not move, etc.), stop and explain -- do not retry automatically.
 
 ---
 

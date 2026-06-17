@@ -12,6 +12,12 @@
 # With no IDs: prints all unreplied bot comments of the selected type(s).
 # With IDs:    prints only those specific comment IDs (inline only).
 #
+# Addressed-state filtering: only the default (inline) mode filters out comments
+# that the current user has already replied to. The --reviews and --issue modes
+# surface ALL matching bot comments with no addressed-state filter (review-body
+# and issue comments have no reply-threading to key an "addressed" check off
+# of), so consumers use judgment to decide which still need action.
+#
 # Intended as a complement to pr-unreplied-comments.sh -- use that to
 # get the list of IDs, then this to read the full bodies of specific ones.
 set -euo pipefail
@@ -47,7 +53,7 @@ repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || {
   echo "Error: could not determine repository. Run from inside a git repo with a GitHub remote."
   exit 1
 }
-me=$(gh api user --jq .login)
+me=$(gh api user --jq .login 2>/dev/null) || { echo "Error: could not determine current GitHub user (run 'gh auth status' or re-auth)" >&2; exit 1; }
 
 BOT_LOGIN_FILTER='(
   .user.login == "coderabbitai[bot]" or

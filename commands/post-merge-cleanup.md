@@ -12,6 +12,14 @@ Run after a PR is merged to clean up the working environment.
 
 If no PR number is provided, stop and ask: "Which PR number was just merged?"
 
+```bash
+pr_number="${ARGUMENTS:-}"
+if [ -z "$pr_number" ]; then
+  echo "No PR number provided. Usage: /post-merge-cleanup <PR-number>" >&2
+  exit 1
+fi
+```
+
 ---
 
 ## Step 1 -- Gather PR metadata
@@ -120,10 +128,20 @@ This is a no-op when golangci-lint is absent or no worktree was removed.
 ## Step 4 -- Delete local branch
 
 ```bash
-git branch -d "$branch" 2>/dev/null && echo "deleted local $branch" || echo "local branch $branch not found or already deleted"
+if ! git show-ref --verify --quiet "refs/heads/$branch"; then
+  echo "local branch $branch not found (already deleted)"
+elif git branch -d "$branch"; then
+  echo "deleted local $branch (merged)"
+else
+  echo "ERROR: local branch $branch is unmerged; refusing to delete." >&2
+  echo "Verify the merge landed, then delete it manually with 'git branch -D $branch'." >&2
+  exit 1
+fi
 ```
 
-Do not use `-D` (force). If the branch is unmerged, stop and warn.
+Do not use `-D` (force). The three-branch check above never swallows the
+unmerged error: a `git branch -d` failure means the branch is unmerged, so the
+script stops and warns rather than silently leaving it (or force-deleting it).
 
 ---
 
@@ -131,12 +149,21 @@ Do not use `-D` (force). If the branch is unmerged, stop and warn.
 
 ```bash
 encoded_branch=$(printf '%s' "$branch" | jq -sRr @uri)
-gh api "repos/$repo/git/refs/heads/$encoded_branch" -X DELETE 2>/dev/null \
-  && echo "deleted remote $branch" \
-  || echo "remote branch $branch already deleted (404)"
+err_file=$(mktemp)
+if gh api "repos/$repo/git/refs/heads/$encoded_branch" -X DELETE 2>"$err_file"; then
+  echo "deleted remote $branch"
+elif grep -q '404' "$err_file"; then
+  echo "remote branch $branch already deleted (404)"
+else
+  echo "ERROR: failed to delete remote branch $branch:" >&2
+  cat "$err_file" >&2
+  rm -f "$err_file"
+  exit 1
+fi
+rm -f "$err_file"
 ```
 
-404 is expected if GitHub deleted it automatically on merge (`--delete-branch` flag). Note and continue.
+404 is expected if GitHub deleted it automatically on merge (`--delete-branch` flag). Note and continue. Any non-404 error is surfaced and stops the run rather than being mistaken for an "already deleted" 404.
 
 ---
 

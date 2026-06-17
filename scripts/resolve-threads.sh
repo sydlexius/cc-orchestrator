@@ -61,12 +61,28 @@ repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || {
 owner="${repo%%/*}"
 name="${repo##*/}"
 
-# Fetch all review threads with first-comment metadata
-threads=$(gh api graphql -f query="
+# Fetch all review threads with first-comment metadata. The reviewThreads
+# connection returns at most 100 nodes per page, so a PR with >100 review
+# threads needs cursor-based pagination or the tail is silently dropped (and
+# those threads never get resolved). Accumulate nodes across pages, passing
+# after:<endCursor>, until pageInfo.hasNextPage is false.
+threads='[]'
+after_cursor=""
+while :; do
+  if [ -z "$after_cursor" ]; then
+    after_arg="null"
+  else
+    after_arg="\"$after_cursor\""
+  fi
+  page=$(gh api graphql -f query="
 {
   repository(owner: \"$owner\", name: \"$name\") {
     pullRequest(number: $pr) {
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $after_arg) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
         nodes {
           id
           isResolved
@@ -80,7 +96,15 @@ threads=$(gh api graphql -f query="
       }
     }
   }
-}" --jq '.data.repository.pullRequest.reviewThreads.nodes')
+}" --jq '.data.repository.pullRequest.reviewThreads')
+
+  page_nodes=$(echo "$page" | jq '.nodes // []')
+  threads=$(jq -n --argjson acc "$threads" --argjson new "$page_nodes" '$acc + $new')
+
+  has_next=$(echo "$page" | jq -r '.pageInfo.hasNextPage')
+  after_cursor=$(echo "$page" | jq -r '.pageInfo.endCursor // ""')
+  [ "$has_next" = "true" ] || break
+done
 
 for db_id in "$@"; do
   thread=$(echo "$threads" | jq --argjson id "$db_id" --arg pat "$bot_pattern" \

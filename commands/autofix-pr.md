@@ -71,11 +71,16 @@ Resolve repo + PR head + worktree:
 repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
 state=$(gh pr view "$pr_number" --json state --jq .state)
 head_ref=$(gh pr view "$pr_number" --json headRefName --jq .headRefName)
+author_login=$(gh pr view "$pr_number" --json author --jq '.author.login // ""')
 worktree=$(git worktree list | grep -F "[$head_ref]" | cut -d' ' -f1)
 ```
 
 Gate on each:
 - `state != OPEN` -> stop: "PR #<n> is <state>; nothing to autofix."
+- `author_login == dependabot[bot]` -> stop: "PR #<n> is a Dependabot PR;
+  `/autofix-pr` is for user-owned PRs only (the foreign-author merge commit
+  makes Dependabot refuse to rebase -- see `feedback_no_update_branch_on_dependabot`).
+  Do not proceed."
 - `worktree` empty -> stop: "No local worktree on `<head_ref>` -- can't
   apply fixes. Recreate the worktree, then re-run."
 

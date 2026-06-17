@@ -72,15 +72,22 @@ if [ -z "$main_worktree" ]; then
   exit 1
 fi
 prefix=$(basename "$main_worktree")
+# The prefix is spliced into an ERE below; a repo basename can legally contain
+# regex metacharacters (e.g. a dot), so escape every ERE metacharacter before
+# use, exactly as esc_suffix does for the suffix.
+esc_prefix=$(printf '%s' "$prefix" | sed -e 's/[][(){}.^$*+?|\\-]/\\&/g')
 
 # Match basename ending in -<suffix>, optionally with a milestone insert
-# (-m<N>-) between prefix and suffix.
-pattern="${prefix}(-m[0-9.]+)?-${esc_suffix}$"
+# (-m<N>-) between prefix and suffix. Anchored at both ends so a longer
+# basename that merely contains the prefix cannot match the wrong worktree.
+pattern="^${esc_prefix}(-m[0-9.]+)?-${esc_suffix}$"
 
 # Find worktree path and branch by matching the path's basename. Parse each
 # porcelain record (separated by blank lines) so the match works whether the
 # worktree is branch-backed or detached.
-read -r worktree_path branch < <(
+# Tab-delimit the awk output (and split on tab) so a worktree path containing
+# spaces is not truncated by the read.
+IFS=$'\t' read -r worktree_path branch < <(
   git worktree list --porcelain \
     | awk -v p="$pattern" 'BEGIN { RS="" }
         {
@@ -89,7 +96,7 @@ read -r worktree_path branch < <(
             if ($i == "worktree")    { wt=$(i+1); base=wt; sub(/.*\//,"",base); i++ }
             else if ($i == "branch") { br=$(i+1); gsub("refs/heads/","",br);   i++ }
           }
-          if (base ~ p) { print wt, br; exit }
+          if (base ~ p) { print wt "\t" br; exit }
         }'
 )
 
@@ -163,13 +170,32 @@ if [ -n "$branch" ]; then
       echo "Local branch already gone."
     fi
 
-    # Delete remote branch
-    echo "=== Deleting remote branch: $branch ==="
-    repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
-    encoded=$(printf '%s' "$branch" | jq -sRr @uri)
-    gh api "repos/$repo/git/refs/heads/$encoded" -X DELETE 2>/dev/null \
-      && echo "Remote branch deleted." \
-      || echo "Remote branch not found or already deleted."
+    # Delete remote branch (guarded). Only delete when the default branch is
+    # resolved AND differs from $branch. In safe mode (default unknown) we
+    # refuse, so an unresolved default branch can never lead to deleting the
+    # remote default branch (the same #1741 hazard the local guard covers).
+    if [ -n "$default_branch" ] && [ "$branch" != "$default_branch" ]; then
+      echo "=== Deleting remote branch: $branch ==="
+      repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+      encoded=$(printf '%s' "$branch" | jq -sRr @uri)
+      # Capture stderr so a genuine API error is surfaced rather than being
+      # silently swallowed and mistaken for an "already deleted" 404.
+      del_err=$(mktemp)
+      if gh api "repos/$repo/git/refs/heads/$encoded" -X DELETE 2>"$del_err"; then
+        echo "Remote branch deleted."
+      elif grep -q '404' "$del_err"; then
+        echo "Remote branch already deleted (404)."
+      else
+        echo "Error: failed to delete remote branch '$branch':" >&2
+        cat "$del_err" >&2
+        rm -f "$del_err"
+        exit 1
+      fi
+      rm -f "$del_err"
+    else
+      echo "!!! WARNING: default branch unknown (safe mode); skipping remote branch deletion for '$branch'." >&2
+      echo "!!! Refusing to delete a remote branch when the repo default cannot be resolved. Delete it manually if it is a merged feature branch." >&2
+    fi
   fi
 fi
 

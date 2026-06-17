@@ -137,13 +137,17 @@ fi
 # base instead of each re-deriving one.
 if [ -z "${BASE:-}" ]; then
   base_ref=""
-  if git rev-parse --verify -q origin/main >/dev/null 2>&1; then
-    base_ref="origin/main"
-  elif git rev-parse --verify -q main >/dev/null 2>&1; then
-    base_ref="main"
-  fi
+  # Prefer the main family over master, and within each prefer the remote ref
+  # so a stale local branch cannot silently widen the diff range. Repos whose
+  # default branch is `master` are supported via the master fallbacks.
+  for _cand in origin/main main origin/master master; do
+    if git rev-parse --verify -q "$_cand" >/dev/null 2>&1; then
+      base_ref="$_cand"
+      break
+    fi
+  done
   if [ -z "$base_ref" ] || ! BASE=$(git merge-base "$base_ref" HEAD 2>/dev/null); then
-    echo "patch-coverage: could not resolve BASE (no 'origin/main' or 'main' branch and BASE not set)." >&2
+    echo "patch-coverage: could not resolve BASE (no 'origin/main', 'main', 'origin/master', or 'master' branch and BASE not set)." >&2
     echo "Set BASE explicitly, e.g. BASE=\$(git merge-base origin/main HEAD)." >&2
     exit 2
   fi
@@ -159,7 +163,14 @@ if [ ! -s "$COVER_OUT" ]; then
   exit 2
 fi
 
-module=$(awk '/^module /{print $2; exit}' go.mod)
+# Guard go.mod readability up front. Under `set -e`, letting awk run against a
+# missing/unreadable go.mod would exit with awk's own code (not the documented
+# config-error code 2); the explicit check keeps the contract.
+if [ ! -r go.mod ]; then
+  echo "patch-coverage: go.mod not found or unreadable" >&2
+  exit 2
+fi
+module=$(awk '/^module /{print $2; exit}' go.mod 2>/dev/null || true)
 if [ -z "$module" ]; then
   echo "patch-coverage: could not read module name from go.mod" >&2
   exit 2
@@ -234,6 +245,15 @@ for file in "${changed[@]}"; do
       echo "patch-coverage: malformed block range in $file: $bad" >&2
       exit 2
     fi
+  fi
+
+  # A file with added lines but no coverage blocks contributes nothing to the
+  # denominator -- which silently shrinks the patch scope and can mask wholly
+  # untested new code. Surface it (informational, on stderr) so the reader is
+  # not misled by a high ratio computed over a quietly narrowed set. The
+  # conservative all-hit counting below is unchanged.
+  if [ -z "$cov_blocks" ]; then
+    echo "  WARNING: $file has added lines but no coverage blocks in $COVER_OUT (untested or non-executable; not counted toward the ratio)." >&2
   fi
 
   # Classify each added line in one awk pass. Order matters: feed all

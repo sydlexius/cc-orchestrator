@@ -1,7 +1,7 @@
 ---
 description: "Merge a PR with CodeRabbit status check, squash, and post-merge cleanup"
 argument-hint: "<PR-number> (e.g. 738)"
-allowed-tools: ["Bash", "Glob", "Grep", "Read", "Edit", "Write", "Agent"]
+allowed-tools: ["Bash", "Glob", "Grep", "Read", "Edit", "Write", "Agent", "Skill"]
 ---
 
 # Merge PR

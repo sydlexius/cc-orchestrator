@@ -163,21 +163,28 @@ while true; do
   head_committer_date=$(gh api "repos/$repo/commits/$cur_head" \
     --jq '.commit.committer.date' 2>/dev/null || true)
 
-  # If we couldn't fetch the committer date (transient API blip), fall back to
-  # the legacy commit_id filter so we don't deadlock. The fallback is the same
-  # buggy behavior the new path fixes, but a one-poll fallback is better than
-  # never returning.
-  if [ -n "$head_committer_date" ]; then
-    cr_latest_state=$(echo "$reviews_json" \
-      | jq -r --arg head_date "$head_committer_date" --arg cr "$CR_LOGIN" '
-          [.[] | select(.user.login == $cr and .submitted_at >= $head_date)]
-          | sort_by(.submitted_at) | last | .state // ""')
-  else
-    cr_latest_state=$(echo "$reviews_json" \
-      | jq -r --arg cr "$CR_LOGIN" --arg head "$cur_head" '
-          [.[] | select(.user.login == $cr and .commit_id == $head)]
-          | sort_by(.submitted_at) | last | .state // ""')
+  # If we couldn't fetch the committer date (transient API blip), do NOT fall
+  # back to the legacy commit_id filter: GitHub rewrites commit_id on every
+  # existing review when a PR is rebased, so that path reintroduces the exact
+  # stale-review bug the committer-date check exists to fix. Instead retry the
+  # poll a few times; if the date never resolves, bail with a setup error
+  # rather than emit a possibly-stale verdict.
+  if [ -z "$head_committer_date" ]; then
+    cd_fail_count=$(( ${cd_fail_count:-0} + 1 ))
+    if [ "$cd_fail_count" -ge 3 ]; then
+      echo "setup error: could not fetch HEAD committer date for $cur_head after 3 attempts" >&2
+      exit 2
+    fi
+    pending="head-date-fetch"
+    sleep "$poll_interval"
+    continue
   fi
+  cd_fail_count=0
+
+  cr_latest_state=$(echo "$reviews_json" \
+    | jq -r --arg head_date "$head_committer_date" --arg cr "$CR_LOGIN" '
+        [.[] | select(.user.login == $cr and .submitted_at >= $head_date)]
+        | sort_by(.submitted_at) | last | .state // ""')
 
   # Review-blocked is a distinct terminal: the author must address feedback
   # before merge is possible. The consumer should dispatch to /handle-review

@@ -42,6 +42,14 @@
 # review threads. The advisory surfaces the patch coverage % and threshold
 # state so /handle-review and /review-stack can flag regressions.
 #
+# Note on addressed-state filtering: the inline section (type 1) and review-body
+# section (type 2) DO filter out comments that $me has already replied to (or
+# referenced). The issue-level actionable selection (type 3) does NOT apply any
+# addressed-state filter -- it surfaces ALL matching bot issue comments every
+# run, because issue comments have no reply-threading to key an "addressed"
+# check off of. Consumers use judgment to decide which issue-level items still
+# need action.
+#
 # Each entry includes reply_type to indicate which reply form to use:
 #   "inline"    -- the ID is a pull request review comment; use reply-comment.sh <pr> <id> <body>
 #   "top-level" -- the ID is a review or issue object; use reply-comment.sh <pr> <body>
@@ -126,16 +134,17 @@ if [ "$trigger_cr" = true ]; then
     body=$(echo "$rate_limit_comment" | jq -r '.body')
     created_at=$(echo "$rate_limit_comment" | jq -r '.created_at')
 
-    # Parse wait duration from "**N minutes and N seconds**" or "**N seconds**"
-    wait_minutes=0
-    wait_seconds=0
-    if echo "$body" | grep -qoP '\*\*\d+ minutes?'; then
-      wait_minutes=$(echo "$body" | grep -oP '\*\*\K\d+(?= minutes?)' | head -1)
-    fi
-    if echo "$body" | grep -qoP '\d+ seconds?\*\*'; then
-      wait_seconds=$(echo "$body" | grep -oP '(\d+)(?= seconds?\*\*)' | head -1)
-    fi
-    total_wait=$(( ${wait_minutes:-0} * 60 + ${wait_seconds:-0} ))
+    # Parse wait duration from "**N minutes and N seconds**" or "**N seconds**".
+    # Uses sed -nE (POSIX ERE) rather than grep -P: -P is a GNU extension and
+    # is absent on macOS/BSD grep, where it errors and the wait silently parses
+    # as zero. The minutes capture is anchored by the literal `**`; the seconds
+    # capture is anchored by a leading non-digit so a greedy `.*` cannot shrink
+    # a multi-digit value (e.g. "30 seconds") down to its last digit.
+    wait_minutes=$(printf '%s' "$body" | sed -nE 's/.*\*\*([0-9]+) minutes?.*/\1/p' | head -1)
+    wait_seconds=$(printf '%s' "$body" | sed -nE 's/.*[^0-9]([0-9]+) seconds?\*\*.*/\1/p' | head -1)
+    wait_minutes=${wait_minutes:-0}
+    wait_seconds=${wait_seconds:-0}
+    total_wait=$(( wait_minutes * 60 + wait_seconds ))
 
     if [ "$total_wait" -gt 0 ]; then
       # Calculate elapsed time since the rate limit message was posted.
