@@ -219,7 +219,8 @@ Build the open list:
 - Subtract from the full list of top-level bot/reviewer comments
 
 Print a numbered list of open comments, grouped by type:
-```
+
+```text
 Open review comments (N total):
 
 Inline (can receive threaded replies):
@@ -281,7 +282,7 @@ in the triage table's Summary column so the scope is visible.
 
 Print the full triage table before making any changes:
 
-```
+```text
 ## Triage
 
 | # | ID     | Category       | File              | Summary |
@@ -424,7 +425,8 @@ wording): report and move on. Do not extend the fix scope for these.
 For each open comment, draft a reply:
 
 **bug / spec-drift / test-gap (fixed):**
-```
+
+```text
 Fixed in <sha>. <one-sentence description of what changed>.
 ```
 
@@ -432,18 +434,21 @@ Get the sha after the fixes are committed (step 7 happens before replies are pos
 see below).
 
 **false-positive:**
-```
+
+```text
 <Explanation of why this is correct. Reference the specific CLAUDE.md pattern or
 architectural decision if applicable. Keep it brief -- one or two sentences.>
 ```
 
 **already-fixed:**
-```
+
+```text
 Fixed in <earlier-sha>.
 ```
 
 **wont-fix:**
-```
+
+```text
 Acknowledged. This is out of scope for this PR -- tracking separately as #<issue> or
 leaving for a follow-up.
 ```
@@ -464,6 +469,7 @@ Co-Authored-By: Claude <noreply@anthropic.com>"
 ```
 
 Get the short SHA:
+
 ```bash
 git rev-parse --short HEAD
 ```
@@ -507,26 +513,33 @@ already-fixed pointer to an earlier SHA).
 **Per-category pattern for review body findings:**
 
 - **bug / spec-drift / test-gap**: anchor to the line your fix changed.
+
   ```bash
   bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh "$pr_number" \
     --file internal/foo/bar.go --line 42 \
     "Fixed in <sha>. <one-line>."
   ```
+
 - **false-positive**: anchor to the referenced line (or nearest in-diff line
   in the same file) with the rebuttal:
+
   ```bash
   bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh "$pr_number" \
     --file internal/foo/bar.go --line 42 \
     "<evidence-based rebuttal, one or two sentences>."
   ```
+
 - **already-fixed**: anchor to the line carrying the fix, citing the
   earlier SHA:
+
   ```bash
   bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh "$pr_number" \
     --file internal/foo/bar.go --line 42 \
     "Fixed in <earlier-sha>."
   ```
+
 - **wont-fix**: anchor to the referenced line with the tracking issue:
+
   ```bash
   bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh "$pr_number" \
     --file internal/foo/bar.go --line 42 \
@@ -598,8 +611,8 @@ comment's author.login matches the regex, and calls the `resolveReviewThread`
 GraphQL mutation. It skips threads that are already resolved or whose author
 doesn't match, and prints one line per thread.
 
-**Only run this step when there were Copilot or Greptile inline comments in
-the current round.** If neither bot's comments were triaged, skip it silently.
+**Only run this step when there were Copilot, Greptile, or Codoki inline comments in
+the current round.** If none of those bots' comments were triaged, skip it silently.
 A typical Greptile round is small (single COMMENTED review, often 1-3 inline
 findings) -- don't skip just because the count is low.
 
@@ -643,7 +656,7 @@ freehand. Compute each field from the data already collected in earlier steps:
 
 Assemble and print:
 
-```
+```text
 ## Done -- PR [#$pr_number](https://github.com/$repo/pull/$pr_number)
 
 - Fixed: $fixed_count comments (bug/spec/test)

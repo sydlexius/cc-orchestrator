@@ -121,6 +121,7 @@ Each agent receives this task:
 > You are gathering bot review data for PR #<number> in repo <repo>.
 >
 > **Step A -- Trigger CodeRabbit review if needed (with rate-limit awareness):**
+>
 > ```bash
 > base=$(gh pr view <number> --json baseRefName --jq .baseRefName)
 > default=$(gh api "repos/<repo>" --jq .default_branch)
@@ -132,31 +133,38 @@ Each agent receives this task:
 >   fi
 > fi
 > ```
+>
 > The `--trigger-cr` flag checks for a dangling rate limit message, waits the
 > remaining time if needed, then posts `@coderabbitai review`.
 >
 > **Step B -- Poll for review readiness (geometric cooldown):**
 > Poll at 15s, 30s, 60s, 120s intervals. At each interval check:
+>
 > ```bash
-> pending=$(bash scripts/pr-unreplied-comments.sh --pending-only <number>)
-> unreplied=$(bash scripts/pr-unreplied-comments.sh --count-only <number>)
+> pending=$(bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh --pending-only <number>)
+> unreplied=$(bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh --count-only <number>)
 > ```
+>
 > Ready when `pending == 0` AND `unreplied` count matches the previous check.
 > If not stable after 4 polls, report the PR as WAITING with details.
 >
 > **Step C -- Fetch all unreplied bot comments (overview then full bodies):**
+>
 > ```bash
-> bash scripts/pr-unreplied-comments.sh <number>
+> bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh <number>
 > bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-read-comments.sh <number>
 > bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-read-comments.sh --reviews <number>
 > ```
+>
 > For specific comment IDs only:
+>
 > ```bash
 > bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-read-comments.sh <number> <id1> <id2> ...
 > ```
 >
 > **Return format:**
-> ```
+>
+> ```text
 > PR: #<number>
 > Branch: <head_branch>
 > Status: NEEDS WORK / WAITING / CLEAN / NO REVIEWS
@@ -175,9 +183,11 @@ Each agent receives this task:
   issue-comment summary, so never infer "no findings" from its review state.
 - Codecov (`codecov[bot]`) is NOT a reviewer -- skip it in the unreplied flow.
   Instead, capture the coverage advisory separately:
+
   ```bash
   bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh --coverage-only <number> <repo>
   ```
+
   Returns a JSON object with `status`, `patch_pct`, `threshold_state`
   (`pass`/`fail`/`unknown`), `report_url`. Include `patch_pct` and
   `threshold_state` in the agent's return payload under a `Coverage:` field.
@@ -189,7 +199,7 @@ immediately. In that case, skip Step B in the agent prompt and go straight to St
 
 Collect results from all agents into a unified status table:
 
-```
+```text
 | PR   | Branch              | Status     | Unreplied | CR blocked? | Coverage   |
 |------|---------------------|------------|-----------|-------------|------------|
 | #32  | feat/32-foo         | NEEDS WORK | 3         | Yes         | 92% pass   |
@@ -251,7 +261,8 @@ Each agent receives:
 > lines 50, 120, and 200), group them as a single fix item.
 >
 > **Return format:**
-> ```
+>
+> ```text
 > PR: #<number>
 > Stale-diff fast path: yes/no
 >
@@ -273,7 +284,7 @@ Each agent receives:
 
 Merge the triage results into a combined view. Present to the user:
 
-```
+```text
 ## Pre-triage results
 
 ### PR #32 (3 comments)
@@ -344,6 +355,7 @@ go test -count=1 ./... 2>&1
 If tests fail, fix the failures before proceeding.
 
 If any `.templ` files were changed:
+
 ```bash
 templ generate
 ```
@@ -364,9 +376,11 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 **CRITICAL -- two reply forms, never mix them up:**
 
 - `reply_type: "inline"` comments (inline diff annotations) -- use the **3-arg form**:
+
   ```bash
   bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh <PR> <comment_id> '<text>'
   ```
+
   This posts a threaded reply under the code annotation.
 
 - `reply_type: "top-level"` comments (review body summaries, issue-level) -- these are
@@ -376,21 +390,25 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 **For inline comments only -- use 3-arg form:**
 
 Fix now:
+
 ```bash
 bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh <PR> <comment_id> 'Fixed in <short-sha>.'
 ```
 
 Rebut:
+
 ```bash
 bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh <PR> <comment_id> '<evidence-based rebuttal>'
 ```
 
 Stacked-PR repeat:
+
 ```bash
 bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh <PR> <comment_id> 'This is wired in PR #<later_pr>. Per-PR review limitation on stacked PRs.'
 ```
 
 Defer:
+
 ```bash
 bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh <PR> <comment_id> 'Tracked in #<issue-number>. Requires <brief justification for deferral>.'
 ```
@@ -456,7 +474,7 @@ echo "<PR>" >> "$SESSION_PRS_FILE"
 
 After pushing fixes to a base PR, ask:
 
-```
+```text
 Fixes pushed to #32. This may affect PRs higher in the stack.
 Restack now? (yes / no / check first)
 ```
@@ -485,7 +503,7 @@ After restacking (or skipping it), continue to the next PR that needs work.
 
 ## Step 5 -- Summary
 
-```
+```text
 ## Stack review complete
 
 | PR   | Fixed | Dismissed | Rebut | Deferred | Pushed |

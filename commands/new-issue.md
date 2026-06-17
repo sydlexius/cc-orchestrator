@@ -65,6 +65,7 @@ gh issue create --title "<title>" --body-file /tmp/gh-issue-body.md --label <lab
 After creation, ask: "Assign to a milestone? (enter milestone title or skip)"
 
 If yes:
+
 ```bash
 gh issue edit <number> --milestone "<title>"
 ```

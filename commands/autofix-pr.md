@@ -81,7 +81,7 @@ Gate on each:
 
 Print the starting line:
 
-```
+```text
 Auto-fix loop for PR #<n> in <worktree>.
 Max <max_rounds> rounds, <per_round_timeout>s per /pr-watch.
 ```
@@ -142,7 +142,7 @@ Invoke `/pr-watch` via the Skill tool with arguments `<pr_number>
 
 PR is settled per CR + CI + branch-protection's combined view. Print:
 
-```
+```text
 round <round>: PR #<pr> settled (CR approved/commented, CI green,
 mergeable_state in {clean, unstable, has_hooks}).
 Next: /merge-pr <pr> when ready.
@@ -253,8 +253,7 @@ with status **CAP**:
 
 > "Hit round cap of <max_rounds>. CR is still flagging findings; this PR
 > may be in a sticky pattern (e.g. a fix introduces a new finding next
-> round). Manual triage recommended: `gh pr view <pr>` + `~/.claude/
-> scripts/pr-unreplied-comments.sh <pr>`."
+> round). Manual triage recommended: `gh pr view <pr>` + `${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh <pr>`."
 
 Per `feedback_cap_cr_rounds`, do NOT silently continue past the cap.
 Offer the user an explicit "bump cap" path: "Re-run with
@@ -266,7 +265,7 @@ Offer the user an explicit "bump cap" path: "Re-run with
 
 Always print at the end:
 
-```
+```text
 == /autofix-pr summary ==
 PR:        #<pr_number>
 Worktree:  <worktree>

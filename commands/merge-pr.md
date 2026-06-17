@@ -81,7 +81,7 @@ If any `codecov/*` context is in state `failure` or the coverage advisory
 reports `threshold_state: fail`: **warn, do not block**. Coverage failures
 are a policy signal for the author, not a correctness gate. Print:
 
-```
+```text
 Coverage advisory: patch coverage <pct>% is below threshold.
 Report: <url>
 
@@ -162,7 +162,7 @@ Look for these indicators in CR's status response:
 - Items marked "Open" with Major or Critical severity
 - "rate limited" (CR hasn't reviewed yet)
 
-If CR indicates a review is in progress, wait and re-poll (up to 3 minutes total).
+If CR indicates a review is in progress, wait and re-poll (up to 60 seconds total).
 
 If CR flags open Major/Critical items, stop and report them. Suggest running
 `/handle-review $pr_number` first.
@@ -223,7 +223,7 @@ default-mode lead is prompted). Instead PRINT the exact command for the human to
 in a SEPARATE PLAIN TERMINAL (outside the IDE) or via the GitHub UI -- NOT as an
 in-session `!` bang, which fails outright in IDE-hosted sessions -- then STOP and wait:
 
-```
+```text
 All pre-merge checks passed for #<pr_number>.
 This is an active orchestrate session, so the merge itself is yours to run
 (the one irreversible step, unforgeable by a bot). Run it in a SEPARATE PLAIN
@@ -296,7 +296,7 @@ The /post-merge-cleanup invocation prints its own detailed cleanup
 summary. This step's job is just to confirm the merge itself, and to
 acknowledge that cleanup ran:
 
-```
+```text
 ## Merged
 
 - PR: #$pr_number

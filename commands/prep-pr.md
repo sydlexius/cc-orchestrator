@@ -15,9 +15,10 @@ Run every pre-push check in order. Gate on failures. Squash and push only when c
 ## Step 1 -- Orient
 
 ```bash
-base=$(git merge-base main HEAD)
+if git rev-parse --verify -q origin/main >/dev/null 2>&1; then base_ref=origin/main; else base_ref=main; fi
+base=$(git merge-base "$base_ref" HEAD)
 git branch --show-current
-git log main..HEAD --oneline
+git log "$base_ref"..HEAD --oneline
 git diff "$base"..HEAD --stat
 ```
 
@@ -40,7 +41,8 @@ in this repo (see `feedback_pr_size_handwritten_loc.md`).
 Compute hand-written diff size:
 
 ```bash
-base=$(git merge-base main HEAD)
+if git rev-parse --verify -q origin/main >/dev/null 2>&1; then base_ref=origin/main; else base_ref=main; fi
+base=$(git merge-base "$base_ref" HEAD)
 git diff --stat "$base"..HEAD -- ':!*_templ.go' ':!*.sum' \
   ':!*.lock' ':!go.work.sum' ':!*.snap'
 ```
@@ -199,7 +201,8 @@ Then follow the semantic checks in `.claude/commands/check-openapi.md` against t
 PR-wide diff:
 
 ```bash
-base=$(git merge-base main HEAD)
+if git rev-parse --verify -q origin/main >/dev/null 2>&1; then base_ref=origin/main; else base_ref=main; fi
+base=$(git merge-base "$base_ref" HEAD)
 git diff "$base"..HEAD --name-only
 ```
 
@@ -217,7 +220,8 @@ If any CRITICAL finding: stop. List what must be fixed.
 If the diff contains any renamed functions, variables, types, or constants:
 
 ```bash
-base=$(git merge-base main HEAD)
+if git rev-parse --verify -q origin/main >/dev/null 2>&1; then base_ref=origin/main; else base_ref=main; fi
+base=$(git merge-base "$base_ref" HEAD)
 git diff "$base"..HEAD | grep '^-.*func \|^-.*type \|^-.*var \|^-.*const ' | \
   sed 's/^-//' | grep -oE '[A-Z][a-zA-Z0-9]*'
 ```
@@ -238,7 +242,8 @@ and comments). Incomplete renames cause compilation errors or silent behavior ch
 Check for raw internal error messages leaking to clients:
 
 ```bash
-base=$(git merge-base main HEAD)
+if git rev-parse --verify -q origin/main >/dev/null 2>&1; then base_ref=origin/main; else base_ref=main; fi
+base=$(git merge-base "$base_ref" HEAD)
 git diff "$base"..HEAD -- internal/api/handlers_*.go | grep '^+' | \
   grep -E 'err\.(Error|String)\(\)|fmt\.(Sprintf|Errorf).*err[^o]' | \
   grep -v 'slog\.\|logger\.\|log\.'
@@ -261,7 +266,8 @@ or two per review round, costing multiple review cycles. See
 Detect candidate expansions in the diff:
 
 ```bash
-base=$(git merge-base main HEAD)
+if git rev-parse --verify -q origin/main >/dev/null 2>&1; then base_ref=origin/main; else base_ref=main; fi
+base=$(git merge-base "$base_ref" HEAD)
 
 # New enum/const values added in internal/ code
 new_consts=$(git diff "$base"..HEAD -- 'internal/**/*.go' | \
@@ -325,7 +331,7 @@ here, at the deliberate pre-PR gate, where that is acceptable.
 
 Run the full review using the Skill tool:
 
-```
+```text
 skill: "pr-review-toolkit:review-pr"
 ```
 
@@ -433,7 +439,8 @@ bypass reason and continue to Step 5. Default is to run.
 ## Step 5 -- Generated file check
 
 ```bash
-base=$(git merge-base main HEAD)
+if git rev-parse --verify -q origin/main >/dev/null 2>&1; then base_ref=origin/main; else base_ref=main; fi
+base=$(git merge-base "$base_ref" HEAD)
 templ_changed=$(git diff --name-only "$base"..HEAD -- '*.templ')
 generated_changed=$(git diff --name-only "$base"..HEAD -- '*_templ.go')
 
@@ -457,7 +464,8 @@ commit-by-commit, which costs review rounds. Do not ask whether to squash -- squ
 Count commits ahead of main:
 
 ```bash
-git log main..HEAD --oneline
+if git rev-parse --verify -q origin/main >/dev/null 2>&1; then base_ref=origin/main; else base_ref=main; fi
+git log "$base_ref"..HEAD --oneline
 ```
 
 If there is already only one commit, say: "Already a single commit -- no squash needed."
@@ -467,7 +475,8 @@ If there is more than one commit, squash non-interactively (no editor, no user
 prompt). Use a soft reset to the merge-base, then a single new commit:
 
 ```bash
-base=$(git merge-base main HEAD)
+if git rev-parse --verify -q origin/main >/dev/null 2>&1; then base_ref=origin/main; else base_ref=main; fi
+base=$(git merge-base "$base_ref" HEAD)
 git reset --soft "$base"
 git commit -m "<conventional-commit-title>" -m "<optional body>"
 ```
@@ -485,7 +494,8 @@ linked GitHub issue's body already says it well, paraphrase from there.
 After the commit, verify the branch is still ahead of main:
 
 ```bash
-git log main..HEAD --oneline
+if git rev-parse --verify -q origin/main >/dev/null 2>&1; then base_ref=origin/main; else base_ref=main; fi
+git log "$base_ref"..HEAD --oneline
 ```
 
 There should be exactly one line. If the squash failed or the branch is no longer
@@ -555,7 +565,7 @@ done
 
 Cross-reference against the valid release labels in `.claude/release.toml`:
 
-```
+```text
 enhancement, bug, ux, database, documentation, technical-debt, testing,
 automation, providers, scanner, rules, images, webhooks, emby, jellyfin, reports
 ```

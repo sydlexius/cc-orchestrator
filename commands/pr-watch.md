@@ -31,7 +31,7 @@ GitHub's check `conclusion` field can be the empty string `""` mid-flight. jq's 
 
 ## Why the quiet-period gate
 
-CodeRabbit posts inline comments seconds AFTER its CI check transitions to SUCCESS. If `mergeable_state` happens to read `clean` in that window before CR's review-state actually lands, a strict snapshot would emit `settled` prematurely and hand the consumer a half-formed triage list. The script counts items from allow-listed bot authors (`coderabbitai[bot]` + `github-actions[bot]`) across reviews + pull-comments + issue-comments, and requires the count to be unchanged across two consecutive 30s polls before terminating. Adds ~30s of latency in the happy path; eliminates the trickle race. Applies to both `settled` and `review-blocked` terminals.
+CodeRabbit posts inline comments seconds AFTER its CI check transitions to SUCCESS. If `mergeable_state` happens to read `clean` in that window before CR's review-state actually lands, a strict snapshot would emit `settled` prematurely and hand the consumer a half-formed triage list. The script counts items from allow-listed bot authors (`coderabbitai[bot]`, `github-actions[bot]`, `greptile-apps[bot]`, and `codoki-pr-intelligence[bot]`) across reviews + pull-comments + issue-comments, and requires the count to be unchanged across two consecutive 30s polls before terminating. Adds ~30s of latency in the happy path; eliminates the trickle race. Applies to both `settled` and `review-blocked` terminals.
 
 ## Args
 

@@ -14,7 +14,7 @@ it as TOML with these sections:
   `default_group` (heading for PRs without a matching label)
 - `[release]` — `tag_prefix` (e.g. `v`)
 
-If the file is missing, stop and tell the user to create it.
+If the file is missing, stop and ask the user to create it.
 
 ### Arguments
 
@@ -76,7 +76,8 @@ The user may provide:
    tone and structure (`gh release view <prev-tag>`).
 
    Format as markdown:
-   ```
+
+   ```markdown
    ## New Features
    - Description of feature (#123)                     <- issue # (PR closes issue 123)
    - Description spanning two issues (#124, #125)
@@ -95,6 +96,7 @@ The user may provide:
    command in `versioning.post_bump` sequentially.
 
 9. **Commit and tag.**
+
    ```bash
    git add -A
    git commit -m "release: v{version}"
