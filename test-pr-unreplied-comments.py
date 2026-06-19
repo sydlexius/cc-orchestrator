@@ -49,6 +49,7 @@ INLINE = os.environ.get("INLINE_JSON", "[]")
 REVIEWS = os.environ.get("REVIEWS_JSON", "[]")
 ISSUE = os.environ.get("ISSUE_JSON", "[]")
 GRAPHQL = os.environ.get("GRAPHQL_JSON", '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}')
+GRAPHQL_NEXT = os.environ.get("GRAPHQL_NEXT", "")
 HEAD_SHA = os.environ.get("HEAD_SHA", "abcdef1234567890abcdef1234567890abcdef12")
 COMMITTER_DATE = os.environ.get("COMMITTER_DATE", "2026-06-18T00:00:00Z")
 PULL = '{"head":{"sha":"%s"}}' % HEAD_SHA
@@ -66,6 +67,16 @@ def emit(data):
 if args[:2] == ["api", "user"]:
     emit('{"login":"%s"}' % ME)
 if args[:2] == ["api", "graphql"]:
+    # Paginated GraphQL: the script passes `-F cursor=null` (or `-f cursor=null`)
+    # for the first page and `-f cursor=<endCursor>` to advance. Serve GRAPHQL for
+    # the first page; serve GRAPHQL_NEXT (when set) for any non-null cursor so a
+    # >100-thread (hasNextPage) scenario can be exercised.
+    cursor = None
+    for a in args:
+        if a.startswith("cursor="):
+            cursor = a.split("=", 1)[1]; break
+    if cursor and cursor != "null" and GRAPHQL_NEXT:
+        emit(GRAPHQL_NEXT)
     emit(GRAPHQL)
 
 endpoint = ""
@@ -85,7 +96,7 @@ emit(PULL)
 
 
 def run(args, *, inline="[]", reviews="[]", issue="[]", graphql=None,
-        committer_date="2026-06-18T00:00:00Z", me="testuser"):
+        graphql_next=None, committer_date="2026-06-18T00:00:00Z", me="testuser"):
     with tempfile.TemporaryDirectory() as td:
         bindir = os.path.join(td, "bin"); os.makedirs(bindir)
         gh = os.path.join(bindir, "gh")
@@ -101,6 +112,8 @@ def run(args, *, inline="[]", reviews="[]", issue="[]", graphql=None,
         env["COMMITTER_DATE"] = committer_date
         if graphql is not None:
             env["GRAPHQL_JSON"] = graphql
+        if graphql_next is not None:
+            env["GRAPHQL_NEXT"] = graphql_next
         p = subprocess.run(["bash", SCRIPT] + args + ["123", "owner/repo"],
                            env=env, capture_output=True, text=True, timeout=20)
         return p.returncode, p.stdout, p.stderr
@@ -211,6 +224,45 @@ def main():
     # Mutual exclusivity with --count-only -> usage error exit 1.
     rc, out, err = run(["--audit", "--count-only"])
     check("audit + --count-only -> exit 1 (mutually exclusive)", rc == 1)
+
+    print("== #132 --audit no-silent-caps: >100-thread pagination ==")
+    # A PR with MORE than one page of review threads. The OLD code stopped at
+    # reviewThreads(first:100) with no pageInfo check, so it could SILENTLY
+    # TRUNCATE and still print "AUDIT: COMPLETE" / exit 0. The fix must paginate:
+    # page 1 (hasNextPage:true) carries a resolved+replied finding; page 2 carries
+    # a replied-but-UNRESOLVED finding. If pagination works, the script sees page 2
+    # and reports INCOMPLETE / exit 1 -- it must NEVER print COMPLETE or exit 0.
+    g_page1 = ('{"data":{"repository":{"pullRequest":{"reviewThreads":{'
+               '"pageInfo":{"hasNextPage":true,"endCursor":"C1"},'
+               '"nodes":[{"isResolved":true,"path":"a.sh","line":10,"comments":{'
+               '"pageInfo":{"hasNextPage":false},"nodes":['
+               '{"author":{"login":"coderabbitai[bot]"}},{"author":{"login":"testuser"}}]}}]'
+               '}}}}}')
+    g_page2 = ('{"data":{"repository":{"pullRequest":{"reviewThreads":{'
+               '"pageInfo":{"hasNextPage":false},'
+               '"nodes":[{"isResolved":false,"path":"b.sh","line":20,"comments":{'
+               '"pageInfo":{"hasNextPage":false},"nodes":['
+               '{"author":{"login":"coderabbitai[bot]"}},{"author":{"login":"testuser"}}]}}]'
+               '}}}}}')
+    rc, out, err = run(["--audit"], graphql=g_page1, graphql_next=g_page2)
+    check("audit pagination: >100 threads (hasNextPage) does NOT print AUDIT: COMPLETE",
+          "AUDIT: COMPLETE" not in out)
+    check("audit pagination: >100 threads does NOT exit 0", rc != 0)
+    check("audit pagination: page 2 thread is aggregated (b.sh:20 present, exit 1)",
+          "b.sh:20" in out and rc == 1)
+
+    # Inner-comments overflow: a single thread with MORE than 100 comments cannot
+    # prove "replied" -> FAIL CLOSED (no COMPLETE, non-zero exit).
+    g_comment_overflow = ('{"data":{"repository":{"pullRequest":{"reviewThreads":{'
+                          '"pageInfo":{"hasNextPage":false},'
+                          '"nodes":[{"isResolved":true,"path":"a.sh","line":10,"comments":{'
+                          '"pageInfo":{"hasNextPage":true},"nodes":['
+                          '{"author":{"login":"coderabbitai[bot]"}}]}}]'
+                          '}}}}}')
+    rc, out, err = run(["--audit"], graphql=g_comment_overflow)
+    check("audit comment-overflow (>100 comments/thread) does NOT print AUDIT: COMPLETE",
+          "AUDIT: COMPLETE" not in out)
+    check("audit comment-overflow fails closed (exit non-zero)", rc != 0)
 
     print()
     if FAILS:

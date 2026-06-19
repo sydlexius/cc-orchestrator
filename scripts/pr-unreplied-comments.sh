@@ -332,9 +332,12 @@ fi
 # Distinct from the default gating mode. Enumerates ALL CR + Codoki comments:
 # inline THREADS (findings; need a reply AND a resolved thread) and issue-level
 # review SUMMARIES (informational; no thread to resolve, never gate the exit). Uses
-# GraphQL for reviewThreads.isResolved (the REST API does not expose it). FAILS
-# CLOSED (exit 2) on any lookup error; exit 1 only when a finding is unreplied or a
-# thread unresolved; exit 0 when every finding is replied AND every thread resolved.
+# GraphQL for reviewThreads.isResolved (the REST API does not expose it). PAGINATES
+# reviewThreads fully (no silent cap at 100 threads) and FAILS CLOSED (exit 2) on
+# any lookup error OR a thread with >100 comments (where "replied" is unprovable),
+# so a complete-coverage claim is never made on truncated data. exit 1 only when a
+# finding is unreplied or a thread unresolved; exit 0 when every finding is replied
+# AND every thread resolved.
 if [ "$audit_mode" = true ]; then
   owner="${repo%%/*}"
   name="${repo##*/}"
@@ -342,27 +345,78 @@ if [ "$audit_mode" = true ]; then
   # membership tests against GraphQL's .author.login and REST's .user.login.
   audit_bots='["coderabbitai[bot]","Copilot","copilot-pull-request-reviewer[bot]","github-advanced-security[bot]","github-actions[bot]","greptile-apps[bot]","codoki-pr-intelligence[bot]"]'
 
-  # shellcheck disable=SC2016  # GraphQL $owner/$name/$pr are query variables, NOT shell expansions.
-  threads_json=$(gh api graphql \
-    -f owner="$owner" -f name="$name" -F pr="$pr_number" \
-    -f query='
-      query($owner:String!,$name:String!,$pr:Int!){
-        repository(owner:$owner,name:$name){
-          pullRequest(number:$pr){
-            reviewThreads(first:100){
-              nodes{
-                isResolved
-                path
-                line
-                comments(first:50){ nodes{ author{ login } } }
+  # Paginate reviewThreads FULLY (#132 no-silent-caps). The audit mode CLAIMS
+  # complete coverage, so it must never stop at the first 100 threads: a PR with
+  # >100 review threads would otherwise SILENTLY TRUNCATE and still print
+  # "AUDIT: COMPLETE" / exit 0 -- false confidence. We loop on
+  # pageInfo.hasNextPage, passing endCursor as `after`, accumulating EVERY thread
+  # node. Each thread's inner comments(first:100) also carries pageInfo; a thread
+  # with MORE than 100 comments FAILS CLOSED (exit 2) because "replied" cannot be
+  # proven without seeing every comment in the thread. Any lookup error also fails
+  # closed. -F cursor=null sends a real GraphQL null for the first page; -f
+  # cursor=<endCursor> advances subsequent pages.
+  audit_thread_nodes='[]'
+  audit_cursor='null'
+  while : ; do
+    if [ "$audit_cursor" = "null" ]; then
+      cursor_arg=(-F cursor=null)
+    else
+      cursor_arg=(-f cursor="$audit_cursor")
+    fi
+    # shellcheck disable=SC2016  # GraphQL $owner/$name/$pr/$cursor are query variables, NOT shell expansions.
+    page_json=$(gh api graphql \
+      -f owner="$owner" -f name="$name" -F pr="$pr_number" "${cursor_arg[@]}" \
+      -f query='
+        query($owner:String!,$name:String!,$pr:Int!,$cursor:String){
+          repository(owner:$owner,name:$name){
+            pullRequest(number:$pr){
+              reviewThreads(first:100,after:$cursor){
+                pageInfo{ hasNextPage endCursor }
+                nodes{
+                  isResolved
+                  path
+                  line
+                  comments(first:100){
+                    pageInfo{ hasNextPage }
+                    nodes{ author{ login } }
+                  }
+                }
               }
             }
           }
-        }
-      }' 2>/dev/null) || {
-    echo "audit: GraphQL reviewThreads query failed for PR #$pr_number ($repo)" >&2
-    exit 2
-  }
+        }' 2>/dev/null) || {
+      echo "audit: GraphQL reviewThreads query failed for PR #$pr_number ($repo)" >&2
+      exit 2
+    }
+
+    # FAIL CLOSED if any thread on this page has MORE comments than the single
+    # page we fetched: we cannot guarantee we observed a human reply, so a
+    # complete-coverage claim would be unprovable. NEVER print COMPLETE / exit 0.
+    overflow=$(echo "$page_json" | jq '[.data.repository.pullRequest.reviewThreads.nodes // [] | .[] | select(.comments.pageInfo.hasNextPage == true)] | length')
+    if [ "${overflow:-0}" -gt 0 ]; then
+      echo "AUDIT INCOMPLETE: a review thread on PR #$pr_number ($repo) has more than 100 comments; cannot guarantee complete coverage." >&2
+      exit 2
+    fi
+
+    page_nodes=$(echo "$page_json" | jq -c '.data.repository.pullRequest.reviewThreads.nodes // []')
+    audit_thread_nodes=$(jq -n --argjson acc "$audit_thread_nodes" --argjson new "$page_nodes" '$acc + $new')
+
+    has_next=$(echo "$page_json" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage // false')
+    if [ "$has_next" != "true" ]; then
+      break
+    fi
+    audit_cursor=$(echo "$page_json" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // empty')
+    if [ -z "$audit_cursor" ]; then
+      # hasNextPage true but no endCursor: cannot advance safely -> fail closed.
+      echo "AUDIT INCOMPLETE: reviewThreads reported more pages but no endCursor for PR #$pr_number ($repo); cannot guarantee complete coverage." >&2
+      exit 2
+    fi
+  done
+
+  # Reshape the accumulated nodes back into the single-query envelope so the
+  # findings jq below is unchanged.
+  threads_json=$(jq -n --argjson nodes "$audit_thread_nodes" \
+    '{data:{repository:{pullRequest:{reviewThreads:{nodes:$nodes}}}}}')
 
   issue_comments_audit=$(gh api "repos/$repo/issues/$pr_number/comments" --paginate 2>/dev/null) || {
     echo "audit: could not fetch issue comments for PR #$pr_number ($repo)" >&2
