@@ -56,6 +56,12 @@ def run(args, *, env_overrides=None, tmux=True):
     """Invoke the CLI. Returns (returncode, stdout+stderr)."""
     env = dict(os.environ)
     env.pop("TOOL_INPUT", None)
+    # #95 STEER ISOLATION: point the bundled steer source at a non-existent path by DEFAULT so an
+    # unrelated configure test never wires the advisory steering hooks nor deploys the steer script
+    # to the real ~/.claude/scripts (steer reads as 'missing-source' -> skipped). Tests that exercise
+    # steering explicitly override ORCHESTRATE_BUNDLED_STEER / ORCHESTRATE_STEER via env_overrides.
+    env["ORCHESTRATE_BUNDLED_STEER"] = "/nonexistent/orchestrate-steer-bundled.sh"
+    env["ORCHESTRATE_STEER"] = "/nonexistent/orchestrate-steer-deployed.sh"
     if tmux:
         # Force the fixture TMUX unconditionally (not `env.get("TMUX") or ...`): when the
         # harness itself runs INSIDE a real tmux (e.g. a teammate pane), inheriting the
@@ -707,11 +713,18 @@ def main():
         # configure's guard deploy operates on temp files, NEVER the real ~/.claude guard.
         cbundle = os.path.join(td, "bundled-guard.sh"); write_stub_guard(cbundle)
         cdest = os.path.join(td, "deployed", "orchestrate-guard.sh")
+        # #133 helper-deploy isolation: point the helper SOURCE at the real bundled scripts/ dir and
+        # the helper DEST at a temp dir, so configure's helper deploy operates on temp files and
+        # NEVER touches the real ~/.claude/scripts. Without these overrides the deploy would default
+        # to ~/.claude/scripts and mutate the operator's real environment during the test.
+        cscripts = os.path.join(td, "deployed-scripts")
+        cbundle_scripts = os.path.dirname(SCRIPT)  # the real scripts/ dir (has all 9 helpers)
         # Pin the shadow-narrowing cascade scan to THIS fixture (cs) so configure's
         # cascade-wide narrowing never reaches the real ~/.claude cascade.
         cov = {"ORCHESTRATE_SETTINGS": cs, "ORCHESTRATE_TEMPLATES_DIR": ctpl,
                "ORCHESTRATE_SETTINGS_FILES": cs,
-               "ORCHESTRATE_GUARD": cdest, "ORCHESTRATE_BUNDLED_GUARD": cbundle}
+               "ORCHESTRATE_GUARD": cdest, "ORCHESTRATE_BUNDLED_GUARD": cbundle,
+               "ORCHESTRATE_SCRIPTS_DIR": cscripts, "ORCHESTRATE_BUNDLED_SCRIPTS_DIR": cbundle_scripts}
         rc, out = run(["configure"], env_overrides=cov)
         check("configure dry-run previews hook + missing entry + guard DEPLOY, writes NOTHING",
               rc == 0 and "PreToolUse" in out and "Bash(go test *)" in out and "DEPLOY the floor guard" in out
@@ -754,6 +767,170 @@ def main():
         rc, out = run(["configure", "--apply", "--yes"], env_overrides=cov)
         check("configure REFUSES to overwrite an unparseable settings.json (no clobber)",
               rc == 1 and "refusing to touch" in out and open(cs).read().startswith("{not"))
+
+    # #133: configure --apply DEPLOYS the 9 bundled PR-lifecycle helpers to the stable SCRIPTS_DIR
+    # path (Option A), retiring claude-kit symlinks; doctor WARNs (never FAILs) on a stale copy.
+    HELPERS = ("pr-watch.sh", "pr-unreplied-comments.sh", "pr-read-comments.sh", "reply-comment.sh",
+               "resolve-threads.sh", "cleanup-worktree.sh", "patch-coverage.sh",
+               "pr-codeql-autofixes.sh", "safe-push.sh")
+    GUARD_HOOK = {"matcher": "Bash", "hooks": [{"type": "command",
+                  "command": 'bash "$HOME/.claude/scripts/orchestrate-guard.sh"'}]}
+    with tempfile.TemporaryDirectory() as td:
+        # Bundled helper SOURCE fixture: 9 distinct stub files named exactly as the real helpers.
+        hbundle = os.path.join(td, "hbundle"); os.makedirs(hbundle)
+        for name in HELPERS:
+            open(os.path.join(hbundle, name), "w").write(f"#!/usr/bin/env bash\n# fixture {name}\necho {name}\n")
+        hdest = os.path.join(td, "hdest")  # deploy target (initially absent)
+        # Guard + settings pre-satisfied so configure's only ACTION is the helper deploy (clean output).
+        hguard = os.path.join(td, "hguard.sh"); write_stub_guard(hguard)  # GUARD==BUNDLED_GUARD -> guard current
+        htpl = os.path.join(td, "htpl"); os.makedirs(htpl)
+        open(os.path.join(htpl, "required-permissions.md"), "w").write(
+            "## Needed allow-list entries\n- `Bash(x *)`\n")
+        hs = os.path.join(td, "settings.json")
+        json.dump({"hooks": {"PreToolUse": [GUARD_HOOK]}, "permissions": {"allow": ["Bash(x *)"]}}, open(hs, "w"))
+        hov = {"ORCHESTRATE_SETTINGS": hs, "ORCHESTRATE_TEMPLATES_DIR": htpl,
+               "ORCHESTRATE_SETTINGS_FILES": hs, "ORCHESTRATE_GUARD": hguard,
+               "ORCHESTRATE_BUNDLED_GUARD": hguard,
+               "ORCHESTRATE_SCRIPTS_DIR": hdest, "ORCHESTRATE_BUNDLED_SCRIPTS_DIR": hbundle}
+
+        # Dry-run previews the helper deploy, writes nothing.
+        rc, out = run(["configure"], env_overrides=hov)
+        check("#133: dry-run previews helper DEPLOY, writes NOTHING",
+              rc == 0 and "PR-lifecycle helper script(s)" in out and not os.path.exists(hdest))
+        # Fresh deploy: all 9 land, executable, byte-identical to the bundled source.
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=hov)
+        deployed_ok = all(
+            os.path.isfile(os.path.join(hdest, n))
+            and open(os.path.join(hdest, n), "rb").read() == open(os.path.join(hbundle, n), "rb").read()
+            and bool(os.stat(os.path.join(hdest, n)).st_mode & 0o111)
+            for n in HELPERS)
+        check("#133: configure --apply deploys all 9 helpers (executable, content matches)", rc == 0 and deployed_ok)
+        # Idempotent re-run: nothing actionable, no failure.
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=hov)
+        check("#133: configure is idempotent once helpers deployed (no helper deploy line)",
+              rc == 0 and "PR-lifecycle helper script(s)" not in out and "FAILED to deploy" not in out)
+        # Stale refresh: a drifted dest copy is overwritten back to the bundled content.
+        one = os.path.join(hdest, "safe-push.sh")
+        open(one, "w").write("#!/bin/sh\n# drifted\n")
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=hov)
+        check("#133: configure --apply REFRESHES a stale helper back to the bundled content",
+              rc == 0 and open(one, "rb").read() == open(os.path.join(hbundle, "safe-push.sh"), "rb").read())
+        # Doctor WARNs (never FAILs) on a stale deployed helper, naming the configure remedy.
+        open(one, "w").write("#!/bin/sh\n# drifted again\n")
+        rc, out = run(["doctor"], env_overrides=hov, tmux=True)
+        # The helper check is WARN-level (never FAIL): assert the [WARN] tag on the helper line +
+        # the remedy. (Doctor's overall rc tracks the teams/tmux checks, which are env-dependent on
+        # CI - so we assert the helper line's tag directly, not the aggregate exit code.)
+        check("#133: doctor WARNs (not FAILs) on a stale helper + names configure --apply remedy",
+              "[WARN] deployed helper script(s) STALE vs the bundled plugin copies" in out
+              and "configure --apply" in out
+              and "[FAIL] deployed helper script(s)" not in out)
+
+    # #133b: claude-kit symlink retirement + broken-symlink + missing-source edge cases.
+    with tempfile.TemporaryDirectory() as td:
+        hbundle = os.path.join(td, "hbundle"); os.makedirs(hbundle)
+        for name in HELPERS:
+            open(os.path.join(hbundle, name), "w").write(f"#!/usr/bin/env bash\n# fixture {name}\n")
+        hdest = os.path.join(td, "hdest"); os.makedirs(hdest)
+        hguard = os.path.join(td, "hguard.sh"); write_stub_guard(hguard)
+        htpl = os.path.join(td, "htpl"); os.makedirs(htpl)
+        open(os.path.join(htpl, "required-permissions.md"), "w").write(
+            "## Needed allow-list entries\n- `Bash(x *)`\n")
+        hs = os.path.join(td, "settings.json")
+        json.dump({"hooks": {"PreToolUse": [GUARD_HOOK]}, "permissions": {"allow": ["Bash(x *)"]}}, open(hs, "w"))
+        hov = {"ORCHESTRATE_SETTINGS": hs, "ORCHESTRATE_TEMPLATES_DIR": htpl,
+               "ORCHESTRATE_SETTINGS_FILES": hs, "ORCHESTRATE_GUARD": hguard,
+               "ORCHESTRATE_BUNDLED_GUARD": hguard,
+               "ORCHESTRATE_SCRIPTS_DIR": hdest, "ORCHESTRATE_BUNDLED_SCRIPTS_DIR": hbundle}
+        # A claude-kit-style symlink at one dest: replaced with a real copy, the symlink backed up to .bak.
+        link_target = os.path.join(td, "claude-kit-pr-watch.sh")
+        open(link_target, "w").write("#!/bin/sh\n# old claude-kit copy\n")
+        link = os.path.join(hdest, "pr-watch.sh"); os.symlink(link_target, link)
+        # A BROKEN symlink at another dest: replaced without error (target gone).
+        broken = os.path.join(hdest, "reply-comment.sh")
+        os.symlink(os.path.join(td, "nonexistent-target.sh"), broken)
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=hov)
+        link_replaced = (os.path.isfile(link) and not os.path.islink(link)
+                         and os.path.islink(link + ".bak")
+                         and open(link, "rb").read() == open(os.path.join(hbundle, "pr-watch.sh"), "rb").read())
+        check("#133: configure replaces a claude-kit symlink with a real copy (+.bak preserves the link)",
+              rc == 0 and link_replaced)
+        check("#133: configure replaces a BROKEN symlink without error",
+              os.path.isfile(broken) and not os.path.islink(broken))
+        # Missing bundled source: WARN, no crash, the rest still applies.
+        hov_ms = dict(hov); hov_ms["ORCHESTRATE_BUNDLED_SCRIPTS_DIR"] = os.path.join(td, "no-such-bundle")
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=hov_ms)
+        check("#133: a missing bundled helper source WARNs, does not crash",
+              rc in (0, 1) and "missing" in out.lower())
+
+    # #95: configure wires the 3 advisory steering hooks + deploys orchestrate-steer.sh (Option A);
+    # --no-steer opts out; doctor WARNs (never FAILs) when steering is missing.
+    def steer_matchers(path):
+        s = json.load(open(path))
+        pre = s.get("hooks", {}).get("PreToolUse", [])
+        return {b["matcher"] for b in pre for h in b.get("hooks", [])
+                if "orchestrate-steer.sh" in h.get("command", "")}
+    with tempfile.TemporaryDirectory() as td:
+        sbundle = os.path.join(td, "orchestrate-steer.sh")
+        open(sbundle, "w").write("#!/usr/bin/env bash\n# fixture steer\nexit 0\n"); os.chmod(sbundle, 0o755)
+        sdest = os.path.join(td, "deployed", "orchestrate-steer.sh")
+        sguard = os.path.join(td, "guard.sh"); write_stub_guard(sguard)  # GUARD==BUNDLED_GUARD -> current
+        hscripts = os.path.join(td, "scripts"); os.makedirs(hscripts)   # SCRIPTS_DIR==BUNDLED -> no helper action
+        for name in HELPERS:
+            open(os.path.join(hscripts, name), "w").write(f"#!/usr/bin/env bash\n# {name}\n")
+        stpl = os.path.join(td, "tpl"); os.makedirs(stpl)
+        open(os.path.join(stpl, "required-permissions.md"), "w").write(
+            "## Needed allow-list entries\n- `Bash(x *)`\n")
+
+        def fresh_settings(fn):
+            p = os.path.join(td, fn)
+            json.dump({"hooks": {"PreToolUse": [GUARD_HOOK]}, "permissions": {"allow": ["Bash(x *)"]}},
+                      open(p, "w"))
+            return p
+
+        def sov(settings_path, steer_bundle=sbundle, steer_dest=sdest):
+            return {"ORCHESTRATE_SETTINGS": settings_path, "ORCHESTRATE_TEMPLATES_DIR": stpl,
+                    "ORCHESTRATE_SETTINGS_FILES": settings_path,
+                    "ORCHESTRATE_GUARD": sguard, "ORCHESTRATE_BUNDLED_GUARD": sguard,
+                    "ORCHESTRATE_SCRIPTS_DIR": hscripts, "ORCHESTRATE_BUNDLED_SCRIPTS_DIR": hscripts,
+                    "ORCHESTRATE_STEER": steer_dest, "ORCHESTRATE_BUNDLED_STEER": steer_bundle}
+
+        # Dry-run previews the steer wiring + deploy, writes nothing.
+        s1 = fresh_settings("s1.json")
+        rc, out = run(["configure"], env_overrides=sov(s1))
+        check("#95: dry-run previews advisory steering hooks + steer DEPLOY, writes nothing",
+              rc == 0 and "advisory WARN-level steering" in out and not os.path.exists(sdest)
+              and steer_matchers(s1) == set())
+        # --apply wires all 3 steer hooks (Edit/Write/Bash) + deploys the steer script (executable).
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=sov(s1))
+        steer_deployed = (os.path.isfile(sdest)
+                          and open(sdest, "rb").read() == open(sbundle, "rb").read()
+                          and bool(os.stat(sdest).st_mode & 0o111))
+        check("#95: configure --apply wires the 3 steering hooks + deploys orchestrate-steer.sh",
+              rc == 0 and steer_matchers(s1) == {"Edit", "Write", "Bash"} and steer_deployed)
+        # Idempotent: second --apply makes no steer change.
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=sov(s1))
+        check("#95: configure is idempotent once steering is wired (no new steer hook line)",
+              rc == 0 and "advisory WARN-level steering" not in out)
+        # --no-steer omits the steer hooks AND does not deploy the steer script.
+        s2 = fresh_settings("s2.json")
+        sdest2 = os.path.join(td, "deployed2", "orchestrate-steer.sh")
+        rc, out = run(["configure", "--apply", "--yes", "--no-steer"],
+                      env_overrides=sov(s2, steer_dest=sdest2))
+        check("#95: --no-steer omits the steering hooks and does not deploy the steer script",
+              rc == 0 and steer_matchers(s2) == set() and not os.path.exists(sdest2))
+        # doctor WARNs (never FAILs) when steering is not wired; names the configure remedy.
+        s3 = fresh_settings("s3.json")  # guard wired, steer absent + not deployed
+        rc, out = run(["doctor"], env_overrides=sov(s3, steer_dest=os.path.join(td, "nope.sh")), tmux=True)
+        check("#95: doctor WARNs (not FAILs) when steering hooks are missing + names the remedy",
+              "[WARN]" in out and "advisory steering hook(s) not wired" in out
+              and "configure --apply" in out and "[FAIL] advisory steering" not in out)
+        # Missing bundled steer source: WARN, no crash, no steer hooks wired.
+        s4 = fresh_settings("s4.json")
+        rc, out = run(["configure", "--apply", "--yes"],
+                      env_overrides=sov(s4, steer_bundle=os.path.join(td, "no-steer-src.sh")))
+        check("#95: a missing bundled steer source WARNs + wires no steering hooks (no crash)",
+              "steer script" in out and "missing" in out.lower() and steer_matchers(s4) == set())
 
     # #71: configure NARROWS a blanket `gh pr` allow-rule that shadows the merge gate.
     # The blanket specifier text lives only INSIDE Bash(...) wrappers (never on a command
@@ -869,6 +1046,8 @@ def main():
         json.dump(d, open(ncfg5, "w"))
         # Drive an interactive (no --yes) --apply with 'n' on stdin via a subprocess wrapper.
         env5 = dict(os.environ); env5["TMUX"] = TEST_TMUX; env5.update(nov(ncfg5))
+        env5["ORCHESTRATE_BUNDLED_STEER"] = "/nonexistent/steer-bundled.sh"  # steer isolation (#95)
+        env5["ORCHESTRATE_STEER"] = "/nonexistent/steer-deployed.sh"
         p5 = subprocess.run([sys.executable, SCRIPT, "configure", "--apply"], env=env5,
                             input="n\n", capture_output=True, text=True, timeout=30)
         check("#71: declining the narrow y/N leaves the file unchanged (no bak)",
