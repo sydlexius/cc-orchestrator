@@ -44,7 +44,7 @@ def heads_blob(*branches):
 def run(args, *, ls_remote="", default_branch="main", open_heads="",
         merged_heads="", closed_heads="", open_fail=False, delete_fail=False,
         merged_fail=False, closed_fail=False, default_fail=False):
-    """Invoke the sweep with stubbed gh + git. Returns (rc, stdout, stderr)."""
+    """Invoke the sweep with stubbed gh + git. Returns (rc, stdout, stderr, deletes)."""
     with tempfile.TemporaryDirectory() as td:
         bindir = os.path.join(td, "bin"); os.makedirs(bindir)
         del_log = os.path.join(td, "deletes.log")

@@ -73,7 +73,7 @@ fi
 # --- Resolve repo ---
 repo="${repo_arg:-${GITHUB_REPOSITORY:-}}"
 if [ -z "$repo" ]; then
-  repo="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+  repo="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)"
 fi
 if [ -z "$repo" ]; then
   echo "stale-branch-sweep: no repo (pass [repo] arg, set GITHUB_REPOSITORY=owner/name, or run in a gh-resolvable repo)" >&2
