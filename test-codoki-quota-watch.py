@@ -163,6 +163,23 @@ def main():
                      oracle_rc=2)
     check("unrelated comment, not settled -> exit 3 (NOT-YET-RUN)", rc == 3 and "NOT-YET-RUN" in out)
 
+    print("== trust boundary: spoofed marker from a NON-Codoki author is ignored ==")
+    # A non-Codoki user posts a comment carrying the literal rate-limit marker. The
+    # author check (G1) must reject it: not RATE-LIMITED, falls through to NOT-YET-RUN.
+    rc, out, err = run(["1", "owner/repo"],
+                       comments=comments_json(comment(RL_BODY, login="impersonator")),
+                       oracle_rc=2)
+    check("spoofed marker (non-Codoki author) -> NOT exit 1 (no false RATE-LIMITED)", rc != 1)
+    check("spoofed marker (non-Codoki author) -> exit 3 (NOT-YET-RUN)",
+          rc == 3 and "NOT-YET-RUN" in (out + err))
+    # A genuine Codoki-authored marker in the same set IS still honored.
+    rc, _, err = run(["1", "owner/repo"],
+                     comments=comments_json(comment(RL_BODY, login="impersonator"),
+                                            comment(RL_BODY)),
+                     oracle_rc=2)
+    check("genuine Codoki marker alongside a spoof -> exit 1 (RATE-LIMITED)",
+          rc == 1 and "RATE-LIMITED" in err)
+
     print("== oracle absent (degraded settled-vs-not) ==")
     rc, out, err = run(["1", "owner/repo"], comments="[]", oracle_absent=True)
     check("oracle absent, no marker -> exit 3 (treated NOT-YET-RUN)", rc == 3 and "NOT-YET-RUN" in (out + err))

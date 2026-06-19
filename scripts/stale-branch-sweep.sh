@@ -11,9 +11,12 @@
 # head is a confirmed orphan ONLY when ALL hold:
 #   - it is NOT the default branch, main, or master;
 #   - it has NO open PR (a head with an open PR is never touched);
-#   - it IS the head of a merged or closed PR (so we know its lifecycle ended).
+#   - it IS the head of a merged or closed PR by BOTH name AND current commit SHA
+#     (so we know THIS commit's lifecycle ended).
 # A head with no PR history at all (e.g. a manually pushed branch) is left alone -
-# we only reap heads we can prove belonged to a finished PR.
+# we only reap heads we can prove belonged to a finished PR. A name that matches an
+# ended PR head but now points at a DIFFERENT SHA (a deleted-then-recreated branch
+# reusing the name) is also left alone - deleting it would destroy live new work.
 #
 # DELETION routes through the construction-guaranteed DELETE-only wrapper
 # gh-delete-branch.sh (a sibling script); this script never hand-rolls a
@@ -91,11 +94,21 @@ fi
 
 # --- Read phase (READ-ONLY) ---
 # Enumerate remote heads via git ls-remote (authoritative; independent of local
-# fetch/prune state). Each line is "<sha>\trefs/heads/<branch>".
-remote_heads="$(git ls-remote --heads origin 2>/dev/null \
-  | sed -n 's#^[0-9a-f]\{40\}[[:space:]]\{1,\}refs/heads/##p' || true)"
+# fetch/prune state). Each line is "<sha>\trefs/heads/<branch>". FAIL CLOSED: a
+# network/auth failure must NOT be swallowed into "no stale heads" (which would
+# exit 0 as if cleanup ran and found nothing) - capture the raw output, abort on
+# failure, and only treat a genuinely-empty SUCCESSFUL read as "none".
+raw_heads="$(git ls-remote --heads origin 2>/dev/null)" || {
+  echo "stale-branch-sweep: could not read remote heads for $repo; aborting (fail closed)." >&2
+  exit 2
+}
+# Reshape each "<40-hex-sha>\trefs/heads/<branch>" line into "<branch>\t<sha>" so
+# the decision phase has each remote head's CURRENT sha (needed to tell a truly
+# ended branch from a reused name that now points at new commits).
+remote_heads="$(printf '%s\n' "$raw_heads" \
+  | sed -nE 's#^([0-9a-f]{40})[[:space:]]+refs/heads/(.+)$#\2'"$(printf '\t')"'\1#p')"
 if [ -z "$remote_heads" ]; then
-  echo "stale-branch-sweep: no remote heads found (or could not reach origin) for $repo."
+  echo "stale-branch-sweep: no remote heads found for $repo."
   exit 0
 fi
 
@@ -115,20 +128,26 @@ if ! open_heads="$(gh pr list --repo "$repo" --state open --limit 1000 --json he
   exit 2
 fi
 
-# Merged + closed PR heads (lifecycle-ended). Each read is checked SEPARATELY and
-# fails closed: a single grouped `$( merged; closed )` would only surface the LAST
-# command's exit status, so a merged-read failure with a successful closed-read
-# would slip through despite this guard. Without BOTH we cannot confirm a head's
-# PR actually finished, so either failure aborts.
-if ! merged_heads="$(gh pr list --repo "$repo" --state merged --limit 1000 --json headRefName --jq '.[].headRefName' 2>/dev/null)"; then
+# Merged + closed PR heads (lifecycle-ended), each as a "<name>\t<sha>" pair so the
+# decision phase can require BOTH name AND commit identity to match. Each read is
+# checked SEPARATELY and fails closed: a single grouped `$( merged; closed )` would
+# only surface the LAST command's exit status, so a merged-read failure with a
+# successful closed-read would slip through despite this guard. Without BOTH we
+# cannot confirm a head's PR actually finished, so either failure aborts.
+if ! merged_heads="$(gh pr list --repo "$repo" --state merged --limit 1000 --json headRefName,headRefOid --jq '.[] | "\(.headRefName)\t\(.headRefOid)"' 2>/dev/null)"; then
   echo "stale-branch-sweep: could not read merged PRs for $repo; aborting (fail closed)." >&2
   exit 2
 fi
-if ! closed_heads="$(gh pr list --repo "$repo" --state closed --limit 1000 --json headRefName --jq '.[].headRefName' 2>/dev/null)"; then
+if ! closed_heads="$(gh pr list --repo "$repo" --state closed --limit 1000 --json headRefName,headRefOid --jq '.[] | "\(.headRefName)\t\(.headRefOid)"' 2>/dev/null)"; then
   echo "stale-branch-sweep: could not read closed PRs for $repo; aborting (fail closed)." >&2
   exit 2
 fi
-ended_heads="$(printf '%s\n%s' "$merged_heads" "$closed_heads")"
+# Concatenate, dropping blank lines (an empty merged/closed set yields none).
+ended_heads="$(printf '%s\n%s\n' "$merged_heads" "$closed_heads" | grep -v '^[[:space:]]*$' || true)"
+# Names alone (for the "name matches an ended head but SHA differs" skip notice).
+ended_names="$(printf '%s\n' "$ended_heads" | cut -f1)"
+
+TAB="$(printf '\t')"
 
 is_in_list() {
   # is_in_list <needle> <newline-list>; exact full-line match.
@@ -137,8 +156,12 @@ is_in_list() {
 }
 
 # --- Decision phase ---
+# A remote head is a confirmed orphan ONLY if it has no open PR AND there exists an
+# ended (merged/closed) PR head with the SAME name AND the SAME current SHA. A name
+# match with a DIFFERENT SHA means the branch was deleted and recreated for new work
+# (the name was reused) - deleting it would destroy live work, so it is skipped.
 candidates=()
-while IFS= read -r branch; do
+while IFS="$TAB" read -r branch sha; do
   [ -z "$branch" ] && continue
   case "$branch" in
     main|master) continue ;;
@@ -149,8 +172,10 @@ while IFS= read -r branch; do
   if is_in_list "$branch" "$open_heads"; then
     continue   # has an open PR -> never touch
   fi
-  if is_in_list "$branch" "$ended_heads"; then
+  if is_in_list "$branch$TAB$sha" "$ended_heads"; then
     candidates+=("$branch")
+  elif is_in_list "$branch" "$ended_names"; then
+    echo "stale-branch-sweep: skipping '$branch' - name matches an ended PR head but its current SHA differs (likely a reused branch with new commits)."
   fi
 done <<< "$remote_heads"
 

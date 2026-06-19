@@ -36,14 +36,28 @@ def check(label, ok):
         FAILS.append(label)
 
 
-def heads_blob(*branches):
-    """Build a `git ls-remote --heads origin` style blob."""
-    return "".join(f"{SHA}\trefs/heads/{b}\n" for b in branches)
+def heads_blob(*pairs):
+    """Build a `git ls-remote --heads origin` style blob.
+
+    Each arg is either a branch name (uses the default SHA) or a (branch, sha)
+    tuple - the latter lets a test point a remote head at a SHA that differs from
+    an ended PR head's SHA (the G3 reused-name case)."""
+    out = ""
+    for p in pairs:
+        b, sha = (p if isinstance(p, tuple) else (p, SHA))
+        out += f"{sha}\trefs/heads/{b}\n"
+    return out
+
+
+def ended_blob(*branches, sha=SHA):
+    """Build a merged/closed PR-heads blob in the script's post-jq "name\\tsha" form."""
+    return "".join(f"{b}\t{sha}\n" for b in branches)
 
 
 def run(args, *, ls_remote="", default_branch="main", open_heads="",
         merged_heads="", closed_heads="", open_fail=False, delete_fail=False,
-        merged_fail=False, closed_fail=False, default_fail=False):
+        merged_fail=False, closed_fail=False, default_fail=False,
+        ls_remote_fail=False):
     """Invoke the sweep with stubbed gh + git. Returns (rc, stdout, stderr, deletes)."""
     with tempfile.TemporaryDirectory() as td:
         bindir = os.path.join(td, "bin"); os.makedirs(bindir)
@@ -81,7 +95,10 @@ def run(args, *, ls_remote="", default_branch="main", open_heads="",
             f.write(
                 "#!/usr/bin/env bash\n"
                 "set -eu\n"
-                "if [ \"${1:-}\" = 'ls-remote' ]; then printf '%s' \"${GIT_LSREMOTE:-}\"; exit 0; fi\n"
+                "if [ \"${1:-}\" = 'ls-remote' ]; then\n"
+                "  [ -n \"${GIT_LSREMOTE_FAIL:-}\" ] && exit 1\n"
+                "  printf '%s' \"${GIT_LSREMOTE:-}\"; exit 0\n"
+                "fi\n"
                 "exit 0\n"
             )
         os.chmod(git, 0o755)
@@ -104,6 +121,8 @@ def run(args, *, ls_remote="", default_branch="main", open_heads="",
             env["GH_CLOSED_FAIL"] = "1"
         if default_fail:
             env["GH_DEFAULT_FAIL"] = "1"
+        if ls_remote_fail:
+            env["GIT_LSREMOTE_FAIL"] = "1"
 
         p = subprocess.run([SCRIPT] + args, env=env, capture_output=True, text=True, timeout=20)
         deletes = ""
@@ -140,7 +159,7 @@ def main():
     rc, out, _, _ = run(["owner/repo"],
                         ls_remote=heads_blob("main", "master", "develop"),
                         default_branch="develop",
-                        merged_heads="main\nmaster\ndevelop\n")
+                        merged_heads=ended_blob("main", "master", "develop"))
     check("main/master/default never candidates -> exit 0, none listed",
           rc == 0 and "would delete" not in out)
 
@@ -148,7 +167,7 @@ def main():
     rc, out, _, dels = run(["owner/repo"],
                            ls_remote=heads_blob("feat/done", "feat/live"),
                            open_heads="feat/live\n",
-                           merged_heads="feat/done\n")
+                           merged_heads=ended_blob("feat/done"))
     check("merged head, no open PR -> listed as 'would delete' (dry-run)",
           rc == 0 and "would delete: feat/done" in out)
     check("dry-run performs NO deletion", dels == "")
@@ -156,7 +175,7 @@ def main():
     print("== fail-closed read errors (each gh read guarded separately) ==")
     rc, _, err, _ = run(["owner/repo"],
                         ls_remote=heads_blob("feat/done"),
-                        open_fail=True, merged_heads="feat/done\n")
+                        open_fail=True, merged_heads=ended_blob("feat/done"))
     check("open-PR read fails -> exit 2 (fail closed)", rc == 2)
     # F2: merged and closed are read SEPARATELY; either failing must abort even if
     # the other succeeds (a grouped read would mask the merged failure).
@@ -166,30 +185,52 @@ def main():
     check("merged-PR read fails (closed ok) -> exit 2 (fail closed)", rc == 2)
     rc, _, err, _ = run(["owner/repo"],
                         ls_remote=heads_blob("feat/done"),
-                        closed_fail=True, merged_heads="feat/done\n")
+                        closed_fail=True, merged_heads=ended_blob("feat/done"))
     check("closed-PR read fails (merged ok) -> exit 2 (fail closed)", rc == 2)
     # F4: default-branch read is load-bearing -> fail closed.
     rc, _, err, _ = run(["owner/repo"],
                         ls_remote=heads_blob("feat/done"),
-                        default_fail=True, merged_heads="feat/done\n")
+                        default_fail=True, merged_heads=ended_blob("feat/done"))
     check("default-branch read fails -> exit 2 (fail closed)", rc == 2)
+    # G2: a git ls-remote failure must fail CLOSED (exit 2), never be read as "none".
+    rc, _, err, _ = run(["owner/repo"],
+                        ls_remote=heads_blob("feat/done"),
+                        ls_remote_fail=True, merged_heads=ended_blob("feat/done"))
+    check("git ls-remote read fails -> exit 2 (fail closed, not exit 0)", rc == 2)
+
+    print("== G3: identity requires BOTH name AND current SHA to match ==")
+    # A remote head whose NAME matches an ended PR head but whose SHA DIFFERS (a
+    # deleted-then-recreated branch reusing the name) is NOT deleted - data-loss guard.
+    other_sha = "b" * 40
+    rc, out, _, dels = run(["--delete", "owner/repo"],
+                           ls_remote=heads_blob(("feat/reused", other_sha)),
+                           merged_heads=ended_blob("feat/reused"))  # ended head has SHA "a"*40
+    check("name matches ended head but SHA differs -> NOT deleted (exit 0)",
+          rc == 0 and dels == "")
+    check("SHA-mismatch skip is reported", "SHA differs" in out)
+    # The matching-SHA case (same name AND same SHA) still IS a candidate under --delete.
+    rc, out, _, dels = run(["--delete", "owner/repo"],
+                           ls_remote=heads_blob("feat/reused"),
+                           merged_heads=ended_blob("feat/reused"))
+    check("name AND SHA both match -> deleted under --delete (exit 0)",
+          rc == 0 and ("feat%2Freused" in dels or "feat/reused" in dels))
 
     print("== delete mode ==")
     rc, out, _, dels = run(["--delete", "owner/repo"],
                            ls_remote=heads_blob("feat/done", "feat/live"),
                            open_heads="feat/live\n",
-                           merged_heads="feat/done\n")
+                           merged_heads=ended_blob("feat/done"))
     check("--delete removes the orphan -> exit 0", rc == 0)
     check("--delete routed a DELETE for feat/done", "feat%2Fdone" in dels or "feat/done" in dels)
     # closed (not merged) PR head also reaps.
     rc, out, _, dels = run(["--delete", "owner/repo"],
                            ls_remote=heads_blob("fix/closed"),
-                           closed_heads="fix/closed\n")
+                           closed_heads=ended_blob("fix/closed"))
     check("closed-PR head also reaped in --delete -> exit 0", rc == 0 and dels != "")
     # a deletion failure surfaces as exit 1.
     rc, _, _, _ = run(["--delete", "owner/repo"],
                       ls_remote=heads_blob("feat/done"),
-                      merged_heads="feat/done\n", delete_fail=True)
+                      merged_heads=ended_blob("feat/done"), delete_fail=True)
     check("a failed deletion -> exit 1", rc == 1)
 
     print()

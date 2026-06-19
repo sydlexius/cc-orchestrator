@@ -121,8 +121,14 @@ fi
 
 # Latest Codoki comment carrying the rate-limit marker (Codoki edits in place, so
 # prefer updated_at; fall back to created_at). Its body, or empty if none.
-rl_body="$(printf '%s' "$comments" | jq -r --arg marker "$CODOKI_MARKER" '
-  [ .[] | select((.body // "") | contains($marker)) ]
+# TRUST BOUNDARY: only a comment authored by Codoki itself counts - require the
+# author login to be the Codoki bot AND the body to carry the marker, so a
+# non-Codoki user cannot spoof `<!-- CODOKI_RATE_LIMIT -->` and force a false
+# RATE-LIMITED. The literal login is what this repo keys on everywhere
+# (pr-watch.sh, pr-unreplied-comments.sh).
+CODOKI_LOGIN='codoki-pr-intelligence[bot]'
+rl_body="$(printf '%s' "$comments" | jq -r --arg marker "$CODOKI_MARKER" --arg login "$CODOKI_LOGIN" '
+  [ .[] | select((.user.login // "") == $login and ((.body // "") | contains($marker))) ]
   | sort_by(.updated_at // .created_at) | last | .body // ""' 2>/dev/null || true)"
 
 # --- Settlement oracle: SETTLED vs NOT-YET-RUN (#110 reuse) ---
