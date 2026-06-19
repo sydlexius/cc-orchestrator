@@ -5,7 +5,7 @@ description: Use when scaffolding and running a lead-orchestrated multi-agent se
 
 # Orchestrate: lead-run multi-agent PR pipeline
 
-**Version 0.35.0** (semver; releases tagged `vX.Y.Z`). Bump on any material change to this skill, its templates, or the runtime - PATCH for a fix, MINOR for a new rule/feature, MAJOR for a breaking charter or deterministic-floor change - so `/reload-skills` surfaces the new number and drift between the symlinked repo and the loaded skill is visible. History: `git log` + the GitHub Release notes cut at each `vX.Y.Z` tag.
+**Version 0.36.0** (semver; releases tagged `vX.Y.Z`). Bump on any material change to this skill, its templates, or the runtime - PATCH for a fix, MINOR for a new rule/feature, MAJOR for a breaking charter or deterministic-floor change - so `/reload-skills` surfaces the new number and drift between the symlinked repo and the loaded skill is visible. History: `git log` + the GitHub Release notes cut at each `vX.Y.Z` tag.
 
 You are the LEAD (orchestrator). You delegate building and the mechanical PR
 lifecycle to single-purpose teammates, and you keep for yourself the decisions
@@ -99,7 +99,7 @@ dispatch-map entry
   -> maintainer merges (human only)
 ```
 
-MERGE HANDOFF (#9 - the human-merge path that actually works). When a PR is MERGE-READY and the maintainer gives the go, the merge is HUMAN-run - but NOT via a `!`-bang inside the IDE/session shell. A `! gh pr merge <n> --squash` fails SILENTLY in the IDE-hosted Claude Code shell (it errors and the PR is NOT merged - recurring dogfood friction). The lead hands off the WORKING path instead: "run `gh pr merge <n> --squash --delete-branch` in a SEPARATE plain terminal OUTSIDE the IDE, or click 'Squash and merge' in the GitHub UI". The lead then VERIFIES merged state (`gh pr view <n> --json state,mergeCommit` -> `MERGED` + a real mergeCommit) BEFORE any post-merge cleanup - never assume the merge happened from a "go". Merge stays human-executed; the deterministic floor and the merge gate are unchanged.
+MERGE HANDOFF (#9 - the human-merge path that actually works). When a PR is MERGE-READY and the maintainer gives the go, the merge is HUMAN-run - but NOT via a `!`-bang inside the IDE/session shell. A `! gh pr merge <n> --squash` fails SILENTLY in the IDE-hosted Claude Code shell (it errors and the PR is NOT merged - recurring dogfood friction). The lead hands off the WORKING path instead: "run `gh pr merge <n> --squash --delete-branch` in a SEPARATE plain terminal OUTSIDE the IDE, or click 'Squash and merge' in the GitHub UI". The lead then VERIFIES merged state (`gh pr view <n> --json state,mergeCommit` -> `MERGED` + a real mergeCommit) BEFORE any post-merge cleanup - never assume the merge happened from a "go". Once `state == MERGED` is confirmed, the lead MUST run `/post-merge-cleanup <n>` - this handoff is mandatory REGARDLESS OF MERGE METHOD (GitHub UI "Squash and merge", `gh pr merge` in a separate terminal, or any out-of-band / human-merged-without-telling-the-lead path); skipping it leaves the remote head lingering indefinitely. Merge stays human-executed; the deterministic floor and the merge gate are unchanged.
 
 `gh pr` - WHAT TO DO (decision index, #124; pointers into the canonical floor/merge-policy prose above):
 - PROMPT-FREE subcommands (allow-listed via `Bash(gh pr <sub> *)`): `view`, `diff`, `checks`,
