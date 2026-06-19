@@ -274,7 +274,11 @@ the full ordered cleanup sequence:
 - Linked-issue verification (each `Closes #N` reference resolved to
   CLOSED, or flagged OPEN with guidance)
 
-This handoff is mandatory -- not a "do this if you remember." It is the
+This handoff is mandatory -- not a "do this if you remember." It applies
+REGARDLESS OF MERGE METHOD: whether the merge landed via the GitHub UI
+"Squash and merge" button, a `gh pr merge` run in a separate terminal,
+or any out-of-band / human-merged-without-telling-the-lead path, the
+verification and cleanup handoff proceed identically. It is the
 sole reason cleanup logic lives in /post-merge-cleanup and not inline
 here: a single source of truth that can evolve (e.g. for leased-main
 edge cases, idempotent re-runs, or new GitHub API behaviours) without

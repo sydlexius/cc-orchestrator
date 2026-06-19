@@ -165,6 +165,37 @@ rm -f "$err_file"
 
 404 is expected if GitHub deleted it automatically on merge (`--delete-branch` flag). Note and continue. Any non-404 error is surfaced and stops the run rather than being mistaken for an "already deleted" 404.
 
+Note: this same inline `gh api -X DELETE` of the remote head also lives in
+`scripts/cleanup-worktree.sh` (around line 191) for consistency. This verify
+substep does NOT touch that file; the note is for cross-reference only.
+
+### Verify the remote head is actually gone
+
+After the delete above reports success or a 404, confirm the remote ref no
+longer exists, using the fully-qualified ref form so it cannot match a tag or
+be ambiguous. WARN-ONLY: a lingering head is surfaced for manual investigation,
+never auto-retried or force-deleted (the warning is sufficient to flag the
+anomaly).
+
+```bash
+if git ls-remote --exit-code origin "refs/heads/$branch" >/dev/null 2>&1; then
+  echo "WARNING: remote head refs/heads/$branch is STILL PRESENT after delete." >&2
+  echo "  The DELETE call reported success/404 but the ref persists. Investigate manually:" >&2
+  echo "    git ls-remote origin \"refs/heads/$branch\"" >&2
+  echo "    gh api \"repos/$repo/git/refs/heads/<encoded>\" -X DELETE   # re-run by hand if appropriate" >&2
+else
+  echo "verified remote head refs/heads/$branch is gone"
+fi
+
+# Confidence guard: the local branch should already be absent after Step 4.
+if git show-ref --verify --quiet "refs/heads/$branch"; then
+  echo "WARNING: local branch $branch still exists (expected gone after Step 4)." >&2
+fi
+```
+
+`git ls-remote --exit-code` exits non-zero when the ref is absent (the expected,
+quiet outcome) and zero when it still exists (the warned anomaly).
+
 ---
 
 ## Step 6 -- Prune stale remote refs
