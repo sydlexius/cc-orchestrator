@@ -187,21 +187,32 @@ def main():
           "STALE-ADVISORY:" in out and "(edited)" in out)
 
     print("== #132 --audit mode ==")
+    # REALISM (#132): GraphQL author.login returns bot logins WITHOUT the "[bot]"
+    # suffix (e.g. "coderabbitai") whereas REST user.login carries it. The audit
+    # FINDINGS path reads GraphQL, so its fixtures MUST use suffix-less bot logins to
+    # match real GitHub; an earlier "[bot]"-suffixed fixture masked the bug where
+    # every bot thread was dropped (0 findings on a fully-resolved PR #129).
     # All replied + resolved -> exit 0.
     g_ok = ('{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":['
             '{"isResolved":true,"path":"a.sh","line":10,"comments":{"nodes":['
-            '{"author":{"login":"coderabbitai[bot]"}},{"author":{"login":"testuser"}}]}}'
+            '{"author":{"login":"coderabbitai"}},{"author":{"login":"testuser"}}]}}'
             ']}}}}}')
     rc, out, err = run(["--audit"], graphql=g_ok)
     check("audit: all findings replied + resolved -> exit 0", rc == 0)
     check("audit: table has TYPE/AUTHOR/LOCATION/REPLIED/RESOLVED columns",
           all(c in out for c in ("TYPE", "AUTHOR", "LOCATION", "REPLIED", "RESOLVED")))
     check("audit: location renders file:line", "a.sh:10" in out)
+    # The core regression: a RESOLVED bot thread (suffix-less GraphQL login) is
+    # ENUMERATED as a finding and counted, NOT silently dropped (PR #129 read 0).
+    check("audit: resolved bot thread (suffix-less GraphQL login) IS enumerated as a finding",
+          "finding" in out and "coderabbitai" in out)
 
-    # Unreplied finding (only the bot comment, no human reply) -> exit 1.
+    # Unreplied finding (only the bot comment, no human reply) -> exit 1. With the
+    # suffix-less login this ALSO proves the root-author select normalizes: pre-fix
+    # the bot thread was dropped (0 findings) and this wrongly exited 0.
     g_unreplied = ('{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":['
                    '{"isResolved":true,"path":"a.sh","line":10,"comments":{"nodes":['
-                   '{"author":{"login":"coderabbitai[bot]"}}]}}'
+                   '{"author":{"login":"coderabbitai"}}]}}'
                    ']}}}}}')
     rc, out, err = run(["--audit"], graphql=g_unreplied)
     check("audit: unreplied finding -> exit 1", rc == 1)
@@ -209,16 +220,32 @@ def main():
     # Replied but unresolved thread -> exit 1.
     g_unresolved = ('{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":['
                     '{"isResolved":false,"path":"a.sh","line":10,"comments":{"nodes":['
-                    '{"author":{"login":"coderabbitai[bot]"}},{"author":{"login":"testuser"}}]}}'
+                    '{"author":{"login":"coderabbitai"}},{"author":{"login":"testuser"}}]}}'
                     ']}}}}}')
     rc, out, err = run(["--audit"], graphql=g_unresolved)
     check("audit: unresolved thread -> exit 1", rc == 1)
 
-    # Includes BOTH CodeRabbit (thread) and Codoki (issue-level summary).
+    # REPLIED normalization (#132): a bot's OWN reply also arrives suffix-less from
+    # GraphQL and must NOT be mis-counted as a human reply. Two bot comments, no
+    # human, resolved -> still UNREPLIED -> exit 1. Pre-fix the second bot's
+    # suffix-less login failed the membership test and read as a human reply
+    # (replied:true), wrongly exiting 0.
+    g_bot_only_reply = ('{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":['
+                        '{"isResolved":true,"path":"a.sh","line":10,"comments":{"nodes":['
+                        '{"author":{"login":"coderabbitai"}},'
+                        '{"author":{"login":"codoki-pr-intelligence"}}]}}'
+                        ']}}}}}')
+    rc, out, err = run(["--audit"], graphql=g_bot_only_reply)
+    check("audit: bot's own (suffix-less) reply is NOT a human reply -> still unreplied -> exit 1",
+          rc == 1)
+
+    # Includes BOTH CodeRabbit (thread, GraphQL suffix-less) and Codoki (issue-level
+    # summary, REST so "[bot]"-suffixed). Summaries read REST .user.login, which
+    # carries the suffix; that path is unchanged.
     codoki_summary = '[{"user":{"login":"codoki-pr-intelligence[bot]"},"body":"Review Status: Safe","created_at":"x","updated_at":"x"}]'
     rc, out, err = run(["--audit"], graphql=g_ok, issue=codoki_summary)
     check("audit: enumerates both CodeRabbit finding and Codoki summary",
-          "coderabbitai[bot]" in out and "codoki-pr-intelligence[bot]" in out)
+          "coderabbitai" in out and "codoki-pr-intelligence[bot]" in out)
     check("audit: Codoki issue-level summary does not flip exit (still 0)", rc == 0)
 
     # Mutual exclusivity with --count-only -> usage error exit 1.
@@ -236,13 +263,13 @@ def main():
                '"pageInfo":{"hasNextPage":true,"endCursor":"C1"},'
                '"nodes":[{"isResolved":true,"path":"a.sh","line":10,"comments":{'
                '"pageInfo":{"hasNextPage":false},"nodes":['
-               '{"author":{"login":"coderabbitai[bot]"}},{"author":{"login":"testuser"}}]}}]'
+               '{"author":{"login":"coderabbitai"}},{"author":{"login":"testuser"}}]}}]'
                '}}}}}')
     g_page2 = ('{"data":{"repository":{"pullRequest":{"reviewThreads":{'
                '"pageInfo":{"hasNextPage":false},'
                '"nodes":[{"isResolved":false,"path":"b.sh","line":20,"comments":{'
                '"pageInfo":{"hasNextPage":false},"nodes":['
-               '{"author":{"login":"coderabbitai[bot]"}},{"author":{"login":"testuser"}}]}}]'
+               '{"author":{"login":"coderabbitai"}},{"author":{"login":"testuser"}}]}}]'
                '}}}}}')
     rc, out, err = run(["--audit"], graphql=g_page1, graphql_next=g_page2)
     check("audit pagination: >100 threads (hasNextPage) does NOT print AUDIT: COMPLETE",
@@ -257,7 +284,7 @@ def main():
                           '"pageInfo":{"hasNextPage":false},'
                           '"nodes":[{"isResolved":true,"path":"a.sh","line":10,"comments":{'
                           '"pageInfo":{"hasNextPage":true},"nodes":['
-                          '{"author":{"login":"coderabbitai[bot]"}}]}}]'
+                          '{"author":{"login":"coderabbitai"}}]}}]'
                           '}}}}}')
     rc, out, err = run(["--audit"], graphql=g_comment_overflow)
     check("audit comment-overflow (>100 comments/thread) does NOT print AUDIT: COMPLETE",

@@ -427,16 +427,27 @@ if [ "$audit_mode" = true ]; then
   # REPLIED when any comment in it is authored by a non-bot (a human reply); RESOLVED
   # is GitHub's reviewThread.isResolved (note: jq treats index 0 as truthy, so a bot
   # matched at array position 0 is still selected).
+  #
+  # BOT-LOGIN NORMALIZATION (#132): GraphQL's author.login returns bot logins WITHOUT
+  # the "[bot]" suffix (e.g. "coderabbitai", "codoki-pr-intelligence") whereas REST's
+  # user.login carries it ("coderabbitai[bot]"). audit_bots is the REST-form set
+  # (summaries rely on it), so a raw membership test against the suffix-less GraphQL
+  # login NEVER matches a bot -> 0 findings AND mis-counts a bot's own reply as a
+  # human reply (replied:true). isbot() normalizes: a login matches if the set
+  # contains it OR it + "[bot]" -- covering GraphQL's suffix-less form while still
+  # matching non-suffixed entries (e.g. "Copilot"). Applied to BOTH the root-author
+  # select and the replied (human-reply) computation. index 0 stays truthy via `or`.
   findings=$(echo "$threads_json" | jq -c --argjson bots "$audit_bots" '
+    def isbot($l): ($bots | index($l)) or ($bots | index($l + "[bot]"));
     [ (.data.repository.pullRequest.reviewThreads.nodes // [])[]
       | (.comments.nodes // []) as $cs
       | ($cs[0].author.login // "") as $root
-      | select($bots | index($root))
+      | select(isbot($root))
       | {
           type: "finding",
           author: $root,
           location: (((.path // "?")) + ":" + ((.line // 0) | tostring)),
-          replied: ([ $cs[] | select((.author.login // "") as $a | ($bots | index($a)) | not) ] | length > 0),
+          replied: ([ $cs[] | (.author.login // "") as $a | select(isbot($a) | not) ] | length > 0),
           resolved: (.isResolved == true)
         } ]')
 
