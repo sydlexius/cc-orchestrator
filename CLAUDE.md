@@ -37,6 +37,12 @@ Runtime (`scripts/`; canonical source is this repo):
   the `gh pr merge` CLI (`is_pr_merge`, #105) AND merge-by-API (`gh api ... pulls/N/merge`);
   a SOLO/non-marker session is never Tier-2-gated. Fails OPEN on any internal error. Threat model
   = honest bot on the obvious path, NOT adversarial evasion (it is a guardrail, not a sandbox).
+- `scripts/orchestrate-steer.sh` - the advisory WARN-level steering hook (#95), SEPARATE from the
+  deny-floor guard. Exit 0 ALWAYS (never blocks); emits a `STEER:` nudge to stderr on two rules:
+  (1) a marker-gated mid-run edit of a canonical file (SKILL.md/templates/guard/steer) -> log
+  feedback instead; (2) a raw `gh api` mutation not via a `gh-*` wrapper -> use the wrapper. Wired
+  for Edit/Write/Bash PreToolUse by `configure` (deployed Option-A like the guard); never duplicates
+  or weakens a guard deny; opt out with `configure --no-steer`. Fails SILENT-OPEN.
 - `orchestrate-resources.py` - cross-session port + data-dir lease allocator (flock-atomic JSON
   state). `stillwater` profile emits SW_* env (lease JSON on STDOUT, eval-able exports on STDERR);
   the encryption key is a 0600 file beside the DB, NEVER in env/.env.
@@ -45,6 +51,9 @@ Runtime (`scripts/`; canonical source is this repo):
   [--apply]` is the consent-based path that wires the floor hook + missing allow-list entries into
   settings.json, DEPLOYS the bundled guard to the stable `~/.claude/scripts/` path (so a fresh
   plugin install has a working floor; idempotent, refreshes a stale copy, warns on a missing source),
+  DEPLOYS the 9 bundled PR-lifecycle helpers the same Option-A way (#133; retiring any claude-kit
+  symlink, backed up to `<dest>.bak`), and (unless `--no-steer`) DEPLOYS + wires the advisory
+  steering hook `orchestrate-steer.sh` for Edit/Write/Bash (#95; doctor only ever WARNs about it),
   AND (via two SEPARATE paths) (a) narrows any blanket `gh pr` allow-rule
   (`Bash(gh pr *)`/`Bash(gh pr:*)`) that shadows the merge gate down to the enumerated
   non-merge subcommands only (broader `gh *`/`*` shadows are surfaced for human resolution,
@@ -69,11 +78,13 @@ disambiguate from the `/ralph-loop` skill) + `DESIGN-*`/`PLAN-*`/`ROADMAP-*` (un
 ## Gates (run locally; CI enforces them)
 
 ```sh
-shellcheck scripts/orchestrate-guard.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/pr-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh
+shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/pr-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh
 ruff check --select F,E741 scripts/orchestrate-*.py scripts/planner_classify.py test-orchestrate-*.py test-planner-classify.py test-gh-wrappers.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-safe-push.py test-pr-watch.py test-version-lockstep.py
 ./scripts/orchestrate-guard.sh --self-test    # MUST use ./ - the self-test re-invokes "$0";
                                               # `bash scripts/orchestrate-guard.sh` makes $0 a bare name -> 127
+./scripts/orchestrate-steer.sh --self-test    # advisory WARN-level steering hook (#95)
 python3 test-orchestrate-guard.py
+python3 test-orchestrate-steer.py
 python3 test-orchestrate-resources.py
 python3 test-orchestrate-setup.py
 python3 test-planner-classify.py
@@ -127,7 +138,9 @@ drives `/plugin marketplace` update-detection, so they must never diverge. The C
   - CR-REQUIRED PR (changes a script's FUNCTION: `.sh`/`.py`/`.mjs` logic): needs maintainer PERMISSION
     TO OPEN the PR, and its MERGE stays human.
   - GATES + hostile pre-push review are NEVER waived - autonomy waives the maintainer's APPROVAL, not the
-    rigor (build + prep + hostile review green before ANY PR; a CR-required PR still gets a triggered CR pass).
+    rigor (build + prep + hostile review green before ANY PR; a CR-required PR still requires a CR pass
+    before merge, and the lead triggers that pass ONLY on explicit per-instance maintainer authorization -
+    a `▶ NEEDS YOU` gate, like merge; never lead-initiated on a standing grant).
   - SELF-IMPOSED CARVE-OUT: a change that edits the deterministic floor / merge-policy / operating-model
     ITSELF routes for MAINTAINER MERGE even when it is "doc" (this file's operating-model + SKILL.md floor
     invariants qualify).

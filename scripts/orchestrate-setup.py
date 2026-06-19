@@ -48,6 +48,12 @@ GUARD = os.environ.get("ORCHESTRATE_GUARD", os.path.join(HOME, ".claude", "scrip
 # skills/orchestrate/design/DESIGN-plugin-floor-lifecycle.md). Env-overridable so the harness can point it at a fixture.
 BUNDLED_GUARD = os.environ.get("ORCHESTRATE_BUNDLED_GUARD",
     os.path.join(os.path.dirname(os.path.realpath(__file__)), "orchestrate-guard.sh"))
+# The WARN-level steering hook (#95) - a SEPARATE script from the deny-floor guard. Deployed to the
+# stable STEER path the same Option-A way, and wired as advisory Edit/Write/Bash PreToolUse hooks.
+# Advisory + opt-out-able (`configure --no-steer`), so doctor only ever WARNs about it, never FAILs.
+STEER = os.environ.get("ORCHESTRATE_STEER", os.path.join(HOME, ".claude", "scripts", "orchestrate-steer.sh"))
+BUNDLED_STEER = os.environ.get("ORCHESTRATE_BUNDLED_STEER",
+    os.path.join(os.path.dirname(os.path.realpath(__file__)), "orchestrate-steer.sh"))
 # Script-relative: under the plugin layout this script lives in scripts/ and the templates ship
 # beside the skill at skills/orchestrate/templates/, so resolve them relative to the script
 # (realpath resolves any ~/.claude/scripts deploy symlink to the real plugin/repo location). A
@@ -56,6 +62,25 @@ BUNDLED_GUARD = os.environ.get("ORCHESTRATE_BUNDLED_GUARD",
 TEMPLATES = os.environ.get("ORCHESTRATE_TEMPLATES_DIR", os.path.normpath(
     os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "skills", "orchestrate", "templates")))
 ARTIFACTS = os.environ.get("ORCHESTRATE_ARTIFACT_DIR", "/tmp")
+
+# Deployed PR-lifecycle helpers (#133). The plugin bundles these 9 helpers under scripts/ and is now
+# their canonical SOURCE. `configure --apply` deploys them to the stable ~/.claude/scripts/ path
+# EXACTLY as it deploys the floor guard (Option A), so leads invoke them through the existing
+# Bash(~/.claude/scripts/*.sh *) allow-rule - no per-plugin-version cache drift, portable across
+# installs. A deploy also RETIRES the old claude-kit symlinks: it converts a symlink at the dest
+# into a real plugin copy (backing the symlink up to <dest>.bak first; never clobbers an unreadable
+# regular-file dest blind). Edits are PR-only; deployed copies are derived. Env-overridable so the
+# harness can point them at fixtures (mirrors GUARD / BUNDLED_GUARD).
+SCRIPTS_DIR = os.environ.get("ORCHESTRATE_SCRIPTS_DIR", os.path.join(HOME, ".claude", "scripts"))
+BUNDLED_SCRIPTS_DIR = os.environ.get("ORCHESTRATE_BUNDLED_SCRIPTS_DIR",
+    os.path.dirname(os.path.realpath(__file__)))
+HELPER_NAMES = (
+    "pr-watch.sh", "pr-unreplied-comments.sh", "pr-read-comments.sh", "reply-comment.sh",
+    "resolve-threads.sh", "cleanup-worktree.sh", "patch-coverage.sh", "pr-codeql-autofixes.sh",
+    "safe-push.sh",
+)
+# The _helper_deploy_action results that warrant an actual deploy write (vs. None / informational).
+HELPER_DEPLOY_ACTIONS = ("deploy", "refresh", "replace-symlink", "replace-broken-symlink")
 
 PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
 
@@ -107,6 +132,21 @@ GUARD_HOOK_BLOCK = {
 GUARD_HOOK_JSON = ("  Add this to ~/.claude/settings.json under hooks.PreToolUse (doctor only\n"
                    "  verifies + prints; `orchestrate-setup.py configure --apply` writes it for you):\n"
                    "    " + json.dumps(GUARD_HOOK_BLOCK))
+
+# The advisory steering hooks (#95). Three PreToolUse blocks (Edit, Write, Bash) all pointing at the
+# stable steer path. SEPARATE from the guard's Bash hook (settings.json runs every matching block, so
+# the guard deny and the steer WARN coexist on a Bash call). Advisory + opt-out-able.
+# The command is fail-OPEN: `[ -r <steer> ] && bash <steer> || true` so a missing/unreadable deployed
+# script returns 0 (never blocks) and emits no per-call "No such file" noise - matching
+# orchestrate-steer.sh's "exit 0 ALWAYS" advisory contract. Shared as one constant so the present()
+# detection (below) can exact-match the SAME string that gets written.
+STEER_HOOK_COMMAND = ('[ -r "$HOME/.claude/scripts/orchestrate-steer.sh" ] && '
+                      'bash "$HOME/.claude/scripts/orchestrate-steer.sh" || true')
+STEER_HOOK_BLOCKS = [
+    {"matcher": m,
+     "hooks": [{"type": "command", "command": STEER_HOOK_COMMAND}]}
+    for m in ("Edit", "Write", "Bash")
+]
 
 
 def _guard_hook_present(settings):
@@ -196,6 +236,192 @@ def check_guard_stale():
     if action in ("deploy", "missing-source"):
         return _emit(WARN, f"could not compare the deployed guard to the bundled guard ({action})")
     return _emit(PASS, "deployed guard matches the bundled plugin guard")
+
+
+def _missing_steer_hook_blocks(settings):
+    """The STEER_HOOK_BLOCKS not yet wired in settings.json (matched by matcher + steer command)."""
+    pre = (settings or {}).get("hooks", {}).get("PreToolUse", [])
+
+    def present(block):
+        # Exact (type+command) match against the canonical STEER_HOOK_COMMAND this block carries, so a
+        # stale path or a disabled `true # orchestrate-steer.sh` line no longer counts as wired; kept
+        # anchored to the same constant written by configure (block["hooks"][0]["command"]).
+        expected = block["hooks"][0]["command"]
+        for b in pre:
+            if b.get("matcher") == block["matcher"]:
+                for h in b.get("hooks", []):
+                    if h.get("type") == "command" and h.get("command") == expected:
+                        return True
+        return False
+    return [b for b in STEER_HOOK_BLOCKS if not present(b)]
+
+
+def _steer_deploy_action():
+    """What `configure` must do to put the bundled steer script at the stable STEER path. Mirrors
+    _guard_deploy_action: 'missing-source' | 'deploy' | 'refresh' | None."""
+    if not os.path.isfile(BUNDLED_STEER):
+        return "missing-source"
+    if not os.path.exists(STEER):
+        return "deploy"
+    if not _files_identical(BUNDLED_STEER, STEER):
+        return "refresh"
+    return None
+
+
+def _deploy_steer():
+    """Copy the bundled steer script to the stable STEER path, executable. Caller gated on --apply +
+    consent. Atomic temp-then-replace, mirroring _deploy_guard. Returns (ok, message)."""
+    try:
+        os.makedirs(os.path.dirname(STEER), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(STEER), prefix=".orch-steer-")
+        os.close(fd)
+        try:
+            shutil.copy2(BUNDLED_STEER, tmp)
+            os.chmod(tmp, os.stat(tmp).st_mode | 0o111)
+            os.replace(tmp, STEER)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return True, f"deployed the steering hook -> {STEER}"
+    except OSError as e:
+        return False, f"FAILED to deploy the steering hook to {STEER}: {e}"
+
+
+def check_steer(settings):
+    """Doctor check for the advisory steering hooks (#95). WARN (never FAIL) when the hooks are not
+    wired or the deployed steer script is stale/uncomparable - steering is opt-out-able and advisory,
+    so its absence is never a hard fail. PASS when all 3 hooks are wired + the deployed steer matches
+    the bundled copy. Stays read-only."""
+    missing = _missing_steer_hook_blocks(settings)
+    action = _steer_deploy_action()
+    msgs = []
+    if missing:
+        msgs.append(f"{len(missing)} advisory steering hook(s) not wired "
+                    f"({', '.join(b['matcher'] for b in missing)})")
+    if action == "deploy":
+        msgs.append(f"deployed steer script missing at {STEER}")
+    elif action == "refresh":
+        msgs.append(f"deployed steer script at {STEER} is STALE vs the bundled copy")
+    elif action == "missing-source":
+        msgs.append(f"bundled steer source missing at {BUNDLED_STEER}")
+    if msgs:
+        return _emit(WARN, "; ".join(msgs) + " - run `orchestrate-setup.py configure --apply` "
+                           "(or `--no-steer` to skip the advisory steering)")
+    return _emit(PASS, "advisory steering hooks wired + deployed steer matches the bundled copy")
+
+
+def _helper_deploy_action(name):
+    """What `configure` must do to put bundled helper `name` at the stable SCRIPTS_DIR path. Mirrors
+    _guard_deploy_action, adding claude-kit symlink retirement (#133):
+      'missing-source'         - the bundled helper source is absent (dev-layout problem);
+      'deploy'                 - the dest does not exist yet (fresh install);
+      'replace-broken-symlink' - dest is a symlink whose target is gone (a dead claude-kit link);
+      'replace-symlink'        - dest is a symlink (the claude-kit link) - convert to a real copy;
+      'unreadable'             - dest is a regular file that exists but cannot be read (never clobber blind);
+      'refresh'                - dest is a regular file that differs from the bundled helper (drift);
+      None                     - dest is byte-identical to the bundled helper (nothing to do).
+    islink is checked BEFORE exists: os.path.exists FOLLOWS the link, so a broken symlink would
+    otherwise read as 'deploy' and silently leave the dead claude-kit link in place."""
+    src = os.path.join(BUNDLED_SCRIPTS_DIR, name)
+    dest = os.path.join(SCRIPTS_DIR, name)
+    if not os.path.isfile(src):
+        return "missing-source"
+    if os.path.islink(dest):
+        return "replace-symlink" if os.path.exists(dest) else "replace-broken-symlink"
+    if not os.path.exists(dest):
+        return "deploy"
+    if not os.access(dest, os.R_OK):
+        return "unreadable"
+    if not _files_identical(src, dest):
+        return "refresh"
+    return None
+
+
+def _deploy_helper(name):
+    """Deploy bundled helper `name` to the stable SCRIPTS_DIR path. The caller has gated on --apply +
+    consent and selected only actionable helpers. Converts a claude-kit symlink into a real copy
+    (backing the symlink itself up to <dest>.bak first); refuses an unreadable regular-file dest
+    (never clobber blind). Atomic temp-then-replace, mirroring _deploy_guard. Returns (ok, message)."""
+    src = os.path.join(BUNDLED_SCRIPTS_DIR, name)
+    dest = os.path.join(SCRIPTS_DIR, name)
+    action = _helper_deploy_action(name)
+    if action == "missing-source":
+        return False, f"helper {name}: bundled source missing at {src} - cannot deploy"
+    if action == "unreadable":
+        return False, f"helper {name}: dest {dest} exists but is unreadable - refusing to clobber blind"
+    if action is None:
+        return True, f"helper {name}: already current"
+    try:
+        os.makedirs(SCRIPTS_DIR, exist_ok=True)
+        # Retire a claude-kit symlink: move the link itself aside before writing the real copy.
+        # os.path.islink (not exists) so a BROKEN link is backed up too, not skipped; os.replace
+        # renames the symlink itself, never its target.
+        if os.path.islink(dest):
+            os.replace(dest, dest + ".bak")
+        fd, tmp = tempfile.mkstemp(dir=SCRIPTS_DIR, prefix=".orch-helper-")
+        os.close(fd)
+        try:
+            shutil.copy2(src, tmp)
+            os.chmod(tmp, os.stat(tmp).st_mode | 0o111)  # ensure u+g+o executable
+            os.replace(tmp, dest)  # atomic
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        verb = {"deploy": "deployed", "refresh": "refreshed (stale)",
+                "replace-symlink": "replaced claude-kit symlink for",
+                "replace-broken-symlink": "replaced broken symlink for"}.get(action, "deployed")
+        return True, f"helper {name}: {verb} -> {dest}"
+    except OSError as e:
+        return False, f"helper {name}: FAILED to deploy to {dest}: {e}"
+
+
+def check_helpers_stale():
+    """Doctor check (WARN-level): the deployed PR-lifecycle helpers should match the bundled plugin
+    copies. Drift (a stale copy, or a not-yet-retired claude-kit symlink) is the post-plugin-update
+    case - WARN, never FAIL, and point at `configure --apply`. Mirrors check_guard_stale and stays
+    read-only (only _helper_deploy_action, which never writes)."""
+    stale, missing, missing_deployed, unreadable = [], [], [], []
+    for name in HELPER_NAMES:
+        action = _helper_deploy_action(name)
+        if action in ("refresh", "replace-symlink", "replace-broken-symlink"):
+            stale.append(name)
+        elif action == "deploy":
+            missing_deployed.append(name)
+        elif action == "unreadable":
+            unreadable.append(name)
+        elif action == "missing-source":
+            missing.append(name)
+    if missing_deployed:
+        return _emit(WARN, "PR-lifecycle helper(s) not yet deployed to the stable path "
+                           f"({', '.join(missing_deployed)}) - run `orchestrate-setup.py configure --apply` to deploy")
+    if unreadable:
+        return _emit(WARN, "deployed helper script(s) exist but are unreadable "
+                           f"({', '.join(unreadable)}) - cannot verify; check permissions")
+    if stale:
+        return _emit(WARN, "deployed helper script(s) STALE vs the bundled plugin copies "
+                           f"({', '.join(stale)}) - run `orchestrate-setup.py configure --apply` to refresh")
+    if missing:
+        return _emit(WARN, "bundled helper source(s) missing "
+                           f"({', '.join(missing)}); cannot verify the deployed copies")
+    return _emit(PASS, "deployed helper scripts match the bundled plugin copies")
+
+
+def _emit_helper_warnings(missing, unreadable):
+    """Print stderr WARNINGs for helpers that cannot be deployed (missing bundled source, or an
+    unreadable dest). Shared by configure's change-preview and its no-op early-return so neither
+    path silently swallows the signal."""
+    for name in missing:
+        print(f"configure: WARNING - bundled helper source for {name} is missing under "
+              f"{BUNDLED_SCRIPTS_DIR}; cannot deploy it (the rest still applies).", file=sys.stderr)
+    for name in unreadable:
+        print(f"configure: WARNING - deployed helper {os.path.join(SCRIPTS_DIR, name)} is unreadable; "
+              "refusing to clobber it blind (the rest still applies).", file=sys.stderr)
 
 
 def check_repo_main(repo):
@@ -774,6 +1000,7 @@ def cmd_doctor(args):
     repo_status, _head = check_repo_main(getattr(args, "repo", None))
     results = [check_agent_teams(settings), check_tmux(),
                check_guard_wired(settings), check_guard_healthy(), check_guard_stale(),
+               check_helpers_stale(), check_steer(settings),
                repo_status, check_allowlist(settings),
                check_merge_gate_shadows(), check_slack_channel(), check_slack_bot_user_id()]
     hard_fail = any(s == FAIL for s in results)
@@ -1164,8 +1391,21 @@ def cmd_configure(args):
     # path so a fresh plugin install has a working floor (Option A). Shadow NARROWING is a separate
     # cascade-wide remediation handled below (its own scan/diff/consent), driven by the single matcher.
     guard_action = _guard_deploy_action()           # 'deploy' | 'refresh' | 'missing-source' | None
-    deploy_needed = guard_action in ("deploy", "refresh")
-    settings_changes = add_hook or bool(missing_allow)
+    # #133: the bundled PR-lifecycle helpers ride the SAME Option-A deploy mechanism as the guard.
+    helper_actions = [(n, _helper_deploy_action(n)) for n in HELPER_NAMES]
+    helpers_actionable = [(n, a) for n, a in helper_actions if a in HELPER_DEPLOY_ACTIONS]
+    helper_missing = [n for n, a in helper_actions if a == "missing-source"]
+    helper_unreadable = [n for n, a in helper_actions if a == "unreadable"]
+    # #95: advisory steering hooks. Skipped entirely with --no-steer, and gated on the bundled steer
+    # source existing (never wire a hook pointing at a script we cannot deploy). steer_action drives
+    # the deploy; steer_blocks_to_add drives the settings wiring.
+    steer_action = _steer_deploy_action()  # 'deploy' | 'refresh' | 'missing-source' | None
+    steer_on = not getattr(args, "no_steer", False) and steer_action != "missing-source"
+    steer_blocks_to_add = _missing_steer_hook_blocks(settings) if steer_on else []
+    steer_deploy_needed = steer_on and steer_action in ("deploy", "refresh")
+    deploy_needed = (guard_action in ("deploy", "refresh") or bool(helpers_actionable)
+                     or steer_deploy_needed)
+    settings_changes = add_hook or bool(missing_allow) or bool(steer_blocks_to_add)
 
     if not settings_changes and not deploy_needed:
         if guard_action == "missing-source":
@@ -1174,7 +1414,11 @@ def cmd_configure(args):
                   "the floor guard.)", file=sys.stderr)
         else:
             print(f"configure: {SETTINGS} already has the floor hook + all documented allow-list entries, "
-                  "and the deployed guard matches the bundled plugin guard.")
+                  "and the deployed guard + helper scripts match the bundled plugin copies.")
+        _emit_helper_warnings(helper_missing, helper_unreadable)
+        if not getattr(args, "no_steer", False) and steer_action == "missing-source":
+            print(f"configure: WARNING - the bundled steer script {BUNDLED_STEER} is missing; skipping "
+                  "the advisory steering hooks (the rest still applies).", file=sys.stderr)
         return _narrow_merge_gate_shadows(args.apply, args.yes)
 
     if settings_changes:
@@ -1184,13 +1428,31 @@ def cmd_configure(args):
             print("    (the always-on deterministic security floor)")
         for m in missing_allow:
             print(f"  permissions.allow += {m}")
-    if deploy_needed:
+        for b in steer_blocks_to_add:
+            print(f"  hooks.PreToolUse += {json.dumps(b)}")
+            print("    (advisory WARN-level steering; opt out with --no-steer)")
+    if guard_action in ("deploy", "refresh"):
         verb = "DEPLOY" if guard_action == "deploy" else "REFRESH (stale)"
         print(f"configure will {verb} the floor guard:")
         print(f"  {BUNDLED_GUARD} -> {GUARD}")
+    if helpers_actionable:
+        print(f"configure will DEPLOY/REFRESH {len(helpers_actionable)} PR-lifecycle helper script(s):")
+        for name, action in helpers_actionable:
+            label = {"deploy": "deploy", "refresh": "refresh (stale)",
+                     "replace-symlink": "replace claude-kit symlink",
+                     "replace-broken-symlink": "replace broken symlink"}[action]
+            print(f"  [{label}] {os.path.join(BUNDLED_SCRIPTS_DIR, name)} -> {os.path.join(SCRIPTS_DIR, name)}")
+    if steer_deploy_needed:
+        verb = "DEPLOY" if steer_action == "deploy" else "REFRESH (stale)"
+        print(f"configure will {verb} the steering hook:")
+        print(f"  {BUNDLED_STEER} -> {STEER}")
     if guard_action == "missing-source":
         print(f"configure: WARNING - the bundled guard {BUNDLED_GUARD} is missing; cannot deploy "
               "the floor guard (the rest still applies).", file=sys.stderr)
+    if not getattr(args, "no_steer", False) and steer_action == "missing-source":
+        print(f"configure: WARNING - the bundled steer script {BUNDLED_STEER} is missing; skipping "
+              "the advisory steering hooks (the rest still applies).", file=sys.stderr)
+    _emit_helper_warnings(helper_missing, helper_unreadable)
 
     if not args.apply:
         print("\n(preview only; re-run with --apply to write. settings.json is backed up first, "
@@ -1217,6 +1479,8 @@ def cmd_configure(args):
             settings.setdefault("hooks", {}).setdefault("PreToolUse", []).append(GUARD_HOOK_BLOCK)
         if missing_allow:
             settings.setdefault("permissions", {}).setdefault("allow", []).extend(missing_allow)
+        if steer_blocks_to_add:
+            settings.setdefault("hooks", {}).setdefault("PreToolUse", []).extend(steer_blocks_to_add)
         try:
             os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
             _atomic_write_json(SETTINGS, settings)
@@ -1225,15 +1489,35 @@ def cmd_configure(args):
             return 1
         backup_note = f" (backup: {SETTINGS}.bak)" if status == "ok" else ""
         print(f"configure: wrote {SETTINGS}{backup_note}.")
-        if add_hook:
-            print("RESTART the Claude Code session for the floor hook to load (PreToolUse hooks load at session start).")
+        if add_hook or steer_blocks_to_add:
+            print("RESTART the Claude Code session for the new PreToolUse hook(s) to load "
+                  "(PreToolUse hooks load at session start).")
 
     # Guard deploy is a filesystem copy, independent of (and after) the settings write.
-    if deploy_needed:
+    if guard_action in ("deploy", "refresh"):
         ok, msg = _deploy_guard()
         print(f"configure: {msg}")
         if not ok:
             return 1
+
+    # #95: steer deploy - the same Option-A filesystem copy to the stable STEER path.
+    if steer_deploy_needed:
+        ok, msg = _deploy_steer()
+        print(f"configure: {msg}")
+        if not ok:
+            return 1
+
+    # #133: helper deploy - the same Option-A filesystem copy to the stable SCRIPTS_DIR path.
+    # Continue past an individual failure (deploy as many as possible), then report at the end.
+    helper_failed = False
+    for name, _action in helpers_actionable:
+        ok, msg = _deploy_helper(name)
+        print(f"configure: {msg}")
+        if not ok:
+            helper_failed = True
+    if helper_failed:
+        print("configure: one or more helper scripts failed to deploy (see above).", file=sys.stderr)
+        return 1
 
     # After applying, narrow any cascade shadow (own scan/diff/consent).
     return _narrow_merge_gate_shadows(args.apply, args.yes)
@@ -1264,6 +1548,9 @@ def main():
                    help="write the changes (default is a dry-run preview)")
     c.add_argument("--yes", action="store_true",
                    help="skip the y/N confirmation (for non-interactive setup)")
+    c.add_argument("--no-steer", action="store_true",
+                   help="skip the advisory WARN-level steering hooks (#95); the deny-floor guard is "
+                        "always wired regardless")
 
     args = p.parse_args()
     return {"doctor": cmd_doctor, "up": cmd_up, "down": cmd_down,
