@@ -2,7 +2,12 @@
 # pr-read-comments.sh -- Read full bodies of PR review comments
 #
 # Usage:
-#   pr-read-comments.sh [--reviews] [--issue] <pr> [comment-id...]
+#   pr-read-comments.sh [--reviews] [--issue] <pr> [owner/repo] [comment-id...]
+#
+# The optional [owner/repo] positional targets a repo other than the cwd's.
+# An argument containing '/' is interpreted as a repo slug; otherwise the
+# positionals after <pr> are treated as numeric comment IDs (so the legacy
+# `pr-read-comments.sh <pr> <comment-id...>` form keeps working).
 #
 # Modes (combinable):
 #   (default)  Inline review comments (diff comments)
@@ -43,16 +48,25 @@ while [[ "${1:-}" == --* ]]; do
 done
 
 if [ "${#}" -lt 1 ]; then
-  echo "Usage: $0 [--reviews] [--issue] <pr> [comment-id...]"
+  echo "Usage: $0 [--reviews] [--issue] <pr> [owner/repo] [comment-id...]"
   exit 1
 fi
 
 pr="$1"
 shift
-repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || {
-  echo "Error: could not determine repository. Run from inside a git repo with a GitHub remote."
-  exit 1
-}
+# Optional [owner/repo] positional: an argument containing '/' is a repo slug,
+# never a numeric comment ID (pattern-based disambiguation). This keeps the
+# legacy `<pr> <comment-id...>` form working while accepting the documented
+# `<pr> <owner/repo> [comment-id...]` form.
+if [[ "${1:-}" == */* ]]; then
+  repo="$1"
+  shift
+else
+  repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || {
+    echo "Error: could not determine repository. Run from inside a git repo with a GitHub remote."
+    exit 1
+  }
+fi
 me=$(gh api user --jq .login 2>/dev/null) || { echo "Error: could not determine current GitHub user (run 'gh auth status' or re-auth)" >&2; exit 1; }
 
 BOT_LOGIN_FILTER='(
