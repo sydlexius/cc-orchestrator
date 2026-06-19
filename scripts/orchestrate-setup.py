@@ -1114,11 +1114,16 @@ def cmd_up(args):
 
 TEARDOWN_CHECKLIST = """down: marker removed (Tier-2 merge-gating OFF).
 Team teardown is the lead's job (tool calls, not this script):
-  1. SendMessage shutdown_request to EACH teammate.
-  2. WAIT for each "terminated" notice.
-  3. THEN TeamDelete (it refuses while a member is alive).
-  4. LEAVE worktrees that still have open PRs; clean the rest with `make remove-worktree`.
-     (down WARNS above about any worktree with uncommitted work - commit before removing it.)"""
+  1. SendMessage shutdown_request to EACH teammate ONCE - do NOT re-send; a re-send
+     re-wakes an idle agent rather than killing it faster.
+  2. WAIT for each "terminated" notice BEFORE removing that teammate's worktree -
+     removing the cwd of a still-alive teammate wedges it on a dead working directory.
+     The team is implicit: there is no TeamDelete step (Anthropic removed
+     TeamCreate/TeamDelete); waiting for every "terminated" notice IS the teardown.
+  3. THEN worktrees: LEAVE any that still have open PRs; clean the rest with
+     `make remove-worktree`. (down WARNS above about any worktree with uncommitted work
+     - commit before removing it.) An Agent-tool worker that never sends "terminated":
+     dismiss it via FleetView or let it reap at session end - do not block teardown on it."""
 
 
 def _gc_stale_tombstones():
