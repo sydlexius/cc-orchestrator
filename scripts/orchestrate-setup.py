@@ -136,9 +136,15 @@ GUARD_HOOK_JSON = ("  Add this to ~/.claude/settings.json under hooks.PreToolUse
 # The advisory steering hooks (#95). Three PreToolUse blocks (Edit, Write, Bash) all pointing at the
 # stable steer path. SEPARATE from the guard's Bash hook (settings.json runs every matching block, so
 # the guard deny and the steer WARN coexist on a Bash call). Advisory + opt-out-able.
+# The command is fail-OPEN: `[ -r <steer> ] && bash <steer> || true` so a missing/unreadable deployed
+# script returns 0 (never blocks) and emits no per-call "No such file" noise - matching
+# orchestrate-steer.sh's "exit 0 ALWAYS" advisory contract. Shared as one constant so the present()
+# detection (below) can exact-match the SAME string that gets written.
+STEER_HOOK_COMMAND = ('[ -r "$HOME/.claude/scripts/orchestrate-steer.sh" ] && '
+                      'bash "$HOME/.claude/scripts/orchestrate-steer.sh" || true')
 STEER_HOOK_BLOCKS = [
     {"matcher": m,
-     "hooks": [{"type": "command", "command": 'bash "$HOME/.claude/scripts/orchestrate-steer.sh"'}]}
+     "hooks": [{"type": "command", "command": STEER_HOOK_COMMAND}]}
     for m in ("Edit", "Write", "Bash")
 ]
 
@@ -237,10 +243,14 @@ def _missing_steer_hook_blocks(settings):
     pre = (settings or {}).get("hooks", {}).get("PreToolUse", [])
 
     def present(block):
+        # Exact (type+command) match against the canonical STEER_HOOK_COMMAND this block carries, so a
+        # stale path or a disabled `true # orchestrate-steer.sh` line no longer counts as wired; kept
+        # anchored to the same constant written by configure (block["hooks"][0]["command"]).
+        expected = block["hooks"][0]["command"]
         for b in pre:
             if b.get("matcher") == block["matcher"]:
                 for h in b.get("hooks", []):
-                    if "orchestrate-steer.sh" in h.get("command", ""):
+                    if h.get("type") == "command" and h.get("command") == expected:
                         return True
         return False
     return [b for b in STEER_HOOK_BLOCKS if not present(b)]
@@ -291,7 +301,9 @@ def check_steer(settings):
     if missing:
         msgs.append(f"{len(missing)} advisory steering hook(s) not wired "
                     f"({', '.join(b['matcher'] for b in missing)})")
-    if action == "refresh":
+    if action == "deploy":
+        msgs.append(f"deployed steer script missing at {STEER}")
+    elif action == "refresh":
         msgs.append(f"deployed steer script at {STEER} is STALE vs the bundled copy")
     elif action == "missing-source":
         msgs.append(f"bundled steer source missing at {BUNDLED_STEER}")
@@ -374,13 +386,23 @@ def check_helpers_stale():
     copies. Drift (a stale copy, or a not-yet-retired claude-kit symlink) is the post-plugin-update
     case - WARN, never FAIL, and point at `configure --apply`. Mirrors check_guard_stale and stays
     read-only (only _helper_deploy_action, which never writes)."""
-    stale, missing = [], []
+    stale, missing, missing_deployed, unreadable = [], [], [], []
     for name in HELPER_NAMES:
         action = _helper_deploy_action(name)
         if action in ("refresh", "replace-symlink", "replace-broken-symlink"):
             stale.append(name)
+        elif action == "deploy":
+            missing_deployed.append(name)
+        elif action == "unreadable":
+            unreadable.append(name)
         elif action == "missing-source":
             missing.append(name)
+    if missing_deployed:
+        return _emit(WARN, "PR-lifecycle helper(s) not yet deployed to the stable path "
+                           f"({', '.join(missing_deployed)}) - run `orchestrate-setup.py configure --apply` to deploy")
+    if unreadable:
+        return _emit(WARN, "deployed helper script(s) exist but are unreadable "
+                           f"({', '.join(unreadable)}) - cannot verify; check permissions")
     if stale:
         return _emit(WARN, "deployed helper script(s) STALE vs the bundled plugin copies "
                            f"({', '.join(stale)}) - run `orchestrate-setup.py configure --apply` to refresh")
@@ -1467,8 +1489,9 @@ def cmd_configure(args):
             return 1
         backup_note = f" (backup: {SETTINGS}.bak)" if status == "ok" else ""
         print(f"configure: wrote {SETTINGS}{backup_note}.")
-        if add_hook:
-            print("RESTART the Claude Code session for the floor hook to load (PreToolUse hooks load at session start).")
+        if add_hook or steer_blocks_to_add:
+            print("RESTART the Claude Code session for the new PreToolUse hook(s) to load "
+                  "(PreToolUse hooks load at session start).")
 
     # Guard deploy is a filesystem copy, independent of (and after) the settings write.
     if guard_action in ("deploy", "refresh"):

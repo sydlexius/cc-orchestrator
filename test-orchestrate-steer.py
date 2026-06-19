@@ -134,11 +134,24 @@ def main():
         "gh api repos/o/r/x --raw-field q=v",
         "gh api repos/o/r/x --input payload.json",
         "cd /repo && gh api -X POST repos/o/r/labels -f name=bug",
+        # PR #136 F6: a COMPOUND command that runs a gh-* wrapper AND a raw `gh api` mutation must
+        # WARN - the old global `gh-*.sh` exemption wrongly suppressed it. The bare `gh api -X` is
+        # present, so the warn must fire even though a wrapper token also appears on the line.
+        "bash gh-comment.sh 5 hi && gh api -X PATCH repos/o/r/issues/1 -f state=closed",
+        "scripts/gh-resolve-thread.sh T_1 && gh api --method DELETE repos/o/r/git/refs/heads/x",
     ]
     for c in MUTATIONS:
         # Marker-independent: fires both with and without a marker.
         rc_ok, warned_all, _ = both_channels({"command": c}, marker_active=False)
         check(f"raw gh-api mutation -> WARN, exit 0 ({c[:42]})", rc_ok and warned_all)
+
+    # PR #136 F6 regression: a wrapper-ALONE invocation (no bare `gh api`) stays SILENT - dropping
+    # the global exemption is safe because the bare-`gh` check needs `gh` + space/EOL, and the char
+    # after `gh` in `gh-comment.sh` is `-`, not a boundary. (Also covered by SILENT_CMDS below.)
+    for c in ["bash gh-comment.sh 5 hi && echo done",
+              "scripts/gh-codeql-dismiss.sh 12 && scripts/gh-resolve-thread.sh T_1"]:
+        rc_ok, _, silent_all = both_channels({"command": c}, marker_active=True)
+        check(f"F6 regression: wrapper-alone compound stays silent ({c[:42]})", rc_ok and silent_all)
 
     # Silent: a gh-* wrapper invocation (the sanctioned path), a read-only GET, non-gh commands.
     SILENT_CMDS = [

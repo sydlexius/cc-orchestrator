@@ -84,15 +84,16 @@ is_canonical_path() {
 }
 
 # A raw `gh api` MUTATION on the command line, NOT routed through a gh-* wrapper. Requires the `gh`
-# word, the `api` subcommand, a mutation flag, and the ABSENCE of a gh-*.sh wrapper invocation
-# (the wrappers are the sanctioned path; a `gh-comment.sh` token never matches the bare `gh` word
-# anyway since its trailing boundary is `-`, but the explicit exclusion is belt-and-suspenders).
+# word, the `api` subcommand, and a mutation flag. A wrapper-ALONE invocation (e.g. `gh-comment.sh
+# 5 hi`) is already silent because the bare-`gh` check requires `gh` followed by space/EOL, and the
+# char after `gh` in `gh-comment.sh` is `-`, not a boundary - so no global gh-*.sh exemption is
+# needed (and a blanket exemption is WRONG: in a compound `gh-comment.sh ... && gh api -X PATCH ...`
+# a bare `gh api` mutation IS present and must still warn).
 # Separator-tolerant (space/=/glued), mirroring the guard's is_merge_api flag matching.
 is_raw_gh_api_mutation() {
   local c="$1"
   printf '%s' "$c" | grep -Eq '(^|[^[:alnum:]_-])gh([[:space:]]|$)' || return 1
   printf '%s' "$c" | grep -Eq '(^|[[:space:]])api([[:space:]]|$)' || return 1
-  printf '%s' "$c" | grep -Eq '(^|[^[:alnum:]_-])gh-[a-z-]+\.sh([[:space:]]|$)' && return 1
   printf '%s' "$c" | grep -Eq '(--method[[:space:]=]|-X[[:space:]=]?[A-Za-z])' && return 0
   printf '%s' "$c" | grep -Eq '(^|[[:space:]])(--(field|input|raw-field)[[:space:]=]|-[fF][[:space:]=]?[^[:space:]])' && return 0
   return 1

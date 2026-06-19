@@ -932,6 +932,109 @@ def main():
         check("#95: a missing bundled steer source WARNs + wires no steering hooks (no crash)",
               "steer script" in out and "missing" in out.lower() and steer_matchers(s4) == set())
 
+        # --- PR #136 CR round-1 fixes (#95 hardening) -------------------------------------------
+        # The canonical fail-open command that configure now writes (must mirror STEER_HOOK_COMMAND
+        # in orchestrate-setup.py exactly). present() exact-matches against THIS string.
+        STEER_CMD = ('[ -r "$HOME/.claude/scripts/orchestrate-steer.sh" ] && '
+                     'bash "$HOME/.claude/scripts/orchestrate-steer.sh" || true')
+
+        def steer_exact_matchers(path):
+            s = json.load(open(path))
+            pre = s.get("hooks", {}).get("PreToolUse", [])
+            return {b["matcher"] for b in pre for h in b.get("hooks", [])
+                    if h.get("type") == "command" and h.get("command") == STEER_CMD}
+
+        def wired_steer_settings(fn):
+            """Settings with the guard hook + all 3 steer hooks wired with the EXACT fail-open
+            command (the in-sync, fully-wired state)."""
+            p = os.path.join(td, fn)
+            blocks = [GUARD_HOOK] + [{"matcher": m, "hooks": [{"type": "command", "command": STEER_CMD}]}
+                                     for m in ("Edit", "Write", "Bash")]
+            json.dump({"hooks": {"PreToolUse": blocks}, "permissions": {"allow": ["Bash(x *)"]}}, open(p, "w"))
+            return p
+
+        # Finding 1: configure writes the fail-open `[ -r ... ] && ... || true` command (suppresses
+        # per-call noise + matches the steer's exit-0-always contract), not a bare `bash <steer>`.
+        s_cmd = fresh_settings("s_cmd.json")
+        run(["configure", "--apply", "--yes"], env_overrides=sov(s_cmd))
+        check("#95 F1: configure writes the fail-open STEER_HOOK_COMMAND (`[ -r ... ] && ... || true`)",
+              steer_exact_matchers(s_cmd) == {"Edit", "Write", "Bash"})
+
+        # Finding 2: present() is an EXACT (type+command) match - a stale/disabled steer line does NOT
+        # count as wired, so configure still adds the real hook. Seed an Edit block with a DISABLED
+        # command (`true # orchestrate-steer.sh`); configure must re-wire all 3 with the exact command.
+        s_stale = os.path.join(td, "s_stale.json")
+        json.dump({"hooks": {"PreToolUse": [GUARD_HOOK,
+                   {"matcher": "Edit", "hooks": [{"type": "command",
+                    "command": 'true # orchestrate-steer.sh (disabled by hand)'}]}]},
+                   "permissions": {"allow": ["Bash(x *)"]}}, open(s_stale, "w"))
+        # The stale Edit line matches the loose substring scan but NOT the exact match.
+        check("#95 F2: a disabled `true # orchestrate-steer.sh` line is NOT counted as exact-wired",
+              "Edit" in steer_matchers(s_stale) and steer_exact_matchers(s_stale) == set())
+        run(["configure", "--apply", "--yes"], env_overrides=sov(s_stale))
+        check("#95 F2: configure re-wires all 3 steer hooks with the exact command despite the stale line",
+              steer_exact_matchers(s_stale) == {"Edit", "Write", "Bash"})
+
+        # Finding 3: check_steer WARNs on the "deploy" action - hooks fully wired but the deployed
+        # steer SCRIPT is absent (so the hook cannot run). Previously fell through to PASS.
+        s_dep = wired_steer_settings("s_dep.json")
+        rc, out = run(["doctor"], env_overrides=sov(s_dep, steer_dest=os.path.join(td, "absent-steer.sh")), tmux=True)
+        check("#95 F3: doctor WARNs (not PASS/FAIL) when the deployed steer script is missing (deploy action)",
+              "[WARN] deployed steer script missing at" in out
+              and "[PASS] advisory steering hooks wired" not in out
+              and "[FAIL] deployed steer" not in out)
+
+        # Finding 5: the restart notice fires for a steer-ONLY hook add (guard already wired), so a
+        # steering-only configure run still tells the user to restart (hooks load at session start).
+        s_rn = fresh_settings("s_rn.json")  # guard wired, helpers current, allow satisfied -> only steer adds
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=sov(s_rn))
+        check("#95 F5: restart notice fires for a steer-only hook add (no guard add)",
+              "RESTART" in out and "PreToolUse hook(s) to load" in out
+              and steer_exact_matchers(s_rn) == {"Edit", "Write", "Bash"})
+
+    # #133 F4: check_helpers_stale WARNs on the "deploy" (fresh install, 0/N deployed) and
+    # "unreadable" actions - a fresh install with helpers not yet deployed must NOT falsely PASS.
+    with tempfile.TemporaryDirectory() as td:
+        hbundle = os.path.join(td, "hbundle"); os.makedirs(hbundle)
+        for name in HELPERS:
+            open(os.path.join(hbundle, name), "w").write(f"#!/usr/bin/env bash\n# fixture {name}\n")
+        hguard = os.path.join(td, "hguard.sh"); write_stub_guard(hguard)
+        htpl = os.path.join(td, "htpl"); os.makedirs(htpl)
+        open(os.path.join(htpl, "required-permissions.md"), "w").write(
+            "## Needed allow-list entries\n- `Bash(x *)`\n")
+        hs = os.path.join(td, "settings.json")
+        json.dump({"hooks": {"PreToolUse": [GUARD_HOOK]}, "permissions": {"allow": ["Bash(x *)"]}}, open(hs, "w"))
+
+        def hov_for(scripts_dir):
+            return {"ORCHESTRATE_SETTINGS": hs, "ORCHESTRATE_TEMPLATES_DIR": htpl,
+                    "ORCHESTRATE_SETTINGS_FILES": hs, "ORCHESTRATE_GUARD": hguard,
+                    "ORCHESTRATE_BUNDLED_GUARD": hguard,
+                    "ORCHESTRATE_SCRIPTS_DIR": scripts_dir, "ORCHESTRATE_BUNDLED_SCRIPTS_DIR": hbundle}
+
+        # Fresh install: SCRIPTS_DIR empty, 0/N helpers deployed -> WARN "not yet deployed", NOT PASS.
+        empty_dest = os.path.join(td, "empty-dest")  # absent dir -> every helper action == 'deploy'
+        rc, out = run(["doctor"], env_overrides=hov_for(empty_dest), tmux=True)
+        check("#133 F4: doctor WARNs (not PASS) on a fresh install with 0/N helpers deployed (deploy action)",
+              "[WARN] PR-lifecycle helper(s) not yet deployed" in out
+              and "[PASS] deployed helper scripts match" not in out)
+
+        # Unreadable deployed helper: all deployed + identical except one chmod 000 -> WARN "unreadable".
+        un_dest = os.path.join(td, "un-dest"); os.makedirs(un_dest)
+        for name in HELPERS:
+            d = os.path.join(un_dest, name)
+            with open(d, "wb") as fo:
+                fo.write(open(os.path.join(hbundle, name), "rb").read())
+            os.chmod(d, 0o755)
+        one = os.path.join(un_dest, HELPERS[0]); os.chmod(one, 0o000)
+        if os.geteuid() != 0 and not os.access(one, os.R_OK):
+            rc, out = run(["doctor"], env_overrides=hov_for(un_dest), tmux=True)
+            check("#133 F4: doctor WARNs (not PASS) on an unreadable deployed helper (unreadable action)",
+                  "[WARN] deployed helper script(s) exist but are unreadable" in out
+                  and "[PASS] deployed helper scripts match" not in out)
+            os.chmod(one, 0o755)  # restore so TemporaryDirectory cleanup can remove it
+        else:
+            check("#133 F4: unreadable-helper case SKIPPED (running as root or fs ignores 000)", True)
+
     # #71: configure NARROWS a blanket `gh pr` allow-rule that shadows the merge gate.
     # The blanket specifier text lives only INSIDE Bash(...) wrappers (never on a command
     # line), and the 'merge' literal is assembled from pieces so no source line carries the
