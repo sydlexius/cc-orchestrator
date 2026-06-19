@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Proof harness for pr-unreplied-comments.sh (#132 gate-correctness + audit; #93 staleness).
+
+Covers three additions, all host-independent (gh is a temp Python stub first on
+PATH, applying any --jq via the real jq; never a real PR):
+
+  #132 default-count fix: the gating line "Review-body comments with actionable
+       findings: N" must ADD CodeRabbit's "Outside diff range comments (K)" block
+       (carried in the review BODY, no inline thread) to the count. The lead's
+       canonical case: a body with "Actionable comments posted: 1" + "Outside diff
+       range comments (6)" must report 7, not 1. Summed across ALL CR submissions.
+
+  #132 --audit mode: complete-coverage enumeration of every CR + Codoki comment
+       (inline FINDINGS via GraphQL reviewThreads + issue-level SUMMARIES). Exit 0
+       only when every finding is replied AND every thread resolved; exit 1
+       otherwise. Summaries are informational (never gate). --audit is mutually
+       exclusive with the gating/scripting early-exit modes.
+
+  #93 staleness advisory: a non-fatal "STALE-ADVISORY:" line for any bot verdict
+       (review or in-place-edited issue comment) predating the current HEAD push.
+       Exit code UNCHANGED.
+
+Default-mode cases pass --allow-stale so the git-backed base-freshness gate is
+skipped (no real repo needed).
+
+Run: python3 test-pr-unreplied-comments.py
+"""
+import os
+import subprocess
+import sys
+import tempfile
+
+SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "pr-unreplied-comments.sh")
+
+FAILS = []
+
+
+def check(label, ok):
+    status = "ok  " if ok else "FAIL"; print(f"  [{status}] {label}")
+    if not ok:
+        FAILS.append(label)
+
+
+GH_STUB = r'''#!/usr/bin/env python3
+import os, sys, subprocess
+args = sys.argv[1:]
+ME = os.environ.get("ME", "testuser")
+INLINE = os.environ.get("INLINE_JSON", "[]")
+REVIEWS = os.environ.get("REVIEWS_JSON", "[]")
+ISSUE = os.environ.get("ISSUE_JSON", "[]")
+GRAPHQL = os.environ.get("GRAPHQL_JSON", '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}')
+HEAD_SHA = os.environ.get("HEAD_SHA", "abcdef1234567890abcdef1234567890abcdef12")
+COMMITTER_DATE = os.environ.get("COMMITTER_DATE", "2026-06-18T00:00:00Z")
+PULL = '{"head":{"sha":"%s"}}' % HEAD_SHA
+COMMIT = '{"commit":{"committer":{"date":"%s"}}}' % COMMITTER_DATE
+
+def emit(data):
+    if "--jq" in args:
+        expr = args[args.index("--jq") + 1]
+        p = subprocess.run(["jq", "-r", expr], input=data, capture_output=True, text=True)
+        sys.stdout.write(p.stdout)
+    else:
+        sys.stdout.write(data)
+    sys.exit(0)
+
+if args[:2] == ["api", "user"]:
+    emit('{"login":"%s"}' % ME)
+if args[:2] == ["api", "graphql"]:
+    emit(GRAPHQL)
+
+endpoint = ""
+for a in args:
+    if "repos/" in a:
+        endpoint = a; break
+if endpoint.endswith("/reviews"):
+    emit(REVIEWS)
+if endpoint.endswith("/comments") and "/pulls/" in endpoint:
+    emit(INLINE)
+if endpoint.endswith("/comments") and "/issues/" in endpoint:
+    emit(ISSUE)
+if "/commits/" in endpoint:
+    emit(COMMIT)
+emit(PULL)
+'''
+
+
+def run(args, *, inline="[]", reviews="[]", issue="[]", graphql=None,
+        committer_date="2026-06-18T00:00:00Z", me="testuser"):
+    with tempfile.TemporaryDirectory() as td:
+        bindir = os.path.join(td, "bin"); os.makedirs(bindir)
+        gh = os.path.join(bindir, "gh")
+        with open(gh, "w") as f:
+            f.write(GH_STUB)
+        os.chmod(gh, 0o755)
+        env = dict(os.environ)
+        env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+        env["ME"] = me
+        env["INLINE_JSON"] = inline
+        env["REVIEWS_JSON"] = reviews
+        env["ISSUE_JSON"] = issue
+        env["COMMITTER_DATE"] = committer_date
+        if graphql is not None:
+            env["GRAPHQL_JSON"] = graphql
+        p = subprocess.run(["bash", SCRIPT] + args + ["123", "owner/repo"],
+                           env=env, capture_output=True, text=True, timeout=20)
+        return p.returncode, p.stdout, p.stderr
+
+
+def findings_count(out):
+    """Extract N from the 'Review-body comments with actionable findings: N' line."""
+    for ln in out.splitlines():
+        if "Review-body comments with actionable findings:" in ln:
+            for tok in ln.replace("=", " ").split():
+                if tok.isdigit():
+                    return int(tok)
+    return None
+
+
+# --- A review body carrying both an actionable inline count AND an outside-diff block.
+CR_BODY_1_PLUS_6 = (
+    '[{"id":111,"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED",'
+    '"submitted_at":"2026-06-18T02:00:00Z",'
+    '"body":"**Actionable comments posted: 1**\\n\\n<summary>Outside diff range comments (6)</summary>\\nfindings here"}]'
+)
+# Two CR submissions, outside-diff (6) and (3): the sum must aggregate across both.
+CR_TWO_SUBMISSIONS = (
+    '[{"id":111,"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED",'
+    '"submitted_at":"2026-06-18T02:00:00Z",'
+    '"body":"<summary>Outside diff range comments (6)</summary>"},'
+    '{"id":222,"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED",'
+    '"submitted_at":"2026-06-18T03:00:00Z",'
+    '"body":"<summary>Outside diff range comments (3)</summary>"}]'
+)
+
+
+def main():
+    print("== #132 default count: outside-diff findings are ADDED to the gate count ==")
+    rc, out, err = run(["--allow-stale"], reviews=CR_BODY_1_PLUS_6)
+    n = findings_count(out)
+    check("Actionable posted:1 + Outside diff range comments (6) -> reports 7 (not 1)", n == 7)
+    check("exit 0", rc == 0)
+
+    rc, out, err = run(["--allow-stale"], reviews=CR_TWO_SUBMISSIONS)
+    n = findings_count(out)
+    # 2 surviving CR review bodies + (6 + 3) outside-diff findings, summed across BOTH
+    # submissions (never latest-per-reviewer).
+    check("two CR submissions aggregate outside-diff: 2 bodies + (6+3) -> reports 11", n == 11)
+
+    rc, out, err = run(["--allow-stale"], reviews="[]")
+    check("no findings -> no sentinel line, exit 0",
+          findings_count(out) is None and rc == 0)
+
+    print("== #93 staleness advisory (non-fatal; exit unchanged) ==")
+    stale_review = ('[{"id":9,"user":{"login":"coderabbitai[bot]"},"state":"APPROVED",'
+                    '"submitted_at":"2026-06-17T00:00:00Z","body":""}]')
+    rc, out, err = run(["--allow-stale"], reviews=stale_review,
+                       committer_date="2026-06-18T00:00:00Z")
+    check("review predating HEAD -> STALE-ADVISORY line present", "STALE-ADVISORY:" in out)
+    check("STALE-ADVISORY names the bot", "coderabbitai[bot]" in out)
+    check("staleness advisory does NOT change exit code (exit 0)", rc == 0)
+
+    fresh_review = ('[{"id":9,"user":{"login":"coderabbitai[bot]"},"state":"APPROVED",'
+                    '"submitted_at":"2026-06-18T05:00:00Z","body":""}]')
+    rc, out, err = run(["--allow-stale"], reviews=fresh_review,
+                       committer_date="2026-06-18T00:00:00Z")
+    check("review newer than HEAD -> no STALE-ADVISORY", "STALE-ADVISORY:" not in out)
+
+    edited_stale = ('[{"id":7,"user":{"login":"codoki-pr-intelligence[bot]"},'
+                    '"created_at":"2026-06-16T00:00:00Z","updated_at":"2026-06-17T00:00:00Z",'
+                    '"body":"Review Status: Safe to merge"}]')
+    rc, out, err = run(["--allow-stale"], issue=edited_stale,
+                       committer_date="2026-06-18T00:00:00Z")
+    check("in-place-edited issue comment predating HEAD -> STALE-ADVISORY (edited)",
+          "STALE-ADVISORY:" in out and "(edited)" in out)
+
+    print("== #132 --audit mode ==")
+    # All replied + resolved -> exit 0.
+    g_ok = ('{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":['
+            '{"isResolved":true,"path":"a.sh","line":10,"comments":{"nodes":['
+            '{"author":{"login":"coderabbitai[bot]"}},{"author":{"login":"testuser"}}]}}'
+            ']}}}}}')
+    rc, out, err = run(["--audit"], graphql=g_ok)
+    check("audit: all findings replied + resolved -> exit 0", rc == 0)
+    check("audit: table has TYPE/AUTHOR/LOCATION/REPLIED/RESOLVED columns",
+          all(c in out for c in ("TYPE", "AUTHOR", "LOCATION", "REPLIED", "RESOLVED")))
+    check("audit: location renders file:line", "a.sh:10" in out)
+
+    # Unreplied finding (only the bot comment, no human reply) -> exit 1.
+    g_unreplied = ('{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":['
+                   '{"isResolved":true,"path":"a.sh","line":10,"comments":{"nodes":['
+                   '{"author":{"login":"coderabbitai[bot]"}}]}}'
+                   ']}}}}}')
+    rc, out, err = run(["--audit"], graphql=g_unreplied)
+    check("audit: unreplied finding -> exit 1", rc == 1)
+
+    # Replied but unresolved thread -> exit 1.
+    g_unresolved = ('{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":['
+                    '{"isResolved":false,"path":"a.sh","line":10,"comments":{"nodes":['
+                    '{"author":{"login":"coderabbitai[bot]"}},{"author":{"login":"testuser"}}]}}'
+                    ']}}}}}')
+    rc, out, err = run(["--audit"], graphql=g_unresolved)
+    check("audit: unresolved thread -> exit 1", rc == 1)
+
+    # Includes BOTH CodeRabbit (thread) and Codoki (issue-level summary).
+    codoki_summary = '[{"user":{"login":"codoki-pr-intelligence[bot]"},"body":"Review Status: Safe","created_at":"x","updated_at":"x"}]'
+    rc, out, err = run(["--audit"], graphql=g_ok, issue=codoki_summary)
+    check("audit: enumerates both CodeRabbit finding and Codoki summary",
+          "coderabbitai[bot]" in out and "codoki-pr-intelligence[bot]" in out)
+    check("audit: Codoki issue-level summary does not flip exit (still 0)", rc == 0)
+
+    # Mutual exclusivity with --count-only -> usage error exit 1.
+    rc, out, err = run(["--audit", "--count-only"])
+    check("audit + --count-only -> exit 1 (mutually exclusive)", rc == 1)
+
+    print()
+    if FAILS:
+        print(f"FAILED ({len(FAILS)}):"); [print("  - " + f) for f in FAILS]; sys.exit(1)
+    print("ALL PASSED")
+
+
+if __name__ == "__main__":
+    main()

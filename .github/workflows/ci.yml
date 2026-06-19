@@ -52,7 +52,7 @@ jobs:
 
       - name: ruff (F,E741)
         if: runner.os == 'Linux'
-        run: ruff check --select F,E741 scripts/orchestrate-resources.py scripts/orchestrate-setup.py scripts/planner_classify.py test-orchestrate-guard.py test-orchestrate-resources.py test-orchestrate-setup.py test-planner-classify.py test-gh-wrappers.py test-ship-gate-preflight.py test-version-lockstep.py
+        run: ruff check --select F,E741 scripts/orchestrate-resources.py scripts/orchestrate-setup.py scripts/planner_classify.py test-orchestrate-guard.py test-orchestrate-resources.py test-orchestrate-setup.py test-planner-classify.py test-gh-wrappers.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-safe-push.py test-pr-watch.py test-version-lockstep.py
 
       # Platform-sensitive: run on BOTH macOS (BSD stat) and Linux (GNU stat).
       # Must invoke via ./ so the self-test's "$0" re-invocation resolves
@@ -78,6 +78,20 @@ jobs:
       # deterministic, host-independent, platform-independent. Runs on both.
       - name: harness - ship-gate-preflight
         run: python3 test-ship-gate-preflight.py
+
+      # pr-unreplied-comments.sh (#132 outside-diff count + --audit; #93 staleness):
+      # stubs gh (and GraphQL) via PATH, applies --jq with the real jq. Host-independent.
+      - name: harness - pr-unreplied-comments
+        run: python3 test-pr-unreplied-comments.py
+
+      # safe-push.sh branch-arg validation (#35): stubs git via PATH, records pushes.
+      - name: harness - safe-push
+        run: python3 test-safe-push.py
+
+      # pr-watch.sh CR-skip + Codoki settlement wiring (#34, #110): stubs gh + the
+      # Codoki oracle; PR_WATCH_POLL_INTERVAL=0 drives the loop deterministically.
+      - name: harness - pr-watch
+        run: python3 test-pr-watch.py
 
       # The setup/doctor harness exercises HOST-COUPLED wiring (settings cascade, tmux,
       # guard execution, git repo state). On a fresh macOS runner doctor behaves differently
