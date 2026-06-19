@@ -1,5 +1,7 @@
 # Design: `orchestrate-setup.py` (Phase 2 - bootstrap + teardown)
 
+> SUPERSEDED (#139): `TeamCreate`/`TeamDelete` referenced below were REMOVED by Anthropic. The team is now IMPLICIT (spawn named teammates directly via the `Agent` tool) and teardown is `shutdown_request` -> wait for each "terminated" notice (no `TeamDelete` step). The live `SKILL.md` teardown is authoritative; this historical doc is left as-is.
+
 Date: 2026-06-05
 Status: SHIPPED (implemented; was APPROVED (brainstorm), pre-implementation)
 Companion: `DESIGN-deterministic-floor.md` (Phase 1, the guard this script arms),

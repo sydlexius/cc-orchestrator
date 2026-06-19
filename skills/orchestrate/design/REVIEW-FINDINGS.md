@@ -1,5 +1,7 @@
 # orchestrate skill - adversarial review findings (2026-06-05, 4 hostile critics)
 
+> SUPERSEDED (#139): `TeamCreate`/`TeamDelete` referenced below were REMOVED by Anthropic. The team is now IMPLICIT (spawn named teammates directly via the `Agent` tool) and teardown is `shutdown_request` -> wait for each "terminated" notice (no `TeamDelete` step). The live `SKILL.md` teardown is authoritative; this historical doc is left as-is.
+
 Dog-food: ran the orchestrate adversarial-review pattern ON orchestrate. 4 parallel
 read-only critics (safety/permissions, lifecycle/concurrency, completeness, operational-realism).
 Below: synthesized + deduped, prioritized. Items marked [FIXED] were corrected the same night;

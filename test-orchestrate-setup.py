@@ -399,7 +399,11 @@ def main():
         check("down GCs a stale tombstone", not os.path.exists(stale))
         rc, out = run(["down"], env_overrides=downov)
         check("down is idempotent (my marker already gone)", rc == 0 and "already disarmed" in out)
-        check("down prints the teardown checklist", "shutdown_request" in out and "TeamDelete" in out)
+        check("down prints the teardown checklist", "shutdown_request" in out and "terminated" in out)
+        check("down teardown drops the old TeamDelete step", "refuses while a member is alive" not in out)
+        check("down teardown notes the implicit team", "implicit" in out)
+        check("down teardown states shutdown ONCE (no-spam, #143)", "ONCE" in out)
+        check("down teardown orders wait-terminated BEFORE worktree removal (#143)", "BEFORE removing" in out)
 
         # TTL clamp: a non-positive ORCHESTRATE_FLOOR_TTL_HOURS must NOT make GC delete a
         # FRESH foreign marker (the cardinal P3-A cross-session-disarm sin). With the clamp,
