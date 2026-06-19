@@ -291,6 +291,66 @@ def main():
           "AUDIT: COMPLETE" not in out)
     check("audit comment-overflow fails closed (exit non-zero)", rc != 0)
 
+    print("== #145 --check-resolved: UNRESOLVED-ADVISORY on the default path ==")
+    g_resolved = ('{"data":{"repository":{"pullRequest":{"reviewThreads":{'
+                  '"pageInfo":{"hasNextPage":false},'
+                  '"nodes":[{"isResolved":true,"path":"a.sh","line":10,'
+                  '"comments":{"nodes":[{"author":{"login":"coderabbitai"}}]}}]'
+                  '}}}}}')
+    g_unresolved = ('{"data":{"repository":{"pullRequest":{"reviewThreads":{'
+                    '"pageInfo":{"hasNextPage":false},'
+                    '"nodes":[{"isResolved":false,"path":"a.sh","line":10,'
+                    '"comments":{"nodes":[{"author":{"login":"coderabbitai"}}]}}]'
+                    '}}}}}')
+    g_unresolved_human = ('{"data":{"repository":{"pullRequest":{"reviewThreads":{'
+                          '"pageInfo":{"hasNextPage":false},'
+                          '"nodes":[{"isResolved":false,"path":"h.sh","line":5,'
+                          '"comments":{"nodes":[{"author":{"login":"some-human"}}]}}]'
+                          '}}}}}')
+    rc, out, err = run(["--check-resolved", "--allow-stale"], graphql=g_resolved)
+    check("all threads resolved -> no UNRESOLVED-ADVISORY", "UNRESOLVED-ADVISORY" not in out)
+    check("all-resolved exit 0", rc == 0)
+
+    rc, out, err = run(["--check-resolved", "--allow-stale"], graphql=g_unresolved)
+    check("one unresolved bot thread -> UNRESOLVED-ADVISORY line", "UNRESOLVED-ADVISORY:" in out)
+    check("advisory carries the bot author", "coderabbitai" in out)
+    check("advisory carries the path:line", "a.sh:10" in out)
+    check("unresolved thread + no unreplied comments -> exit 0 (advisory non-fatal)", rc == 0)
+
+    rc, out, err = run(["--check-resolved", "--allow-stale"], graphql=g_unresolved_human)
+    check("non-bot-rooted unresolved thread -> NO advisory", "UNRESOLVED-ADVISORY" not in out)
+
+    rc, out, err = run(["--check-resolved", "--audit"])
+    check("--check-resolved + --audit -> usage error", rc != 0 and "mutually exclusive" in err)
+
+    rc, out, err = run(["--check-resolved", "--allow-stale"], graphql="not-json")
+    check("graphql failure degrades to a stderr note (best-effort)", "UNRESOLVED-ADVISORY:" in err)
+    check("graphql failure does NOT change exit code", rc == 0)
+    check("graphql failure emits no advisory on stdout", "UNRESOLVED-ADVISORY" not in out)
+
+    # found > 0 AND an unresolved thread: the advisory rides ALONGSIDE the normal
+    # unreplied report and does not perturb the (found>0) exit code.
+    rc, out, err = run(["--check-resolved", "--allow-stale"],
+                       reviews=CR_BODY_1_PLUS_6, graphql=g_unresolved)
+    check("found>0 + --check-resolved: unreplied total still reported", "Total unreplied" in out)
+    check("found>0 + --check-resolved: advisory ALSO emitted", "UNRESOLVED-ADVISORY:" in out)
+    check("found>0 + --check-resolved: exit unchanged (0)", rc == 0)
+
+    # Multi-page reviewThreads: the advisory loop must follow hasNextPage/endCursor
+    # and surface unresolved threads from EVERY page (not just the first 100).
+    g_page1 = ('{"data":{"repository":{"pullRequest":{"reviewThreads":{'
+               '"pageInfo":{"hasNextPage":true,"endCursor":"C1"},'
+               '"nodes":[{"isResolved":false,"path":"p1.sh","line":1,'
+               '"comments":{"nodes":[{"author":{"login":"coderabbitai"}}]}}]}}}}}')
+    g_page2 = ('{"data":{"repository":{"pullRequest":{"reviewThreads":{'
+               '"pageInfo":{"hasNextPage":false},'
+               '"nodes":[{"isResolved":false,"path":"p2.sh","line":2,'
+               '"comments":{"nodes":[{"author":{"login":"coderabbitai"}}]}}]}}}}}')
+    rc, out, err = run(["--check-resolved", "--allow-stale"], graphql=g_page1, graphql_next=g_page2)
+    check("multi-page advisory: page-1 unresolved thread surfaced", "p1.sh:1" in out)
+    check("multi-page advisory: page-2 unresolved thread surfaced (pagination followed)", "p2.sh:2" in out)
+    check("multi-page advisory: exit 0", rc == 0)
+
     print()
     if FAILS:
         print(f"FAILED ({len(FAILS)}):"); [print("  - " + f) for f in FAILS]; sys.exit(1)

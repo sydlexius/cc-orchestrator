@@ -48,11 +48,11 @@ jobs:
       # Platform-independent lint: run once, on Linux. (jq is preinstalled on both runners.)
       - name: shellcheck (security guard + runtime scripts)
         if: runner.os == 'Linux'
-        run: shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/pr-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh
+        run: shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh
 
       - name: ruff (F,E741)
         if: runner.os == 'Linux'
-        run: ruff check --select F,E741 scripts/orchestrate-resources.py scripts/orchestrate-setup.py scripts/planner_classify.py test-orchestrate-guard.py test-orchestrate-steer.py test-orchestrate-resources.py test-orchestrate-setup.py test-planner-classify.py test-gh-wrappers.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-safe-push.py test-pr-watch.py test-version-lockstep.py
+        run: ruff check --select F,E741 scripts/orchestrate-resources.py scripts/orchestrate-setup.py scripts/planner_classify.py test-orchestrate-guard.py test-orchestrate-steer.py test-orchestrate-resources.py test-orchestrate-setup.py test-planner-classify.py test-gh-wrappers.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py
 
       # Platform-sensitive: run on BOTH macOS (BSD stat) and Linux (GNU stat).
       # Must invoke via ./ so the self-test's "$0" re-invocation resolves
@@ -92,6 +92,11 @@ jobs:
       - name: harness - pr-unreplied-comments
         run: python3 test-pr-unreplied-comments.py
 
+      # pr-read-comments.sh optional [owner/repo] positional (#144): stubs gh via
+      # PATH + a call-log, asserts slug-vs-comment-id disambiguation. Host-independent.
+      - name: harness - pr-read-comments
+        run: python3 test-pr-read-comments.py
+
       # safe-push.sh branch-arg validation (#35): stubs git via PATH, records pushes.
       - name: harness - safe-push
         run: python3 test-safe-push.py
@@ -114,3 +119,12 @@ jobs:
       # Version lockstep: SKILL.md **Version** == plugin.json "version". Platform-independent.
       - name: harness - version-lockstep
         run: python3 test-version-lockstep.py
+
+      # stale-branch-sweep.sh (#137) + codoki-quota-watch.sh (#70): stub gh/git via
+      # PATH, host-independent. Wired here for parity with the CLAUDE.md gate list
+      # (the #138 PR added the harnesses to CLAUDE.md but not to this workflow).
+      - name: harness - stale-branch-sweep
+        run: python3 test-stale-branch-sweep.py
+
+      - name: harness - codoki-quota-watch
+        run: python3 test-codoki-quota-watch.py

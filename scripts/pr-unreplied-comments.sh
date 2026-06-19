@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # pr-unreplied-comments.sh -- List unreplied bot review comments on a PR
 #
-# Usage: pr-unreplied-comments.sh [--wait] [--count-only] [--full] [--trigger-cr] [--latest-per-reviewer] [--coverage-only] [--allow-stale] [--audit] <pr_number> [repo]
+# Usage: pr-unreplied-comments.sh [--wait] [--count-only] [--full] [--trigger-cr] [--latest-per-reviewer] [--coverage-only] [--allow-stale] [--check-resolved] [--audit] <pr_number> [repo]
 #
 # Options:
 #   --audit / --all        COMPLETE-COVERAGE audit mode (distinct from the default
@@ -43,6 +43,15 @@
 #                          freshness gate does NOT run for --count-only / --pending-only /
 #                          --coverage-only / --trigger-cr (scripting/polling modes that
 #                          should stay cheap and unblocking).
+#   --check-resolved       Also emit a non-fatal "UNRESOLVED-ADVISORY:" line for each
+#                          bot-rooted review thread whose isResolved is false (GraphQL-only
+#                          signal, absent from the REST comments API). Wires thread-
+#                          resolution into the DEFAULT path so a consumer can gate ANY
+#                          PR-state claim (blocked/idle/waiting-on-you/merge-ready) on
+#                          resolution, not just on unreplied comments. BEST-EFFORT and
+#                          ADVISORY: never changes the exit code; a query error degrades to
+#                          one stderr note. Mutually exclusive with --audit (which already
+#                          reports per-finding resolution). Suppressed in --count-only.
 #
 # Checks four comment types:
 #   1. Inline review comments (PR diff comments)      -- reply_type: "inline"   (use 3-arg reply-comment.sh)
@@ -124,6 +133,12 @@ BOT_LOGIN_FILTER='(
   .user.login == "codoki-pr-intelligence[bot]"
 )'
 
+# Same bot set as a JSON array for membership tests against GraphQL's
+# .author.login (suffix-less) and REST's .user.login. Shared by --audit and the
+# --check-resolved advisory; isbot() in each consumer normalizes the "[bot]"
+# suffix (GraphQL drops it).
+BOT_LOGINS_JSON='["coderabbitai[bot]","Copilot","copilot-pull-request-reviewer[bot]","github-advanced-security[bot]","github-actions[bot]","greptile-apps[bot]","codoki-pr-intelligence[bot]"]'
+
 # --- Parse arguments ---
 wait_mode=false
 count_only=false
@@ -134,6 +149,7 @@ latest_per_reviewer=false
 coverage_only=false
 allow_stale=false
 audit_mode=false
+check_resolved=false
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
     --wait) wait_mode=true; shift ;;
@@ -145,6 +161,7 @@ while [[ "${1:-}" == --* ]]; do
     --coverage-only) coverage_only=true; shift ;;
     --allow-stale) allow_stale=true; shift ;;
     --audit|--all) audit_mode=true; shift ;;
+    --check-resolved) check_resolved=true; shift ;;
     *) echo "Unknown flag: $1"; exit 1 ;;
   esac
 done
@@ -155,6 +172,13 @@ if [ "$audit_mode" = true ]; then
   if [ "$count_only" = true ] || [ "$pending_only" = true ] || \
      [ "$coverage_only" = true ] || [ "$trigger_cr" = true ]; then
     echo "Usage: --audit is mutually exclusive with --count-only / --pending-only / --coverage-only / --trigger-cr" >&2
+    exit 1
+  fi
+  # --check-resolved wires the same isResolved signal into the DEFAULT path; in
+  # --audit that signal is already part of the per-finding table, so combining
+  # them is redundant and incompatible (the audit path exits before the advisory).
+  if [ "$check_resolved" = true ]; then
+    echo "Usage: --check-resolved is mutually exclusive with --audit (--audit already reports thread resolution)" >&2
     exit 1
   fi
 fi
@@ -343,7 +367,7 @@ if [ "$audit_mode" = true ]; then
   name="${repo##*/}"
   # Bot logins to enumerate. Mirrors BOT_LOGIN_FILTER but as a JSON array for
   # membership tests against GraphQL's .author.login and REST's .user.login.
-  audit_bots='["coderabbitai[bot]","Copilot","copilot-pull-request-reviewer[bot]","github-advanced-security[bot]","github-actions[bot]","greptile-apps[bot]","codoki-pr-intelligence[bot]"]'
+  audit_bots="$BOT_LOGINS_JSON"
 
   # Paginate reviewThreads FULLY (#132 no-silent-caps). The audit mode CLAIMS
   # complete coverage, so it must never stop at the first 100 threads: a PR with
@@ -836,6 +860,64 @@ if [ "$count_only" = false ]; then
       | select(.updated_at < $hd)
       | (if .updated_at != .created_at then " (edited)" else "" end) as $e
       | "STALE-ADVISORY: \(.user.login) verdict updated \(.updated_at)\($e) predates current HEAD \($sha)"'
+  fi
+fi
+
+# --- Unresolved-thread advisory (#145; --check-resolved; non-fatal, exit UNCHANGED)
+# Wire the thread-RESOLUTION signal (reviewThread.isResolved - GraphQL-only; the
+# REST comments API never exposes it) into the DEFAULT gating path, so a consumer
+# can gate ANY PR-state claim (blocked / idle / waiting-on-you / merge-ready) on
+# resolution, not just on unreplied comments. ADVISORY ONLY: prints parseable
+# "UNRESOLVED-ADVISORY:" lines and NEVER changes the exit code (the STALE-ADVISORY
+# contract). DELIBERATELY NOT the --audit loop: --audit FAILS CLOSED (exit 2) to
+# back a complete-coverage claim, whereas this is BEST-EFFORT - a query error or a
+# missing cursor degrades to one stderr note and is skipped, never a non-zero
+# exit. It needs only each thread's ROOT author + isResolved, so it fetches
+# comments(first:1) and has no >100-comments overflow case. Opt-in via
+# --check-resolved; suppressed in --count-only (numeric-only) output.
+if [ "$check_resolved" = true ] && [ "$count_only" = false ]; then
+  cr_owner="${repo%%/*}"
+  cr_name="${repo##*/}"
+  cr_nodes='[]'
+  cr_cursor='null'
+  cr_ok=true
+  while : ; do
+    if [ "$cr_cursor" = "null" ]; then
+      cr_cursor_arg=(-F cursor=null)
+    else
+      cr_cursor_arg=(-f cursor="$cr_cursor")
+    fi
+    # shellcheck disable=SC2016  # GraphQL $owner/$name/$pr/$cursor are query variables, NOT shell expansions.
+    cr_page=$(gh api graphql \
+      -f owner="$cr_owner" -f name="$cr_name" -F pr="$pr_number" "${cr_cursor_arg[@]}" \
+      -f query='
+        query($owner:String!,$name:String!,$pr:Int!,$cursor:String){
+          repository(owner:$owner,name:$name){
+            pullRequest(number:$pr){
+              reviewThreads(first:100,after:$cursor){
+                pageInfo{ hasNextPage endCursor }
+                nodes{ isResolved path line comments(first:1){ nodes{ author{ login } } } }
+              }
+            }
+          }
+        }' 2>/dev/null) || { cr_ok=false; break; }
+    cr_page_nodes=$(echo "$cr_page" | jq -c '.data.repository.pullRequest.reviewThreads.nodes // []' 2>/dev/null) || { cr_ok=false; break; }
+    cr_nodes=$(jq -n --argjson acc "$cr_nodes" --argjson new "$cr_page_nodes" '$acc + $new')
+    cr_has_next=$(echo "$cr_page" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage // false')
+    [ "$cr_has_next" = "true" ] || break
+    cr_cursor=$(echo "$cr_page" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // empty')
+    [ -n "$cr_cursor" ] || { cr_ok=false; break; }
+  done
+  if [ "$cr_ok" = true ]; then
+    echo "$cr_nodes" | jq -r --argjson bots "$BOT_LOGINS_JSON" '
+      def isbot($l): ($bots | index($l)) or ($bots | index($l + "[bot]"));
+      .[]
+      | ((.comments.nodes // [])[0].author.login // "") as $root
+      | select(isbot($root))
+      | select(.isResolved == false)
+      | "UNRESOLVED-ADVISORY: \($root) thread at \((.path // "?")):\((.line // 0)) is unresolved"'
+  else
+    echo "UNRESOLVED-ADVISORY: could not fully enumerate review threads for PR #$pr_number ($repo); resolution state unverified" >&2
   fi
 fi
 
