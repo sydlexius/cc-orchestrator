@@ -26,42 +26,42 @@ If still no PR found, stop and ask: "Which PR number should I merge?"
 
 ## Step 1 -- Pre-flight checks
 
+The deterministic merge-readiness gate is `ship-gate-preflight.sh` (the #110
+oracle). It reads GitHub's `statusCheckRollup` (every check terminal + acceptable,
+no required/non-required split, fail-closed) AND calls `pr-unreplied-comments.sh`
+internally to require 0 actionable review-body findings (including CodeRabbit's
+outside-diff findings, corrected in #132) AND couples GitHub's `reviewDecision`.
+So it SUPERSEDES the old `mergeStateStatus`/`mergeable` read, the hand-rolled
+CHANGES_REQUESTED enumeration, and the direct `pr-unreplied-comments.sh` call --
+those are removed here (the oracle covers all three). It exits 0 = ready, 2 =
+block (any red/incomplete check, unaddressed finding, or lookup error), 1 = usage.
+
 Run these in parallel:
 
 ```bash
 repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
 
-# CI status
-gh pr view $pr_number --json mergeStateStatus,mergeable \
-  --jq '{mergeStateStatus, mergeable}'
+# Deterministic merge-readiness oracle (CI rollup + unreplied review-body findings
+# + reviewDecision). Exit 0 = ready; exit 2 = block (stderr names the failing gate).
+bash ${CLAUDE_PLUGIN_ROOT}/scripts/ship-gate-preflight.sh "$pr_number" "$repo"
 
-# Merge blockers (active CHANGES_REQUESTED -- latest review per reviewer)
-gh api "repos/$repo/pulls/$pr_number/reviews" --paginate \
-  --jq '[ group_by(.user.login)[]
-         | sort_by(.submitted_at) | last
-         | select(.state == "CHANGES_REQUESTED")
-         | {id, user: .user.login}
-       ]'
-
-# Unreplied bot comments
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh $pr_number
-
-# Codecov coverage advisory (informational)
+# Codecov coverage advisory (informational; outside the oracle's scope)
 bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh --coverage-only $pr_number
 
-# Code-scanning (GHAS / CodeQL) alerts -- a SEPARATE API surface the comment
-# scripts can't see. Do not merge with open, untriaged code-scanning alerts.
+# Code-scanning (GHAS / CodeQL) alerts -- a SEPARATE API surface the oracle and the
+# comment scripts can't see. Do not merge with open, untriaged code-scanning alerts.
 bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-codeql-autofixes.sh $pr_number
 ```
 
-If there are CHANGES_REQUESTED reviews or unreplied inline comments, stop and report.
-Suggest running `/handle-review $pr_number` first.
+If `ship-gate-preflight.sh` exits non-zero, STOP and report its stderr message
+(which names the failing gate -- a red/incomplete check, an unaddressed
+review-body finding, or an unrecognized reviewDecision). For unaddressed review
+findings, suggest running `/handle-review $pr_number` first. Only proceed to
+Step 2 when the oracle exits 0.
 
 If the code-scanning surfacer reports open alerts, stop: triage them first (apply
 the autofix / fix, or dismiss genuine false positives via the documented
 `gh api -X PATCH` route) before merging. Do not merge over untriaged alerts.
-
-If CI is not CLEAN/MERGEABLE, stop and explain why.
 
 ### Codecov status check (advisory, not blocking)
 

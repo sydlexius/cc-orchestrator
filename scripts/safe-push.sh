@@ -29,6 +29,12 @@
 #   bash safe-push.sh <branch>         # push named branch -u origin
 #   bash safe-push.sh <branch> --force # any flag forwarded to git push
 #
+# NOTE: the branch name must be the FIRST argument; `-u origin` is added
+# automatically and must NOT be passed by the caller. Invoking it as
+# `safe-push.sh -u origin <branch>` is a misuse: the leading `-u` is rejected
+# (exit 2) rather than silently consumed, which previously produced a confusing
+# `fatal: refs/remotes/origin/HEAD cannot be resolved to branch` error (#35).
+#
 # Exit codes:
 #   0 -- push succeeded AND the remote ref matches local HEAD
 #   1 -- push exited non-zero, or the remote ref does not match local HEAD
@@ -58,10 +64,20 @@ chmod 600 "$LOG"
 
 branch="${1:-}"
 shift_count=0
-if [ -n "$branch" ] && [ "${branch#-}" = "$branch" ]; then
+if [ -n "$branch" ]; then
+  # A leading-dash FIRST positional is a footgun: the caller almost certainly
+  # passed flags (e.g. `-u origin <branch>`) where a branch name was expected.
+  # Reject it with a clear usage error rather than silently discarding it and
+  # letting the unconsumed flags flow onto the `git push` line (#35). A missing
+  # first positional is still valid (handled below via the current-branch
+  # fallback); only a leading-dash first positional is rejected here. Legitimate
+  # trailing flags in "$@" (e.g. `<branch> --force-with-lease`) are untouched.
+  if [ "${branch#-}" != "$branch" ]; then
+    echo "safe-push: first arg must be a branch name; -u origin is added automatically." >&2
+    echo "           Usage: safe-push.sh <branch> [extra git-push flags]" >&2
+    exit 2
+  fi
   shift_count=1
-else
-  branch=""
 fi
 
 if [ -z "$branch" ]; then

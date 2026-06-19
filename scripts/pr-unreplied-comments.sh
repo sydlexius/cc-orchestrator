@@ -1,9 +1,23 @@
 #!/usr/bin/env bash
 # pr-unreplied-comments.sh -- List unreplied bot review comments on a PR
 #
-# Usage: pr-unreplied-comments.sh [--wait] [--count-only] [--full] [--trigger-cr] [--latest-per-reviewer] [--coverage-only] [--allow-stale] <pr_number> [repo]
+# Usage: pr-unreplied-comments.sh [--wait] [--count-only] [--full] [--trigger-cr] [--latest-per-reviewer] [--coverage-only] [--allow-stale] [--audit] <pr_number> [repo]
 #
 # Options:
+#   --audit / --all        COMPLETE-COVERAGE audit mode (distinct from the default
+#                          gating mode). Enumerates EVERY CodeRabbit + Codoki review
+#                          comment -- inline THREADS (findings) AND issue-level review
+#                          summaries -- and prints a per-comment table: TYPE, AUTHOR,
+#                          LOCATION (file:line or "(issue-level)"), REPLIED (yes/NO),
+#                          RESOLVED (yes/NO/n-a). FINDINGS (inline threads) need a
+#                          reply AND a resolved thread; issue-level SUMMARIES are
+#                          informational (no thread to resolve) and never affect the
+#                          exit code. Exit 0 ONLY when every finding is replied AND
+#                          every finding-thread resolved; non-zero otherwise -- so it
+#                          can gate a "fully audited, nothing missed" claim. Uses
+#                          GraphQL (reviewThreads.isResolved) for thread resolution.
+#                          Mutually exclusive with --count-only / --pending-only /
+#                          --coverage-only / --trigger-cr (exits 1 on a bad combo).
 #   --wait                 Poll with geometric cooldown (15s/30s/60s/120s) until bot reviews
 #                          stabilize. Use after pushing to ensure all bot comments have landed.
 #   --count-only           Output only the count of unreplied comments (for scripting/polling).
@@ -49,6 +63,23 @@
 # run, because issue comments have no reply-threading to key an "addressed"
 # check off of. Consumers use judgment to decide which issue-level items still
 # need action.
+#
+# Outside-diff findings (gate correctness, #132): CodeRabbit carries findings it
+# cannot post as inline comments in an "Outside diff range comments (N)" collapsible
+# inside the review BODY. These are real actionable findings with no inline thread.
+# The default gating count (the "Review-body comments with actionable findings: N"
+# line) ADDS the sum of those N values across ALL surviving CR review bodies, so a
+# review body with "Actionable comments posted: 1" + "Outside diff range comments (6)"
+# reports 7, not 1. The sum is taken over ALL CR submissions (never latest-per-reviewer:
+# an APPROVED later review does not clear an outside-diff Major from an earlier one).
+#
+# Staleness advisory (#93): in the default display mode this script also emits a
+# non-fatal "STALE-ADVISORY: <bot> verdict updated <ts> predates current HEAD <sha>"
+# line for any bot verdict (latest review or in-place-edited issue comment) whose
+# timestamp predates the current HEAD push. It is ADVISORY ONLY -- the exit code is
+# UNCHANGED -- so /handle-review and /merge-pr can re-read/re-trigger before trusting
+# a verdict that was made against pre-HEAD code (Codoki edits its single comment in
+# place: created_at fixed, updated_at advances, verdict can flip on the same id).
 #
 # Each entry includes reply_type to indicate which reply form to use:
 #   "inline"    -- the ID is a pull request review comment; use reply-comment.sh <pr> <id> <body>
@@ -102,6 +133,7 @@ trigger_cr=false
 latest_per_reviewer=false
 coverage_only=false
 allow_stale=false
+audit_mode=false
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
     --wait) wait_mode=true; shift ;;
@@ -112,9 +144,20 @@ while [[ "${1:-}" == --* ]]; do
     --latest-per-reviewer) latest_per_reviewer=true; shift ;;
     --coverage-only) coverage_only=true; shift ;;
     --allow-stale) allow_stale=true; shift ;;
+    --audit|--all) audit_mode=true; shift ;;
     *) echo "Unknown flag: $1"; exit 1 ;;
   esac
 done
+
+# --audit is a distinct complete-coverage mode; combining it with the gating /
+# scripting early-exit modes is a usage error (their outputs are incompatible).
+if [ "$audit_mode" = true ]; then
+  if [ "$count_only" = true ] || [ "$pending_only" = true ] || \
+     [ "$coverage_only" = true ] || [ "$trigger_cr" = true ]; then
+    echo "Usage: --audit is mutually exclusive with --count-only / --pending-only / --coverage-only / --trigger-cr" >&2
+    exit 1
+  fi
+fi
 
 pr_number="${1:?Usage: pr-unreplied-comments.sh [--wait] [--count-only] [--pending-only] [--trigger-cr] [--latest-per-reviewer] <pr_number> [repo]}"
 repo="${2:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"
@@ -282,6 +325,165 @@ fi
 # --- Coverage-only mode: print the codecov advisory as JSON and exit ---
 if [ "$coverage_only" = true ]; then
   build_coverage_advisory
+  exit 0
+fi
+
+# --- Audit mode: complete-coverage enumeration of every bot comment (#132) ------
+# Distinct from the default gating mode. Enumerates ALL CR + Codoki comments:
+# inline THREADS (findings; need a reply AND a resolved thread) and issue-level
+# review SUMMARIES (informational; no thread to resolve, never gate the exit). Uses
+# GraphQL for reviewThreads.isResolved (the REST API does not expose it). PAGINATES
+# reviewThreads fully (no silent cap at 100 threads) and FAILS CLOSED (exit 2) on
+# any lookup error OR a thread with >100 comments (where "replied" is unprovable),
+# so a complete-coverage claim is never made on truncated data. exit 1 only when a
+# finding is unreplied or a thread unresolved; exit 0 when every finding is replied
+# AND every thread resolved.
+if [ "$audit_mode" = true ]; then
+  owner="${repo%%/*}"
+  name="${repo##*/}"
+  # Bot logins to enumerate. Mirrors BOT_LOGIN_FILTER but as a JSON array for
+  # membership tests against GraphQL's .author.login and REST's .user.login.
+  audit_bots='["coderabbitai[bot]","Copilot","copilot-pull-request-reviewer[bot]","github-advanced-security[bot]","github-actions[bot]","greptile-apps[bot]","codoki-pr-intelligence[bot]"]'
+
+  # Paginate reviewThreads FULLY (#132 no-silent-caps). The audit mode CLAIMS
+  # complete coverage, so it must never stop at the first 100 threads: a PR with
+  # >100 review threads would otherwise SILENTLY TRUNCATE and still print
+  # "AUDIT: COMPLETE" / exit 0 -- false confidence. We loop on
+  # pageInfo.hasNextPage, passing endCursor as `after`, accumulating EVERY thread
+  # node. Each thread's inner comments(first:100) also carries pageInfo; a thread
+  # with MORE than 100 comments FAILS CLOSED (exit 2) because "replied" cannot be
+  # proven without seeing every comment in the thread. Any lookup error also fails
+  # closed. -F cursor=null sends a real GraphQL null for the first page; -f
+  # cursor=<endCursor> advances subsequent pages.
+  audit_thread_nodes='[]'
+  audit_cursor='null'
+  while : ; do
+    if [ "$audit_cursor" = "null" ]; then
+      cursor_arg=(-F cursor=null)
+    else
+      cursor_arg=(-f cursor="$audit_cursor")
+    fi
+    # shellcheck disable=SC2016  # GraphQL $owner/$name/$pr/$cursor are query variables, NOT shell expansions.
+    page_json=$(gh api graphql \
+      -f owner="$owner" -f name="$name" -F pr="$pr_number" "${cursor_arg[@]}" \
+      -f query='
+        query($owner:String!,$name:String!,$pr:Int!,$cursor:String){
+          repository(owner:$owner,name:$name){
+            pullRequest(number:$pr){
+              reviewThreads(first:100,after:$cursor){
+                pageInfo{ hasNextPage endCursor }
+                nodes{
+                  isResolved
+                  path
+                  line
+                  comments(first:100){
+                    pageInfo{ hasNextPage }
+                    nodes{ author{ login } }
+                  }
+                }
+              }
+            }
+          }
+        }' 2>/dev/null) || {
+      echo "audit: GraphQL reviewThreads query failed for PR #$pr_number ($repo)" >&2
+      exit 2
+    }
+
+    # FAIL CLOSED if any thread on this page has MORE comments than the single
+    # page we fetched: we cannot guarantee we observed a human reply, so a
+    # complete-coverage claim would be unprovable. NEVER print COMPLETE / exit 0.
+    overflow=$(echo "$page_json" | jq '[.data.repository.pullRequest.reviewThreads.nodes // [] | .[] | select(.comments.pageInfo.hasNextPage == true)] | length')
+    if [ "${overflow:-0}" -gt 0 ]; then
+      echo "AUDIT INCOMPLETE: a review thread on PR #$pr_number ($repo) has more than 100 comments; cannot guarantee complete coverage." >&2
+      exit 2
+    fi
+
+    page_nodes=$(echo "$page_json" | jq -c '.data.repository.pullRequest.reviewThreads.nodes // []')
+    audit_thread_nodes=$(jq -n --argjson acc "$audit_thread_nodes" --argjson new "$page_nodes" '$acc + $new')
+
+    has_next=$(echo "$page_json" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage // false')
+    if [ "$has_next" != "true" ]; then
+      break
+    fi
+    audit_cursor=$(echo "$page_json" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // empty')
+    if [ -z "$audit_cursor" ]; then
+      # hasNextPage true but no endCursor: cannot advance safely -> fail closed.
+      echo "AUDIT INCOMPLETE: reviewThreads reported more pages but no endCursor for PR #$pr_number ($repo); cannot guarantee complete coverage." >&2
+      exit 2
+    fi
+  done
+
+  # Reshape the accumulated nodes back into the single-query envelope so the
+  # findings jq below is unchanged.
+  threads_json=$(jq -n --argjson nodes "$audit_thread_nodes" \
+    '{data:{repository:{pullRequest:{reviewThreads:{nodes:$nodes}}}}}')
+
+  issue_comments_audit=$(gh api "repos/$repo/issues/$pr_number/comments" --paginate 2>/dev/null) || {
+    echo "audit: could not fetch issue comments for PR #$pr_number ($repo)" >&2
+    exit 2
+  }
+
+  # FINDINGS: inline review threads whose ROOT comment author is a bot. A thread is
+  # REPLIED when any comment in it is authored by a non-bot (a human reply); RESOLVED
+  # is GitHub's reviewThread.isResolved (note: jq treats index 0 as truthy, so a bot
+  # matched at array position 0 is still selected).
+  #
+  # BOT-LOGIN NORMALIZATION (#132): GraphQL's author.login returns bot logins WITHOUT
+  # the "[bot]" suffix (e.g. "coderabbitai", "codoki-pr-intelligence") whereas REST's
+  # user.login carries it ("coderabbitai[bot]"). audit_bots is the REST-form set
+  # (summaries rely on it), so a raw membership test against the suffix-less GraphQL
+  # login NEVER matches a bot -> 0 findings AND mis-counts a bot's own reply as a
+  # human reply (replied:true). isbot() normalizes: a login matches if the set
+  # contains it OR it + "[bot]" -- covering GraphQL's suffix-less form while still
+  # matching non-suffixed entries (e.g. "Copilot"). Applied to BOTH the root-author
+  # select and the replied (human-reply) computation. index 0 stays truthy via `or`.
+  findings=$(echo "$threads_json" | jq -c --argjson bots "$audit_bots" '
+    def isbot($l): ($bots | index($l)) or ($bots | index($l + "[bot]"));
+    [ (.data.repository.pullRequest.reviewThreads.nodes // [])[]
+      | (.comments.nodes // []) as $cs
+      | ($cs[0].author.login // "") as $root
+      | select(isbot($root))
+      | {
+          type: "finding",
+          author: $root,
+          location: (((.path // "?")) + ":" + ((.line // 0) | tostring)),
+          replied: ([ $cs[] | (.author.login // "") as $a | select(isbot($a) | not) ] | length > 0),
+          resolved: (.isResolved == true)
+        } ]')
+
+  # SUMMARIES: issue-level bot review comments (informational; no thread to resolve).
+  summaries=$(echo "$issue_comments_audit" | jq -c --argjson bots "$audit_bots" '
+    [ .[] | select((.user.login // "") as $l | $bots | index($l))
+      | { type: "summary", author: .user.login, location: "(issue-level)",
+          replied: null, resolved: null } ]')
+
+  audit_all=$(jq -n --argjson f "$findings" --argjson s "$summaries" '$f + $s')
+
+  printf '%-9s %-34s %-32s %-8s %-9s\n' "TYPE" "AUTHOR" "LOCATION" "REPLIED" "RESOLVED"
+  echo "$audit_all" | jq -r '.[] | [
+    .type, .author, .location,
+    (if .replied == true then "yes" elif .replied == false then "NO" else "n-a" end),
+    (if .resolved == true then "yes" elif .resolved == false then "NO" else "n-a" end)
+  ] | @tsv' | while IFS=$'\t' read -r a_type a_author a_loc a_rep a_res; do
+    printf '%-9s %-34s %-32s %-8s %-9s\n' "$a_type" "$a_author" "$a_loc" "$a_rep" "$a_res"
+  done
+
+  findings_n=$(echo "$findings" | jq 'length')
+  summaries_n=$(echo "$summaries" | jq 'length')
+  unreplied_n=$(echo "$findings" | jq '[.[] | select(.replied == false)] | length')
+  unresolved_n=$(echo "$findings" | jq '[.[] | select(.resolved == false)] | length')
+  replied_n=$(( findings_n - unreplied_n ))
+  resolved_n=$(( findings_n - unresolved_n ))
+
+  echo ""
+  echo "Findings: $findings_n (replied: $replied_n, unreplied: $unreplied_n; resolved: $resolved_n, unresolved: $unresolved_n)"
+  echo "Summaries (issue-level, informational): $summaries_n"
+
+  if [ "$unreplied_n" -gt 0 ] || [ "$unresolved_n" -gt 0 ]; then
+    echo "AUDIT: INCOMPLETE -- $unreplied_n unreplied finding(s), $unresolved_n unresolved thread(s) on PR #$pr_number."
+    exit 1
+  fi
+  echo "AUDIT: COMPLETE -- all $findings_n finding(s) replied and all threads resolved on PR #$pr_number."
   exit 0
 fi
 
@@ -493,6 +695,18 @@ review_bodies=$(jq -n \
   )
   ')
 
+# Outside-diff finding count (#132): CodeRabbit carries findings it cannot post as
+# inline comments inside an "Outside diff range comments (N)" collapsible in the
+# review BODY. These are real actionable findings with no inline thread, so the
+# gating count must ADD N (not just count the body as 1). Computed from the FULL
+# bodies here, BEFORE the truncating display transform below would strip the block.
+# Summed across ALL surviving CR review bodies -- never latest-per-reviewer: an
+# APPROVED later review does not clear an outside-diff Major from an earlier
+# COMMENTED one (stillwater#1931).
+outside_diff_sum=$(echo "$review_bodies" | jq '
+  [ .[] | (.body // "") | scan("Outside diff range comments \\(([0-9]+)\\)") ]
+  | flatten | map(tonumber) | add // 0')
+
 if [ "$latest_per_reviewer" = true ]; then
   review_bodies=$(echo "$review_bodies" | jq 'group_by(.user.login) | map(max_by(.id)) | flatten |
     map({id, type: "review-body", reply_type: "top-level", user: .user.login, state, body: '"$rb_body_expr"'})')
@@ -501,15 +715,17 @@ else
 fi
 
 review_body_count=$(echo "$review_bodies" | jq 'length')
+# Authoritative gating count = surviving review bodies + their outside-diff findings.
+review_body_findings=$(( review_body_count + outside_diff_sum ))
 
-if [ "$review_body_count" -gt 0 ]; then
+if [ "$review_body_findings" -gt 0 ]; then
   if [ "$count_only" = false ]; then
-    echo "=== Review-body comments with actionable findings: $review_body_count ==="
+    echo "=== Review-body comments with actionable findings: $review_body_findings ==="
     echo ""
     echo "$review_bodies"
     echo ""
   fi
-  found=$((found + review_body_count))
+  found=$((found + review_body_findings))
 fi
 
 # 3. Issue-level comments (skip auto-generated summaries)
@@ -589,6 +805,37 @@ if [ "$count_only" = false ]; then
     fi
     echo "  No reply required -- codecov comments are informational."
     echo ""
+  fi
+fi
+
+# --- Staleness advisory (#93; non-fatal, exit code UNCHANGED) ----------------
+# Surface when a bot VERDICT predates the current HEAD push so a consumer never
+# trusts a review made against pre-HEAD code (Codoki edits its single comment in
+# place: created_at fixed, updated_at advances, the verdict can flip on the same
+# id). Compares each bot's LATEST verdict timestamp (review .submitted_at;
+# issue-comment .updated_at) against the HEAD commit's committer date. ADVISORY
+# ONLY: prints a parseable "STALE-ADVISORY:" line and does NOT change the exit
+# code, so callers that branch on a non-zero exit are unaffected. Suppressed in
+# --count-only (numeric-only) output.
+if [ "$count_only" = false ]; then
+  head_full_sha=$(gh api "repos/$repo/pulls/$pr_number" --jq '.head.sha' 2>/dev/null || echo "")
+  head_committer_date=$(gh api "repos/$repo/commits/$head_full_sha" --jq '.commit.committer.date' 2>/dev/null || echo "")
+  if [ -n "$head_full_sha" ] && [ -n "$head_committer_date" ]; then
+    short_head="${head_full_sha:0:8}"
+    # Latest review per bot author whose submitted_at predates the HEAD push.
+    echo "$all_reviews" | jq -r --arg hd "$head_committer_date" --arg sha "$short_head" '
+      [ .[] | select('"$BOT_LOGIN_FILTER"') | select((.submitted_at // "") != "") ]
+      | group_by(.user.login) | map(max_by(.submitted_at)) | .[]
+      | select(.submitted_at < $hd)
+      | "STALE-ADVISORY: \(.user.login) verdict updated \(.submitted_at) predates current HEAD \($sha)"'
+    # Latest issue comment per bot author whose updated_at predates the HEAD push
+    # (in-place edits advance updated_at while created_at stays fixed -> "(edited)").
+    echo "$issue_comments" | jq -r --arg hd "$head_committer_date" --arg sha "$short_head" '
+      [ .[] | select('"$BOT_LOGIN_FILTER"') | select((.updated_at // "") != "") ]
+      | group_by(.user.login) | map(max_by(.updated_at)) | .[]
+      | select(.updated_at < $hd)
+      | (if .updated_at != .created_at then " (edited)" else "" end) as $e
+      | "STALE-ADVISORY: \(.user.login) verdict updated \(.updated_at)\($e) predates current HEAD \($sha)"'
   fi
 fi
 

@@ -12,10 +12,27 @@
 #   Polls every 30s (silent). Exits when one of these terminal states holds:
 #
 #     settled head=<sha8> mergeable=<state>
-#         All of: CodeRabbit has reviewed HEAD (non-DISMISSED, non-CHANGES_REQUESTED),
-#         every CI check is in a terminal state, and GitHub's mergeable_state is in
-#         the merge-ready set (clean / unstable / has_hooks). Exit 0.
-#         Consumer next action: /merge-pr.
+#         All of: the CodeRabbit reviewer requirement is SATISFIED, the Codoki
+#         check is settled, every CI check is in a terminal state, and GitHub's
+#         mergeable_state is in the merge-ready set (clean / unstable / has_hooks).
+#         Exit 0. Consumer next action: /merge-pr.
+#
+#         CR requirement SATISFIED means ANY of: (a) CodeRabbit reviewed HEAD with
+#         a non-DISMISSED, non-CHANGES_REQUESTED review (CR enabled, the original
+#         path - preserved), OR (b) CR will NOT review this PR -- the `norabbit`
+#         label is present, or CR posted a "Review skipped" check (CR auto-review
+#         disabled). Without (b), a norabbit / CR-disabled PR would wait the full
+#         timeout for a review that never lands (#34). When CR IS enabled the
+#         original wait-for-the-real-review behavior is unchanged.
+#
+#         Codoki SETTLED: Codoki posts its verdict as a `Codoki PR Review` entry in
+#         statusCheckRollup, NOT in the reviews API, so it is invisible to a
+#         reviews-API poll. This script defers Codoki detection to the deterministic
+#         oracle `ship-gate-preflight.sh --codoki-only`, which reads statusCheckRollup
+#         (#110). Exit 0 from the oracle = Codoki settled; exit 2 = not yet settled
+#         (stays pending); exit 1 = oracle usage error (fail-open, not blocked). When
+#         the oracle is not installed, Codoki gating is skipped (falls back to the
+#         CR + CI + mergeable gates only).
 #
 #     review-blocked head=<sha8> by=<participant>
 #         CodeRabbit's latest review on HEAD is CHANGES_REQUESTED. Exit 0.
@@ -69,7 +86,11 @@ fi
 pr="$1"
 repo="${2:-}"
 timeout_secs="${3:-1800}"
-poll_interval=30
+# Poll cadence. Overridable via PR_WATCH_POLL_INTERVAL (numeric seconds) so the
+# external test harness can drive the loop without a 30s wait; defaults to 30 in
+# all normal use. A non-numeric override is ignored (falls back to 30).
+poll_interval="${PR_WATCH_POLL_INTERVAL:-30}"
+case "$poll_interval" in ''|*[!0-9]*) poll_interval=30 ;; esac
 
 if ! [[ "$pr" =~ ^[0-9]+$ ]]; then
   echo "setup error: pr_number must be numeric, got: $pr" >&2
@@ -121,6 +142,36 @@ count_bot_activity() {
     | jq "[.[] | select($QUIET_AUTHORS_JQ)] | length" 2>/dev/null || echo 0)
   echo $(( rev_n + inline_n + issue_n ))
 }
+
+# cr_review_skipped -- true (exit 0) when CodeRabbit will NOT post a review on this
+# PR, detected via a `gh pr checks` entry whose name matches CodeRabbit AND whose
+# description signals a skip ("Review skipped", emitted when CR auto-review is
+# disabled). This is re-checked each poll because the skipped check can land a few
+# seconds after the PR opens. Fails CLOSED for waiting (returns 1 = not skipped) on
+# any gh/jq error, so a transient blip never falsely settles a CR-enabled PR.
+cr_review_skipped() {
+  local cj
+  cj=$(gh pr checks "$pr" --repo "$repo" --json name,state,description 2>/dev/null) || true
+  [ -z "$cj" ] && return 1
+  echo "$cj" | jq -e '
+    [ .[] | select(((.name // "") | test("coderabbit"; "i"))
+                   and ((.description // "") | test("review skipped"; "i"))) ]
+    | length > 0' >/dev/null 2>&1
+}
+
+# norabbit label => the maintainer explicitly opted this PR out of CR review, so CR
+# will never post one. Checked ONCE before the loop (label state is stable). Fails
+# open (treated as not-labeled) on any gh error so detection falls through to the
+# per-poll skipped-check fallback.
+cr_norabbit=false
+if gh pr view "$pr" --repo "$repo" --json labels --jq '.labels[].name' 2>/dev/null \
+     | grep -qx "norabbit"; then
+  cr_norabbit=true
+fi
+
+# Oracle path for Codoki settlement (#110). Resolved once; the per-poll check is
+# skipped entirely when it is absent (fail-open to CR + CI + mergeable gates).
+CODOKI_ORACLE="${HOME}/.claude/scripts/ship-gate-preflight.sh"
 
 prev_bot_count=""
 start=$(date +%s)
@@ -209,10 +260,37 @@ while true; do
 
   # CR must have weighed in on HEAD with a non-DISMISSED review. APPROVED and
   # COMMENTED both qualify; only "" (no review yet) and DISMISSED keep us pending.
+  # EXCEPTION (#34): if CR will not review this PR at all -- the `norabbit` label
+  # is set, or CR posted a "Review skipped" check (auto-review disabled) -- the CR
+  # requirement is SATISFIED and we do not wait for a review that never lands. When
+  # CR IS enabled, none of those signals fire and the original wait is unchanged.
   case "$cr_latest_state" in
     APPROVED|COMMENTED) ;;
-    *) pending_list+=("cr-review") ;;
+    *)
+      if [ "$cr_norabbit" = true ] || cr_review_skipped; then
+        : # CR will not review (norabbit / Review skipped) -> requirement satisfied
+      else
+        pending_list+=("cr-review")
+      fi
+      ;;
   esac
+
+  # Codoki settlement (#110). Codoki posts its verdict as a `Codoki PR Review`
+  # entry in statusCheckRollup (NOT the reviews API), so this script defers to the
+  # deterministic oracle which reads that rollup. Exit 0 = settled (do not block);
+  # exit 2 = check missing/incomplete/failed (block on "codoki-check"); exit 1 =
+  # oracle usage error, a script bug rather than a PR state -> fail open, do not
+  # block. The oracle is skipped entirely when it is not installed.
+  if [ -x "$CODOKI_ORACLE" ]; then
+    if "$CODOKI_ORACLE" --codoki-only "$pr" "$repo" >/dev/null 2>&1; then
+      :
+    else
+      codoki_rc=$?
+      if [ "$codoki_rc" -eq 2 ]; then
+        pending_list+=("codoki-check")
+      fi
+    fi
+  fi
 
   # Every CI check must be in a terminal state. Use `state` not `conclusion` --
   # state goes through gh's bucket mapping (SUCCESS|FAILURE|...|PENDING|...) and
