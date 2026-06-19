@@ -70,7 +70,7 @@ disambiguate from the `/ralph-loop` skill) + `DESIGN-*`/`PLAN-*`/`ROADMAP-*` (un
 
 ```sh
 shellcheck scripts/orchestrate-guard.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/pr-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh
-ruff check --select F,E741 scripts/orchestrate-*.py scripts/planner_classify.py test-orchestrate-*.py test-planner-classify.py test-gh-wrappers.py test-pr-unreplied-comments.py test-safe-push.py test-pr-watch.py test-version-lockstep.py
+ruff check --select F,E741 scripts/orchestrate-*.py scripts/planner_classify.py test-orchestrate-*.py test-planner-classify.py test-gh-wrappers.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-safe-push.py test-pr-watch.py test-version-lockstep.py
 ./scripts/orchestrate-guard.sh --self-test    # MUST use ./ - the self-test re-invokes "$0";
                                               # `bash scripts/orchestrate-guard.sh` makes $0 a bare name -> 127
 python3 test-orchestrate-guard.py
