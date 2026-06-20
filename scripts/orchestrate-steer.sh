@@ -34,17 +34,27 @@ emit_warn() {
   exit 0
 }
 
-# --- self-test: feed a raw `gh api` mutation payload (marker-INDEPENDENT rule) and assert a WARN
-# is emitted at exit 0. Used by setup/doctor to catch a silently broken steer. Prints PASS/FAIL.
+# --- self-test: feed the marker-INDEPENDENT command rules and assert each emits a WARN at exit 0.
+# Used by setup/doctor to catch a silently broken steer. Prints PASS/FAIL.
 if [ "${1:-}" = "--self-test" ]; then
+  st_fail=""
+  # (2) raw gh-api mutation must WARN at exit 0.
   st_out=$(printf '%s' '{"tool_name":"Bash","tool_input":{"command":"gh api -X PATCH repos/o/r/issues/1"}}' \
-    | "$0" 2>&1)
-  st_rc=$?
-  if [ "$st_rc" -eq 0 ] && printf '%s' "$st_out" | grep -q 'STEER'; then
-    echo "orchestrate-steer self-test PASS (raw gh-api mutation warned, exit 0)"
+    | "$0" 2>&1); st_rc=$?
+  { [ "$st_rc" -eq 0 ] && printf '%s' "$st_out" | grep -q 'STEER'; } \
+    || st_fail="gh-api rule (rc=$st_rc out=$st_out)"
+  # (3) raw gh pr comment mutation must WARN at exit 0.
+  if [ -z "$st_fail" ]; then
+    st_out=$(printf '%s' '{"tool_name":"Bash","tool_input":{"command":"gh pr comment 5 -b hi"}}' \
+      | "$0" 2>&1); st_rc=$?
+    { [ "$st_rc" -eq 0 ] && printf '%s' "$st_out" | grep -q 'STEER'; } \
+      || st_fail="gh-pr rule (rc=$st_rc out=$st_out)"
+  fi
+  if [ -z "$st_fail" ]; then
+    echo "orchestrate-steer self-test PASS (raw gh-api + raw gh pr comment/create mutations warned, exit 0)"
     exit 0
   fi
-  echo "orchestrate-steer self-test FAIL: expected a STEER warn at exit 0, got rc=$st_rc out=$st_out" >&2
+  echo "orchestrate-steer self-test FAIL: expected a STEER warn at exit 0, got $st_fail" >&2
   exit 1
 fi
 
@@ -99,6 +109,26 @@ is_raw_gh_api_mutation() {
   return 1
 }
 
+# A raw `gh pr` SUBCOMMAND that has a real canonical alternative, run directly on the command line
+# (#159). This is canonical-STEERING, NOT creep prevention: every high-traffic gh pr subcommand is
+# already allow-listed (so it never prompts), and a hook cannot intercept the "always allow" click -
+# so warning the allow-listed set buys nothing. We nudge ONLY the two subcommands with a canonical
+# target: `comment` (-> reply-comment.sh / gh-comment.sh) and `create` (-> /prep-pr). DELIBERATELY
+# EXCLUDES `merge` (floor-denied in a marker session, AND the sanctioned prompt-free path in solo -
+# a nag there is wrong), plus `edit`/`ready`/`close`/`review` and all reads (allow-listed lifecycle
+# or no canonical redirect). A wrapper-ALONE invocation (gh-comment.sh, reply-comment.sh) is already
+# silent: the bare-`gh` check needs `gh` + space/EOL and the char after `gh` in those names is `-`;
+# likewise `comment`/`create` inside a wrapper name is not space-delimited. ACCEPTED false-positive
+# (mirrors is_raw_gh_api_mutation's F30 class): a gh pr READ compounded with a standalone
+# `comment`/`create` word in an arg trips the whole-line grep - harmless (advisory WARN, exit 0).
+is_raw_gh_pr_mutation() {
+  local c="$1"
+  printf '%s' "$c" | grep -Eq '(^|[^[:alnum:]_-])gh([[:space:]]|$)' || return 1
+  printf '%s' "$c" | grep -Eq '(^|[[:space:]])pr([[:space:]]|$)' || return 1
+  printf '%s' "$c" | grep -Eq '(^|[[:space:]])(comment|create)([[:space:]]|$)' && return 0
+  return 1
+}
+
 # THIS session's marker present AND fresh. Verbatim mirror of the guard's marker_active so the two
 # sides never drift (keyed by sanitized $TMUX; non-tmux/solo is never gated; GNU stat then BSD).
 marker_active() {
@@ -122,6 +152,11 @@ fi
 # (2) raw gh-api mutation WARN: marker-independent.
 if [ -n "$cmd" ] && is_raw_gh_api_mutation "$cmd"; then
   emit_warn "Use the gh-* wrapper (gh-api-get.sh / gh-comment.sh / gh-codeql-dismiss.sh / gh-codeql-autofix.sh / gh-resolve-thread.sh / gh-delete-branch.sh) instead of raw gh api."
+fi
+
+# (3) raw gh pr comment/create -> canonical path WARN: marker-independent (#159; advisory only).
+if [ -n "$cmd" ] && is_raw_gh_pr_mutation "$cmd"; then
+  emit_warn "Canonical path for gh pr: 'gh pr comment' -> reply-comment.sh / gh-comment.sh; 'gh pr create' -> open the PR via /prep-pr (the required gate). Other gh pr subcommands (incl. merge) are intentionally not flagged."
 fi
 
 exit 0
