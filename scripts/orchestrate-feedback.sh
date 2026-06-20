@@ -88,9 +88,8 @@ case "$sub" in
     fi
     [ -n "$body" ] || die "add: empty body (pass a body arg or pipe it on stdin)"
     repo="${GITHUB_REPOSITORY:-}"
-    if [ -z "$repo" ]; then
-      repo=$(git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
-        && gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)
+    if [ -z "$repo" ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)
     fi
     repo=$(printf '%s' "${repo:-unknown}" | tr -c 'A-Za-z0-9_-' '-' | tr -s '-' | sed 's/^-//; s/-$//')
     [ -n "$repo" ] || repo="unknown"
@@ -144,7 +143,10 @@ case "$sub" in
       */*|*..*) die "drain: <entry> must be a bare inbox filename, not a path" ;;
     esac
     src="$INBOX/$entry"
-    [ -f "$src" ] || die "drain: '$entry' not found in inbox (already drained, or wrong name?)"
+    # Reject symlinks: [ -f ] is true for a symlink to a regular file, so a crafted
+    # symlink planted in inbox/ could make `cat "$src"` leak an arbitrary file into
+    # drained/. Only a real, non-symlink regular file is a valid entry.
+    { [ -f "$src" ] && [ ! -L "$src" ]; } || die "drain: '$entry' is not a regular (non-symlink) file in inbox (already drained, or wrong name?)"
     ensure_dirs
     # Append the breadcrumb via tmp + rename (atomic), then move to cold storage.
     tmp=$(mktemp "$INBOX/.tmp.XXXXXX")

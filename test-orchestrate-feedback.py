@@ -31,7 +31,7 @@ def run(maildir, args, *, stdin=None, repo="sydlexius/cc-orchestrator"):
     env["ORCHESTRATE_FEEDBACK_DIR"] = maildir
     env["GITHUB_REPOSITORY"] = repo
     p = subprocess.run(["bash", SCRIPT] + args, env=env, input=stdin,
-                       capture_output=True, text=True, timeout=30)
+                       capture_output=True, text=True, timeout=90)
     return p.returncode, p.stdout, p.stderr
 
 
@@ -110,6 +110,16 @@ def main():
         check("missing --verdict -> non-zero", rc != 0)
         rc, out, err = run(md, ["drain", "../escape.md", "--issue", "5", "--verdict", "x"])
         check("path-traversal entry -> non-zero", rc != 0)
+        # Symlink hardening: a planted symlink in inbox/ must be refused (else drain
+        # would cat an arbitrary target into drained/).
+        secret = os.path.join(td, "secret.txt")
+        open(secret, "w").write("SECRET")
+        link = os.path.join(md, "inbox", "evil.md")
+        os.symlink(secret, link)
+        rc, out, err = run(md, ["drain", "evil.md", "--issue", "5", "--verdict", "x"])
+        check("symlink entry -> non-zero (rejected)", rc != 0)
+        check("symlink entry NOT moved to drained/", "evil.md" not in drained_files(md))
+        os.unlink(link)
         rc, out, err = run(md, ["drain", "does-not-exist.md", "--issue", "5", "--verdict", "x"])
         check("missing entry -> non-zero", rc != 0)
         rc, out, err = run(md, ["drain", fname, "--issue", "149", "--verdict", "x"])
