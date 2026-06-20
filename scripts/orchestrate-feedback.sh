@@ -142,18 +142,25 @@ case "$sub" in
     case "$entry" in
       */*|*..*) die "drain: <entry> must be a bare inbox filename, not a path" ;;
     esac
-    src="$INBOX/$entry"
-    # Reject symlinks: [ -f ] is true for a symlink to a regular file, so a crafted
-    # symlink planted in inbox/ could make `cat "$src"` leak an arbitrary file into
-    # drained/. Only a real, non-symlink regular file is a valid entry.
-    { [ -f "$src" ] && [ ! -L "$src" ]; } || die "drain: '$entry' is not a regular (non-symlink) file in inbox (already drained, or wrong name?)"
     ensure_dirs
-    # Append the breadcrumb via tmp + rename (atomic), then move to cold storage.
-    tmp=$(mktemp "$INBOX/.tmp.XXXXXX")
-    cat "$src" >"$tmp"
-    printf '\nDRAINED -> #%s [%s]\n' "$issue" "$verdict" >>"$tmp"
-    mv "$tmp" "$src"
-    mv "$src" "$DRAINED/$entry"
+    src="$INBOX/$entry"
+    # CLAIM-THEN-VALIDATE (closes a TOCTOU symlink race). A check on inbox/<entry>
+    # followed by a later read is racy: a writer to inbox/ could swap the file for a
+    # symlink between the check and the read, leaking an arbitrary target into
+    # drained/. Instead, atomically RENAME the entry to a PRIVATE claim path FIRST
+    # (mv -n refuses to clobber); after that the path is private and cannot be
+    # swapped, so validating + reading the CLAIMED path is race-free. A symlink
+    # entry is renamed AS the link (rename never follows it) and rejected here.
+    claim="$INBOX/.claim.$$.$RANDOM"
+    mv -n -- "$src" "$claim" 2>/dev/null \
+      || die "drain: '$entry' not found in inbox (already drained, or wrong name?)"
+    if [ ! -f "$claim" ] || [ -L "$claim" ]; then
+      rm -f -- "$claim"
+      die "drain: '$entry' is not a regular (non-symlink) file in inbox"
+    fi
+    # The claim is private now: append the breadcrumb, then move to cold storage.
+    printf '\nDRAINED -> #%s [%s]\n' "$issue" "$verdict" >>"$claim"
+    mv -- "$claim" "$DRAINED/$entry"
     echo "drained $entry -> #$issue"
     ;;
 

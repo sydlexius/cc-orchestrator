@@ -110,16 +110,24 @@ def main():
         check("missing --verdict -> non-zero", rc != 0)
         rc, out, err = run(md, ["drain", "../escape.md", "--issue", "5", "--verdict", "x"])
         check("path-traversal entry -> non-zero", rc != 0)
-        # Symlink hardening: a planted symlink in inbox/ must be refused (else drain
-        # would cat an arbitrary target into drained/).
+        # Symlink hardening (claim-then-validate, TOCTOU-safe): a planted symlink in
+        # inbox/ must be refused, never followed into drained/. drain claims the entry
+        # (rename) then rejects the symlink, so it does not survive in inbox or drained.
         secret = os.path.join(td, "secret.txt")
-        open(secret, "w").write("SECRET")
-        link = os.path.join(md, "inbox", "evil.md")
-        os.symlink(secret, link)
+        with open(secret, "w") as fh:
+            fh.write("SECRET-CONTENT")
+        os.symlink(secret, os.path.join(md, "inbox", "evil.md"))
         rc, out, err = run(md, ["drain", "evil.md", "--issue", "5", "--verdict", "x"])
         check("symlink entry -> non-zero (rejected)", rc != 0)
         check("symlink entry NOT moved to drained/", "evil.md" not in drained_files(md))
-        os.unlink(link)
+
+        def drained_leaked(s):
+            for f in drained_files(md):
+                with open(os.path.join(md, "drained", f)) as fh:
+                    if s in fh.read():
+                        return True
+            return False
+        check("symlink target content NOT leaked into drained/", not drained_leaked("SECRET-CONTENT"))
         rc, out, err = run(md, ["drain", "does-not-exist.md", "--issue", "5", "--verdict", "x"])
         check("missing entry -> non-zero", rc != 0)
         rc, out, err = run(md, ["drain", fname, "--issue", "149", "--verdict", "x"])
