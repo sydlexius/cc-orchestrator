@@ -25,7 +25,18 @@ permissions:
 jobs:
   gates:
     name: gates (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    # Route the ubuntu leg to a self-hosted runner ONLY when all three hold:
+    #   - it is the ubuntu-latest matrix leg (macOS has no self-hosted host),
+    #   - the event is NOT a pull_request (push/dispatch only - never a fork PR),
+    #   - the repo variable SELF_HOSTED_LINUX == 'true' (the kill switch).
+    # Otherwise fall back to the GitHub-hosted matrix.os. Unset the variable to
+    # instantly revert everything to GitHub-hosted with no code change.
+    runs-on: >-
+      ${{ (matrix.os == 'ubuntu-latest'
+           && github.event_name != 'pull_request'
+           && vars.SELF_HOSTED_LINUX == 'true')
+          && fromJSON('["self-hosted","linux","x64","unraid"]')
+          || matrix.os }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
