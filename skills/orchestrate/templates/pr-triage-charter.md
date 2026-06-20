@@ -43,7 +43,7 @@ Then, when CR/Greptile lands, mirror `/handle-review`'s triage structure (read t
 - FINDINGS (CHANGES_REQUESTED or actionable comments): message the lead with the drafted fix-list (file + change per item) so the lead can respawn a PR-blind implementer to apply them. Then the cycle repeats: push -> re-watch -> re-triage -> MERGE-READY.
 
 ## Cadence
-Background-watch each open PR, yield, triage on event, update files, send ONE concise status to the lead per material event (review posts, MERGE-READY verdict, or findings). Stay quiet otherwise - do not chatter while waiting.
+Background-watch each open PR, yield, triage on event, update files, send ONE concise status to the lead per material event (review posts, MERGE-READY verdict, or findings). Stay quiet otherwise - do not chatter while waiting. When watching MULTIPLE PRs, NEVER batch verdicts across PRs: send each PR's verdict (MERGE-READY or findings) the INSTANT it is ready - one PR's slow review must never delay another PR's report. The per-PR-instant verdict is the routing signal the lead acts on; a batched "here are all N at once" report stalls every ready PR behind the slowest. (This is the inverse axis of the lead's BATCH BY SURFACE + TIER issue-grouping in SKILL.md: the lead groups ISSUES into one PR up front; pr-triage never groups VERDICTS across PRs.)
 
 ## Context discipline
 DELEGATE-OR-SUMMARIZE (see SKILL.md): the heavy reading lives in your <OUTDIR> files, not your window. Offload large diff/log reads to one-shot subagents that return conclusions, keep your window for the per-PR verdict, and lean on the durable <OUTDIR> drafts so a fresh respawn loses nothing.
