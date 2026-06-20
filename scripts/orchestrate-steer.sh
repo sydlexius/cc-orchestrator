@@ -116,7 +116,7 @@ marker_active() {
 # --- dispatch (at most one rule fires; a tool call carries a file_path XOR a command) -------------
 # (1) canonical-edit WARN: marker-gated.
 if [ -n "$file_path" ] && is_canonical_path "$file_path" && marker_active; then
-  emit_warn "Canonical symlinked file - log skill/charter/guard feedback to ~/.claude/orchestrate-session-feedback.md and triage via PR; do not edit mid-run."
+  emit_warn "Canonical symlinked file - log skill/charter/guard feedback via orchestrate-feedback.sh add (~/.claude/orchestrate-feedback/) and triage via PR; do not edit mid-run."
 fi
 
 # (2) raw gh-api mutation WARN: marker-independent.

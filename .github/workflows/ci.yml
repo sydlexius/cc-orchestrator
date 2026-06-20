@@ -62,11 +62,11 @@ jobs:
       # Platform-independent lint: run once, on Linux. (jq is preinstalled on both runners.)
       - name: shellcheck (security guard + runtime scripts)
         if: runner.os == 'Linux'
-        run: shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh
+        run: shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-feedback.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh
 
       - name: ruff (F,E741)
         if: runner.os == 'Linux'
-        run: ruff check --select F,E741 scripts/orchestrate-resources.py scripts/orchestrate-setup.py scripts/planner_classify.py test-orchestrate-guard.py test-orchestrate-steer.py test-orchestrate-resources.py test-orchestrate-setup.py test-planner-classify.py test-gh-wrappers.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py
+        run: ruff check --select F,E741 scripts/orchestrate-resources.py scripts/orchestrate-setup.py scripts/planner_classify.py test-orchestrate-guard.py test-orchestrate-steer.py test-orchestrate-resources.py test-orchestrate-setup.py test-orchestrate-feedback.py test-planner-classify.py test-gh-wrappers.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py
 
       # Platform-sensitive: run on BOTH macOS (BSD stat) and Linux (GNU stat).
       # Must invoke via ./ so the self-test's "$0" re-invocation resolves
@@ -129,6 +129,11 @@ jobs:
       - name: harness - setup
         if: runner.os == 'Linux'
         run: python3 test-orchestrate-setup.py
+
+      # Maildir feedback store (#149): temp-dir isolated, stubs nothing (real bash
+      # mktemp/mv), incl. a 25-way concurrency test. Host-independent.
+      - name: harness - feedback
+        run: python3 test-orchestrate-feedback.py
 
       # Version lockstep: SKILL.md **Version** == plugin.json "version". Platform-independent.
       - name: harness - version-lockstep

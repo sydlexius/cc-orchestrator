@@ -78,7 +78,7 @@ disambiguate from the `/ralph-loop` skill) + `DESIGN-*`/`PLAN-*`/`ROADMAP-*` (un
 ## Gates (run locally; CI enforces them)
 
 ```sh
-shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh
+shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-feedback.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh
 ruff check --select F,E741 scripts/orchestrate-*.py scripts/planner_classify.py test-orchestrate-*.py test-planner-classify.py test-gh-wrappers.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py
 ./scripts/orchestrate-guard.sh --self-test    # MUST use ./ - the self-test re-invokes "$0";
                                               # `bash scripts/orchestrate-guard.sh` makes $0 a bare name -> 127
@@ -87,6 +87,7 @@ python3 test-orchestrate-guard.py
 python3 test-orchestrate-steer.py
 python3 test-orchestrate-resources.py
 python3 test-orchestrate-setup.py
+python3 test-orchestrate-feedback.py
 python3 test-planner-classify.py
 python3 test-gh-wrappers.py
 python3 test-ship-gate-preflight.py
@@ -170,9 +171,9 @@ drives `/plugin marketplace` update-detection, so they must never diverge. The C
 - FEEDBACK-LOG DRAIN GATE (maintainer directive 2026-06-15; BINDING). This rule lives HERE in CLAUDE.md,
   not only in SKILL.md, on purpose: the SKILL.md copy kept getting SKIPPED and does not reliably survive
   context exhaustion / compaction, whereas CLAUDE.md is injected at every session start. A
-  `~/.claude/orchestrate-session-feedback.md` entry is DRAINED (removed from the log) ONLY after this EXACT
-  three-step ordering - never out of order, never collapsed into one pass, never skipped because an entry
-  "looks obviously right":
+  `~/.claude/orchestrate-feedback/inbox/<entry>` entry is DRAINED (moved to `drained/` cold storage via
+  `orchestrate-feedback.sh drain`, #149) ONLY after this EXACT three-step ordering - never out of order,
+  never collapsed into one pass, never skipped because an entry "looks obviously right":
   1. TASK A HOSTILE REVIEWER on the entry FIRST. Dispatch an ACTUAL adversarial reviewer (a subagent, or
      the `engage-ralph-loop.md` brief) - the lead's own glance does NOT count. It REPRODUCES every empirical
      claim (run it, never static-grep), pushes back on holes / over-reach / mis-scoping, and runs a
@@ -180,10 +181,10 @@ drives `/plugin marketplace` update-detection, so they must never diverge. The C
      allow-list. No tasked hostile review -> no issue, no drain.
   2. THEN FILE THE ISSUE (only after step 1). A verified entry becomes a normal issue (template + agent
      hints + immediate CR steering per the SKILL.md DRAIN PROCEDURE); an unreproducible claim is still filed,
-     framed as a KNOWLEDGE-GAP issue (never lose the signal); an entry the hostile review KILLS is dropped
-     with a one-line logged reason left IN the log.
-  3. THEN DRAIN THE ENTRY (only after step 2). The entry stays in the log until its issue number (or the
-     logged-drop reason) is recorded against it. NEVER drain before the issue exists; NEVER file before the
+     framed as a KNOWLEDGE-GAP issue (never lose the signal); an entry the hostile review KILLS is drained
+     with a one-line drop reason as its `--verdict` (KILLED: <reason>), so the killed-entry record lives in `drained/`.
+  3. THEN DRAIN THE ENTRY (only after step 2). The entry stays in `inbox/` until its issue number (or the
+     KILLED drop reason) is recorded against it via `drain`. NEVER drain before the issue exists; NEVER file before the
      hostile review. This GATES the SKILL.md "TRIAGE RIGOR / DRAIN PROCEDURE"; if the two ever disagree, this
      ordering wins.
 
