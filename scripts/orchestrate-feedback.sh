@@ -158,6 +158,15 @@ case "$sub" in
       rm -f -- "$claim"
       die "drain: '$entry' is not a regular (non-symlink) file in inbox"
     fi
+    # Reject a HARDLINK (link count > 1): appending to (`>>`) and moving a
+    # hardlinked inode would modify AND expose the link target. The claimed entry
+    # must be a private, single-link regular file. `find -links 1` prints the path
+    # only when the count is exactly 1 (empty otherwise); test its OUTPUT - find's
+    # exit status is 0 regardless of match, so a `! find` test would be a no-op.
+    if [ -z "$(find "$claim" -maxdepth 0 -type f -links 1 2>/dev/null)" ]; then
+      rm -f -- "$claim"
+      die "drain: '$entry' must be a single-link regular file (hardlink rejected)"
+    fi
     # The claim is private now: append the breadcrumb, then move to cold storage.
     printf '\nDRAINED -> #%s [%s]\n' "$issue" "$verdict" >>"$claim"
     mv -- "$claim" "$DRAINED/$entry"

@@ -128,6 +128,20 @@ def main():
                         return True
             return False
         check("symlink target content NOT leaked into drained/", not drained_leaked("SECRET-CONTENT"))
+
+        # Hardlink hardening: a planted hardlink (link count > 1) in inbox/ must be
+        # refused before any append/move, so the link target is neither modified nor
+        # exposed in drained/.
+        target = os.path.join(td, "hltarget.txt")
+        with open(target, "w") as fh:
+            fh.write("HL-SECRET")
+        hl = os.path.join(md, "inbox", "hardlink.md")
+        os.link(target, hl)  # hard link: hardlink.md and target share an inode (links=2)
+        rc, out, err = run(md, ["drain", "hardlink.md", "--issue", "5", "--verdict", "x"])
+        check("hardlink entry -> non-zero (rejected)", rc != 0)
+        check("hardlink entry NOT moved to drained/", "hardlink.md" not in drained_files(md))
+        check("hardlink target NOT modified (no breadcrumb appended)", open(target).read() == "HL-SECRET")
+        check("hardlink target content NOT leaked into drained/", not drained_leaked("HL-SECRET"))
         rc, out, err = run(md, ["drain", "does-not-exist.md", "--issue", "5", "--verdict", "x"])
         check("missing entry -> non-zero", rc != 0)
         rc, out, err = run(md, ["drain", fname, "--issue", "149", "--verdict", "x"])
