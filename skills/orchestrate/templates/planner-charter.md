@@ -55,6 +55,6 @@ re-routing again still collides, STOP and surface to the lead rather than iterat
 
 ## Non-goals (deferred to P2; do NOT build speculatively)
 - PRE-CODE overlap/size PREDICTION from issue-body path-globs (before branches exist) - weak signal, false
-  collisions; F22 safety is about disjoint WORKTREES, not disjoint files. If a real run needs it, log to
-  `orchestrate-session-feedback.md` and reopen.
+  collisions; F22 safety is about disjoint WORKTREES, not disjoint files. If a real run needs it, log via
+  `orchestrate-feedback.sh add` (the `~/.claude/orchestrate-feedback/` maildir) and reopen.
 - Predicted-vs-confirmed confidence labelling - unnecessary once P1 is diff-only (everything is exact).

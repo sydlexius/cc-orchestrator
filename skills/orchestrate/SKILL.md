@@ -5,7 +5,7 @@ description: Use when scaffolding and running a lead-orchestrated multi-agent se
 
 # Orchestrate: lead-run multi-agent PR pipeline
 
-**Version 0.41.0** (semver; releases tagged `vX.Y.Z`). Bump on any material change to this skill, its templates, or the runtime - PATCH for a fix, MINOR for a new rule/feature, MAJOR for a breaking charter or deterministic-floor change - so `/reload-skills` surfaces the new number and drift between the symlinked repo and the loaded skill is visible. History: `git log` + the GitHub Release notes cut at each `vX.Y.Z` tag.
+**Version 0.42.0** (semver; releases tagged `vX.Y.Z`). Bump on any material change to this skill, its templates, or the runtime - PATCH for a fix, MINOR for a new rule/feature, MAJOR for a breaking charter or deterministic-floor change - so `/reload-skills` surfaces the new number and drift between the symlinked repo and the loaded skill is visible. History: `git log` + the GitHub Release notes cut at each `vX.Y.Z` tag.
 
 You are the LEAD (orchestrator). You delegate building and the mechanical PR
 lifecycle to single-purpose teammates, and you keep for yourself the decisions
@@ -211,9 +211,13 @@ A Medium-effort Opus lead survives only a few hours before forced compaction, an
 - Resume: read the checkpoint block FIRST, then re-spawn only what is needed.
 
 ## Session feedback log (standing rule)
-ALL friction and improvement ideas surfaced during a run go to ONE place:
-`~/.claude/orchestrate-session-feedback.md` (machine-local running log, OUTSIDE the repo so writing it never touches the repo tree; see its
-header for the entry format). This covers a deterministic-floor (or any hard) gate that BLOCKS
+ALL friction and improvement ideas surfaced during a run go to ONE place: the maildir feedback
+store at `~/.claude/orchestrate-feedback/` (machine-local, OUTSIDE the repo so writing it never
+touches the repo tree), managed by `${CLAUDE_PLUGIN_ROOT}/scripts/orchestrate-feedback.sh` (#149).
+ONE FILE PER ENTRY under `inbox/` (atomic add via mktemp+rename - race-free for multiple active
+leads, no shared flat file to clobber, replacing the legacy `orchestrate-session-feedback.md`);
+filed entries move to `drained/` cold storage. Add with `orchestrate-feedback.sh add <slug>` (see
+HOW TO WRITE THE LOG below), list undrained with `... list`, drain with `... drain`. This covers a deterministic-floor (or any hard) gate that BLOCKS
 something legitimate, a convenience that would NOT sacrifice security, doc-drift, AND suggested
 improvements to this skill / charters / templates / playbook (house style, new invariants,
 lifecycle tweaks). NEVER edit `SKILL.md`, `templates/`, or `orchestrate-guard.sh` DIRECTLY mid-run:
@@ -224,7 +228,7 @@ collided with an in-flight PR and had to be reverted cross-session). Record it i
 LEAD folds it into the real file via the repo's normal PR process in a deliberate triage pass
 (do the edit in an ISOLATED git worktree so the live symlinked file is never touched until merge).
 The advisory steering hook (`orchestrate-steer.sh`, #95) WARNs on a marker-active mid-run edit of these canonical files as a deterministic backstop to this rule.
-HOW TO WRITE THE LOG (and any commit message that quotes push/merge prose): use the file-edit tool, or `git commit -F <file>` - NEVER a `cat >> ... <<EOF` Bash heredoc. The Bash guard hook inspects COMMAND LINES, so prose mentioning `git push`/merge in a heredoc body trips it (it literally blocked the entry documenting that block, dogfood 2026-06-06). File-edit tools and `-F <file>` do not pass through the Bash hook. Related: the guard loads at SESSION START, so a guard fix only takes effect once the affected session RESTARTS - a running session keeps its old guard snapshot.
+HOW TO WRITE THE LOG (and any commit message that quotes push/merge prose): write the entry body to a temp file with the FILE-EDIT tool, then pipe it in via a STDIN REDIRECT - `orchestrate-feedback.sh add <slug> < <bodyfile>` - NEVER put the body on the command line (positional arg) and NEVER a `cat >> ... <<EOF` heredoc. The Bash guard hook inspects COMMAND LINES, so prose mentioning `git push`/merge in a heredoc body OR a positional body arg trips it (it literally blocked the entry documenting that block, dogfood 2026-06-06); a `< file` redirect keeps the prose OFF the command line. The helper reads its body from stdin precisely for this. Related: the guard loads at SESSION START, so a guard fix only takes effect once the affected session RESTARTS - a running session keeps its old guard snapshot.
 Teammates that hit a blocked gate or have a suggestion surface it to the lead, who records it
 (teammates do not write the log directly). This is the triage queue: entries get folded into
 guard/skill/charter fixes - the Tier-2 merge `ask` circuit-breaker came from exactly such a logged
@@ -243,9 +247,13 @@ and CR-steering are ONE step, not two passes: (1) `gh issue create` with the rig
 hints; (2) IMMEDIATELY `gh issue comment <N> --body '@coderabbitai <entry-specific guidance>'` so CR's
 auto-generated Coding Plan is steered from the start (CR posts its plan ~10-15 min AFTER create, so the
 steering must already be on the issue when it generates). A drained entry is NOT done until BOTH have
-happened - never file the issue and defer the steering to a later pass. Before coding the issue later,
-re-verify each CR design choice against the current code (plans can be stale).
-Append, never rewrite; triage separately.
+happened - never file the issue and defer the steering to a later pass. THEN (3) move the entry to
+cold storage: `orchestrate-feedback.sh drain <entry> --issue <N> --verdict <text>` (it appends a
+`DRAINED -> #N` breadcrumb and moves the file inbox/ -> drained/). The 3-step ORDER is fixed:
+hostile review -> file the issue (+ steer) -> drain the entry; never drain before the issue exists.
+Before coding the issue later, re-verify each CR design choice against the current code (plans can be stale).
+ONE FILE PER ENTRY: never hand-edit `inbox/`, and never READ `drained/` during a pass - dedup a
+candidate against `gh issue list`, never against the drained corpus (the GitHub issue is the durable record).
 
 ## MAINTAINER CHANNEL (Slack)
 Optional out-of-band standout + steering channel via the official Slack MCP plugin
