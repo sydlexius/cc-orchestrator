@@ -43,12 +43,19 @@ if [ "${1:-}" = "--self-test" ]; then
     | "$0" 2>&1); st_rc=$?
   { [ "$st_rc" -eq 0 ] && printf '%s' "$st_out" | grep -q 'STEER'; } \
     || st_fail="gh-api rule (rc=$st_rc out=$st_out)"
-  # (3) raw gh pr comment mutation must WARN at exit 0.
+  # (3a) raw gh pr comment mutation must WARN at exit 0.
   if [ -z "$st_fail" ]; then
     st_out=$(printf '%s' '{"tool_name":"Bash","tool_input":{"command":"gh pr comment 5 -b hi"}}' \
       | "$0" 2>&1); st_rc=$?
     { [ "$st_rc" -eq 0 ] && printf '%s' "$st_out" | grep -q 'STEER'; } \
-      || st_fail="gh-pr rule (rc=$st_rc out=$st_out)"
+      || st_fail="gh-pr rule (comment) (rc=$st_rc out=$st_out)"
+  fi
+  # (3b) raw gh pr create mutation must WARN at exit 0 (so the PASS message's "create" claim is real).
+  if [ -z "$st_fail" ]; then
+    st_out=$(printf '%s' '{"tool_name":"Bash","tool_input":{"command":"gh pr create --fill"}}' \
+      | "$0" 2>&1); st_rc=$?
+    { [ "$st_rc" -eq 0 ] && printf '%s' "$st_out" | grep -q 'STEER'; } \
+      || st_fail="gh-pr rule (create) (rc=$st_rc out=$st_out)"
   fi
   if [ -z "$st_fail" ]; then
     echo "orchestrate-steer self-test PASS (raw gh-api + raw gh pr comment/create mutations warned, exit 0)"
