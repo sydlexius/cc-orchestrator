@@ -169,6 +169,57 @@ def main():
         rc_ok, _, silent_all = both_channels({"command": c}, marker_active=True)
         check(f"non-mutation / wrapper / non-gh -> silent ({c[:42]})", rc_ok and silent_all)
 
+    # ---- Rule 3: raw gh pr mutation -> canonical path (marker-independent, #159) ----
+    # Reframed as canonical-STEERING, NOT creep prevention: every high-traffic gh pr subcommand is
+    # already allow-listed (it never prompts), so the hook only nudges the two with a real canonical
+    # target: `gh pr comment` -> reply-comment.sh/gh-comment.sh ; `gh pr create` -> /prep-pr.
+    GH_PR_MUTATIONS = [
+        'gh pr comment 5 --body "hi"',
+        "gh pr comment -b x 5",
+        "gh pr create --base main --title t --body b",
+        "gh pr create --fill",
+        "cd /repo && gh pr create --draft",
+    ]
+    for c in GH_PR_MUTATIONS:
+        rc_ok, warned_all, _ = both_channels({"command": c}, marker_active=False)
+        check(f"raw gh pr mutation -> WARN, exit 0 ({c[:42]})", rc_ok and warned_all)
+
+    # EXCLUDED on purpose -> stay SILENT: merge (floor-denied in marker sessions, the sanctioned
+    # prompt-free path in solo - a nag is wrong), edit/ready/close/review (allow-listed lifecycle or
+    # no canonical redirect), and every read. Warning these would be pure noise.
+    GH_PR_SILENT = [
+        "gh pr merge 5 --squash",
+        "gh pr edit 5 --add-label x",
+        "gh pr ready 5",
+        "gh pr close 5",
+        "gh pr review 5 --approve",
+        "gh pr view 5 --json state",
+        "gh pr diff 5",
+        "gh pr checks 5",
+        "gh pr list --state open",
+        "gh pr status",
+    ]
+    for c in GH_PR_SILENT:
+        rc_ok, _, silent_all = both_channels({"command": c}, marker_active=True)
+        check(f"excluded gh pr subcommand -> silent ({c[:42]})", rc_ok and silent_all)
+
+    # Wrapper-alone stays silent: the word-boundary on bare `gh` excludes gh-comment.sh /
+    # reply-comment.sh (the char after `gh` is `-`, and `comment`/`create` inside those names is not
+    # space-delimited), even though those wrappers contain the subcommand word.
+    for c in ["bash gh-comment.sh 5 hi && echo done",
+              "scripts/reply-comment.sh 5 --file f --line 1 fixed",
+              "safe-push.sh my-branch && scripts/gh-resolve-thread.sh T_1"]:
+        rc_ok, _, silent_all = both_channels({"command": c}, marker_active=True)
+        check(f"gh pr rule: wrapper-alone stays silent ({c[:42]})", rc_ok and silent_all)
+
+    # ACCEPTED FALSE-POSITIVE (mirrors the gh-api F30 class): a gh pr READ compounded with a
+    # standalone `create`/`comment` word in an arg trips the whole-line grep. Harmless - advisory
+    # WARN, exit 0, reword to silence. Asserted so the behavior stays intentional, not a surprise.
+    rc_ok, warned_all, _ = both_channels(
+        {"command": "gh pr list && echo create the changelog"}, marker_active=False)
+    check("accepted FP: gh pr read + standalone 'create' word -> WARN (documented)",
+          rc_ok and warned_all)
+
     # Empty payload -> silent, exit 0 (fail-open).
     rc, err = run_steer({}, channel="stdin")
     check("empty tool_input -> silent, exit 0 (fail-open)", rc == 0 and not warned(err))

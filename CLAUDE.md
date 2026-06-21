@@ -38,9 +38,12 @@ Runtime (`scripts/`; canonical source is this repo):
   a SOLO/non-marker session is never Tier-2-gated. Fails OPEN on any internal error. Threat model
   = honest bot on the obvious path, NOT adversarial evasion (it is a guardrail, not a sandbox).
 - `scripts/orchestrate-steer.sh` - the advisory WARN-level steering hook (#95), SEPARATE from the
-  deny-floor guard. Exit 0 ALWAYS (never blocks); emits a `STEER:` nudge to stderr on two rules:
+  deny-floor guard. Exit 0 ALWAYS (never blocks); emits a `STEER:` nudge to stderr on three rules:
   (1) a marker-gated mid-run edit of a canonical file (SKILL.md/templates/guard/steer) -> log
-  feedback instead; (2) a raw `gh api` mutation not via a `gh-*` wrapper -> use the wrapper. Wired
+  feedback instead; (2) a raw `gh api` mutation not via a `gh-*` wrapper -> use the wrapper;
+  (3) a raw `gh pr comment`/`gh pr create` -> canonical path (reply-comment.sh/gh-comment.sh; /prep-pr)
+  (#159; canonical-steering only - `merge` and the allow-listed lifecycle subcommands are NOT flagged).
+  Wired
   for Edit/Write/Bash PreToolUse by `configure` (deployed Option-A like the guard); never duplicates
   or weakens a guard deny; opt out with `configure --no-steer`. Fails SILENT-OPEN.
 - `orchestrate-resources.py` - cross-session port + data-dir lease allocator (flock-atomic JSON
