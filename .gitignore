@@ -1,3 +1,11 @@
+# macOS
+.DS_Store
+
+# Claude Code machine-local settings (personal allow-list grants, absolute paths,
+# and the configure --apply backup; never commit - the user owns every grant)
+.claude/settings.local.json
+.claude/*.bak
+
 # Python
 __pycache__/
 *.pyc
