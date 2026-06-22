@@ -45,7 +45,12 @@ repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
 # + reviewDecision). Exit 0 = ready; exit 2 = block (stderr names the failing gate).
 bash ${CLAUDE_PLUGIN_ROOT}/scripts/ship-gate-preflight.sh "$pr_number" "$repo"
 
-# Codecov coverage advisory (informational; outside the oracle's scope)
+# Coverage advisory (informational; outside the oracle's scope). This is only
+# meaningful on repos that run a coverage service (e.g. codecov). When the repo
+# has no coverage integration, the script returns {"status":"none"} -- treat that
+# as SKIP / "N/A", not a failure and not a merge block (there is simply no
+# coverage comment yet). Only a returned threshold-fail is worth surfacing, and
+# even then it is advisory.
 bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh --coverage-only $pr_number
 
 # Code-scanning (GHAS / CodeQL) alerts -- a SEPARATE API surface the oracle and the
@@ -63,11 +68,16 @@ If the code-scanning surfacer reports open alerts, stop: triage them first (appl
 the autofix / fix, or dismiss genuine false positives via the documented
 `gh api -X PATCH` route) before merging. Do not merge over untriaged alerts.
 
-### Codecov status check (advisory, not blocking)
+### Coverage status check (advisory, not blocking)
 
-Check codecov's commit statuses on HEAD. Codecov posts two contexts:
-`codecov/patch` (patch-level coverage vs. threshold) and `codecov/project`
-(overall project coverage vs. threshold).
+This step is OPTIONAL and only applies when the target repo uses a coverage
+service that posts commit statuses (codecov being the common one). It is not
+assumed present: a repo with no coverage integration (this one included) posts
+no `codecov/*` status, and this step self-skips cleanly with nothing to report.
+
+When codecov IS active it posts two contexts: `codecov/patch` (patch-level
+coverage vs. threshold) and `codecov/project` (overall project coverage vs.
+threshold).
 
 ```bash
 head_sha=$(gh pr view $pr_number --json headRefOid --jq .headRefOid)
@@ -93,8 +103,9 @@ missing lines are in generated code. Cancel and add tests if not. Proceed?
 Default to waiting for explicit confirmation. If the user chose to proceed
 in a prior conversation turn, do not re-prompt.
 
-If codecov has not posted a status or the threshold state is `pass`, skip
-this prompt entirely.
+If no `codecov/*` status is posted (the `$codecov_status` array is empty) or
+the threshold state is `pass`, skip this prompt entirely -- the absent-signal
+case is a SKIP, never a block.
 
 ---
 
@@ -305,7 +316,10 @@ acknowledge that cleanup ran:
 
 - PR: #$pr_number
 - CR status: <verified clean / fallback check / skipped>
-- Coverage: <patch_pct>% <threshold_state> | none
+- Coverage: <patch_pct>% <threshold_state> | N/A
 - Commit: <squash merge SHA>
 - Post-merge cleanup: see /post-merge-cleanup output above
 ```
+
+Display "N/A" for Coverage when `--coverage-only` returned `{"status":"none"}`
+(no coverage service on the repo) -- a missing coverage signal is not a failure.

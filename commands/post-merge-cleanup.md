@@ -108,21 +108,6 @@ If a worktree path is found:
 
 If no worktree is found, note it and continue.
 
-### Clear stale linter caches after worktree removal
-
-golangci-lint caches analysis results keyed by absolute file path. After a
-worktree is removed, those paths no longer exist, but the cache still
-references them: a later `golangci-lint run` in a sibling worktree can fail
-with phantom findings (it can't read the deleted files to see their `//nolint`
-directives, so it reports the raw errors). When a worktree was removed above
-and this is a Go repo, clear the cache so the next gate run is clean:
-
-```bash
-command -v golangci-lint >/dev/null 2>&1 && golangci-lint cache clean || true
-```
-
-This is a no-op when golangci-lint is absent or no worktree was removed.
-
 ---
 
 ## Step 4 -- Delete local branch
