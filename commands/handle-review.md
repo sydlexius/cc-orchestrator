@@ -13,9 +13,11 @@ This command targets bot reviewer comments (logins ending with `[bot]`). For hum
 reviewer comments, apply the same triage and fix discipline manually.
 
 **Codecov** (`codecov[bot]`) is **not** treated as a reviewer bot by this command.
-Codecov posts coverage summaries as issue-level comments that have no threaded-reply
-surface and require no reply. The helper script surfaces them as an informational
-"Coverage advisory" -- see Step 2.
+This applies only when codecov is active on the target repo; a repo with no
+coverage service posts no such comments and the whole coverage path is a no-op.
+When present, codecov posts coverage summaries as issue-level comments that have
+no threaded-reply surface and require no reply. The helper script surfaces them
+as an informational "Coverage advisory" -- see Step 2.
 
 **Greptile** (`greptile-apps[bot]`) IS treated as a reviewer bot here. It posts a
 single COMMENTED review ~20 min AFTER CodeRabbit APPROVES (well after CR has
@@ -188,6 +190,11 @@ actionable; otherwise note them silently and move on.
 
 ### Coverage advisory handling
 
+This whole subsection is conditional on the repo having a coverage service. If
+the coverage probe returns `{"status":"none"}` (no codecov integration, the case
+on repos like cc-orchestrator itself), skip all coverage advisory handling
+entirely -- there is no signal to act on, and that is not a failure.
+
 If the script emits a "Coverage advisory" section with `threshold_state: fail`,
 surface it to the user alongside (not as part of) the triage table. A failing
 patch-coverage threshold is not a review comment and must not be categorised
@@ -252,7 +259,7 @@ For each open comment:
 | Category | Meaning |
 |----------|---------|
 | `bug` | Real code defect -- must fix |
-| `spec-drift` | OpenAPI spec doesn't match implementation -- must fix |
+| `spec-drift` | Docs, schema, or interface contract no longer matches the implementation (e.g. a help text, a config schema, an API spec) -- must fix |
 | `test-gap` | Missing test coverage for a real gap -- should fix |
 | `false-positive` | Established pattern, known behavior, or intentional design |
 | `already-fixed` | Was corrected in a later commit; reply needed but no code change |
@@ -273,8 +280,10 @@ For each comment about:
 Run a targeted search before writing any fixes:
 
 ```bash
-# Example: find all occurrences of the stale name
-grep -rn "resized\|resizeErr" . --include="*.go" | grep -v "_test.go" | grep -v "func Resize"
+# Example: find all occurrences of the stale name. Scope --include to the target
+# repo's source types -- e.g. --include="*.sh" --include="*.py" for this repo, or
+# the relevant language extensions in another.
+grep -rn "old_name\|oldNameErr" . --include="*.sh" --include="*.py" | grep -v "test-"
 ```
 
 Add every additional occurrence found to the fix scope for that comment. Note them
@@ -285,12 +294,12 @@ Print the full triage table before making any changes:
 ```text
 ## Triage
 
-| # | ID     | Category       | File              | Summary |
-|---|--------|----------------|-------------------|---------|
-| 1 | 123456 | bug            | handlers_image.go | error path returns empty warnings slice |
-| 2 | 789012 | false-positive | handlers_image.go | SSRF transport pattern |
-| 3 | 345678 | already-fixed  | openapi.yaml      | description was stale, fixed in abc1234 |
-| 4 | 456789 | bug            | fixers.go (+3)    | stale `resized` name -- also in bulk_executor.go, handlers_image.go (x2) |
+| # | ID     | Category       | File                 | Summary |
+|---|--------|----------------|----------------------|---------|
+| 1 | 123456 | bug            | reply-comment.sh     | error path returns empty result, swallows failure |
+| 2 | 789012 | false-positive | orchestrate-guard.sh | intentional fail-open on internal error |
+| 3 | 345678 | already-fixed  | SKILL.md             | stale description, fixed in abc1234 |
+| 4 | 456789 | bug            | pr-watch.sh (+3)     | stale `old_name` -- also in safe-push.sh, ship-gate-preflight.sh (x2) |
 ...
 ```
 
@@ -335,23 +344,37 @@ Before committing, decide whether to run the `pr-review-toolkit` agents. Determi
 validation comes first; agents are only warranted when the diff is substantive enough
 for their cost (~50-100K tokens, ~60s wall time) to yield real signal.
 
-**Always run the deterministic gate first** -- this catches lint, type, test, OpenAPI,
-patch-coverage, and generated-file regressions at zero agent cost:
+**Always run the deterministic gate first** -- this catches lint, type, test,
+schema-drift, coverage, and generated-file regressions at zero agent cost:
 
 ```bash
 git diff --name-only   # identify changed files
+# Run the target repo's deterministic gate. If the repo provides a single
+# pre-push gate script, use it:
 bash scripts/pre-push-gate.sh   # or equivalent per project
 ```
 
-Only escalate to agents if `pre-push-gate` passes AND the diff meets the "agents
-merited" bar below. When the gate fails, fix the failures first -- agents cannot
-tell you something the compiler or linter already told you.
+If `scripts/pre-push-gate.sh` does NOT exist (it is absent in this repo, for
+example), skip it and run the target repo's actual gate block instead. The
+authoritative gates are usually listed in the repo's CLAUDE.md `## Gates`
+section -- run those commands. For cc-orchestrator that is: `shellcheck` on the
+shell scripts, `ruff check --select F,E741` on the `.py` files, the
+`orchestrate-guard.sh`/`orchestrate-steer.sh` `--self-test` runs, and the
+`python3 test-*.py` harnesses.
+
+Only escalate to agents if the deterministic gate passes AND the diff meets the
+"agents merited" bar below. When the gate fails, fix the failures first -- agents
+cannot tell you something the compiler or linter already told you.
 
 ### Estimating patch coverage (do not hand-roll)
 
-When a round touches a failing `codecov/patch` status, **do not write an ad-hoc
-coverage script.** Use the maintained estimator, which mirrors Codecov's
-projection (all-hit rule + trailing-brace correction):
+This block applies only when the target repo runs a coverage service and a round
+touches a failing `codecov/patch` status. On a repo with no coverage integration
+it is a no-op -- skip it. When it does apply, **do not write an ad-hoc coverage
+script.** Use the maintained estimator, which mirrors Codecov's projection
+(all-hit rule + trailing-brace correction). The profile-generation step below is
+illustrative (a Go example); substitute the target repo's coverage-profile
+command:
 
 ```bash
 go test -count=1 -coverprofile=/tmp/cover.out ./...
@@ -359,6 +382,11 @@ COVER_OUT=/tmp/cover.out PATCH_COVERAGE_THRESHOLD=<repo target> \
   PATCH_COVERAGE_EXCLUDE="<codecov.yml ignore globs>" \
   bash ${CLAUDE_PLUGIN_ROOT}/scripts/patch-coverage.sh   # or repo-local scripts/patch-coverage.sh
 ```
+
+Self-skip on the absent-signal cases: if `patch-coverage.sh` exits 0 reporting
+"no Go source changes in scope" (the diff touches nothing the estimator
+measures), or exits 2 (missing coverage profile -- no coverage tooling on the
+repo), treat coverage as SKIP and move on. Neither is a failure.
 
 Interpret the result as a **conservative lower bound**: it counts a line covered
 only if every coverage block touching it was hit (mixed-hit lines count as
@@ -465,7 +493,7 @@ git commit -m "fix: address PR review findings
 
 <bullet list of what was fixed>
 
-Co-Authored-By: Claude <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ```
 
 Get the short SHA:
