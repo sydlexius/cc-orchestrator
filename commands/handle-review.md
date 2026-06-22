@@ -493,7 +493,7 @@ git commit -m "fix: address PR review findings
 
 <bullet list of what was fixed>
 
-Co-Authored-By: Claude <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ```
 
 Get the short SHA:
