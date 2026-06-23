@@ -232,11 +232,42 @@ if [ ! -x "$helper" ]; then
   exit 2
 fi
 
-unreplied_out="$("$helper" "$pr" "$repo" 2>/dev/null)" || {
-  echo "BLOCK: pr-unreplied-comments.sh failed for #$pr (cannot verify review state)." >&2
+# Invoke the helper with --allow-stale. The helper exits 2 (printing a
+# "STOP: head branch is behind base" section to STDOUT) when the PR branch is
+# BEHIND base -- a DETERMINISTIC condition, not a transient. That base-freshness
+# STOP is irrelevant to THIS gate: the oracle counts actionable review-body
+# findings, which are readable regardless of base-freshness, and the
+# up-to-date-with-base concern is ALREADY covered by the separate
+# mergeStateStatus / check gates above. Without --allow-stale the helper's
+# behind-base exit 2 would mask as a generic "helper failed" and BLOCK every
+# behind-base PR (#178). The combined stdout+stderr is captured to a temp file
+# (the helper's diagnostic lines land on stdout) so a genuine failure surfaces
+# its exit code + an output tail rather than being swallowed by 2>/dev/null.
+#
+# A bounded retry (3 attempts, no delay -- matching pr-watch.sh) absorbs a
+# genuinely transient non-zero (e.g. a flaky gh/network blip) before declaring
+# BLOCK. FAIL CLOSED is preserved: a persistent non-zero still BLOCKs, now with
+# the exit code + output tail surfaced for diagnosis.
+unreplied_capture="$(mktemp)"
+helper_rc=0
+for _attempt in 1 2 3; do
+  helper_rc=0
+  "$helper" --allow-stale "$pr" "$repo" >"$unreplied_capture" 2>&1 || helper_rc=$?
+  if [ "$helper_rc" -eq 0 ]; then
+    break
+  fi
+done
+unreplied_out="$(cat "$unreplied_capture")"
+if [ "$helper_rc" -ne 0 ]; then
+  helper_tail="$(tail -n 5 "$unreplied_capture")"
+  rm -f "$unreplied_capture"
+  echo "BLOCK: pr-unreplied-comments.sh failed for #$pr after 3 attempt(s) (exit $helper_rc; cannot verify review state)." >&2
+  echo "  --- helper output (last 5 lines) ---" >&2
+  echo "$helper_tail" >&2
   echo "RESULT: BLOCK -- review gate unverifiable. [#$pr $repo]" >&2
   exit 2
-}
+fi
+rm -f "$unreplied_capture"
 
 # The helper prints the "Review-body comments with actionable findings: N" line
 # ONLY when N>0, so three cases must be distinguished -- FAIL CLOSED on the third:
