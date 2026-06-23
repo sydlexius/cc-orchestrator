@@ -139,7 +139,10 @@ def test_form_b_order_and_pass():
         rc, out = run_runner(root)
         check("Form B: all pass -> exit 0", rc == 0)
         check("Form B: announces enumerate form", "Form B" in out)
-        order = open(marker).read().split()
+        order = []
+        if os.path.exists(marker):
+            with open(marker, encoding="utf-8") as f:
+                order = f.read().split()
         check("Form B: steps run IN ORDER", order == ["1", "2"])
         check("Form B: per-step PASS lines", "[PASS] first" in out and "[PASS] second" in out)
 
@@ -283,6 +286,35 @@ def test_broken_toml():
         check("broken toml: parse error surfaced", "could not parse" in out)
 
 
+def test_malformed_prep_pr_fails_closed():
+    # A present config whose [prep_pr] is missing or mis-typed must FAIL CLOSED
+    # (exit 2), not silently skip every gate (a typo must never disable gating).
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, ".gates.toml", "prep_pr = \"oops\"\n")  # not a table
+        rc, out = run_runner(root)
+        check("prep_pr not a table -> exit 2 (fail closed)", rc == 2)
+        check("prep_pr not a table: failing-closed message", "failing closed" in out)
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, ".gates.toml", "[merge_pr]\ncoverage_advisory = false\n")  # no [prep_pr]
+        rc, _ = run_runner(root)
+        check("config present but no [prep_pr] -> exit 2 (fail closed)", rc == 2)
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, ".gates.toml", "[prep_pr]\nsteps = [{ name = \"x\", run = 5 }]\n")
+        rc, out = run_runner(root)
+        check("step `run` not a string -> exit 2 (fail closed)", rc == 2)
+        check("invalid run: explained", "invalid `run`" in out)
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, ".gates.toml",
+              "[prep_pr]\nsteps = [{ name = \"x\", run = \"true\", required = \"yes\" }]\n")
+        rc, out = run_runner(root)
+        check("step `required` not a bool -> exit 2 (fail closed)", rc == 2)
+        check("invalid required: explained", "invalid `required`" in out)
+
+
 # --- Fallback chain ---------------------------------------------------------
 
 def test_fallback_umbrella_makefile():
@@ -334,7 +366,10 @@ nothing
         rc, out = run_runner(root, drop_tools=("make",))
         check("fallback L2: CLAUDE.md ## Gates -> exit 0", rc == 0)
         check("fallback L2: announces layer 2", "layer 2" in out)
-        ran = open(marker).read().split()
+        ran = []
+        if os.path.exists(marker):
+            with open(marker, encoding="utf-8") as f:
+                ran = f.read().split()
         check("fallback L2: gate commands run in order",
               ran == ["gate-a", "gate-b"])
 
@@ -406,6 +441,7 @@ def main():
         test_form_b_skip_if_absent_skips, test_form_b_skip_if_absent_present_runs,
         test_form_b_skip_if_no_match_skips, test_form_b_skip_if_match_runs,
         test_mutually_exclusive, test_broken_toml,
+        test_malformed_prep_pr_fails_closed,
         test_fallback_umbrella_makefile, test_fallback_umbrella_prepush_script,
         test_fallback_claude_md, test_fallback_claude_md_hard_fail,
         test_fallback_basics_python, test_fallback_basics_python_fail,

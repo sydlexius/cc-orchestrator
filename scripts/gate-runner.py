@@ -135,10 +135,10 @@ def _skip_reason(step, root):
 
 
 def run_form_b(steps, root):
-    log(f"gate-runner: .gates.toml Form B (enumerate) -> {len(steps)} step(s)")
     if not isinstance(steps, list):
         warn("[prep_pr].steps must be an array of step tables")
         return 2
+    log(f"gate-runner: .gates.toml Form B (enumerate) -> {len(steps)} step(s)")
     soft_failures = 0
     for i, step in enumerate(steps):
         if not isinstance(step, dict):
@@ -146,10 +146,13 @@ def run_form_b(steps, root):
             continue
         name = step.get("name") or f"step-{i}"
         run = step.get("run")
-        if not run:
-            warn(f"step {name!r} has no `run`; skipping")
-            continue
+        if not isinstance(run, str) or not run.strip():
+            warn(f"step {name!r} has invalid `run` (expected a non-empty string)")
+            return 2
         required = step.get("required", True)
+        if not isinstance(required, bool):
+            warn(f"step {name!r} has invalid `required` (expected a boolean)")
+            return 2
         reason = _skip_reason(step, root)
         if reason:
             log(f"[SKIP] {name}: {reason}")
@@ -321,8 +324,8 @@ def main(argv=None):
 
     prep = data.get("prep_pr")
     if not isinstance(prep, dict):
-        warn(f"{CONFIG_NAME} has no [prep_pr] table; nothing to run.")
-        return 0
+        warn(f"{CONFIG_NAME} is present but has no valid [prep_pr] table; failing closed.")
+        return 2
 
     log(f"gate-runner: using {config_path}")
     return run_prep_pr(prep, root)
