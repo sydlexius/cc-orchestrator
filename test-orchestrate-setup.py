@@ -1382,6 +1382,30 @@ def main():
         check("#68 scaffold: brief body has no <STACK> placeholder remaining",
               "<STACK>" not in brief68_body)
 
+    # #179: null-safe hook-presence walkers. A settings file with a present-but-null
+    # `hooks` key ({"hooks": null}) or a null event list ({"hooks": {"PreToolUse": null}})
+    # is valid JSON but bypasses a bare .get(default); the walkers must coalesce it and
+    # return cleanly (no AttributeError/TypeError), not crash. #162 hardened
+    # _session_init_hook_present; #179 extends the same pattern to _guard_hook_present and
+    # _missing_steer_hook_blocks. Call each walker directly on the pathological inputs.
+    print("\n  [#179: null-safe hook-presence walkers]")
+    _null_settings = [
+        ("hooks=null", {"hooks": None}),
+        ("hooks.PreToolUse=null", {"hooks": {"PreToolUse": None}}),
+        ("hooks.SessionStart=null", {"hooks": {"SessionStart": None}}),
+        ("settings=null", None),
+        ("hooks.PreToolUse=[null]", {"hooks": {"PreToolUse": [None]}}),
+    ]
+    for label, settings in _null_settings:
+        try:
+            g = _mod._guard_hook_present(settings)
+            s = _mod._session_init_hook_present(settings)
+            m = _mod._missing_steer_hook_blocks(settings)
+            ok = (g is False) and (s is False) and isinstance(m, list)
+            check(f"#179: walkers handle {label} cleanly (no crash)", ok)
+        except (AttributeError, TypeError) as e:
+            check(f"#179: walkers handle {label} cleanly (no crash) -- raised {type(e).__name__}", False)
+
     # #112: _derive_repo_slug parses the ssh:// URL form (additive; existing forms unchanged).
     # Also exercises the --slug override on `up` for belt-and-suspenders fallback.
     import importlib.util as _ilu112

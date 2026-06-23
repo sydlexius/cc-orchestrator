@@ -171,9 +171,13 @@ SESSION_INIT_HOOK_BLOCK = {
 
 def _guard_hook_present(settings):
     """True if the deterministic-floor Bash hook is already wired in settings.json."""
-    for block in (settings or {}).get("hooks", {}).get("PreToolUse", []):
-        if block.get("matcher") == "Bash":
-            for h in block.get("hooks", []):
+    # `or {}` / `or []` coerce a valid-JSON-but-null value (e.g. {"hooks": null}
+    # or {"hooks": {"PreToolUse": null}}) so a present-but-null key does not bypass
+    # the default and crash this walker (mirrors _session_init_hook_present, #162/#179).
+    hooks = (settings or {}).get("hooks") or {}
+    for block in (hooks.get("PreToolUse") or []):
+        if (block or {}).get("matcher") == "Bash":
+            for h in ((block or {}).get("hooks") or []):
                 if "orchestrate-guard.sh" in h.get("command", ""):
                     return True
     return False
@@ -260,7 +264,11 @@ def check_guard_stale():
 
 def _missing_steer_hook_blocks(settings):
     """The STEER_HOOK_BLOCKS not yet wired in settings.json (matched by matcher + steer command)."""
-    pre = (settings or {}).get("hooks", {}).get("PreToolUse", [])
+    # `or {}` / `or []` coerce a valid-JSON-but-null value (e.g. {"hooks": null} or
+    # {"hooks": {"PreToolUse": null}}) so a present-but-null key does not bypass the
+    # default and crash this walker (mirrors _session_init_hook_present, #162/#179).
+    hooks = (settings or {}).get("hooks") or {}
+    pre = (hooks.get("PreToolUse") or [])
 
     def present(block):
         # Exact (type+command) match against the canonical STEER_HOOK_COMMAND this block carries, so a
@@ -268,8 +276,8 @@ def _missing_steer_hook_blocks(settings):
         # anchored to the same constant written by configure (block["hooks"][0]["command"]).
         expected = block["hooks"][0]["command"]
         for b in pre:
-            if b.get("matcher") == block["matcher"]:
-                for h in b.get("hooks", []):
+            if (b or {}).get("matcher") == block["matcher"]:
+                for h in ((b or {}).get("hooks") or []):
                     if h.get("type") == "command" and h.get("command") == expected:
                         return True
         return False
