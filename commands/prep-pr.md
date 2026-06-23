@@ -89,53 +89,50 @@ If both thresholds are within bounds: print the hand-written totals
 
 ---
 
-## Step 2 -- Tests and gates (detection-first)
+## Step 2 -- Tests and gates (delegate to gate-runner)
 
-This command ships in a plugin installed into arbitrary repos, so it must
-**detect and run the target repo's own gates** rather than hardcode any one
-stack. Do not assume Go, Node, Python, or any specific toolchain -- find what
-the repo declares and run it.
-
-**Primary path -- the repo's declared gate block.** Read the target repo's
-`CLAUDE.md` and look for a `## Gates` section (or an equivalently named
-"run locally; CI enforces them" block). Execute the commands listed there,
-in order, gating on the first failure.
+This command ships in a plugin installed into arbitrary repos, so it must run
+the **target repo's own gates** rather than hardcode any one stack. Gate
+detection is no longer re-implemented in this prose: it is owned by the bundled
+`gate-runner.py`, which reads `.gates.toml` when present and otherwise falls
+back through a fail-open detection chain (umbrella script -> the `## Gates`
+block in `CLAUDE.md` -> language-agnostic basics -> warn-and-proceed). Delegate
+to it:
 
 ```bash
-# Locate a gate block in the repo's CLAUDE.md (illustrative detection):
-if [ -f CLAUDE.md ] && grep -qiE '^##+ +Gates' CLAUDE.md; then
-  echo "Found a '## Gates' block in CLAUDE.md -- run those commands in order."
+# Prefer the repo-local copy (dev / --plugin-dir installs); else the deployed
+# copy at the stable path. The runner finds the repo root itself and reads
+# .gates.toml or falls back; it exits non-zero on the first required-gate
+# failure, 0 when everything passed/skipped/fell open.
+if [ -f scripts/gate-runner.py ]; then
+  python3 scripts/gate-runner.py
+else
+  python3 ~/.claude/scripts/gate-runner.py
 fi
+gate_rc=$?
 ```
 
-**Fallback path -- a pre-push gate script.** If there is no declared gate
-block, check for a conventional pre-push gate runner and execute it if present:
+`gate-runner.py` reads `.gates.toml` (`[prep_pr]` with either a `gate`
+delegate or an ordered `steps` list; see
+`skills/orchestrate/templates/gates.toml.md` for the schema). When there is no
+`.gates.toml`, it falls back automatically -- so a repo with a `## Gates` block,
+a `make gate` target, a `scripts/pre-push-gate.sh`, or just a manifest still
+gets the right gates run, and a config-less repo is warned but never hard-
+blocked. It prints a per-step `[PASS]` / `[SKIP]` / `[FAIL]` line.
 
-```bash
-if [ -x scripts/pre-push-gate.sh ]; then
-  bash scripts/pre-push-gate.sh
-fi
-```
+*Illustrative -- what runs in cc-orchestrator (this repo):* its `.gates.toml`
+enumerates `shellcheck` on the shell scripts, `ruff check --select F,E741` on
+the `.py` files, the guard and steer `--self-test`s, and the `python3
+test-*.py` harnesses. Another target repo declares a different set (or relies on
+the fallback chain).
 
-**Last resort.** If neither a `## Gates` block nor a `scripts/pre-push-gate.sh`
-exists, fall back to whatever test runner the repo's manifest implies (e.g.
-`go test ./...` when `go.mod` is present, `npm test` when `package.json`
-declares a test script, `python3 test-*.py` harnesses when present). State
-which runner you inferred and why before running it.
-
-*Illustrative -- what detection finds in cc-orchestrator (this repo):* the
-`## Gates` block runs `shellcheck` on the shell scripts, `ruff check --select
-F,E741` on the `.py` files, the guard and steer `--self-test`s, and the
-`python3 test-*.py` harnesses. These are examples of a detected gate set, not
-a hardcoded assumption -- another target repo will declare a different set.
-
-If any gate fails: print the failures, stop, and say:
+If `gate_rc` is non-zero: print the runner's failure output, stop, and say:
 "Fix the failing gate before proceeding. Do not push broken code."
 
-If all detected gates pass: note it and continue to Step 2b.
+If `gate_rc` is 0: note it and continue to Step 2b.
 
 **If a gate run produces a coverage profile** (e.g. a `go test
--coverprofile=<file>` line in the detected gate block), capture that profile
+-coverprofile=<file>` step in the repo's `.gates.toml`), capture that profile
 path so Step 2b can reuse it. Repos with no coverage tooling produce no
 profile, and Step 2b self-skips accordingly.
 
@@ -159,7 +156,12 @@ fi
 ```
 
 When no coverage service is detected (no `codecov.yml` and no `codecov/*`
-status context), SKIP this step entirely and continue to Step 3.
+status context), SKIP this step entirely and continue to Step 3 -- treat patch
+coverage as **N/A**, not a failure (the coverage `status:none` self-skip). The
+repo's `.gates.toml` can make this explicit with `[merge_pr]`
+`coverage_advisory = false`: when that is set (or the runner / `patch-coverage.sh
+--coverage-only` reports `{"status":"none"}`), report Coverage as N/A and
+continue rather than gating.
 
 When a coverage service IS active: Codecov's patch-coverage check measures the
 percentage of *changed lines* that are exercised by tests, and PRs that fall

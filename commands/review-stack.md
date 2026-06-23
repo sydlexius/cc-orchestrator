@@ -357,28 +357,29 @@ For each "Defer" item:
 
 **Do not commit between fixes.** Make all changes first, then commit once.
 
-### 4d. Run verification (detection-first)
+### 4d. Run verification (delegate to gate-runner)
 
-Run the target repo's own gates rather than any hardcoded runner. Prefer the
-`## Gates` block in the repo's `CLAUDE.md`; fall back to `scripts/pre-push-gate.sh`
-if present; last-resort, infer from the repo's manifest (same detection pattern
-as `/prep-pr` Step 2):
+Run the target repo's own gates by delegating to the bundled `gate-runner.py`
+(it reads the repo's `.gates.toml`, or falls back through the umbrella ->
+CLAUDE.md `## Gates` -> language-basics -> warn-and-proceed chain), the same
+runner `/prep-pr` Step 2 uses -- one source of truth, no per-stack detection
+re-implemented here:
 
 ```bash
-if [ -f CLAUDE.md ] && grep -qiE '^##+ +Gates' CLAUDE.md; then
-  echo "Run the commands from CLAUDE.md '## Gates' in order."
-elif [ -x scripts/pre-push-gate.sh ]; then
-  bash scripts/pre-push-gate.sh
+if [ -f scripts/gate-runner.py ]; then
+  python3 scripts/gate-runner.py
 else
-  echo "Infer the runner from the repo manifest (e.g. go test ./..., npm test, python3 test-*.py)."
+  python3 ~/.claude/scripts/gate-runner.py
 fi
+gate_rc=$?
 ```
 
-*Illustrative -- this repo's detected gates:* `shellcheck` on the shell scripts,
-`ruff check --select F,E741` on the `.py` files, the guard/steer self-tests, and
-the `python3 test-*.py` harnesses. Another target repo declares a different set.
+*Illustrative -- this repo's gates (from its `.gates.toml`):* `shellcheck` on
+the shell scripts, `ruff check --select F,E741` on the `.py` files, the
+guard/steer self-tests, and the `python3 test-*.py` harnesses. Another target
+repo declares a different set (or relies on the fallback chain).
 
-If any gate fails, fix the failures before proceeding.
+If `gate_rc` is non-zero, fix the failures before proceeding.
 
 If the repo uses templ and any `.templ` files were changed (self-skip when no
 `.templ` files exist), regenerate:
