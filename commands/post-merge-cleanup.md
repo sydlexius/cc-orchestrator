@@ -209,7 +209,37 @@ If `issues` is empty, note: "No closing issues referenced in this PR."
 
 ---
 
-## Step 8 -- Summary
+## Step 8 -- Cut the release (if this merge bumped the version)
+
+A version-bumping merge ships a new version, so the matching `vX.Y.Z` tag and GitHub Release must be cut NOW, as part of this cleanup, not deferred. Deferring it is how tags drift behind shipped versions (one un-cut release silently becomes several).
+
+Detect whether this merge changed a version-defining file. This is repo-agnostic: key off a version file changing in the merge, NOT a hardcoded path. Adapt the globs to how the target repo versions (this repo uses a `SKILL.md` `**Version**` line locked to `plugin.json`; others use `package.json`, `Cargo.toml`, `pyproject.toml`, etc.):
+
+```bash
+version_changed=$(git show "$sha" --format= --name-only \
+  | grep -iE '(^|/)(plugin\.json|package\.json|Cargo\.toml|pyproject\.toml)$|SKILL\.md' || true)
+```
+
+If `version_changed` is empty, SKIP this step (this merge did not ship a new version) and continue to the summary.
+
+Otherwise, read the shipped version and compare it to the latest release tag:
+
+```bash
+# current_ver: read from whichever file the repo treats as the source of truth
+# (e.g. the SKILL.md "**Version X.Y.Z**" line, or `jq -r .version plugin.json`).
+latest_tag=$(git tag --list 'v*' | sort -V | tail -1)
+```
+
+- If a tag for the current version ALREADY exists, nothing to cut (already released).
+- If the current version is AHEAD of `latest_tag` with no matching tag, CUT THE RELEASE NOW:
+  - Prefer the `/push-release` skill for the current HEAD version - it crafts house-style notes plus the tag and GitHub Release. Do NOT duplicate its note logic here.
+  - If you are backfilling an already-merged version (HEAD has moved on), tag the annotated `vX.Y.Z` at this merge commit `$sha` and `gh release create vX.Y.Z` there, with house-style notes (intro, Highlights, themed prose, issue links, Compare/Install footer) - never a bare `--generate-notes` dump.
+
+Never end cleanup with a version-bumping merge left un-released.
+
+---
+
+## Step 9 -- Summary
 
 Report:
 - PR: #$pr_number (`$sha`)
