@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-"""Proof harness for pr-watch.sh CR-skip + Codoki-settlement wiring (#34, #110).
+"""Proof harness for pr-watch.sh CR-skip + Codoki-settlement wiring (#34, #110, #173).
 
-Two behaviors are exercised here, both host-independent (gh + the Codoki oracle
+Three behaviors are exercised here, all host-independent (gh + the Codoki oracle
 are stubbed; never a real PR):
 
   #34  A `norabbit`-labeled or CR-"Review skipped" PR must SETTLE without waiting
-       for a CodeRabbit review that will never land. A CR-ENABLED PR (no label,
-       no skip check) must still WAIT for the real review (preserved behavior).
+       for a CodeRabbit review that will never land.
+
+  #173 CR-waiting is OPT-IN. With org-wide auto-review OFF, an untriggered PR posts
+       NO CR check at all, so the default must be SATISFIED. The script waits for
+       `cr-review` ONLY on positive evidence CR will review: an existing review
+       (incl. DISMISSED), CR in requested_reviewers, or a `@coderabbitai review` /
+       `@coderabbitai full review` trigger comment. A bare/`resolve`/`summary`
+       mention does NOT count (guardrail). The idle-no-trigger PR settles.
 
   #110 Codoki posts its verdict as a `Codoki PR Review` entry in statusCheckRollup,
        invisible to the reviews API. pr-watch defers Codoki settlement to the
@@ -52,6 +58,7 @@ CHECKS = os.environ.get("CHECKS_JSON", "[]")
 LABELS = os.environ.get("LABELS_JSON", "[]")
 COMMENTS = os.environ.get("COMMENTS_JSON", "[]")
 ISSUE = os.environ.get("ISSUE_JSON", "[]")
+REQUESTED = os.environ.get("REQUESTED_REVIEWERS_JSON", '{"users":[]}')
 PULL = '{"head":{"sha":"%s"},"mergeable_state":"%s"}' % (HEAD_SHA, MERGEABLE)
 COMMIT = '{"commit":{"committer":{"date":"%s"}}}' % COMMITTER_DATE
 
@@ -80,6 +87,8 @@ if endpoint.endswith("/comments") and "/pulls/" in endpoint:
     emit(COMMENTS)
 if endpoint.endswith("/comments") and "/issues/" in endpoint:
     emit(ISSUE)
+if endpoint.endswith("/requested_reviewers"):
+    emit(REQUESTED)
 if "/commits/" in endpoint:
     emit(COMMIT)
 # bare pulls/<n>
@@ -88,6 +97,7 @@ emit(PULL)
 
 
 def run(*, labels="[]", checks="[]", reviews="[]", codoki_rc=0,
+        requested_reviewers='{"users":[]}', comments="[]", issue_comments="[]",
         timeout_secs=2, expect_fast=True):
     with tempfile.TemporaryDirectory() as td:
         bindir = os.path.join(td, "bin"); os.makedirs(bindir)
@@ -114,8 +124,9 @@ def run(*, labels="[]", checks="[]", reviews="[]", codoki_rc=0,
         env["LABELS_JSON"] = labels
         env["CHECKS_JSON"] = checks
         env["REVIEWS_JSON"] = reviews
-        env["COMMENTS_JSON"] = "[]"
-        env["ISSUE_JSON"] = "[]"
+        env["COMMENTS_JSON"] = comments
+        env["ISSUE_JSON"] = issue_comments
+        env["REQUESTED_REVIEWERS_JSON"] = requested_reviewers
         env["CODOKI_RC"] = str(codoki_rc)
         env["PR_WATCH_POLL_INTERVAL"] = "0"
 
@@ -125,8 +136,14 @@ def run(*, labels="[]", checks="[]", reviews="[]", codoki_rc=0,
 
 
 CR_APPROVED = '[{"user":{"login":"coderabbitai[bot]"},"state":"APPROVED","submitted_at":"2026-06-18T01:00:00Z"}]'
+CR_DISMISSED = '[{"user":{"login":"coderabbitai[bot]"},"state":"DISMISSED","submitted_at":"2026-06-18T01:00:00Z"}]'
 SKIP_CHECK = '[{"name":"CodeRabbit","state":"SUCCESS","description":"Review skipped"}]'
 GREEN_CHECK = '[{"name":"ci","state":"SUCCESS","description":"Build passed"}]'
+
+CR_REQUESTED = '{"users":[{"login":"coderabbitai[bot]"}]}'
+TRIGGER_COMMENT = '[{"body":"please @coderabbitai review this PR"}]'
+TRIGGER_FULL_COMMENT = '[{"body":"@coderabbitai full review"}]'
+RESOLVE_COMMENT = '[{"body":"@coderabbitai resolve"}]'
 
 
 def main():
@@ -140,10 +157,45 @@ def main():
     check("Review-skipped check + Codoki settled -> exit 0", rc == 0)
     check("emits 'settled' line", "settled head=" in out)
 
-    print("== #34: CR enabled (no label, no skip), no CR review -> stays pending ==")
+    print("== #173: idle CR -- no review, no norabbit, no trigger, not requested -> settles ==")
+    # The exact bug: auto-review OFF means CR posts NO check at all, so the old
+    # opt-out logic waited the full timeout. Opt-in: no positive evidence -> satisfied.
     rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews="[]", timeout_secs=2)
-    check("no CR review + CR enabled -> exit 1 (timeout, not settled)", rc == 1)
+    check("idle CR + green CI + Codoki settled -> exit 0 (not a timeout)", rc == 0)
+    check("emits 'settled' line", "settled head=" in out)
+    check("pending list never names cr-review", "cr-review" not in err)
+
+    print("== #173: @coderabbitai review trigger comment present -> waits for CR ==")
+    rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews="[]",
+                       issue_comments=TRIGGER_COMMENT, timeout_secs=2)
+    check("triggered, no review yet -> exit 1 (timeout, not settled)", rc == 1)
     check("pending names cr-review", "cr-review" in err)
+
+    print("== #173: @coderabbitai full review trigger comment present -> waits for CR ==")
+    rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews="[]",
+                       issue_comments=TRIGGER_FULL_COMMENT, timeout_secs=2)
+    check("full-review triggered, no review yet -> exit 1 (timeout)", rc == 1)
+    check("pending names cr-review", "cr-review" in err)
+
+    print("== #173: CR in requested_reviewers -> waits for CR ==")
+    rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews="[]",
+                       requested_reviewers=CR_REQUESTED, timeout_secs=2)
+    check("CR requested, no review yet -> exit 1 (timeout)", rc == 1)
+    check("pending names cr-review", "cr-review" in err)
+
+    print("== #173: existing DISMISSED CR review -> still expected, waits (no regression) ==")
+    rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews=CR_DISMISSED, timeout_secs=2)
+    check("DISMISSED review present -> exit 1 (timeout, stays pending)", rc == 1)
+    check("pending names cr-review", "cr-review" in err)
+
+    print("== #173 (guardrail 1): @coderabbitai resolve alone does NOT count as triggered -> settles ==")
+    # `@coderabbitai resolve`/`summary` engage CR WITHOUT requesting a review, so
+    # they must not re-introduce the false-wait. Only review-triggering forms count.
+    rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews="[]",
+                       issue_comments=RESOLVE_COMMENT, timeout_secs=2)
+    check("resolve-only comment -> exit 0 (settles, not triggered)", rc == 0)
+    check("emits 'settled' line", "settled head=" in out)
+    check("pending list never names cr-review", "cr-review" not in err)
 
     print("== #110: Codoki not settled (oracle exit 2) -> stays pending ==")
     rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews=CR_APPROVED,
