@@ -41,7 +41,15 @@ import re
 import shutil
 import subprocess
 import sys
-import tomllib
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # tomllib is stdlib only in Python 3.11+
+    sys.stderr.write(
+        "gate-runner: requires Python 3.11+ (stdlib tomllib); found %s. "
+        "Re-run with a 3.11+ interpreter.\n" % sys.version.split()[0]
+    )
+    raise SystemExit(2)
 
 CONFIG_NAME = ".gates.toml"
 
