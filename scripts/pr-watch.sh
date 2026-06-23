@@ -183,10 +183,16 @@ cr_is_requested() {
 # evidence (matching them would re-introduce the false-wait bug, #173). Fails
 # CLOSED (returns 1 = not triggered) on any gh/jq error.
 cr_was_triggered() {
+  # A trigger is a NON-CR author posting `@coderabbitai review` / `full review`.
+  # Exclude coderabbitai[bot]'s OWN comments: its auto-generated summary/walkthrough
+  # boilerplate quotes the literal `@coderabbitai review` as user instructions, which
+  # would otherwise false-positive every CR-touched PR back into a hang (the #173 bug).
   gh api --paginate "repos/$repo/issues/$pr/comments" 2>/dev/null \
     | jq -s 'add // []' 2>/dev/null \
-    | jq -e '[ .[] | select((.body // "")
-                | test("@coderabbitai[[:space:]]+(full[[:space:]]+)?review\\b"; "i")) ]
+    | jq -e --arg cr "$CR_LOGIN" '[ .[]
+        | select(((.user.login // "") != $cr)
+                 and ((.body // "")
+                      | test("@coderabbitai[[:space:]]+(full[[:space:]]+)?review\\b"; "i"))) ]
              | length > 0' >/dev/null 2>&1
 }
 

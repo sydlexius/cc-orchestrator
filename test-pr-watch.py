@@ -144,6 +144,11 @@ CR_REQUESTED = '{"users":[{"login":"coderabbitai[bot]"}]}'
 TRIGGER_COMMENT = '[{"body":"please @coderabbitai review this PR"}]'
 TRIGGER_FULL_COMMENT = '[{"body":"@coderabbitai full review"}]'
 RESOLVE_COMMENT = '[{"body":"@coderabbitai resolve"}]'
+# CR's OWN auto-generated summary/walkthrough boilerplate quotes "@coderabbitai review"
+# as user instructions. It must NOT count as a trigger (the #173 live-UAT-caught bug:
+# every CR-touched PR would otherwise false-positive back into a cr-review hang).
+CR_BOILERPLATE_COMMENT = ('[{"user":{"login":"coderabbitai[bot]"},'
+                          '"body":"<!-- summarize -->\\nTip: tag @coderabbitai review to re-run."}]')
 
 
 def main():
@@ -195,6 +200,12 @@ def main():
                        issue_comments=RESOLVE_COMMENT, timeout_secs=2)
     check("resolve-only comment -> exit 0 (settles, not triggered)", rc == 0)
     check("emits 'settled' line", "settled head=" in out)
+    check("pending list never names cr-review", "cr-review" not in err)
+
+    print("== #173 (live-UAT bug): CR's OWN comment quoting @coderabbitai review does NOT trigger -> settles ==")
+    rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews="[]",
+                       issue_comments=CR_BOILERPLATE_COMMENT, timeout_secs=2)
+    check("CR-authored boilerplate -> exit 0 (settles, not a trigger)", rc == 0)
     check("pending list never names cr-review", "cr-review" not in err)
 
     print("== #110: Codoki not settled (oracle exit 2) -> stays pending ==")
