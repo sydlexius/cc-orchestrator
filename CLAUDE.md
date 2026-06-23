@@ -58,6 +58,10 @@ Runtime (`scripts/`; canonical source is this repo):
   DEPLOYS the 9 bundled PR-lifecycle helpers the same Option-A way (#133; retiring any claude-kit
   symlink, backed up to `<dest>.bak`), and (unless `--no-steer`) DEPLOYS + wires the advisory
   steering hook `orchestrate-steer.sh` for Edit/Write/Bash (#95; doctor only ever WARNs about it),
+  DEPLOYS this script to the stable path + wires a read-only SessionStart `init` advisory hook (#162;
+  the `init` subcommand reuses the single `_scan_merge_gate_shadows` matcher to surface a `gh pr *`
+  merge-gate shadow at session start - READ-ONLY, SILENT on a clean cascade, exit 0 on every path
+  (fail-open); doctor stays the authoritative HARD-FAIL and only WARNs that the init hook is wired),
   AND (via two SEPARATE paths) (a) narrows any blanket `gh pr` allow-rule
   (`Bash(gh pr *)`/`Bash(gh pr:*)`) that shadows the merge gate down to the enumerated
   non-merge subcommands only (broader `gh *`/`*` shadows are surfaced for human resolution,

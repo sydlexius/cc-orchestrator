@@ -338,8 +338,11 @@ def _session_init_hook_present(settings):
     (type+command) match against the canonical SESSION_INIT_HOOK_COMMAND so a stale/disabled line
     does not count as wired - anchored to the SAME string configure writes. SessionStart blocks
     carry no matcher, so we scan every block's hooks list."""
-    for block in (settings or {}).get("hooks", {}).get("SessionStart", []):
-        for h in block.get("hooks", []):
+    # `or {}` / `or []` coerce a valid-JSON-but-null value (e.g. {"hooks": null}) so a malformed
+    # settings file is treated as "not wired" rather than crashing this check.
+    hooks = (settings or {}).get("hooks") or {}
+    for block in (hooks.get("SessionStart") or []):
+        for h in ((block or {}).get("hooks") or []):
             if h.get("type") == "command" and h.get("command") == SESSION_INIT_HOOK_COMMAND:
                 return True
     return False
