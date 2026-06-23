@@ -217,7 +217,7 @@ Detect whether this merge changed a version-defining file. This is repo-agnostic
 
 ```bash
 version_changed=$(git show "$sha" --format= --name-only \
-  | grep -iE '(^|/)(plugin\.json|package\.json|Cargo\.toml|pyproject\.toml)$|SKILL\.md' || true)
+  | grep -iE '(^|/)(plugin\.json|package\.json|Cargo\.toml|pyproject\.toml|SKILL\.md)$' || true)
 ```
 
 If `version_changed` is empty, SKIP this step (this merge did not ship a new version) and continue to the summary.
