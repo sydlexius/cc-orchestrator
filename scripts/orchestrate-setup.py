@@ -74,6 +74,14 @@ ARTIFACTS = os.environ.get("ORCHESTRATE_ARTIFACT_DIR", "/tmp")
 SCRIPTS_DIR = os.environ.get("ORCHESTRATE_SCRIPTS_DIR", os.path.join(HOME, ".claude", "scripts"))
 BUNDLED_SCRIPTS_DIR = os.environ.get("ORCHESTRATE_BUNDLED_SCRIPTS_DIR",
     os.path.dirname(os.path.realpath(__file__)))
+# The SessionStart `init` advisory (#162) reuses THIS very script. `configure --apply` deploys this
+# script to the stable SCRIPTS_DIR path (Option A, exactly like the guard/steer) so the SessionStart
+# hook can call a stable-path entry point - and REFRESHES it on every run so a stale shadow-detection
+# logic can never persist after a plugin update. The bundled source is this file; the dest is the
+# stable path. Env-overridable so the harness can point them at fixtures (mirrors GUARD/BUNDLED_GUARD).
+BUNDLED_SETUP = os.environ.get("ORCHESTRATE_BUNDLED_SETUP", os.path.realpath(__file__))
+SETUP_DEST = os.environ.get("ORCHESTRATE_SETUP_DEST",
+    os.path.join(SCRIPTS_DIR, "orchestrate-setup.py"))
 HELPER_NAMES = (
     "pr-watch.sh", "pr-unreplied-comments.sh", "pr-read-comments.sh", "reply-comment.sh",
     "resolve-threads.sh", "cleanup-worktree.sh", "patch-coverage.sh", "pr-codeql-autofixes.sh",
@@ -147,6 +155,18 @@ STEER_HOOK_BLOCKS = [
      "hooks": [{"type": "command", "command": STEER_HOOK_COMMAND}]}
     for m in ("Edit", "Write", "Bash")
 ]
+
+# The SessionStart advisory hook (#162). At session start it runs `orchestrate-setup.py init`, a
+# READ-ONLY scan that surfaces a `gh pr *` merge-gate-shadow advisory to stdout (injected into the
+# session context) and is SILENT when the cascade is clean. SessionStart blocks carry no `matcher`.
+# The command is fail-OPEN: `... init 2>/dev/null || true` so any scan/parse/exec error returns 0 and
+# emits no stderr noise - a SessionStart hook must NEVER block or fail a session. Shared as one
+# constant so the present() idempotency check exact-matches the SAME string configure writes.
+SESSION_INIT_HOOK_COMMAND = (
+    'python3 "$HOME/.claude/scripts/orchestrate-setup.py" init 2>/dev/null || true')
+SESSION_INIT_HOOK_BLOCK = {
+    "hooks": [{"type": "command", "command": SESSION_INIT_HOOK_COMMAND}],
+}
 
 
 def _guard_hook_present(settings):
@@ -311,6 +331,73 @@ def check_steer(settings):
         return _emit(WARN, "; ".join(msgs) + " - run `orchestrate-setup.py configure --apply` "
                            "(or `--no-steer` to skip the advisory steering)")
     return _emit(PASS, "advisory steering hooks wired + deployed steer matches the bundled copy")
+
+
+def _session_init_hook_present(settings):
+    """True if the SessionStart advisory init hook is already wired in settings.json. Exact
+    (type+command) match against the canonical SESSION_INIT_HOOK_COMMAND so a stale/disabled line
+    does not count as wired - anchored to the SAME string configure writes. SessionStart blocks
+    carry no matcher, so we scan every block's hooks list."""
+    for block in (settings or {}).get("hooks", {}).get("SessionStart", []):
+        for h in block.get("hooks", []):
+            if h.get("type") == "command" and h.get("command") == SESSION_INIT_HOOK_COMMAND:
+                return True
+    return False
+
+
+def check_session_init_hook(settings):
+    """Doctor check for the SessionStart advisory init hook (#162). WARN (never FAIL) when the hook
+    is not wired - the SessionStart surfacing is advisory, and its absence does NOT compromise the
+    floor. This deliberately does NOT soften or replace doctor's HARD-FAIL on detected shadows via
+    check_merge_gate_shadows(): the merge gate is still hard-enforced; this only nudges to wire the
+    convenience surfacing. Stays read-only."""
+    if _session_init_hook_present(settings):
+        return _emit(PASS, "SessionStart shadow-advisory init hook wired")
+    return _emit(WARN, "SessionStart shadow-advisory init hook (#162) not wired - run "
+                       "`orchestrate-setup.py configure --apply` to wire it (advisory surfacing only; "
+                       "the merge-gate HARD-FAIL check is unaffected)")
+
+
+def _setup_deploy_action():
+    """What `configure` must do to put THIS script at the stable SETUP_DEST path so the SessionStart
+    hook can call a stable-path entry point. Mirrors _guard_deploy_action, but ALWAYS refreshes when
+    the dest differs (no None short-circuit on first run is needed - identical content returns None):
+      'missing-source' - BUNDLED_SETUP is absent (should never happen for the running script);
+      'deploy'         - SETUP_DEST does not exist yet (fresh install);
+      'refresh'        - SETUP_DEST exists but differs from the bundled script (post-update drift);
+      None             - SETUP_DEST is byte-identical to the bundled script (nothing to do)."""
+    if not os.path.isfile(BUNDLED_SETUP):
+        return "missing-source"
+    if not os.path.exists(SETUP_DEST):
+        return "deploy"
+    if not _files_identical(BUNDLED_SETUP, SETUP_DEST):
+        return "refresh"
+    return None
+
+
+def _deploy_setup():
+    """Copy THIS script to the stable SETUP_DEST path, executable. Caller gated on --apply + consent.
+    Atomic temp-then-replace, mirroring _deploy_guard. Refuses a no-op self-copy (source resolves to
+    the same realpath as dest) so we never clobber the running file with itself. Returns (ok, msg)."""
+    if os.path.realpath(BUNDLED_SETUP) == os.path.realpath(SETUP_DEST):
+        return True, f"setup script already at the stable path ({SETUP_DEST}); no self-copy needed"
+    try:
+        os.makedirs(os.path.dirname(SETUP_DEST), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(SETUP_DEST), prefix=".orch-setup-")
+        os.close(fd)
+        try:
+            shutil.copy2(BUNDLED_SETUP, tmp)
+            os.chmod(tmp, os.stat(tmp).st_mode | 0o111)
+            os.replace(tmp, SETUP_DEST)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return True, f"deployed the setup script -> {SETUP_DEST}"
+    except OSError as e:
+        return False, f"FAILED to deploy the setup script to {SETUP_DEST}: {e}"
 
 
 def _helper_deploy_action(name):
@@ -1001,6 +1088,7 @@ def cmd_doctor(args):
     results = [check_agent_teams(settings), check_tmux(),
                check_guard_wired(settings), check_guard_healthy(), check_guard_stale(),
                check_helpers_stale(), check_steer(settings),
+               check_session_init_hook(settings),
                repo_status, check_allowlist(settings),
                check_merge_gate_shadows(), check_slack_channel(), check_slack_bot_user_id()]
     hard_fail = any(s == FAIL for s in results)
@@ -1242,6 +1330,28 @@ def cmd_down(args):
     return 0
 
 
+def cmd_init(args):
+    """SessionStart advisory (#162). STRICTLY READ-ONLY: run the SAME read-only merge-gate-shadow
+    scan doctor uses (_scan_merge_gate_shadows - never forked) and, if a shadow is found, print a
+    single-line advisory to stdout (surfaced into the session context). SILENT when the cascade is
+    clean (zero stdout - no per-session-start noise). Exit 0 on EVERY path, including a scan/parse
+    error (logged to stderr, no stdout), so a SessionStart hook can never block or fail a session.
+    Writes/mutates NOTHING - doctor/configure stay the only writers; this never touches settings."""
+    try:
+        shadows, _errors = _scan_merge_gate_shadows()
+    except Exception as e:  # noqa: BLE001 - fail-open: a SessionStart hook must never block a session
+        print(f"orchestrate-setup init: shadow scan failed ({e}); skipping advisory.", file=sys.stderr)
+        return 0
+    # Deliberately ignore _errors here: an unparseable cascade file is doctor's HARD-FAIL concern,
+    # not a SessionStart surface (init is WARN-level advisory only and must stay silent/clean unless
+    # an actual shadow grant is present). doctor remains the authoritative parse-error check.
+    if shadows:
+        gh_pr = MERGE_TARGET.rsplit(" ", 1)[0]  # "gh pr"; assembled off MERGE_TARGET, no trigger string
+        print(f"blanket `{gh_pr} *` shadows the merge gate - run "
+              "`orchestrate-setup.py configure --apply` to narrow it")
+    return 0
+
+
 def _load_settings_for_write():
     """Read SETTINGS for a write-merge. Returns (settings_dict_or_None, status):
       'ok'          - parsed JSON dict
@@ -1408,9 +1518,16 @@ def cmd_configure(args):
     steer_on = not getattr(args, "no_steer", False) and steer_action != "missing-source"
     steer_blocks_to_add = _missing_steer_hook_blocks(settings) if steer_on else []
     steer_deploy_needed = steer_on and steer_action in ("deploy", "refresh")
+    # #162: deploy THIS script to the stable path so the SessionStart `init` hook calls a stable
+    # entry point, and refresh it on drift (stale shadow-detection logic must never persist). Wire
+    # the SessionStart advisory hook the same idempotent way as the steer hooks.
+    setup_action = _setup_deploy_action()  # 'deploy' | 'refresh' | 'missing-source' | None
+    setup_deploy_needed = setup_action in ("deploy", "refresh")
+    add_session_init = not _session_init_hook_present(settings)
     deploy_needed = (guard_action in ("deploy", "refresh") or bool(helpers_actionable)
-                     or steer_deploy_needed)
-    settings_changes = add_hook or bool(missing_allow) or bool(steer_blocks_to_add)
+                     or steer_deploy_needed or setup_deploy_needed)
+    settings_changes = (add_hook or bool(missing_allow) or bool(steer_blocks_to_add)
+                        or add_session_init)
 
     if not settings_changes and not deploy_needed:
         if guard_action == "missing-source":
@@ -1436,6 +1553,13 @@ def cmd_configure(args):
         for b in steer_blocks_to_add:
             print(f"  hooks.PreToolUse += {json.dumps(b)}")
             print("    (advisory WARN-level steering; opt out with --no-steer)")
+        if add_session_init:
+            print(f"  hooks.SessionStart += {json.dumps(SESSION_INIT_HOOK_BLOCK)}")
+            print("    (#162: advisory merge-gate-shadow surfacing at session start; read-only)")
+    if setup_deploy_needed:
+        verb = "DEPLOY" if setup_action == "deploy" else "REFRESH (stale)"
+        print(f"configure will {verb} the setup script (for the SessionStart init hook):")
+        print(f"  {BUNDLED_SETUP} -> {SETUP_DEST}")
     if guard_action in ("deploy", "refresh"):
         verb = "DEPLOY" if guard_action == "deploy" else "REFRESH (stale)"
         print(f"configure will {verb} the floor guard:")
@@ -1486,6 +1610,8 @@ def cmd_configure(args):
             settings.setdefault("permissions", {}).setdefault("allow", []).extend(missing_allow)
         if steer_blocks_to_add:
             settings.setdefault("hooks", {}).setdefault("PreToolUse", []).extend(steer_blocks_to_add)
+        if add_session_init:
+            settings.setdefault("hooks", {}).setdefault("SessionStart", []).append(SESSION_INIT_HOOK_BLOCK)
         try:
             os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
             _atomic_write_json(SETTINGS, settings)
@@ -1494,7 +1620,7 @@ def cmd_configure(args):
             return 1
         backup_note = f" (backup: {SETTINGS}.bak)" if status == "ok" else ""
         print(f"configure: wrote {SETTINGS}{backup_note}.")
-        if add_hook or steer_blocks_to_add:
+        if add_hook or steer_blocks_to_add or add_session_init:
             print("RESTART the Claude Code session for the new PreToolUse hook(s) to load "
                   "(PreToolUse hooks load at session start).")
 
@@ -1508,6 +1634,15 @@ def cmd_configure(args):
     # #95: steer deploy - the same Option-A filesystem copy to the stable STEER path.
     if steer_deploy_needed:
         ok, msg = _deploy_steer()
+        print(f"configure: {msg}")
+        if not ok:
+            return 1
+
+    # #162: setup-script deploy - the same Option-A filesystem copy to the stable SETUP_DEST path so
+    # the SessionStart `init` hook calls a stable entry point. Refreshes on drift; a self-copy no-op
+    # is detected and skipped inside _deploy_setup.
+    if setup_deploy_needed:
+        ok, msg = _deploy_setup()
         print(f"configure: {msg}")
         if not ok:
             return 1
@@ -1547,6 +1682,11 @@ def main():
     w = sub.add_parser("down")
     w.add_argument("--team")
 
+    # #162: read-only SessionStart advisory; no required args, no git-repo assumption.
+    sub.add_parser("init",
+                   help="read-only SessionStart advisory: surface a gh-pr merge-gate shadow "
+                        "(silent when clean; always exits 0)")
+
     c = sub.add_parser("configure",
                        help="wire the floor hook + allow-list into settings.json (consent-based)")
     c.add_argument("--apply", action="store_true",
@@ -1559,7 +1699,7 @@ def main():
 
     args = p.parse_args()
     return {"doctor": cmd_doctor, "up": cmd_up, "down": cmd_down,
-            "configure": cmd_configure}[args.cmd](args)
+            "init": cmd_init, "configure": cmd_configure}[args.cmd](args)
 
 
 if __name__ == "__main__":
