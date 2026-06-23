@@ -345,22 +345,29 @@ validation comes first; agents are only warranted when the diff is substantive e
 for their cost (~50-100K tokens, ~60s wall time) to yield real signal.
 
 **Always run the deterministic gate first** -- this catches lint, type, test,
-schema-drift, coverage, and generated-file regressions at zero agent cost:
+schema-drift, coverage, and generated-file regressions at zero agent cost.
+Delegate gate detection + execution to the bundled `gate-runner.py` (it reads
+the repo's `.gates.toml`, or falls back through the umbrella -> CLAUDE.md
+`## Gates` -> language-basics -> warn-and-proceed chain), rather than
+re-implementing per-stack test commands here:
 
 ```bash
 git diff --name-only   # identify changed files
-# Run the target repo's deterministic gate. If the repo provides a single
-# pre-push gate script, use it:
-bash scripts/pre-push-gate.sh   # or equivalent per project
+if [ -f scripts/gate-runner.py ]; then
+  python3 scripts/gate-runner.py
+else
+  python3 ~/.claude/scripts/gate-runner.py
+fi
+gate_rc=$?
 ```
 
-If `scripts/pre-push-gate.sh` does NOT exist (it is absent in this repo, for
-example), skip it and run the target repo's actual gate block instead. The
-authoritative gates are usually listed in the repo's CLAUDE.md `## Gates`
-section -- run those commands. For cc-orchestrator that is: `shellcheck` on the
-shell scripts, `ruff check --select F,E741` on the `.py` files, the
+The runner prints a per-step `[PASS]` / `[SKIP]` / `[FAIL]` line and exits
+non-zero on the first required-gate failure. *Illustrative -- what runs in
+cc-orchestrator:* its `.gates.toml` enumerates `shellcheck` on the shell
+scripts, `ruff check --select F,E741` on the `.py` files, the
 `orchestrate-guard.sh`/`orchestrate-steer.sh` `--self-test` runs, and the
-`python3 test-*.py` harnesses.
+`python3 test-*.py` harnesses. Another target repo declares a different set (or
+relies on the runner's fallback chain).
 
 Only escalate to agents if the deterministic gate passes AND the diff meets the
 "agents merited" bar below. When the gate fails, fix the failures first -- agents
@@ -386,7 +393,10 @@ COVER_OUT=/tmp/cover.out PATCH_COVERAGE_THRESHOLD=<repo target> \
 Self-skip on the absent-signal cases: if `patch-coverage.sh` exits 0 reporting
 "no Go source changes in scope" (the diff touches nothing the estimator
 measures), or exits 2 (missing coverage profile -- no coverage tooling on the
-repo), treat coverage as SKIP and move on. Neither is a failure.
+repo), treat coverage as SKIP and move on. Neither is a failure. Likewise when
+`patch-coverage.sh --coverage-only` returns `{"status":"none"}`, or the repo's
+`.gates.toml` sets `[merge_pr]` `coverage_advisory = false`, report Coverage as
+**N/A** (a self-skip, not a failure).
 
 Interpret the result as a **conservative lower bound**: it counts a line covered
 only if every coverage block touching it was hit (mixed-hit lines count as
