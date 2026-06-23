@@ -1523,7 +1523,10 @@ def cmd_configure(args):
     # the SessionStart advisory hook the same idempotent way as the steer hooks.
     setup_action = _setup_deploy_action()  # 'deploy' | 'refresh' | 'missing-source' | None
     setup_deploy_needed = setup_action in ("deploy", "refresh")
-    add_session_init = not _session_init_hook_present(settings)
+    # Gate the SessionStart wiring on the setup source being deployable: wiring a hook that calls a
+    # script we cannot deploy is pointless (mirrors steer_on gating on the bundled steer existing).
+    session_init_ok = setup_action != "missing-source"
+    add_session_init = session_init_ok and not _session_init_hook_present(settings)
     deploy_needed = (guard_action in ("deploy", "refresh") or bool(helpers_actionable)
                      or steer_deploy_needed or setup_deploy_needed)
     settings_changes = (add_hook or bool(missing_allow) or bool(steer_blocks_to_add)
