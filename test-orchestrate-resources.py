@@ -79,16 +79,18 @@ def main():
         rc, out3, _ = run(["allocate", "--session", "A", "--teammate", "y"], env_overrides=ov)
         check("second teammate gets a distinct port",
               json.loads(out3)["resources"]["port"]["value"] != port_x)
-        # a LISTENing port in range is skipped
+        # a LISTENing port in range is skipped. Bind an OS-assigned EPHEMERAL port
+        # (bind to :0, read the assigned number) and drive the allocator's range to
+        # exactly that port, instead of scanning a fixed range and hoping one is free.
+        # Scanning a fixed range flaked under port contention (#176): a candidate port
+        # could be occupied non-deterministically, so the case passed standalone but
+        # failed under load. An ephemeral bind is always free at bind time (mirrors the
+        # bind(("127.0.0.1", 0)) pattern used elsewhere in this file).
         import socket
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        bound = None
-        for cand in range(1980, 2081):
-            try:
-                s.bind(("127.0.0.1", cand)); s.listen(1); bound = cand; break
-            except OSError:
-                continue
+        s.bind(("127.0.0.1", 0)); s.listen(1)
+        bound = s.getsockname()[1]
         ov_one = dict(ov); ov_one["ORCHESTRATE_PORT_RANGE"] = f"{bound}-{bound}"
         rc, out4, err4 = run(["allocate", "--session", "B", "--teammate", "z"], env_overrides=ov_one)
         check("range-of-one that is LISTENing -> allocate fails (exhausted) with a clear msg",
