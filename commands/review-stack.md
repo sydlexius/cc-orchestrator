@@ -19,7 +19,10 @@ base PR, restack before handling the next PR up the chain.
   without processing any reviews. Useful to see what would be reviewed.
 
 ```bash
-SESSION_PRS_FILE="/tmp/stillwater-session-prs.txt"
+# Derive a per-repo breadcrumb path so the command is not tied to any one repo.
+REPO_NAME="$(basename "$(git remote get-url origin 2>/dev/null)" .git)"
+REPO_NAME="${REPO_NAME:-$(basename "$PWD")}"
+SESSION_PRS_FILE="/tmp/${REPO_NAME}-session-prs.txt"
 
 if [ "$ARGUMENTS" = "--clear" ]; then
   rm -f "$SESSION_PRS_FILE"
@@ -79,12 +82,14 @@ session breadcrumb file. Other skills (`/prep-pr`, `/handle-review`) append PR
 numbers to this file as they push PRs, so it tracks exactly what was worked on.
 
 ```bash
-SESSION_PRS_FILE="/tmp/stillwater-session-prs.txt"
+REPO_NAME="$(basename "$(git remote get-url origin 2>/dev/null)" .git)"
+REPO_NAME="${REPO_NAME:-$(basename "$PWD")}"
+SESSION_PRS_FILE="/tmp/${REPO_NAME}-session-prs.txt"
 
 if [ -f "$SESSION_PRS_FILE" ]; then
   # Read unique PR numbers, filter to still-open PRs
-  session_numbers=$(sort -u "$SESSION_PRS_FILE")
-  open_prs=$(gh pr list --state open --json number,baseRefName,headRefName)
+  session_numbers="$(sort -u "$SESSION_PRS_FILE")"
+  open_prs="$(gh pr list --state open --json number,baseRefName,headRefName)"
   # Intersect: keep only PRs that are both in the file and still open
 fi
 ```
@@ -192,6 +197,11 @@ Each agent receives this task:
   (`pass`/`fail`/`unknown`), `report_url`. Include `patch_pct` and
   `threshold_state` in the agent's return payload under a `Coverage:` field.
 
+  **Self-skip when no coverage service is active.** If `--coverage-only`
+  returns `{"status":"none"}` (no codecov comment on the PR, e.g. a repo with
+  no codecov integration), report the Coverage field as `N/A` and treat it as
+  a SKIP -- not a failure and not a NEEDS WORK trigger.
+
 **Skip the cooldown** if the user explicitly says reviews are done or asks to proceed
 immediately. In that case, skip Step B in the agent prompt and go straight to Step C.
 
@@ -207,11 +217,12 @@ Collect results from all agents into a unified status table:
 | #34  | feat/34-baz         | WAITING    | ?         | --          | none       |
 ```
 
-The Coverage column surfaces codecov's patch % plus threshold state. A
-`fail` state does NOT automatically move the PR into NEEDS WORK -- coverage
-regressions are policy signals, not review comments. Flag fails to the user
-in the triage confirmation (Step 3) so they can decide whether to add tests
-or accept the patch coverage.
+The Coverage column surfaces codecov's patch % plus threshold state, or `N/A`
+when `--coverage-only` returned `{"status":"none"}` (no coverage service on the
+repo). A `fail` state does NOT automatically move the PR into NEEDS WORK --
+coverage regressions are policy signals, not review comments. An `N/A` is a
+self-skip, never a blocker. Flag fails to the user in the triage confirmation
+(Step 3) so they can decide whether to add tests or accept the patch coverage.
 
 If any PRs are WAITING, report which bots are still pending and ask:
 "N PRs still waiting for reviews. Proceed with available reviews, or keep waiting?"
@@ -241,7 +252,7 @@ Each agent receives:
 >
 > | Category | Description | Default action |
 > |----------|-------------|----------------|
-> | **openapi-drift** | Missing/wrong field in openapi.yaml | Fix now |
+> | **spec-drift** | Generated/spec artifact out of sync with implementation (e.g. an OpenAPI spec, a generated client, a checked-in schema) | Fix now |
 > | **error-handling** | Missing error check, raw error in response, swallowed error | Fix now |
 > | **test-gap** | Missing test, untested edge case, data race in test | Fix now |
 > | **rename-incomplete** | Old name still referenced somewhere | Fix now (batch) |
@@ -268,9 +279,9 @@ Each agent receives:
 >
 > | # | Category | File:Line | Commit | Stale? | Summary | Action | Group |
 > |---|----------|-----------|--------|--------|---------|--------|-------|
-> | 1 | openapi-drift | handlers_artist.go:45 | abc1234 | no | Missing "aliases" in spec | Fix now | -- |
-> | 2 | error-handling | handlers_push.go:92 | abc1234 | no | Raw err.Error() in response | Fix now | -- |
-> | 3 | false-positive | handlers_image.go:300 | def5678 | yes | Suggests unnecessary nil check | Rebut | -- |
+> | 1 | spec-drift | schema.json:45 | abc1234 | no | Missing "aliases" field in spec | Fix now | -- |
+> | 2 | error-handling | worker.py:92 | abc1234 | no | Raw error string in response | Fix now | -- |
+> | 3 | false-positive | image.sh:300 | def5678 | yes | Suggests unnecessary nil check | Rebut | -- |
 >
 > Fix items: <count>
 > Rebut items: <count>
@@ -346,18 +357,36 @@ For each "Defer" item:
 
 **Do not commit between fixes.** Make all changes first, then commit once.
 
-### 4d. Run verification
+### 4d. Run verification (detection-first)
+
+Run the target repo's own gates rather than any hardcoded runner. Prefer the
+`## Gates` block in the repo's `CLAUDE.md`; fall back to `scripts/pre-push-gate.sh`
+if present; last-resort, infer from the repo's manifest (same detection pattern
+as `/prep-pr` Step 2):
 
 ```bash
-go test -count=1 ./... 2>&1
+if [ -f CLAUDE.md ] && grep -qiE '^##+ +Gates' CLAUDE.md; then
+  echo "Run the commands from CLAUDE.md '## Gates' in order."
+elif [ -x scripts/pre-push-gate.sh ]; then
+  bash scripts/pre-push-gate.sh
+else
+  echo "Infer the runner from the repo manifest (e.g. go test ./..., npm test, python3 test-*.py)."
+fi
 ```
 
-If tests fail, fix the failures before proceeding.
+*Illustrative -- this repo's detected gates:* `shellcheck` on the shell scripts,
+`ruff check --select F,E741` on the `.py` files, the guard/steer self-tests, and
+the `python3 test-*.py` harnesses. Another target repo declares a different set.
 
-If any `.templ` files were changed:
+If any gate fails, fix the failures before proceeding.
+
+If the repo uses templ and any `.templ` files were changed (self-skip when no
+`.templ` files exist), regenerate:
 
 ```bash
-templ generate
+if compgen -G '*.templ' >/dev/null 2>&1 || git ls-files '*.templ' | grep -q .; then
+  templ generate
+fi
 ```
 
 ### 4e. Commit
@@ -368,7 +397,7 @@ git commit -m "address PR review feedback
 
 - <one-line summary per fix>
 
-Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ```
 
 ### 4f. Reply to all comments in batch
@@ -434,7 +463,7 @@ cleanly if `--file` / `--line` aren't paired.
 
 Per-category pattern (anchor each to the relevant file:line in the diff):
 
-- **openapi-drift / error-handling / test-gap (fixed)**:
+- **spec-drift / error-handling / test-gap (fixed)**:
   `'Fixed in <short-sha>.'`
 - **rename-incomplete (batch)**: anchor to one representative fix line:
   `'Fixed in <short-sha> across <N> call sites.'`
@@ -466,7 +495,9 @@ git push
 After a successful push, record the PR number in the session breadcrumb file:
 
 ```bash
-SESSION_PRS_FILE="/tmp/stillwater-session-prs.txt"
+REPO_NAME="$(basename "$(git remote get-url origin 2>/dev/null)" .git)"
+REPO_NAME="${REPO_NAME:-$(basename "$PWD")}"
+SESSION_PRS_FILE="/tmp/${REPO_NAME}-session-prs.txt"
 echo "<PR>" >> "$SESSION_PRS_FILE"
 ```
 

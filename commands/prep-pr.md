@@ -33,18 +33,23 @@ If on `main`, stop immediately: "You are on main. Create a feature branch first.
 
 ## Step 1b -- Hand-written PR size gate
 
-Generated files (`_templ.go`, `*.sum`, `*.lock`) inflate `git diff --stat`
-and disguise PR risk. The relevant signal is **hand-written LOC** — what
-reviewers actually have to read, and what correlates with CR round count
-in this repo (see `feedback_pr_size_handwritten_loc.md`).
+Generated and lock files (`*.sum`, `*.lock`, `*.snap`, compiled caches)
+inflate `git diff --stat` and disguise PR risk. The relevant signal is
+**hand-written LOC** -- what reviewers actually have to read, and what
+correlates with CR round count (see `feedback_pr_size_handwritten_loc.md`).
+
+The exclude list below is generic; add the target repo's own generated-file
+globs as detected (e.g. `*_templ.go` for a templ repo, `*.pb.go` for a
+protobuf repo). All such examples are illustrative of what detection would
+find -- do not assume any specific stack.
 
 Compute hand-written diff size:
 
 ```bash
 if git rev-parse --verify -q origin/main >/dev/null 2>&1; then base_ref=origin/main; else base_ref=main; fi
 base=$(git merge-base "$base_ref" HEAD)
-git diff --stat "$base"..HEAD -- ':!*_templ.go' ':!*.sum' \
-  ':!*.lock' ':!go.work.sum' ':!*.snap'
+git diff --stat "$base"..HEAD -- ':!*.sum' ':!*.lock' ':!*.snap' \
+  ':!*.pyc' ':!__pycache__/*'
 ```
 
 Capture totals (additions + deletions) and file count from the
@@ -57,9 +62,9 @@ Capture totals (additions + deletions) and file count from the
 If either is exceeded, **stop** and say:
 
 > "This PR has `<N>` hand-written LOC across `<F>` files, exceeding the
-> sustainable-PR-size threshold (800 LOC / 10 files). Large PRs in this
-> repo correlate with multi-round CR churn (#1484 ran 12 rounds; #1497
-> ran 6 rounds).
+> sustainable-PR-size threshold (800 LOC / 10 files). Large PRs
+> correlate with multi-round CR churn (a single oversized PR routinely
+> costs several extra review rounds).
 >
 > Options:
 > 1. **Split into multiple PRs by issue/concern (preferred).** Open
@@ -84,22 +89,79 @@ If both thresholds are within bounds: print the hand-written totals
 
 ---
 
-## Step 2 -- Tests
+## Step 2 -- Tests and gates (detection-first)
+
+This command ships in a plugin installed into arbitrary repos, so it must
+**detect and run the target repo's own gates** rather than hardcode any one
+stack. Do not assume Go, Node, Python, or any specific toolchain -- find what
+the repo declares and run it.
+
+**Primary path -- the repo's declared gate block.** Read the target repo's
+`CLAUDE.md` and look for a `## Gates` section (or an equivalently named
+"run locally; CI enforces them" block). Execute the commands listed there,
+in order, gating on the first failure.
 
 ```bash
-go test -count=1 -coverprofile=/tmp/stillwater-cover.out ./... 2>&1
+# Locate a gate block in the repo's CLAUDE.md (illustrative detection):
+if [ -f CLAUDE.md ] && grep -qiE '^##+ +Gates' CLAUDE.md; then
+  echo "Found a '## Gates' block in CLAUDE.md -- run those commands in order."
+fi
 ```
 
-If any test fails: print the failures, stop, and say:
-"Fix failing tests before proceeding. Do not push broken code."
+**Fallback path -- a pre-push gate script.** If there is no declared gate
+block, check for a conventional pre-push gate runner and execute it if present:
 
-If tests pass: note it and continue to Step 2b.
+```bash
+if [ -x scripts/pre-push-gate.sh ]; then
+  bash scripts/pre-push-gate.sh
+fi
+```
+
+**Last resort.** If neither a `## Gates` block nor a `scripts/pre-push-gate.sh`
+exists, fall back to whatever test runner the repo's manifest implies (e.g.
+`go test ./...` when `go.mod` is present, `npm test` when `package.json`
+declares a test script, `python3 test-*.py` harnesses when present). State
+which runner you inferred and why before running it.
+
+*Illustrative -- what detection finds in cc-orchestrator (this repo):* the
+`## Gates` block runs `shellcheck` on the shell scripts, `ruff check --select
+F,E741` on the `.py` files, the guard and steer `--self-test`s, and the
+`python3 test-*.py` harnesses. These are examples of a detected gate set, not
+a hardcoded assumption -- another target repo will declare a different set.
+
+If any gate fails: print the failures, stop, and say:
+"Fix the failing gate before proceeding. Do not push broken code."
+
+If all detected gates pass: note it and continue to Step 2b.
+
+**If a gate run produces a coverage profile** (e.g. a `go test
+-coverprofile=<file>` line in the detected gate block), capture that profile
+path so Step 2b can reuse it. Repos with no coverage tooling produce no
+profile, and Step 2b self-skips accordingly.
 
 ---
 
 ## Step 2b -- Patch coverage gate (Codecov parity)
 
-This is a **gate**, not a warning. Codecov's patch-coverage check measures the
+This step is a **gate** when a coverage service is active on the repo, and a
+**self-skip no-op** when none is. Detect the coverage service first:
+
+```bash
+# A coverage service is present if EITHER signal exists:
+#   - a codecov.yml (or .codecov.yml) at the repo root, OR
+#   - a codecov/* commit-status context on the PR head
+#     (e.g. `gh pr checks` lists a "codecov/patch" or "codecov/project" context)
+if [ -f codecov.yml ] || [ -f .codecov.yml ]; then
+  echo "codecov.yml present -- run the patch-coverage gate below."
+else
+  echo "No codecov.yml -- the patch-coverage gate self-skips (no coverage service)."
+fi
+```
+
+When no coverage service is detected (no `codecov.yml` and no `codecov/*`
+status context), SKIP this step entirely and continue to Step 3.
+
+When a coverage service IS active: Codecov's patch-coverage check measures the
 percentage of *changed lines* that are exercised by tests, and PRs that fall
 below the project's threshold get flagged. The earlier "0%-function" check
 silently passed PRs whose changed lines were partially covered (e.g. a function
@@ -126,11 +188,16 @@ benchmark matches exactly what Codecov enforces -- no threshold parsing or
 hard-coded excludes needed here:
 
 ```bash
-COVER_OUT=/tmp/stillwater-cover.out \
+COVER_OUT="${COVER_PROFILE:-/tmp/patch-cover.out}" \
   bash "${CLAUDE_PLUGIN_ROOT}/scripts/patch-coverage.sh"
 gate_status=$?
-rm -f /tmp/stillwater-cover.out
+rm -f "${COVER_PROFILE:-/tmp/patch-cover.out}"
 ```
+
+Point `COVER_PROFILE` at whatever coverage profile the Step 2 gate run
+produced (the detected gate block's `-coverprofile` output). If the detected
+gates produced no profile -- the repo has no coverage tooling -- this gate
+self-skips (see exit code `2` below).
 
 To override for a one-off -- a repo with no `codecov.yml` patch target, or a
 deliberately lower bar -- pass `PATCH_COVERAGE_THRESHOLD=<n>` (and/or
@@ -139,8 +206,10 @@ description. An explicit env var always wins over the `codecov.yml` value.
 
 **Interpret the exit code:**
 
-- `0` -- patch coverage meets the threshold, or there's nothing in scope. Print
-  the script's report and continue to Step 3.
+- `0` -- patch coverage meets the threshold, or there's nothing in scope (the
+  script reports "no Go source changes in scope" when the diff has no covered
+  source -- treat that as a SKIP, not a failure). Print the script's report and
+  continue to Step 3.
 - `1` -- patch coverage below threshold. Print the per-file breakdown the
   script emitted, then say:
   > "Patch coverage `<pct>%` is below the `<threshold>%` threshold. Codecov
@@ -149,9 +218,15 @@ description. An explicit env var always wins over the `codecov.yml` value.
   > `PATCH_COVERAGE_THRESHOLD=<lower>` and explain in the PR description.)"
   >
   > Do NOT proceed without the user explicitly overriding.
-- `2` -- script configuration error (missing profile, unreadable go.mod, no
-  `main` branch, etc.). Treat this as a setup issue, surface the script's
-  stderr, and stop. Do not silently skip.
+- `2` -- missing profile or other setup condition. The disposition depends on
+  whether a coverage service was detected at the top of this step:
+  - **Coverage service active** (codecov.yml or a `codecov/*` status context):
+    treat exit 2 as a real configuration error -- surface the script's stderr
+    and stop. Do not silently skip a gate the repo actually enforces.
+  - **No coverage service detected**, or the Step 2 gates produced no coverage
+    profile (the repo has no coverage tooling -- e.g. a stdlib-only shell/Python
+    repo): treat exit 2 as a SKIP. Print "Patch-coverage gate skipped (no
+    coverage profile / no coverage service)." and continue to Step 3.
 
 **If the script is missing** (`${CLAUDE_PLUGIN_ROOT}/scripts/patch-coverage.sh` not found),
 treat as a `2` configuration error: stop and tell the user to reinstall or update
@@ -189,7 +264,22 @@ local gate then falls back to its default and can't perfectly match.
 
 ---
 
-## Step 3 -- OpenAPI consistency check
+## Step 3 -- OpenAPI consistency check (self-skipping)
+
+**Self-skip when there is no OpenAPI surface.** This step applies only to repos
+that declare an HTTP API with an OpenAPI spec. Detect the signal first:
+
+```bash
+if [ -d internal/api ]; then
+  echo "internal/api/ present -- run the OpenAPI consistency check below."
+else
+  echo "No internal/api/ -- OpenAPI consistency check skipped."
+fi
+```
+
+If `internal/api/` is absent, SKIP this step and continue to Step 3b. The
+commands below are illustrative of the check a repo with an OpenAPI surface
+would run; adapt the path to the target repo's API package as detected.
 
 Run the AST-based consistency test first:
 
@@ -224,22 +314,41 @@ If the diff contains any renamed functions, variables, types, or constants:
 ```bash
 if git rev-parse --verify -q origin/main >/dev/null 2>&1; then base_ref=origin/main; else base_ref=main; fi
 base=$(git merge-base "$base_ref" HEAD)
-git diff "$base"..HEAD | grep '^-.*func \|^-.*type \|^-.*var \|^-.*const ' | \
-  sed 's/^-//' | grep -oE '[A-Z][a-zA-Z0-9]*'
+git diff "$base"..HEAD | grep -E '^-.*(func|def|class|type|var|const) ' | \
+  sed 's/^-//' | grep -oE '[A-Za-z_][A-Za-z0-9_]*'
 ```
 
-For each old name found, grep the full codebase for remaining references:
+For each old name found, grep the full codebase for remaining references.
+Scope the `--include` globs to the target repo's source file types as detected
+(below uses this repo's `*.sh`/`*.py`; a Go repo would use `*.go`/`*.templ`,
+etc.):
 
 ```bash
-grep -rn "OldName" --include='*.go' --include='*.templ' .
+grep -rn "OldName" --include='*.sh' --include='*.py' .
 ```
 
 **Flag as CRITICAL** if the old name still appears in code (excluding the diff's `-` lines
-and comments). Incomplete renames cause compilation errors or silent behavior changes.
+and comments). Incomplete renames cause build/compile failures (in compiled
+languages) or silent behavior changes (in interpreted ones).
 
 ---
 
-## Step 3c -- Raw error leak check
+## Step 3c -- Raw error leak check (self-skipping)
+
+**Self-skip when there are no API handler files.** This check targets HTTP
+handler response paths. Detect the signal first:
+
+```bash
+if compgen -G 'internal/api/handlers_*.go' >/dev/null 2>&1; then
+  echo "internal/api/handlers_*.go present -- run the raw-error-leak check below."
+else
+  echo "No internal/api/handlers_*.go -- raw-error-leak check skipped."
+fi
+```
+
+If no `internal/api/handlers_*.go` files exist, SKIP this step and continue to
+Step 3d. The check below is illustrative of a Go-handler repo; adapt the paths
+and patterns to the target repo's handler layer as detected.
 
 Check for raw internal error messages leaking to clients:
 
@@ -256,7 +365,23 @@ Client-visible messages must be generic; the full error belongs in a server-side
 
 ---
 
-## Step 3d -- Axis/state vocabulary drift check
+## Step 3d -- Axis/state vocabulary drift check (self-skipping)
+
+**Self-skip when there is no i18n + template surface.** This check targets
+repos that pair backend state with user-facing localized copy. Detect the
+signal first:
+
+```bash
+if [ -d internal/i18n ] && [ -d web/templates ]; then
+  echo "internal/i18n/ + web/templates/ present -- run the vocabulary-drift check below."
+else
+  echo "No internal/i18n/ + web/templates/ -- vocabulary-drift check skipped."
+fi
+```
+
+If either `internal/i18n/` or `web/templates/` is absent, SKIP this step and
+continue to Step 3e. The grep patterns below are illustrative of a Go + templ +
+i18n repo; adapt them to the target repo's localization surface as detected.
 
 When a PR extends a multi-state system with a new axis, state, or mode, backend
 code is usually updated while user-facing copy (i18n keys, inline templ
@@ -304,12 +429,27 @@ drift check skipped." and continue.
 
 ---
 
-## Step 3e -- Vulnerability scan (govulncheck)
+## Step 3e -- Vulnerability scan (self-skipping)
 
-Run the vulnerability scan that mirrors the Security CI job. This is a **gate**.
-`make vulncheck` wraps `go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...`,
-the same pinned version CI installs, so a local pass means CI's govulncheck
-will pass too.
+**Self-skip when there is no Go module.** This step runs Go's `govulncheck`.
+Detect the signal first:
+
+```bash
+if [ -f go.mod ]; then
+  echo "go.mod present -- run the vulnerability scan below."
+else
+  echo "No go.mod -- govulncheck step skipped (run the target repo's own dependency-audit gate, if any)."
+fi
+```
+
+If `go.mod` is absent, SKIP this Go-specific scan. If the target repo declares
+its own dependency-audit gate (e.g. `pip-audit`, `npm audit`, `cargo audit`),
+that belongs in the Step 2 detected gate block, not here. Continue to Step 4a.
+
+When `go.mod` is present, run the vulnerability scan that mirrors the Security
+CI job. This is a **gate**. `make vulncheck` wraps `go run
+golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...`, the same pinned version CI
+installs, so a local pass means CI's govulncheck will pass too.
 
 ```bash
 make vulncheck
@@ -329,16 +469,18 @@ here, at the deliberate pre-PR gate, where that is acceptable.
 
 ---
 
-## Step 4a -- Local code review (review-toolkit agents)
+## Step 4a -- Local hostile review
 
-Run the full review using the Skill tool:
+Run an adversarial pre-push review of the diff. Dispatch a hostile-reviewer
+subagent following the `engage-ralph-loop.md` brief (the adversarial-critic
+loop bundled with this plugin), pointed at the branch diff. The reviewer
+reproduces every empirical claim (runs it, never static-greps), pushes back on
+holes / over-reach / mis-scoping, and runs a least-privilege check that the
+change never weakens a security floor or broadens an allow-list.
 
-```text
-skill: "pr-review-toolkit:review-pr"
-```
-
-This runs all applicable review agents (code-reviewer, silent-failure-hunter, and conditionally
-pr-test-analyzer, type-design-analyzer, comment-analyzer) and consolidates findings.
+If the target repo also has a local review toolkit installed (e.g. a
+`pr-review-toolkit:review-pr` skill), running it here is a useful complement;
+treat its absence as a no-op, not a failure.
 
 If any Critical findings: stop. Say "Fix all critical issues before pushing."
 
@@ -351,17 +493,17 @@ Wait for the user's answer before continuing.
 
 ## Step 4b -- Local CodeRabbit review (CR CLI)
 
-After the review-toolkit's findings have been triaged and any fixes applied,
-run the CodeRabbit CLI as a final pre-push pass. The CLI shares an engine
-with cloud-side CR, so findings here predict the first cloud review-round
+After the Step 4a hostile-review findings have been triaged and any fixes
+applied, run the CodeRabbit CLI as a final pre-push pass. The CLI shares an
+engine with cloud-side CR, so findings here predict the first cloud review-round
 with high accuracy -- catching them now collapses entire cloud review rounds.
 
 **Cost:** ~3-4 min wall-clock on a medium diff. **Pay-off:** every cloud
 round prevented is ~2 min of post-push waiting avoided. Net positive after
 the first prevented round.
 
-**Why this slot, not earlier:** running local CR before review-toolkit
-triage means surfacing findings on code the toolkit will rewrite, which
+**Why this slot, not earlier:** running local CR before the Step 4a hostile
+review triage means surfacing findings on code that review will rewrite, which
 wastes the pass. Running it after UAT (when applicable) keeps the diff
 in final-state-ish shape so findings correspond to what will be pushed.
 
@@ -419,8 +561,8 @@ For every finding categorized as `bug`, `spec-drift`, or `test-gap`:
   already ran the full suite, and the patch coverage gate from Step 2b
   is the floor).
 - For `defer` findings, file a tracking issue with the rationale and
-  record the issue number in the PR body's Pre-flight checklist (under
-  a "Local CR follow-ups" line).
+  record the issue number in the PR body (under a "Local CR follow-ups"
+  line).
 
 ### When CR is missing entirely (rare)
 
@@ -438,7 +580,13 @@ bypass reason and continue to Step 5. Default is to run.
 
 ---
 
-## Step 5 -- Generated file check
+## Step 5 -- Generated-file / lockstep check (self-skipping)
+
+Detect which generated-file invariant the target repo has, and check only that
+one. Three branches; if no signal is present, skip the step.
+
+**Branch A -- templ-generated code** (signal: `*.templ` files exist). Check
+that touched `*.templ` files regenerated their `*_templ.go` outputs:
 
 ```bash
 if git rev-parse --verify -q origin/main >/dev/null 2>&1; then base_ref=origin/main; else base_ref=main; fi
@@ -453,7 +601,27 @@ if [ -n "$templ_changed" ] && [ -z "$generated_changed" ]; then
 fi
 ```
 
-If the check exits with an error, stop and show the message.
+**Branch B -- version lockstep** (signal: `skills/orchestrate/SKILL.md` and
+`.claude-plugin/plugin.json` both exist -- the generated-file equivalent for
+this repo). The plugin manifest version must move in lockstep with the SKILL.md
+`**Version**` line:
+
+```bash
+if [ -f skills/orchestrate/SKILL.md ] && [ -f .claude-plugin/plugin.json ]; then
+  python3 test-version-lockstep.py
+fi
+```
+
+If the lockstep harness fails (the two versions diverged), stop: bump both to
+the same value before pushing.
+
+**Branch C -- no signal.** If neither `*.templ` files nor the
+SKILL.md/plugin.json pair is present, the repo has no generated-file invariant
+this step knows about -- print "No generated-file invariant detected -- step
+skipped." and continue to Step 6. (Add the target repo's own generated-file
+check here as detected, e.g. `*.pb.go` from protobuf, an OpenAPI client, etc.)
+
+If any branch's check exits with an error, stop and show the message.
 
 ---
 
@@ -549,12 +717,14 @@ If yes, determine which issue(s) this branch closes:
 
 Collect all discovered issue numbers into a list.
 
-### Step 8a -- Resolve PR labels (REQUIRED -- CI check will fail without labels)
+### Step 8a -- Resolve PR labels (if the repo enforces them)
 
-There is a required CI check ("Label gate / Require release label") that fails PRs
-missing a valid release label. You MUST apply labels at PR creation time.
+Some repos gate PRs on a required label (e.g. a "Require release label" CI
+check). Detect whether the target repo has such a check before forcing labels:
+inspect its label set and required checks rather than assuming a fixed
+vocabulary. If the repo has no label gate, labels are optional polish.
 
-Fetch labels from each linked issue:
+Fetch labels from each linked issue and reuse the matching ones:
 
 ```bash
 for n in <issue-numbers>; do
@@ -562,24 +732,18 @@ for n in <issue-numbers>; do
 done
 ```
 
-Cross-reference against the valid release labels in `.claude/release.toml`:
+Cross-reference against the target repo's own label vocabulary (list it with
+`gh label list`); do not assume any fixed set. If no linked issue carries a
+relevant label, infer the best match from the change type (a bug fix -> a
+`bug`-style label, a new feature -> an `enhancement`-style label, and so on,
+using whatever names the repo actually defines).
 
-```text
-enhancement, bug, ux, database, documentation, technical-debt, testing,
-automation, providers, scanner, rules, images, webhooks, emby, jellyfin, reports
-```
+Build a `--label` flag string from the matched names, e.g.
+`--label "enhancement"`.
 
-Collect all matching labels. If no linked issue has a valid label, infer the best
-match from the change type:
-- Bug fix -> `bug`
-- New feature -> `enhancement`
-- UI/template changes -> `ux`
-- Provider changes -> `providers`
-- Rule engine changes -> `rules`
-- Test-only changes -> `testing`
-- Dashboard/report changes -> `reports`
-
-Build a `--label` flag string: `--label "enhancement" --label "providers"` etc.
+**Mechanical / docs-only / config-only PRs:** consider suggesting the
+`norabbit` label to the maintainer (it is in the org CodeRabbit denylist, so it
+skips an unnecessary review). Suggest only -- never apply it without consent.
 
 ### Step 8b -- Create the PR
 
@@ -605,57 +769,67 @@ If `.github/pull_request_template.md` exists in the repo, read it and
 construct `body` by mirroring the template's section structure. For each
 section, fill in or pre-mark as follows:
 
+The exact section names vary by repo; match whatever the detected template
+declares. The mapping below reflects this repo's template
+(`.github/pull_request_template.md`) as an illustrative example:
+
 | Section | Action |
 |---------|--------|
-| `## Summary` | Bullet points from `$ARGUMENTS` if provided, else inferred from the squashed commit message. 1-3 bullets, why-focused, per project convention. |
+| `## Summary` | Bullet points from `$ARGUMENTS` if provided, else inferred from the squashed commit message. 1-3 bullets, why-focused. Note any behavior change to the guard, resource allocator, setup, or skill/charters. |
 | `## Linked issue` | Replace the `Closes #` placeholder with the resolved `issue_refs`. Use `Part of #N` for an intermediate slice if explicitly told so; otherwise `Closes #N`. |
-| `## Pre-flight checklist` | Pre-mark `[x]` for items this `/prep-pr` run just validated; leave `[ ]` for items requiring user/reviewer attention. See mapping below. |
-| `## Test plan` | Pre-mark `[x]` for the canonical gate entries (`go test -race ./...`, `scripts/pre-push-gate.sh`); leave `[ ]` for "Manual UAT steps" and "Reviewer follow-ups" sub-bullets. |
+| `## Gates (run locally; CI enforces them ...)` | Pre-mark `[x]` for each gate command the detected Step 2 gate block actually ran and passed; leave `[ ]` for any the run did not cover. |
+| `## Security-floor changes` | Delete this section if the diff does not touch the guard/floor. If it does, pre-mark the TDD / adversarial-critic / no-trigger-substring items per what this run validated. |
+| `## Test plan` | Pre-mark `[x]` for the gate entries this run exercised; leave `[ ]` for "Reviewer follow-ups" and any manual UAT sub-bullets. |
 
-**Pre-flight checklist `[x]` mapping** (current template as of 2026-05-19):
+**Gates checkbox `[x]` mapping** (this repo's template, illustrative):
 
 | Item | Mark `[x]` if |
 |------|---------------|
-| Pre-push gate green locally | Steps 2 + 2b passed (always true here) |
-| Code review pass complete | Step 4 ran without unresolved Critical findings |
-| Commits squashed | Step 6 produced a single commit (already-one or just squashed) |
-| Label(s) set | Step 8a produced a non-empty label list (the `gh pr create` call applies them) |
-| Docs label decision made | Step 8a applied either `needs-docs-review` or `docs: not-required` (mark `[x]`); else `[ ]` and let the user pick |
-| Screenshot for UI change | Leave `[ ]` -- the agent cannot capture screenshots; user/reviewer fills |
-| UAT performed for user-visible changes | Leave `[ ]` -- the agent cannot run UAT; user fills (or N/A for non-UI changes) |
-| OpenAPI spec updated if shapes changed | Mark `[x]` if Step 3 reported no spec drift OR the agent applied fixes; else `[ ]` |
-| `templ generate` re-run | Mark `[x]` if Step 5 passed OR no `.templ` files in the diff; else `[ ]` |
+| Gate command (shellcheck / ruff / self-tests / `test-*.py`) | That command ran in the detected Step 2 gate block and passed |
+| Security-floor TDD item | The diff touches the guard AND harness cases were added/updated before the change; else leave `[ ]` (or delete the whole section if the guard is untouched) |
+| Adversarial-critic pass | Step 4a's hostile review ran and converged; else `[ ]` |
+| No trigger substrings on Bash lines | Confirmed no `git push`/`main`/`gh pr merge`/etc. payloads on command lines (payloads stay in fixtures); else `[ ]` |
 
-**Do NOT add** a "Generated with Claude Code" footer in the body. The
-project's template intentionally doesn't include it -- humans use the same
-template, and the footer is repo-meta noise (per `feedback_use_pr_template`).
+For a repo with a different template (UI screenshots, UAT, OpenAPI, `templ
+generate` rows, etc.), map each row to the corresponding self-skipping step
+above: mark `[x]` when that step passed or self-skipped as not-applicable, leave
+`[ ]` when it needs user/reviewer attention (screenshots and manual UAT always
+stay `[ ]` -- the agent cannot capture or perform them).
+
+**Do NOT add** a "Generated with Claude Code" footer in the body unless the
+target repo's template includes one. Humans use the same template, and an
+unsolicited footer is repo-meta noise (per `feedback_use_pr_template`).
 
 **Fallback (no template file).** If `.github/pull_request_template.md`
-does not exist (older repos, non-stillwater consumers of this skill), use
-the legacy heredoc form below:
+does not exist (older repos, other consumers of this skill), write the body to
+a file and pass it with `--body-file` (a file, not a Bash heredoc -- the
+security floor greps command lines, and a `--body-file` keeps any trigger words
+off the command line). Fill the Gates list from the detected Step 2 gate block
+rather than any hardcoded runner:
 
 ```bash
-gh pr create --title "<branch-description>" \
-  --label "<label1>" --label "<label2>" \
-  --body "$(cat <<'EOF'
-## Summary
-<bullet points from $ARGUMENTS or inferred from commit message>
-
-## Linked issue
-<issue_refs from the resolver above>
-
-## Test plan
-- [ ] `go test -race ./...` passes
-- [ ] OpenAPI spec verified against implementation
-- [ ] Local review toolkit passed
-EOF
-)"
+title="<conventional-commit-title>"
+body_file="$(mktemp)"
+{
+  printf '## Summary\n'
+  printf -- '- <bullets from $ARGUMENTS or inferred from the squashed commit>\n\n'
+  printf '## Linked issue\n%s\n\n' "$issue_refs"
+  printf '## Gates\n'
+  printf -- '- [x] <each gate command the detected Step 2 block ran and passed>\n'
+} > "$body_file"
+gh pr create --title "$title" --label "$label" --body-file "$body_file"
+rm -f "$body_file"
 ```
+
+List the Gates as whatever detection found (e.g. for this repo: `shellcheck`,
+`ruff check --select F,E741`, the guard/steer self-tests, the `test-*.py`
+harnesses); for a Go repo it would be `go test ./...`, govulncheck, etc. The
+examples are illustrative of a detected gate set, not a hardcoded assumption.
 
 **If a PR already exists**, print its URL and say "PR already open -- bot
 reviewers will review the push automatically." Do not attempt to re-create.
 
 **Note:** The first push is the cleanest moment for review -- every issue
 caught before the first push saves a review round. This is why Steps 2-5
-gate so aggressively, and why the Pre-flight checklist tells reviewers
+gate so aggressively, and why the Gates checklist tells reviewers
 explicitly which gates already passed.
