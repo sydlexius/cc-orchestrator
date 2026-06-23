@@ -17,13 +17,18 @@
 #         mergeable_state is in the merge-ready set (clean / unstable / has_hooks).
 #         Exit 0. Consumer next action: /merge-pr.
 #
-#         CR requirement SATISFIED means ANY of: (a) CodeRabbit reviewed HEAD with
-#         a non-DISMISSED, non-CHANGES_REQUESTED review (CR enabled, the original
-#         path - preserved), OR (b) CR will NOT review this PR -- the `norabbit`
-#         label is present, or CR posted a "Review skipped" check (CR auto-review
-#         disabled). Without (b), a norabbit / CR-disabled PR would wait the full
-#         timeout for a review that never lands (#34). When CR IS enabled the
-#         original wait-for-the-real-review behavior is unchanged.
+#         CR-waiting is OPT-IN (#173): the `cr-review` requirement is treated as
+#         SATISFIED by DEFAULT, and we wait ONLY when there is positive evidence CR
+#         will review this PR. SATISFIED means ANY of: (a) CodeRabbit reviewed HEAD
+#         with a non-DISMISSED, non-CHANGES_REQUESTED review (the original path -
+#         preserved), OR (b) an explicit opt-out -- the `norabbit` label, or a CR
+#         "Review skipped" check (#34), OR (c) CR is NOT expected -- no existing
+#         review, CR not in requested_reviewers, and no `@coderabbitai review`
+#         trigger comment. On this org CR auto-review is OFF, so an untriggered PR
+#         posts NO check at all; the old opt-OUT logic waited the full timeout for a
+#         review that never lands (#173). We WAIT (pending cr-review) only when CR is
+#         expected: a review is in-flight (existing review, incl. DISMISSED), CR is a
+#         requested reviewer, or a review was triggered.
 #
 #         Codoki SETTLED: Codoki posts its verdict as a `Codoki PR Review` entry in
 #         statusCheckRollup, NOT in the reviews API, so it is invisible to a
@@ -159,6 +164,58 @@ cr_review_skipped() {
     | length > 0' >/dev/null 2>&1
 }
 
+# cr_is_requested -- true (exit 0) when `coderabbitai[bot]` is in the PR's
+# requested_reviewers list (the maintainer asked CR to review). Positive evidence
+# CR will post a review. Fails CLOSED (returns 1 = not requested) on any gh/jq
+# error so a transient API blip does not falsely keep an idle PR pending.
+cr_is_requested() {
+  gh api "repos/$repo/pulls/$pr/requested_reviewers" \
+    --jq '.users[].login' 2>/dev/null \
+    | grep -qxF "$CR_LOGIN"
+}
+
+# cr_was_triggered -- true (exit 0) when an issue comment carries a CR REVIEW
+# trigger command. Org-wide CR auto-review is OFF, so a review only happens when
+# someone posts `@coderabbitai review` or `@coderabbitai full review`. We match
+# ONLY those review-triggering forms (case-insensitive, tolerating surrounding
+# text); a bare `@coderabbitai` mention or `@coderabbitai resolve`/`summary`
+# engages CR WITHOUT requesting a review, so those must NOT count as positive
+# evidence (matching them would re-introduce the false-wait bug, #173). Fails
+# CLOSED (returns 1 = not triggered) on any gh/jq error.
+cr_was_triggered() {
+  # A trigger is a NON-CR author posting `@coderabbitai review` / `full review`.
+  # Exclude coderabbitai[bot]'s OWN comments: its auto-generated summary/walkthrough
+  # boilerplate quotes the literal `@coderabbitai review` as user instructions, which
+  # would otherwise false-positive every CR-touched PR back into a hang (the #173 bug).
+  gh api --paginate "repos/$repo/issues/$pr/comments" 2>/dev/null \
+    | jq -s 'add // []' 2>/dev/null \
+    | jq -e --arg cr "$CR_LOGIN" '[ .[]
+        | select(((.user.login // "") != $cr)
+                 and ((.body // "")
+                      | test("@coderabbitai[[:space:]]+(full[[:space:]]+)?review\\b"; "i"))) ]
+             | length > 0' >/dev/null 2>&1
+}
+
+# cr_review_expected -- composite: true (exit 0) when there is POSITIVE evidence
+# CR will (or already did) review this PR. CR-waiting is OPT-IN: the caller only
+# adds `cr-review` to the pending list when this returns true. Any of:
+#   - a CR review already exists for HEAD ($cr_latest_state non-empty, incl.
+#     DISMISSED -- CR engaged, may post again), OR
+#   - CR is in requested_reviewers, OR
+#   - a `@coderabbitai review` trigger comment is present.
+# When none hold (the default for an auto-review-off PR that was never triggered),
+# CR is NOT expected and the requirement is treated as satisfied -- the fix for
+# #173, where the old opt-out logic waited the full timeout for a review that
+# never lands. Note: the per-poll detection EXCLUDES the existing-review check
+# (callers pass $cr_latest_state, computed each poll) from the fail-closed helpers,
+# so a genuine in-flight review always keeps us waiting.
+cr_review_expected() {
+  [ -n "$cr_latest_state" ] && return 0
+  cr_is_requested && return 0
+  cr_was_triggered && return 0
+  return 1
+}
+
 # norabbit label => the maintainer explicitly opted this PR out of CR review, so CR
 # will never post one. Checked ONCE before the loop (label state is stable). Fails
 # open (treated as not-labeled) on any gh error so detection falls through to the
@@ -258,19 +315,28 @@ while true; do
   # Build the pending-criteria list. Empty list = settled.
   pending_list=()
 
-  # CR must have weighed in on HEAD with a non-DISMISSED review. APPROVED and
-  # COMMENTED both qualify; only "" (no review yet) and DISMISSED keep us pending.
-  # EXCEPTION (#34): if CR will not review this PR at all -- the `norabbit` label
-  # is set, or CR posted a "Review skipped" check (auto-review disabled) -- the CR
-  # requirement is SATISFIED and we do not wait for a review that never lands. When
-  # CR IS enabled, none of those signals fire and the original wait is unchanged.
+  # CR-waiting is OPT-IN (#173): we add `cr-review` to pending ONLY when there is
+  # positive evidence CR will review this PR. The DEFAULT is satisfied. APPROVED and
+  # COMMENTED on HEAD qualify directly; "" (no review yet) and DISMISSED keep us
+  # pending ONLY if CR is still expected (in-flight). The explicit opt-out fast-paths
+  # (#34) -- the `norabbit` label or a CR "Review skipped" check -- stay as additional
+  # satisfy conditions even if some stale expectation signal lingers. On this org CR
+  # auto-review is OFF, so an untriggered PR posts NO check at all (no "Review skipped");
+  # the old opt-out logic waited the full timeout for a review that never lands -- the
+  # bug this inversion fixes. cr_review_expected() is positive evidence: an existing
+  # review (incl. DISMISSED), CR in requested_reviewers, or a `@coderabbitai review`
+  # trigger comment; its helpers fail CLOSED (assume not-expected) so an API blip
+  # never hangs, while a genuine in-flight review (non-empty $cr_latest_state) always
+  # keeps us waiting.
   case "$cr_latest_state" in
     APPROVED|COMMENTED) ;;
     *)
       if [ "$cr_norabbit" = true ] || cr_review_skipped; then
-        : # CR will not review (norabbit / Review skipped) -> requirement satisfied
-      else
+        : # explicit opt-out (norabbit / Review skipped) -> requirement satisfied
+      elif cr_review_expected; then
         pending_list+=("cr-review")
+      else
+        : # no positive evidence CR will review (auto-review off, untriggered) -> satisfied
       fi
       ;;
   esac
