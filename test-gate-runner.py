@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+"""Proof harness for scripts/gate-runner.py (#169).
+
+The gate-runner reads a repo's `.gates.toml` (or falls back through a fail-open
+detection chain) and runs the gates. This harness exercises it END-TO-END in
+isolated temp dirs: it builds a throwaway repo per case, writes a `.gates.toml`
+(or omits it to drive the fallback chain), invokes the REAL gate-runner.py as a
+subprocess, and asserts on its exit code + the per-step PASS/SKIP/FAIL lines.
+
+Isolation: every case runs in its own tempfile.TemporaryDirectory(). To make
+`git rev-parse --show-toplevel` resolve the temp dir as the repo root (the
+runner finds the root that way), each temp repo is `git init`-ed. PATH is
+controlled per-case (a temp bin dir prepended, or a tool removed) to drive the
+skip predicates and the umbrella/basics fallbacks deterministically -- the
+harness NEVER depends on what is installed on the host.
+
+Contract asserted: exit 0 = all gates passed / skipped / fell open; non-zero =
+a required gate failed (1) or a config error (2). Form A, Form B, both skip
+predicates, required=false soft-fail, every fallback layer, and the terminal
+fail-open (no config + nothing detectable -> exit 0).
+
+Run: python3 test-gate-runner.py
+"""
+import os
+import subprocess
+import sys
+import tempfile
+
+RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      "scripts", "gate-runner.py")
+
+FAILS = []
+
+
+def check(label, ok):
+    status = "ok  " if ok else "FAIL"; print(f"  [{status}] {label}")
+    if not ok:
+        FAILS.append(label)
+
+
+def git_init(root):
+    """Init a quiet temp git repo so --show-toplevel resolves to root."""
+    env = dict(os.environ)
+    env["GIT_CONFIG_GLOBAL"] = os.path.join(root, ".gitconfig-none")
+    env["GIT_CONFIG_SYSTEM"] = os.path.join(root, ".gitconfig-none-sys")
+    subprocess.run(["git", "init", "-q"], cwd=root, env=env, check=True)
+
+
+def write(root, relpath, content, *, executable=False):
+    path = os.path.join(root, relpath)
+    os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(relpath) else None
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    if executable:
+        os.chmod(path, 0o755)
+    return path
+
+
+def run_runner(root, *, extra_path=None, drop_tools=()):
+    """Invoke the real gate-runner.py inside `root`. Returns (rc, stdout+stderr).
+
+    extra_path: a dir prepended to PATH (so a fake tool resolves).
+    drop_tools: tool names to make absent -- we build a SANITIZED PATH of
+    symlinks to the real binaries EXCEPT the dropped ones, so shutil.which()
+    returns None for them regardless of the host."""
+    env = dict(os.environ)
+    parts = []
+    if extra_path:
+        parts.append(extra_path)
+    if drop_tools:
+        sandbox_bin = os.path.join(root, ".sandbox-bin")
+        os.makedirs(sandbox_bin, exist_ok=True)
+        # Mirror every binary on the current PATH except the dropped ones.
+        seen = set()
+        for d in os.environ.get("PATH", "").split(os.pathsep):
+            if not d or not os.path.isdir(d):
+                continue
+            for name in os.listdir(d):
+                if name in drop_tools or name in seen:
+                    continue
+                src = os.path.join(d, name)
+                if os.path.isfile(src) and os.access(src, os.X_OK):
+                    link = os.path.join(sandbox_bin, name)
+                    if not os.path.lexists(link):
+                        try:
+                            os.symlink(src, link)
+                            seen.add(name)
+                        except OSError:
+                            pass
+        parts.append(sandbox_bin)
+        env["PATH"] = os.pathsep.join(parts)
+    elif parts:
+        env["PATH"] = os.pathsep.join(parts + [os.environ.get("PATH", "")])
+    proc = subprocess.run(
+        [sys.executable, RUNNER], cwd=root, env=env,
+        capture_output=True, text=True, check=False,
+    )
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+# --- Form A (delegate) ------------------------------------------------------
+
+def test_form_a_pass():
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, "ok.sh", "#!/bin/sh\nexit 0\n", executable=True)
+        write(root, ".gates.toml", '[prep_pr]\ngate = "sh ok.sh"\n')
+        rc, out = run_runner(root)
+        check("Form A: pass -> exit 0", rc == 0)
+        check("Form A: announces delegate form", "Form A" in out)
+        check("Form A: PASS line printed", "[PASS] gate" in out)
+
+
+def test_form_a_fail():
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, ".gates.toml", '[prep_pr]\ngate = "sh -c \'exit 3\'"\n')
+        rc, out = run_runner(root)
+        check("Form A: fail -> exit 1", rc == 1)
+        check("Form A: FAIL line printed", "[FAIL] gate" in out)
+
+
+# --- Form B (enumerate) -----------------------------------------------------
+
+def test_form_b_order_and_pass():
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        marker = os.path.join(root, "order.txt")
+        cfg = f"""\
+[prep_pr]
+  [[prep_pr.steps]]
+  name = "first"
+  run = "echo 1 >> {marker}"
+  [[prep_pr.steps]]
+  name = "second"
+  run = "echo 2 >> {marker}"
+"""
+        write(root, ".gates.toml", cfg)
+        rc, out = run_runner(root)
+        check("Form B: all pass -> exit 0", rc == 0)
+        check("Form B: announces enumerate form", "Form B" in out)
+        order = open(marker).read().split()
+        check("Form B: steps run IN ORDER", order == ["1", "2"])
+        check("Form B: per-step PASS lines", "[PASS] first" in out and "[PASS] second" in out)
+
+
+def test_form_b_hard_fail_stops():
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        marker = os.path.join(root, "ran.txt")
+        cfg = f"""\
+[prep_pr]
+  [[prep_pr.steps]]
+  name = "boom"
+  run = "sh -c 'exit 1'"
+  [[prep_pr.steps]]
+  name = "after"
+  run = "echo reached >> {marker}"
+"""
+        write(root, ".gates.toml", cfg)
+        rc, out = run_runner(root)
+        check("Form B: required fail -> exit 1", rc == 1)
+        check("Form B: FAIL line for failing step", "[FAIL] boom" in out)
+        check("Form B: stops at first hard fail (later step NOT run)",
+              not os.path.exists(marker))
+
+
+def test_form_b_soft_fail_continues():
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        marker = os.path.join(root, "ran.txt")
+        cfg = f"""\
+[prep_pr]
+  [[prep_pr.steps]]
+  name = "soft"
+  run = "sh -c 'exit 1'"
+  required = false
+  [[prep_pr.steps]]
+  name = "after"
+  run = "echo reached >> {marker}"
+"""
+        write(root, ".gates.toml", cfg)
+        rc, out = run_runner(root)
+        check("Form B: required=false soft fail -> exit 0", rc == 0)
+        check("Form B: later step still runs after soft fail",
+              os.path.exists(marker))
+        check("Form B: soft failure announced", "soft failure" in out)
+
+
+def test_form_b_skip_if_absent_skips():
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        cfg = """\
+[prep_pr]
+  [[prep_pr.steps]]
+  name = "needs-tool"
+  run = "sh -c 'exit 1'"
+  skip_if_absent = "definitely-not-a-real-binary-xyz"
+"""
+        write(root, ".gates.toml", cfg)
+        rc, out = run_runner(root)
+        check("skip_if_absent (missing) -> SKIP, exit 0", rc == 0)
+        check("skip_if_absent (missing): SKIP line", "[SKIP] needs-tool" in out)
+        check("skip_if_absent (missing): run NOT executed (no FAIL)",
+              "[FAIL] needs-tool" not in out)
+
+
+def test_form_b_skip_if_absent_present_runs():
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        # `sh` is certainly present -> step must RUN (and pass here).
+        cfg = """\
+[prep_pr]
+  [[prep_pr.steps]]
+  name = "have-sh"
+  run = "sh -c 'exit 0'"
+  skip_if_absent = "sh"
+"""
+        write(root, ".gates.toml", cfg)
+        rc, out = run_runner(root)
+        check("skip_if_absent (present) -> step RUNS, exit 0", rc == 0)
+        check("skip_if_absent (present): PASS not SKIP",
+              "[PASS] have-sh" in out and "[SKIP] have-sh" not in out)
+
+
+def test_form_b_skip_if_no_match_skips():
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        cfg = """\
+[prep_pr]
+  [[prep_pr.steps]]
+  name = "ui-lint"
+  run = "sh -c 'exit 1'"
+  skip_if = "web/**/*.ts"
+"""
+        write(root, ".gates.toml", cfg)
+        rc, out = run_runner(root)
+        check("skip_if (no match) -> SKIP, exit 0", rc == 0)
+        check("skip_if (no match): SKIP line w/ reason",
+              "[SKIP] ui-lint" in out and "no files match" in out)
+
+
+def test_form_b_skip_if_match_runs():
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, "web/app.ts", "// ui\n")
+        cfg = """\
+[prep_pr]
+  [[prep_pr.steps]]
+  name = "ui-lint"
+  run = "sh -c 'exit 0'"
+  skip_if = "web/**/*.ts"
+"""
+        write(root, ".gates.toml", cfg)
+        rc, out = run_runner(root)
+        check("skip_if (match) -> step RUNS, exit 0", rc == 0)
+        check("skip_if (match): PASS not SKIP",
+              "[PASS] ui-lint" in out and "[SKIP] ui-lint" not in out)
+
+
+def test_mutually_exclusive():
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        cfg = """\
+[prep_pr]
+gate = "true"
+  [[prep_pr.steps]]
+  name = "x"
+  run = "true"
+"""
+        write(root, ".gates.toml", cfg)
+        rc, out = run_runner(root)
+        check("gate + steps both set -> exit 2 (config error)", rc == 2)
+        check("mutually exclusive: explained", "mutually exclusive" in out)
+
+
+def test_broken_toml():
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, ".gates.toml", "this is = = not valid toml [[[\n")
+        rc, out = run_runner(root)
+        check("present-but-broken .gates.toml -> exit 2", rc == 2)
+        check("broken toml: parse error surfaced", "could not parse" in out)
+
+
+# --- Fallback chain ---------------------------------------------------------
+
+def test_fallback_umbrella_makefile():
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        # A real `make gate` target; requires `make` on PATH.
+        if subprocess.run(["sh", "-c", "command -v make"],
+                          capture_output=True).returncode != 0:
+            check("fallback L1 make gate (make unavailable -- skipped)", True)
+            return
+        write(root, "Makefile", "gate:\n\t@echo made-gate\n")
+        rc, out = run_runner(root)
+        check("fallback L1: `make gate` target -> exit 0", rc == 0)
+        check("fallback L1: announces layer 1 umbrella (make gate)",
+              "layer 1" in out and "make gate" in out)
+
+
+def test_fallback_umbrella_prepush_script():
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        # No make gate target; ensure `make` cannot find one either.
+        write(root, "scripts/pre-push-gate.sh",
+              "#!/bin/sh\necho umbrella-ran\nexit 0\n", executable=True)
+        rc, out = run_runner(root, drop_tools=("make",))
+        check("fallback L1: scripts/pre-push-gate.sh -> exit 0", rc == 0)
+        check("fallback L1: announces pre-push-gate.sh",
+              "pre-push-gate.sh" in out)
+
+
+def test_fallback_claude_md():
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        marker = os.path.join(root, "claude-ran.txt")
+        claude = f"""\
+# Repo
+
+## Gates (run locally; CI enforces them)
+
+```sh
+echo gate-a >> {marker}
+echo gate-b >> {marker}
+```
+
+## Versioning
+nothing
+"""
+        write(root, "CLAUDE.md", claude)
+        # No umbrella: drop make, no pre-push-gate.sh.
+        rc, out = run_runner(root, drop_tools=("make",))
+        check("fallback L2: CLAUDE.md ## Gates -> exit 0", rc == 0)
+        check("fallback L2: announces layer 2", "layer 2" in out)
+        ran = open(marker).read().split()
+        check("fallback L2: gate commands run in order",
+              ran == ["gate-a", "gate-b"])
+
+
+def test_fallback_claude_md_hard_fail():
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        claude = """\
+## Gates
+
+```sh
+sh -c 'exit 5'
+echo should-not-run
+```
+"""
+        write(root, "CLAUDE.md", claude)
+        rc, out = run_runner(root, drop_tools=("make",))
+        check("fallback L2: a failing gate command -> exit 1", rc == 1)
+
+
+def test_fallback_basics_python():
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        # No .gates.toml, no make gate, no pre-push-gate.sh, no CLAUDE.md
+        # Gates block -> manifest inference from test-*.py harnesses.
+        write(root, "test-thing.py", "import sys; sys.exit(0)\n")
+        rc, out = run_runner(root, drop_tools=("make",))
+        check("fallback L3: python3 test-*.py basics -> exit 0", rc == 0)
+        check("fallback L3: announces layer 3 basics", "layer 3" in out)
+        check("fallback L3: WARNs about inference", "inferring" in out)
+
+
+def test_fallback_basics_python_fail():
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, "test-thing.py", "import sys; sys.exit(2)\n")
+        rc, out = run_runner(root, drop_tools=("make",))
+        check("fallback L3: a failing harness -> exit 1", rc == 1)
+
+
+def test_fallback_terminal_fail_open():
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        # Nothing detectable at all -> warn and PROCEED (exit 0).
+        rc, out = run_runner(root, drop_tools=("make",))
+        check("fallback L4: nothing detectable -> exit 0 (fail-open)", rc == 0)
+        check("fallback L4: warns 'proceeding without gates'",
+              "proceeding without gates" in out)
+
+
+def test_no_claude_gates_block_falls_through():
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        # CLAUDE.md WITHOUT a ## Gates block -> layer 2 must NOT match;
+        # with no manifest, lands on the terminal fail-open.
+        write(root, "CLAUDE.md", "# Repo\n\nNo gates here.\n")
+        rc, out = run_runner(root, drop_tools=("make",))
+        check("CLAUDE.md w/o ## Gates -> terminal fail-open exit 0", rc == 0)
+        check("CLAUDE.md w/o ## Gates: not treated as layer 2",
+              "layer 2" not in out)
+
+
+def main():
+    print("test-gate-runner.py")
+    for fn in [
+        test_form_a_pass, test_form_a_fail,
+        test_form_b_order_and_pass, test_form_b_hard_fail_stops,
+        test_form_b_soft_fail_continues,
+        test_form_b_skip_if_absent_skips, test_form_b_skip_if_absent_present_runs,
+        test_form_b_skip_if_no_match_skips, test_form_b_skip_if_match_runs,
+        test_mutually_exclusive, test_broken_toml,
+        test_fallback_umbrella_makefile, test_fallback_umbrella_prepush_script,
+        test_fallback_claude_md, test_fallback_claude_md_hard_fail,
+        test_fallback_basics_python, test_fallback_basics_python_fail,
+        test_fallback_terminal_fail_open, test_no_claude_gates_block_falls_through,
+    ]:
+        print(f"- {fn.__name__}")
+        fn()
+    print()
+    if FAILS:
+        print(f"FAIL ({len(FAILS)} check(s) failed):")
+        for f in FAILS:
+            print(f"  - {f}")
+        sys.exit(1)
+    print("all gate-runner checks passed")
+
+
+if __name__ == "__main__":
+    main()

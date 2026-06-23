@@ -77,7 +77,7 @@ BUNDLED_SCRIPTS_DIR = os.environ.get("ORCHESTRATE_BUNDLED_SCRIPTS_DIR",
 HELPER_NAMES = (
     "pr-watch.sh", "pr-unreplied-comments.sh", "pr-read-comments.sh", "reply-comment.sh",
     "resolve-threads.sh", "cleanup-worktree.sh", "patch-coverage.sh", "pr-codeql-autofixes.sh",
-    "safe-push.sh",
+    "safe-push.sh", "gate-runner.py", "pre-push-hook.sh",
 )
 # The _helper_deploy_action results that warrant an actual deploy write (vs. None / informational).
 HELPER_DEPLOY_ACTIONS = ("deploy", "refresh", "replace-symlink", "replace-broken-symlink")
