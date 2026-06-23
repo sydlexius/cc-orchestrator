@@ -62,6 +62,12 @@ def run(args, *, env_overrides=None, tmux=True):
     # steering explicitly override ORCHESTRATE_BUNDLED_STEER / ORCHESTRATE_STEER via env_overrides.
     env["ORCHESTRATE_BUNDLED_STEER"] = "/nonexistent/orchestrate-steer-bundled.sh"
     env["ORCHESTRATE_STEER"] = "/nonexistent/orchestrate-steer-deployed.sh"
+    # #162 SETUP/INIT ISOLATION: by DEFAULT point the bundled setup source at a non-existent path so
+    # an unrelated configure test never deploys the setup script to the real ~/.claude/scripts NOR
+    # wires the SessionStart init hook (setup reads as 'missing-source' -> deploy skipped + wiring
+    # gated off). Tests exercising the init hook override ORCHESTRATE_BUNDLED_SETUP / _SETUP_DEST.
+    env["ORCHESTRATE_BUNDLED_SETUP"] = "/nonexistent/orchestrate-setup-bundled.py"
+    env["ORCHESTRATE_SETUP_DEST"] = "/nonexistent/orchestrate-setup-deployed.py"
     if tmux:
         # Force the fixture TMUX unconditionally (not `env.get("TMUX") or ...`): when the
         # harness itself runs INSIDE a real tmux (e.g. a teammate pane), inheriting the
@@ -995,6 +1001,142 @@ def main():
         check("#95 F5: restart notice fires for a steer-only hook add (no guard add)",
               "RESTART" in out and "PreToolUse hook(s) to load" in out
               and steer_exact_matchers(s_rn) == {"Edit", "Write", "Bash"})
+
+    # #162: read-only `init` SessionStart advisory. STRICTLY read-only (settings byte-identical
+    # before/after), SILENT on a clean cascade, advisory on a shadow, exit 0 on EVERY path including
+    # a scan/parse error, no required args, no git-repo assumption.
+    with tempfile.TemporaryDirectory() as td:
+        clean = os.path.join(td, "clean.json")
+        json.dump({"permissions": {"allow": ["Bash(gh pr view *)"]}}, open(clean, "w"))
+        shadow = os.path.join(td, "shadow.json")
+        json.dump({"permissions": {"allow": ["Bash(gh pr *)"]}}, open(shadow, "w"))
+        bad = os.path.join(td, "bad.json")
+        open(bad, "w").write("not json {")
+
+        def init_ov(cascade):
+            # Pin the cascade to ONLY the given fixture (no real ~/.claude, no git project files).
+            return {"ORCHESTRATE_SETTINGS_FILES": cascade}
+
+        # Clean cascade: exit 0, ZERO stdout (no per-session-start noise).
+        rc, out = run(["init"], env_overrides=init_ov(clean))
+        check("#162: init is SILENT on a clean cascade (exit 0, no stdout)",
+              rc == 0 and out.strip() == "")
+
+        # Read-only: the clean settings file is byte-identical before/after init.
+        before = open(clean, "rb").read()
+        run(["init"], env_overrides=init_ov(clean))
+        check("#162: init never mutates a clean settings file (byte-identical)",
+              open(clean, "rb").read() == before)
+
+        # Shadow present: exit 0 + advisory naming `configure --apply`.
+        rc, out = run(["init"], env_overrides=init_ov(shadow))
+        check("#162: init prints the advisory (naming configure --apply) on a shadowed cascade",
+              rc == 0 and "configure --apply" in out and "shadows the merge gate" in out)
+
+        # Read-only: the shadowed settings file is byte-identical before/after init (NEVER narrows).
+        before_sh = open(shadow, "rb").read()
+        run(["init"], env_overrides=init_ov(shadow))
+        check("#162: init never mutates a shadowed settings file (read-only; configure narrows, init does not)",
+              open(shadow, "rb").read() == before_sh)
+
+        # Parse error in the cascade: exit 0, NO traceback, NO stdout advisory (init stays silent;
+        # the unparseable-file HARD-FAIL is doctor's job, not the SessionStart surface).
+        rc, out = run(["init"], env_overrides=init_ov(bad))
+        check("#162: init exits 0 with no traceback on an unparseable cascade file",
+              rc == 0 and "Traceback" not in out)
+
+        # No required args: `init` alone parses + runs (no --repo / --team needed).
+        rc, out = run(["init"], env_overrides=init_ov(clean))
+        check("#162: init requires no args (runs with `init` alone)", rc == 0)
+
+        # No git-repo assumption: with an empty cascade override and CWD that may have no project
+        # files, init still exits 0 silently (the scan degrades gracefully with no git toplevel).
+        empty = os.path.join(td, "noexist.json")  # path does not exist -> skipped silently
+        rc, out = run(["init"], env_overrides=init_ov(empty))
+        check("#162: init exits 0 + silent when the cascade points at a non-existent file (no git assumption)",
+              rc == 0 and out.strip() == "")
+
+    # #162: configure --apply DEPLOYS the setup script to the stable path + WIRES the SessionStart
+    # init hook (idempotently); doctor WARNs (never FAILs) when the hook is missing; doctor STILL
+    # HARD-FAILs on a shadow (the init advisory does not soften the authoritative check).
+    def session_init_commands(path):
+        s = json.load(open(path))
+        ss = s.get("hooks", {}).get("SessionStart", [])
+        return [h.get("command", "") for b in ss for h in b.get("hooks", [])]
+    with tempfile.TemporaryDirectory() as td:
+        sbundle = os.path.join(td, "orchestrate-setup.py")  # bundled setup fixture (deployable)
+        open(sbundle, "w").write("#!/usr/bin/env python3\n# fixture setup\n")
+        sdest = os.path.join(td, "deployed", "orchestrate-setup.py")
+        iguard = os.path.join(td, "guard.sh"); write_stub_guard(iguard)  # GUARD==BUNDLED -> current
+        iscripts = os.path.join(td, "scripts"); os.makedirs(iscripts)    # SCRIPTS==BUNDLED -> no helper
+        for name in HELPERS:
+            open(os.path.join(iscripts, name), "w").write(f"#!/usr/bin/env bash\n# {name}\n")
+        itpl = os.path.join(td, "tpl"); os.makedirs(itpl)
+        open(os.path.join(itpl, "required-permissions.md"), "w").write(
+            "## Needed allow-list entries\n- `Bash(x *)`\n")
+
+        def isettings(fn):
+            p = os.path.join(td, fn)
+            json.dump({"hooks": {"PreToolUse": [GUARD_HOOK]}, "permissions": {"allow": ["Bash(x *)"]}},
+                      open(p, "w"))
+            return p
+
+        def iov(settings_path, setup_bundle=sbundle, setup_dest=sdest):
+            return {"ORCHESTRATE_SETTINGS": settings_path, "ORCHESTRATE_TEMPLATES_DIR": itpl,
+                    "ORCHESTRATE_SETTINGS_FILES": settings_path,
+                    "ORCHESTRATE_GUARD": iguard, "ORCHESTRATE_BUNDLED_GUARD": iguard,
+                    "ORCHESTRATE_SCRIPTS_DIR": iscripts, "ORCHESTRATE_BUNDLED_SCRIPTS_DIR": iscripts,
+                    "ORCHESTRATE_BUNDLED_SETUP": setup_bundle, "ORCHESTRATE_SETUP_DEST": setup_dest}
+
+        # Dry-run previews the setup DEPLOY + SessionStart wiring, writes nothing.
+        i1 = isettings("i1.json")
+        rc, out = run(["configure"], env_overrides=iov(i1))
+        check("#162: dry-run previews setup DEPLOY + SessionStart wiring, writes nothing",
+              rc == 0 and "SessionStart" in out and not os.path.exists(sdest)
+              and session_init_commands(i1) == [])
+
+        # --apply deploys the setup script (executable, content matches) + wires the SessionStart hook.
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=iov(i1))
+        setup_deployed = (os.path.isfile(sdest)
+                          and open(sdest, "rb").read() == open(sbundle, "rb").read()
+                          and bool(os.stat(sdest).st_mode & 0o111))
+        EXPECT_CMD = 'python3 "$HOME/.claude/scripts/orchestrate-setup.py" init 2>/dev/null || true'
+        check("#162: configure --apply deploys the setup script (executable) + wires SessionStart",
+              rc == 0 and setup_deployed and session_init_commands(i1) == [EXPECT_CMD])
+
+        # The deployed setup script is callable: `init` subcommand exits 0 against it.
+        p = subprocess.run([sys.executable, sdest, "init"],
+                           env={**os.environ, "ORCHESTRATE_SETTINGS_FILES": i1},
+                           capture_output=True, text=True, timeout=30)
+        check("#162: the deployed setup script is callable (init exits 0)", p.returncode == 0)
+
+        # Idempotent: a second --apply adds no duplicate SessionStart entry (still exactly one).
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=iov(i1))
+        check("#162: configure is idempotent once SessionStart is wired (no duplicate entry)",
+              rc == 0 and session_init_commands(i1) == [EXPECT_CMD])
+
+        # Missing bundled setup source: no deploy, NO SessionStart wiring (no crash).
+        i2 = isettings("i2.json")
+        rc, out = run(["configure", "--apply", "--yes"],
+                      env_overrides=iov(i2, setup_bundle=os.path.join(td, "no-setup-src.py"),
+                                        setup_dest=os.path.join(td, "deployed2", "orchestrate-setup.py")))
+        check("#162: a missing bundled setup source wires no SessionStart hook (no crash)",
+              session_init_commands(i2) == [])
+
+        # doctor WARNs (never FAILs) when the SessionStart hook is missing; names the remedy.
+        i3 = isettings("i3.json")  # guard wired, SessionStart absent
+        rc, out = run(["doctor"], env_overrides=iov(i3, setup_dest=os.path.join(td, "nope.py")), tmux=True)
+        check("#162: doctor WARNs (not FAILs) when the SessionStart init hook is missing + names the remedy",
+              "[WARN] SessionStart shadow-advisory init hook" in out and "configure --apply" in out
+              and "[FAIL] SessionStart" not in out)
+
+        # doctor STILL HARD-FAILs on a shadow (the init WARN advisory does NOT soften the authority).
+        ishadow = os.path.join(td, "ishadow.json")
+        json.dump({"hooks": {"PreToolUse": [GUARD_HOOK]},
+                   "permissions": {"allow": ["Bash(x *)", "Bash(gh pr *)"]}}, open(ishadow, "w"))
+        rc, out = run(["doctor"], env_overrides=iov(ishadow), tmux=True)
+        check("#162: doctor STILL HARD-FAILs on a merge-gate shadow (init advisory does not soften it)",
+              rc == 1 and "SHADOW" in out and "doctor: HARD-FAIL" in out)
 
     # #133 F4: check_helpers_stale WARNs on the "deploy" (fresh install, 0/N deployed) and
     # "unreadable" actions - a fresh install with helpers not yet deployed must NOT falsely PASS.
