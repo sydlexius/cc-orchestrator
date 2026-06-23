@@ -1395,6 +1395,11 @@ def main():
         ("hooks.SessionStart=null", {"hooks": {"SessionStart": None}}),
         ("settings=null", None),
         ("hooks.PreToolUse=[null]", {"hooks": {"PreToolUse": [None]}}),
+        # A null hook ENTRY inside a block's hooks list (Codoki #183: the inner `h`
+        # must be coalesced too, not just the outer hooks/event/block levels).
+        ("hooks.PreToolUse=[{matcher,hooks:[null]}]",
+         {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [None]}],
+                    "SessionStart": [{"hooks": [None]}]}}),
     ]
     for label, settings in _null_settings:
         try:

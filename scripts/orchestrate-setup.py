@@ -178,7 +178,7 @@ def _guard_hook_present(settings):
     for block in (hooks.get("PreToolUse") or []):
         if (block or {}).get("matcher") == "Bash":
             for h in ((block or {}).get("hooks") or []):
-                if "orchestrate-guard.sh" in h.get("command", ""):
+                if "orchestrate-guard.sh" in (h or {}).get("command", ""):
                     return True
     return False
 
@@ -278,7 +278,7 @@ def _missing_steer_hook_blocks(settings):
         for b in pre:
             if (b or {}).get("matcher") == block["matcher"]:
                 for h in ((b or {}).get("hooks") or []):
-                    if h.get("type") == "command" and h.get("command") == expected:
+                    if (h or {}).get("type") == "command" and (h or {}).get("command") == expected:
                         return True
         return False
     return [b for b in STEER_HOOK_BLOCKS if not present(b)]
@@ -351,7 +351,7 @@ def _session_init_hook_present(settings):
     hooks = (settings or {}).get("hooks") or {}
     for block in (hooks.get("SessionStart") or []):
         for h in ((block or {}).get("hooks") or []):
-            if h.get("type") == "command" and h.get("command") == SESSION_INIT_HOOK_COMMAND:
+            if (h or {}).get("type") == "command" and (h or {}).get("command") == SESSION_INIT_HOOK_COMMAND:
                 return True
     return False
 

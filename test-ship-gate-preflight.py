@@ -76,8 +76,8 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         unreplied_fail=False, unreplied_missing=False, unreplied_raw=None,
         unreplied_fail_until=0):
     """Invoke the oracle with stubbed gh + pr-unreplied-comments.sh.
-    Returns (exit_code, stdout, stderr, argfile) where argfile is the path the
-    helper records its received argv into (one line per invocation) -- used to
+    Returns (exit_code, stdout, stderr, argv) where argv is the recorded helper
+    argv content (one line per invocation, read back from the log) -- used to
     assert the oracle passes --allow-stale and to drive the retry cases.
     UNREPLIED_FAIL_UNTIL=N makes the stub exit 2 on its first N invocations
     (counted via a counter file) then succeed, exercising the bounded retry."""
