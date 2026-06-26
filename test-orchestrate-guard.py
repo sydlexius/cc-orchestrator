@@ -316,6 +316,36 @@ CASES = [
     # a heredoc/prose body line that does NOT lead with git stays allowed across a bare newline
     ("FP2r2: heredoc body bare-newline git-push prose allowed",
      "cat <<'EOF'\nfirst line\nthe git push origin step was denied\nEOF", False, "allow"),
+    # --- (#186) tag-push carve-out: a PURE tag push is exempt from the prep-pr-ok
+    # ADVISORY only (block 3). A tag push never goes through a PR, so /prep-pr is N/A.
+    # Recognized: the `--tags` flag, or a `refs/tags/<name>` destination. No override needed.
+    # POSITIVE exempt (allow WITHOUT # prep-pr-ok):
+    ("tag push refs/tags/ exempt from advisory", "git push origin refs/tags/v1.10.0", False, "allow"),
+    ("tag push --tags exempt from advisory", "git push --tags", False, "allow"),
+    ("tag push --tags origin exempt", "git push --tags origin", False, "allow"),
+    ("tag push origin --tags exempt", "git push origin --tags", False, "allow"),
+    ("tag push exempt even with marker active", "git push origin refs/tags/v1.10.0", True, "allow"),
+    ("tag push with redundant override still allowed", "git push origin refs/tags/v1.10.0 # prep-pr-ok", False, "allow"),
+    # REGRESSION: the carve-out must NOT leak a Tier-1 deny (those fire BEFORE is_push_clause):
+    ("tag+main mixed still blocks (main deny)", "git push origin refs/tags/v1 main", False, "block"),
+    ("--tags + bare force still blocks (force deny)", "git push --tags --force origin feat", False, "block"),
+    ("push main TO a tag ref still blocks (main: refspec)", "git push origin main:refs/tags/x", False, "block"),
+    ("--tags + --no-verify still blocks (no-verify deny)", "git push --tags --no-verify origin feat", False, "block"),
+    # PRESERVE advisory for real branch pushes (narrowing: refs/tags/ needs the slash):
+    ("branch named refs/tags-backup is NOT a tag push (advisory)", "git push origin refs/tags-backup", False, "block"),
+    ("plain feature push still advisory-blocks (unchanged)", "git push origin feat", False, "block"),
+    # COMPOUND: a tag clause exempts itself but a later feature clause still gates:
+    ("compound tag && feature: feature clause still advisory-blocks",
+     "git push origin refs/tags/v1 && git push origin feat", False, "block"),
+    # MARKER session: the carve-out never disarms the Tier-2 merge gate:
+    ("compound tag && gh-pr-merge (active) still blocks merge (Tier-2)",
+     "git push origin refs/tags/v1 && gh pr merge 5", True, "block"),
+    # A tag token only in a TRAILING COMMENT must NOT exempt a real feature push from the
+    # advisory (the matcher strips a trailing `#...` comment before testing for tag refs):
+    ("feature push with refs/tags/ only in comment still advisory-blocks",
+     "git push origin feat # refs/tags/v1", False, "block"),
+    ("feature push with --tags only in comment still advisory-blocks",
+     "git push origin feat # use --tags", False, "block"),
 ]
 
 FAILS = []

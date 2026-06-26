@@ -34,12 +34,20 @@ if [ "${1:-}" = "--self-test" ]; then
   rc=0
   printf '%s' '{"tool_name":"Bash","tool_input":{"command":"git push origin main"}}' \
     | "$0" >/dev/null 2>&1 || rc=$?
-  if [ "$rc" -eq 2 ]; then
-    echo "orchestrate-guard self-test PASS (Tier-1 push-main blocked)"
-    exit 0
+  if [ "$rc" -ne 2 ]; then
+    echo "orchestrate-guard self-test FAIL: expected exit 2, got $rc - guard is failing OPEN" >&2
+    exit 1
   fi
-  echo "orchestrate-guard self-test FAIL: expected exit 2, got $rc - guard is failing OPEN" >&2
-  exit 1
+  # (#186) a pure tag push is exempt from the prep-pr-ok advisory -> exit 0.
+  trc=0
+  printf '%s' '{"tool_name":"Bash","tool_input":{"command":"git push origin refs/tags/v0.0.0"}}' \
+    | "$0" >/dev/null 2>&1 || trc=$?
+  if [ "$trc" -ne 0 ]; then
+    echo "orchestrate-guard self-test FAIL: tag push expected exit 0, got $trc (#186 carve-out broken)" >&2
+    exit 1
+  fi
+  echo "orchestrate-guard self-test PASS (Tier-1 push-main blocked; tag push exempt from advisory)"
+  exit 0
 fi
 
 # --- read the command: stdin JSON first, then $TOOL_INPUT env, else fail OPEN ---
@@ -91,6 +99,29 @@ looks_like_safe_push() {
   printf '%s' "$cmd" | grep -Eq '^[[:space:]]*'"$_INTRO"'([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*((bash|sh)[[:space:]]+)?([^[:space:]]*/)?safe-push(\.sh)?([[:space:]]|$)'
 }
 is_push() { looks_like_git_push || looks_like_safe_push; }
+
+# (#186) A push clause that targets ONLY tag refs (a release tag push) is exempt
+# from the prep-pr-ok ADVISORY (block 3) only - a tag push never goes through a PR,
+# so /prep-pr (gate/review/squash) is conceptually N/A. This can NEVER weaken a
+# Tier-1/Tier-2 deny: those are evaluated and exit BEFORE is_push_clause is recorded
+# (so a tag push that ALSO trips main/force/--no-verify/--admin/merge is already
+# hard-blocked upstream); this matcher only ever suppresses the advisory nudge.
+# Recognized forms: the `--tags` flag, or a `refs/tags/<name>` destination (the
+# trailing slash is required, so a branch like `refs/tags-backup` is NOT exempt).
+# Accepted limitations (advisory-only, never a deny): a bare tag-NAME push
+# (`git push origin v1.2.3`) is indistinguishable from a branch push by static
+# matching and is NOT exempt (use the refs/tags/ form or the `# prep-pr-ok`
+# override); a clause that MIXES a tag ref with a branch ref is exempted by the tag
+# match and so skips the nudge for that branch - it only ever relaxes a NUDGE.
+is_tag_only_push() {
+  is_push || return 1
+  # Strip a trailing `#...` shell comment so a tag token mentioned ONLY in a comment
+  # (`git push origin feat # refs/tags/v1`) does not falsely exempt a real branch push.
+  local tcmd
+  tcmd=$(printf '%s' "$cmd" | sed 's/[[:space:]]#.*$//')
+  printf '%s' "$tcmd" | grep -Eq '(^|[[:space:]])--tags([[:space:]]|$)' && return 0
+  printf '%s' "$tcmd" | grep -Eq '(^|[[:space:]:])refs/tags/'
+}
 
 # main/master as a push DESTINATION: whole word, boundary = start/space/colon/quote.
 # Quotes catch `git push origin 'main'` / "main" (the shell strips them, so it IS a
@@ -287,7 +318,9 @@ if printf '%s' "$orig_cmd" | grep -Eq 'push|--no-verify|--admin|(^|[^[:alnum:]_-
     fi
     # Record a real push INVOCATION in THIS clause (command-position anchored) for the
     # advisory gate below. A "push" substring in a quoted arg / prose does NOT set this.
-    is_push && is_push_clause=1
+    # (#186) A pure tag push is exempt from the advisory ONLY - this runs AFTER every
+    # Tier-1/Tier-2 deny above, so it can never relax a hard block, only the nudge.
+    is_push && ! is_tag_only_push && is_push_clause=1
   done < <(printf '%s' "$orig_cmd" | awk '{ rec = (NR==1 ? $0 : rec "\n" $0) } END { gsub(/\\\n/, "", rec); gsub(/&&|[|][|]|;|[|]/, "\n", rec); print rec }')
 fi
 cmd="$orig_cmd"
