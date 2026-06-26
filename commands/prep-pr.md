@@ -629,9 +629,14 @@ If any branch's check exits with an error, stop and show the message.
 
 ## Step 6 -- Squash to a single commit
 
-PR branches must reach the first push as **exactly one commit**. Reviewers (CodeRabbit
-and humans) read the full changeset at once instead of discovering issues
-commit-by-commit, which costs review rounds. Do not ask whether to squash -- squash.
+Squashing to one commit at first push makes reviewers (CodeRabbit and humans) read
+the full changeset at once instead of discovering issues commit-by-commit, which
+costs review rounds. Squashing is therefore the recommended default -- but it is
+history-shaping, not a gate, and the maintainer may intentionally keep distinct
+per-logical-unit commits on a multi-part PR. So it is the maintainer's call per PR:
+**prompt rather than squash unconditionally.** (Final `main` history is one commit
+regardless -- `/merge-pr` squash-merges -- so keeping commits here costs nothing at
+merge time; it only changes how the first push reads in review.)
 
 Count commits ahead of main:
 
@@ -643,8 +648,15 @@ git log "$base_ref"..HEAD --oneline
 If there is already only one commit, say: "Already a single commit -- no squash needed."
 and continue to Step 7.
 
-If there is more than one commit, squash non-interactively (no editor, no user
-prompt). Use a soft reset to the merge-base, then a single new commit:
+If there is more than one commit, ASK before squashing -- do not squash
+unconditionally. Prompt: "Branch has `<N>` commits ahead of main. Squash to one for
+the first push (recommended -- reviewers read the full changeset at once)? (squash /
+keep)". The recommendation defaults to squash; honor "keep" to push the commits
+as-is and continue to Step 7. A standing instruction for this PR ("keep N commits" /
+"don't squash") is honored without re-prompting (see User override below).
+
+On "squash", do it non-interactively (no editor). Use a soft reset to the merge-base,
+then a single new commit:
 
 ```bash
 if git rev-parse --verify -q origin/main >/dev/null 2>&1; then base_ref=origin/main; else base_ref=main; fi
@@ -678,9 +690,10 @@ push (e.g. fix-up commits during `/handle-review`). Those should be additive
 commits, not force-pushes, so reviewers can see exactly what changed in response to
 their feedback. Squash-on-merge happens at `/merge-pr` time.
 
-**User override:** if the user has explicitly said "keep N commits" or "don't
-squash" for this specific PR, honor that. The default is still squash for the next
-PR.
+**Maintainer control:** the squash is opt-in per PR via the prompt above. A standing
+"keep N commits" / "don't squash" instruction for this specific PR is honored without
+re-prompting. The recommendation defaults to squash but is never forced; the default
+recommendation still applies to the next PR.
 
 ---
 
