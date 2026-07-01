@@ -13,7 +13,7 @@ pattern = "**Version {version}**"
 # (already a hard dep for every test-*.py harness -- no jq dependency added) so
 # this stays a config-only change; the JSON is edited structurally, not by line.
 post_bump = [
-  '''python3 -c "import json,re,pathlib; m=re.search(r'\*\*Version ([0-9]+\.[0-9]+\.[0-9]+)\*\*', pathlib.Path('skills/orchestrate/SKILL.md').read_text()); v=m.group(1); p=pathlib.Path('.claude-plugin/plugin.json'); d=json.loads(p.read_text()); d['version']=v; p.write_text(json.dumps(d,indent=2)+chr(10))"''',
+  '''python3 -c "import json,re,pathlib,sys; t=pathlib.Path('skills/orchestrate/SKILL.md').read_text(encoding='utf-8'); m=re.search(r'\*\*Version ([0-9]+\.[0-9]+\.[0-9]+)\*\*', t); v=m.group(1) if m else sys.exit('ERROR: **Version X.Y.Z** line not found in SKILL.md'); p=pathlib.Path('.claude-plugin/plugin.json'); d=json.loads(p.read_text(encoding='utf-8')); d['version']=v; p.write_text(json.dumps(d,indent=2,ensure_ascii=False)+chr(10), encoding='utf-8')"''',
   "python3 test-version-lockstep.py",
 ]
 
