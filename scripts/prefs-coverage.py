@@ -15,7 +15,7 @@ opt-out; narrow surface = directly-changed files; verify is necessary-not-
 sufficient; absent-manifest self-skip.
 
 Exit codes: 0 = pass, self-skip, or nothing-in-scope; 1 = un-exempted MISSING;
-2 = config / drift / parse error (fails closed).
+2 = config / parse error (fails closed).
 """
 import sys
 import os
@@ -31,8 +31,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
 
 
 def sh(args, timeout=120):
-    # Bounded so a hung git op or a repo-defined list_cmd fails fast (rc 124)
-    # instead of burning the whole job budget.
+    # Bounded so a hung git op fails fast (rc 124) instead of burning the job budget.
     try:
         return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -78,47 +77,22 @@ def main():
     # masquerade as a MISSING finding; config/shape errors must be a clean exit 2.
     prefs = cfg.get("pref", [])
     exempts = cfg.get("exempt", [])
-    source = cfg.get("source", {})
     if not isinstance(prefs, list) or not all(isinstance(p, dict) for p in prefs):
         print("prefs-coverage: CONFIG -- [[pref]] must be an array of tables.", file=sys.stderr)
         return 2
     if not isinstance(exempts, list) or not all(isinstance(e, dict) for e in exempts):
         print("prefs-coverage: CONFIG -- [[exempt]] must be an array of tables.", file=sys.stderr)
         return 2
-    if not isinstance(source, dict):
-        print("prefs-coverage: CONFIG -- [source] must be a table.", file=sys.stderr)
-        return 2
     if not prefs:
         print("prefs-coverage: .prefs.toml has no [[pref]] entries -- nothing to check.")
         return 0
 
-    # DRIFT guard (best-effort): every [[pref]].key must exist in [source]. Only
-    # enforced when [source].list_cmd emits the authoritative keys; otherwise the
-    # human-read [source].file is a reviewer concern, not machine-checkable here.
-    lc = source.get("list_cmd")
-    if lc is not None:
-        # Run WITHOUT a shell: list_cmd is an argv array of strings, executed with
-        # shell=False (no `bash -c`). A PR-modified .prefs.toml therefore cannot inject
-        # shell metacharacters (pipes / redirects / ; / $()) into CI (#201). Strict type
-        # validation fails closed (exit 2) rather than crashing on a bad shape.
-        if not (isinstance(lc, list) and lc and all(isinstance(x, str) for x in lc)):
-            print("prefs-coverage: CONFIG -- [source].list_cmd must be a non-empty array "
-                  "of strings (argv; run without a shell).", file=sys.stderr)
-            return 2
-        r = sh(lc)
-        if r.returncode == 124:
-            print("prefs-coverage: CONFIG -- [source].list_cmd timed out.", file=sys.stderr)
-            return 2
-        if r.returncode == 0:
-            known = {x.strip() for x in r.stdout.splitlines() if x.strip()}
-            # Only drift-check prefs that HAVE a key; a keyless [[pref]] is a CONFIG
-            # error caught in the per-pref loop below (not a spurious DRIFT [None]).
-            drift = [p["key"] for p in prefs if p.get("key") and p["key"] not in known]
-            if drift:
-                print(f"prefs-coverage: DRIFT -- [[pref]] keys absent from [source]: {drift}",
-                      file=sys.stderr)
-                return 2
-
+    # NOTE: [source] is a human-read pointer only (file/docs) -- this tool does NOT
+    # execute anything from it. A key-DRIFT check that ran the repo's key-emitting
+    # command was deliberately dropped (#201): executing any PR-controlled command in
+    # CI is an RCE vector, and the drift check is optional; it can return later behind
+    # a trusted-context gate. The enumeration-from-authoritative-source discipline
+    # stays a reviewer concern (the adversarial-review charter), not a shell exec here.
     changed = changed_files(resolve_base())
     if not changed:
         print("prefs-coverage: no changed files in range -- nothing to check.")

@@ -3,8 +3,8 @@
 
 Stdlib-only, subprocess-driven (repo convention). Builds throwaway git repos with
 a base commit on `main` + a feature change, then asserts the consumer's exit code
-and output: HONORS / MISSING-blocked / MISSING-exempted / DRIFT / self-skip /
-CONFIG / nothing-in-scope. Uses TOML LITERAL strings for `verify` so the regex
+and output: HONORS / MISSING-blocked / MISSING-exempted / self-skip / CONFIG /
+nothing-in-scope. Uses TOML LITERAL strings for `verify` so the regex
 backslashes survive intact.
 """
 import os
@@ -172,29 +172,14 @@ def main():
     check("surface glob spans subdirs (single-* fnmatch) -> HONORS, exit 0",
           rc == 0 and "HONORS" in out and "sub/logs.templ" in out)
 
-    # 6. DRIFT: a [[pref]].key absent from [source].list_cmd output
-    drift_manifest = (
-        "[source]\n"
-        'list_cmd = ["printf", "theme\\nfont_size\\n"]\n\n'  # argv, no shell
-        + MANIFEST  # density is NOT in {theme, font_size}
-    )
-    r = setup({".prefs.toml": drift_manifest, "web/templates/logs.templ": "old\n"},
+    # 6. [source] is a pure human-read pointer -- NOT executed (drift-check/list_cmd
+    #    dropped, #201). A manifest with [source] file/docs runs without any exec.
+    src_ptr = '[source]\nfile = "internal/api/prefs.go"\ndocs = "docs/prefs.md"\n\n' + MANIFEST
+    r = setup({".prefs.toml": src_ptr, "web/templates/logs.templ": "old\n"},
               {"web/templates/logs.templ": HONORING})
     repos.append(r)
     rc, out = run(r)
-    check("DRIFT ([[pref]].key not in [source]) -> exit 2", rc == 2 and "DRIFT" in out)
-
-    # 7. no drift when the key IS in [source]
-    ok_src = (
-        "[source]\n"
-        'list_cmd = ["printf", "density\\ntheme\\n"]\n\n'  # argv, no shell
-        + MANIFEST
-    )
-    r = setup({".prefs.toml": ok_src, "web/templates/logs.templ": "old\n"},
-              {"web/templates/logs.templ": HONORING})
-    repos.append(r)
-    rc, out = run(r)
-    check("no-drift (key in [source]) + HONORS -> exit 0", rc == 0 and "HONORS" in out)
+    check("[source] file/docs is a no-exec pointer -> HONORS, exit 0", rc == 0 and "HONORS" in out)
 
     # 8. CONFIG: bad verify regex -> exit 2 (fails closed)
     bad_rx = (
@@ -226,14 +211,6 @@ def main():
     repos.append(r)
     rc, out = run(r)
     check("malformed [[pref]] shape -> CONFIG exit 2 (fail closed)", rc == 2 and "CONFIG" in out)
-
-    # 11. list_cmd as a non-array (a shell string) -> CONFIG exit 2 (argv required; no shell)
-    bad_lc = '[source]\nlist_cmd = "printf density"\n\n' + MANIFEST
-    r = setup({".prefs.toml": bad_lc, "web/templates/logs.templ": "old\n"},
-              {"web/templates/logs.templ": HONORING})
-    repos.append(r)
-    rc, out = run(r)
-    check("list_cmd as a string (not argv array) -> CONFIG exit 2", rc == 2 and "CONFIG" in out)
 
     for r in repos:
         shutil.rmtree(r, ignore_errors=True)

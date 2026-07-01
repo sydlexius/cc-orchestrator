@@ -34,16 +34,16 @@ no manifest, and that is valid, not an error.
 Where the AUTHORITATIVE list of pref keys lives. The reviewer/consumer reads the
 canonical pref names from here -- never from memory, and never from the `[[pref]]`
 blocks below (those are a coverage subset, not the source of truth). Used to
-enumerate prefs the manifest omitted and to drift-check that every `[[pref]].key`
-still exists.
+enumerate prefs the manifest omitted, and as the reviewer/charter's authoritative
+enumeration source.
 
 | Key        | Type   | Meaning |
 |------------|--------|---------|
-| `list_cmd` | array of string | (optional) An argv array run WITHOUT a shell (no `bash -c`, so a repo-defined command cannot inject shell metacharacters into CI) that emits the authoritative pref keys, one per line, e.g. `["go", "run", "./cmd/gen-prefs", "--keys"]`. Preferred over `file`: it can never drift. Bounded by a timeout; a non-string-array value is a CONFIG error. |
-| `file`     | string | (optional) A file a reviewer reads for the pref definitions (a schema, a typed model/registry, a settings struct). Human-read fallback when there is no `list_cmd`. |
+| `file`     | string | (optional) A file a reviewer reads for the pref definitions (a schema, a typed model/registry, a settings struct). A **human-read pointer only** -- the consumer never executes anything from `[source]`. |
 | `docs`     | string | (optional) A generated human reference (e.g. a `preferences.md`). |
 
-At least one of `list_cmd` / `file` should be set for a repo that has user prefs.
+Set `file` (and optionally `docs`) for a repo that has user prefs, so the reviewer
+enumerates prefs from the authoritative source rather than from memory.
 
 ---
 
@@ -55,7 +55,7 @@ are simply OMITTED -- they have no rendered surface to cover.
 
 | Key           | Type   | Default   | Meaning |
 |---------------|--------|-----------|---------|
-| `key`         | string | (req.)    | The pref name. MUST match a key from `[source]` (drift-checked). |
+| `key`         | string | (req.)    | The pref name. Should match a key in `[source]` (the reviewer/charter enumerates from there). |
 | `applies_via` | string | (req.)    | The mechanism kind. One of the five below. |
 | `mechanism`   | string | (req.)    | Human-readable: the concrete token/attr/class/selector a surface wires into to honor the pref. |
 | `surface`     | string | (req.)    | An `fnmatch` path glob naming which files this pref GOVERNS (the surfaces that must honor it), e.g. `web/templates/*.templ`. NOTE the `fnmatch` semantics: `*` matches across `/`, so a single-`*` glob already spans subdirectories (`web/templates/*.templ` matches `web/templates/a/b/x.templ`); do NOT use `**`. The consumer checks only the diff's changed files matching this glob -- a changed file outside it is not in scope for this pref. |
@@ -133,7 +133,7 @@ safe to wire unconditionally. A consuming repo adds it as an opt-in `.gates.toml
 ```
 
 Exit codes: `0` pass / self-skip / nothing-in-scope; `1` un-exempted MISSING (the
-hard gate); `2` config / drift / parse error (fails closed). The
+hard gate); `2` config / parse error (fails closed). The
 adversarial-review charter also reads the manifest directly (the USER-PREFERENCE
 COVERAGE dimension) for its static enumeration.
 
