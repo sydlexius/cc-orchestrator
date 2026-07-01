@@ -425,7 +425,7 @@ Self-skip on the absent-signal cases: if `patch-coverage.sh` exits 0 reporting
 "no Go source changes in scope" (the diff touches nothing the estimator
 measures), or exits 2 (missing coverage profile -- no coverage tooling on the
 repo), treat coverage as SKIP and move on. Neither is a failure. Likewise when
-`patch-coverage.sh --coverage-only` returns `{"status":"none"}`, or the repo's
+`pr-unreplied-comments.sh --coverage-only` returns `{"status":"none"}`, or the repo's
 `.gates.toml` sets `[merge_pr]` `coverage_advisory = false`, report Coverage as
 **N/A** (a self-skip, not a failure).
 

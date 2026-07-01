@@ -539,7 +539,7 @@ After restacking (or skipping it), continue to the next PR that needs work.
 Parallelism: Steps 2-3 ran N agents concurrently (data gathering + pre-triage).
 Step 4 ran serially in dependency order (cascade constraint).
 
-CodeRabbit will re-review pushed PRs automatically.
+Codoki auto-reviews the pushed PRs. CodeRabbit re-reviews only if the maintainer allocates a pass - this command never triggers one (CR auto-review is OFF org-wide).
 
 This is the Way.
 ```
@@ -557,5 +557,5 @@ This is the Way.
 - **Auto-dismiss obvious cross-stack repeats** without asking (e.g. "dead code" that's wired in a later PR).
 - **If a restack fails with conflicts,** stop and report. Don't auto-resolve.
 - **If a restack invalidates pre-triage,** note it during the fix phase and adjust.
-- **CodeRabbit re-reviews automatically.**
+- **Codoki re-reviews automatically; CodeRabbit does not (auto-review OFF org-wide -- a CR pass is maintainer-allocated).**
 - **Save the original branch** so you can return to it at the end.

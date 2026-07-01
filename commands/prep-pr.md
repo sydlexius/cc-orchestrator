@@ -159,7 +159,7 @@ When no coverage service is detected (no `codecov.yml` and no `codecov/*`
 status context), SKIP this step entirely and continue to Step 3 -- treat patch
 coverage as **N/A**, not a failure (the coverage `status:none` self-skip). The
 repo's `.gates.toml` can make this explicit with `[merge_pr]`
-`coverage_advisory = false`: when that is set (or the runner / `patch-coverage.sh
+`coverage_advisory = false`: when that is set (or the runner / `pr-unreplied-comments.sh
 --coverage-only` reports `{"status":"none"}`), report Coverage as N/A and
 continue rather than gating.
 
