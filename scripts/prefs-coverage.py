@@ -57,6 +57,7 @@ def changed_files(base):
 
 def main():
     root = sh(["git", "rev-parse", "--show-toplevel"]).stdout.strip() or os.getcwd()
+    os.chdir(root)  # anchor all subsequent git ops to the repo root (robust from nested cwd)
     manifest = os.path.join(root, ".prefs.toml")
     if not os.path.isfile(manifest):
         print("prefs-coverage: no .prefs.toml -- self-skip (no UI-preference manifest).")
@@ -95,11 +96,27 @@ def main():
         print("prefs-coverage: no changed files in range -- nothing to check.")
         return 0
 
+    # Normalize/validate [[exempt]].prefs up front. TOML allows a bare string, and
+    # `key in "font_family"` is SUBSTRING membership -- it would falsely exempt a pref
+    # named "font". Coerce a lone string to a 1-element list; filter a list to strings;
+    # reject any other type as a CONFIG error (fail closed).
+    norm_exempts = []
+    for ex in exempts:
+        pv = ex.get("prefs", [])
+        if isinstance(pv, str):
+            pv = [pv]
+        elif isinstance(pv, list):
+            pv = [x for x in pv if isinstance(x, str)]
+        else:
+            print(f"prefs-coverage: CONFIG -- [[exempt]].prefs must be a string or "
+                  f"array of strings: {ex}", file=sys.stderr)
+            return 2
+        norm_exempts.append((ex.get("surface", ""), pv, ex.get("reason", "(no reason given)")))
+
     def exemption(path, key):
-        for ex in exempts:
-            glob = ex.get("surface", "")
-            if glob and fnmatch.fnmatch(path, glob) and key in ex.get("prefs", []):
-                return ex.get("reason", "(no reason given)")
+        for glob, pv, reason in norm_exempts:
+            if glob and fnmatch.fnmatch(path, glob) and key in pv:
+                return reason
         return None
 
     missing = []

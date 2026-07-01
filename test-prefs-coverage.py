@@ -114,6 +114,49 @@ def main():
     check("MISSING-exempted -> exit 0, prints reason",
           rc == 0 and "EXEMPT" in out and "density N/A" in out)
 
+    # 4b. HIGH regression: a STRING [[exempt]].prefs must not SUBSTRING-exempt a pref.
+    #     pref "font" must NOT be exempted by prefs = "font_family" (a bare string).
+    substr_manifest = (
+        "[[pref]]\n"
+        'key = "font"\n'
+        'applies_via = "class"\n'
+        'mechanism = "m"\n'
+        'surface = "web/templates/*.templ"\n'
+        "verify = 'FONTMARKER'\n"
+        'severity = "high"\n'
+        "\n[[exempt]]\n"
+        'surface = "web/templates/*.templ"\n'
+        'prefs = "font_family"\n'  # STRING, not a list -- must not substring-match "font"
+        'reason = "unrelated"\n'
+    )
+    r = setup({".prefs.toml": substr_manifest, "web/templates/x.templ": "old\n"},
+              {"web/templates/x.templ": "no marker here\n"})
+    repos.append(r)
+    rc, out = run(r)
+    check("string [[exempt]].prefs does NOT substring-exempt (font vs font_family) -> exit 1",
+          rc == 1 and "MISSING" in out)
+
+    # 4c. a legit string [[exempt]].prefs (exact key) DOES exempt (normalized to a list)
+    exact_str = (
+        "[[pref]]\n"
+        'key = "density"\n'
+        'applies_via = "data-attr"\n'
+        'mechanism = "m"\n'
+        'surface = "web/templates/*.templ"\n'
+        "verify = 'var\\(--sw-density-'\n"
+        'severity = "high"\n'
+        "\n[[exempt]]\n"
+        'surface = "web/templates/*.templ"\n'
+        'prefs = "density"\n'  # STRING, exact key -> normalized to ["density"], exempts
+        'reason = "ok"\n'
+    )
+    r = setup({".prefs.toml": exact_str, "web/templates/x.templ": "old\n"},
+              {"web/templates/x.templ": "no marker\n"})
+    repos.append(r)
+    rc, out = run(r)
+    check("string [[exempt]].prefs with exact key -> exempts (exit 0)",
+          rc == 0 and "EXEMPT" in out)
+
     # 5. nothing-in-scope: changed file does not match any pref.surface
     r = setup({".prefs.toml": MANIFEST, "internal/api/handler.go": "old\n"},
               {"internal/api/handler.go": "new\n"})
