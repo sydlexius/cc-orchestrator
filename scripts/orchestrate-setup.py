@@ -63,7 +63,7 @@ TEMPLATES = os.environ.get("ORCHESTRATE_TEMPLATES_DIR", os.path.normpath(
     os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "skills", "orchestrate", "templates")))
 ARTIFACTS = os.environ.get("ORCHESTRATE_ARTIFACT_DIR", "/tmp")
 
-# Deployed PR-lifecycle helpers (#133). The plugin bundles these 9 helpers under scripts/ and is now
+# Deployed PR-lifecycle helpers (#133). The plugin bundles these 12 helpers under scripts/ and is now
 # their canonical SOURCE. `configure --apply` deploys them to the stable ~/.claude/scripts/ path
 # EXACTLY as it deploys the floor guard (Option A), so leads invoke them through the existing
 # Bash(~/.claude/scripts/*.sh *) allow-rule - no per-plugin-version cache drift, portable across

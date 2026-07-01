@@ -55,7 +55,7 @@ Runtime (`scripts/`; canonical source is this repo):
   [--apply]` is the consent-based path that wires the floor hook + missing allow-list entries into
   settings.json, DEPLOYS the bundled guard to the stable `~/.claude/scripts/` path (so a fresh
   plugin install has a working floor; idempotent, refreshes a stale copy, warns on a missing source),
-  DEPLOYS the 9 bundled PR-lifecycle helpers the same Option-A way (#133; retiring any claude-kit
+  DEPLOYS the 12 bundled PR-lifecycle helpers the same Option-A way (#133; retiring any claude-kit
   symlink, backed up to `<dest>.bak`), and (unless `--no-steer`) DEPLOYS + wires the advisory
   steering hook `orchestrate-steer.sh` for Edit/Write/Bash (#95; doctor only ever WARNs about it),
   DEPLOYS this script to the stable path + wires a read-only SessionStart `init` advisory hook (#162;
@@ -119,6 +119,7 @@ python3 test-pr-watch.py
 python3 test-version-lockstep.py
 python3 test-stale-branch-sweep.py
 python3 test-codoki-quota-watch.py
+python3 test-gate-runner.py
 python3 test-prefs-coverage.py
 ```
 
