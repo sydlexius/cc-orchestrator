@@ -106,7 +106,7 @@ cr_reviews=$(gh api "repos/$repo/pulls/$pr_number/reviews" \
 cr_requested=$(gh api "repos/$repo/pulls/$pr_number/requested_reviewers" \
   --jq '[.users[].login] | index("coderabbitai[bot]") // empty')                 # (b)
 cr_triggered=$(gh api "repos/$repo/issues/$pr_number/comments" \
-  --jq '[.[] | select(.body | test("@coderabbitai\\s+(full\\s+)?review"))] | length')  # (c)
+  --jq '[.[] | select(.body | test("@coderabbitai\\s+(full\\s+)?review\\b"; "i"))] | length')  # (c)
 ```
 
 If none of those signals is present (`cr_reviews == 0` AND `cr_requested` empty
