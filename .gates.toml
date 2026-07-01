@@ -17,7 +17,7 @@
 
   [[prep_pr.steps]]
   name = "ruff"
-  run = "ruff check --select F,E741 scripts/orchestrate-*.py scripts/planner_classify.py scripts/gate-runner.py test-orchestrate-*.py test-planner-classify.py test-gh-wrappers.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py"
+  run = "ruff check --select F,E741 scripts/orchestrate-*.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-planner-classify.py test-gh-wrappers.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py"
   skip_if_absent = "ruff"
 
   [[prep_pr.steps]]
@@ -91,6 +91,10 @@
   [[prep_pr.steps]]
   name = "test-gate-runner"
   run = "python3 test-gate-runner.py"
+
+  [[prep_pr.steps]]
+  name = "test-prefs-coverage"
+  run = "python3 test-prefs-coverage.py"
 
 [merge_pr]
 # cc-orchestrator is a stdlib-only shell/Python repo with no coverage service;
