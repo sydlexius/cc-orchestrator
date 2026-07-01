@@ -39,9 +39,19 @@
 #         the oracle is not installed, Codoki gating is skipped (falls back to the
 #         CR + CI + mergeable gates only).
 #
-#     review-blocked head=<sha8> by=<participant>
-#         CodeRabbit's latest review on HEAD is CHANGES_REQUESTED. Exit 0.
-#         Consumer next action: /handle-review.
+#     review-blocked head=<sha8> by=<login[,login...]>
+#         The latest HEAD review from ANY reviewer in the blocking set is
+#         CHANGES_REQUESTED. Exit 0. Consumer next action: /handle-review.
+#         Reviewer-agnostic (#195): not just CodeRabbit -- any bot OR human whose
+#         most-recent review on the current HEAD requests changes. The `by=` field
+#         lists every such reviewer's login. The blocking set defaults to "any
+#         reviewer"; set PR_WATCH_BLOCKING_REVIEWERS to a comma/space-separated login
+#         list to RESTRICT which reviewers can trip this terminal (e.g. to ignore a
+#         specific bot's CHANGES_REQUESTED). The quiet-period gate applies here too.
+#         NOTE: `settled` is UNCHANGED and still requires green CI + a merge-ready
+#         mergeable_state; the "stop on comment-count increment / not-necessarily-
+#         green" idea was evaluated and REJECTED (see #195) -- it would collapse the
+#         two terminals and hand /merge-pr a red PR.
 #
 #     timeout: waited <secs>s pending=<list>      [stderr]   Exit 1.
 #     setup error: <message>                      [stderr]   Exit 2.
@@ -116,9 +126,35 @@ fi
 # ---------------------------------------------------------------------------
 # Polling loop
 # ---------------------------------------------------------------------------
-# CodeRabbit is the only required reviewer. The script is silent until a terminal
-# state holds. The consumer dispatches off the single stdout line at the end.
+# CodeRabbit is the reviewer the SETTLE path is opt-in-gated on (#173). The
+# review-blocked terminal, by contrast, is reviewer-agnostic (#195). The script is
+# silent until a terminal state holds; the consumer dispatches off the single stdout
+# line at the end.
 CR_LOGIN='coderabbitai[bot]'
+
+# Blocking-reviewer set for the review-blocked terminal (#195). DEFAULT (unset or
+# empty) is reviewer-agnostic: the latest HEAD review from ANY reviewer -- bot or
+# human -- being CHANGES_REQUESTED trips review-blocked. Set
+# PR_WATCH_BLOCKING_REVIEWERS to a comma/space-separated login list to RESTRICT the
+# set (a reviewer outside it can no longer trip the terminal). The empty JSON array
+# `[]` is the "match any" sentinel consumed by the per-poll jq below.
+blocking_set_json='[]'
+if [ -n "${PR_WATCH_BLOCKING_REVIEWERS:-}" ]; then
+  # Split on commas AND whitespace, then build the login array in ONE jq pass:
+  # `[inputs | select(length > 0)]` always emits exactly one array (empty when the
+  # value reduces to zero tokens, e.g. a separator-only ",," or "   "). Deliberately
+  # NO `grep` in this pipeline -- grep exits 1 on no-match, which under `set -o
+  # pipefail` combined with a `|| echo '[]'` fallback double-emitted `[]\n[]` (a jq
+  # STREAM, not a single JSON value), breaking the per-poll `--argjson` for the whole
+  # watch and hanging it to timeout. Belt-and-suspenders: fall back to the match-any
+  # sentinel `[]` if the result is somehow not a single JSON array.
+  blocking_set_json=$(printf '%s' "$PR_WATCH_BLOCKING_REVIEWERS" \
+    | tr ',' ' ' | tr -s ' \t' '\n' \
+    | jq -Rn '[inputs | select(length > 0)]' 2>/dev/null || echo '[]')
+  if ! printf '%s' "$blocking_set_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    blocking_set_json='[]'
+  fi
+fi
 
 # Quiet-period allow-list: bots whose late-trickling comments would change a
 # triager's view. CR posts findings as inline comments seconds AFTER its CI
@@ -296,15 +332,31 @@ while true; do
         [.[] | select(.user.login == $cr and .submitted_at >= $head_date)]
         | sort_by(.submitted_at) | last | .state // ""')
 
-  # Review-blocked is a distinct terminal: the author must address feedback
-  # before merge is possible. The consumer should dispatch to /handle-review
-  # instead of waiting for a settle that cannot happen. Apply the quiet-period
-  # gate here too -- CR can post inline findings AFTER setting CHANGES_REQUESTED,
-  # so a premature emission would hand the consumer a half-formed triage list.
-  if [ "$cr_latest_state" = "CHANGES_REQUESTED" ]; then
+  # Review-blocked is a distinct, reviewer-agnostic terminal (#195): the author
+  # must address feedback before merge is possible, so the consumer dispatches to
+  # /handle-review instead of waiting for a settle that cannot happen. Compute the
+  # blocking reviewers = every reviewer whose LATEST review on the current HEAD is
+  # CHANGES_REQUESTED, restricted to the blocking set when one is configured. Uses
+  # the same committer-date filter as the CR settle check (a rebase rewrites review
+  # commit_ids, so submitted_at >= head_committer_date is the safe "reviewed the
+  # current state" test); group_by/last picks each reviewer's most-recent review so a
+  # superseding APPROVED clears an earlier CHANGES_REQUESTED. Apply the quiet-period
+  # gate here too -- a reviewer can post inline findings AFTER setting
+  # CHANGES_REQUESTED, so a premature emission would hand a half-formed triage list.
+  blocked_by=$(echo "$reviews_json" | jq -r \
+    --arg head_date "$head_committer_date" \
+    --argjson allow "$blocking_set_json" '
+      [ .[] | select((.user.login // "") != "" and .submitted_at >= $head_date) ]
+      | group_by(.user.login)
+      | map(sort_by(.submitted_at) | last)
+      | map(select(.state == "CHANGES_REQUESTED"))
+      | map(.user.login)
+      | if ($allow | length) > 0 then map(select(. as $l | $allow | index($l))) else . end
+      | join(",")' 2>/dev/null || echo "")
+  if [ -n "$blocked_by" ]; then
     cur_bot_count=$(count_bot_activity)
     if [ -n "$prev_bot_count" ] && [ "$cur_bot_count" = "$prev_bot_count" ]; then
-      echo "review-blocked head=${cur_head:0:8} by=cr"
+      echo "review-blocked head=${cur_head:0:8} by=${blocked_by}"
       exit 0
     fi
     prev_bot_count="$cur_bot_count"

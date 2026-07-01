@@ -98,7 +98,7 @@ emit(PULL)
 
 def run(*, labels="[]", checks="[]", reviews="[]", codoki_rc=0,
         requested_reviewers='{"users":[]}', comments="[]", issue_comments="[]",
-        timeout_secs=2, expect_fast=True):
+        timeout_secs=2, expect_fast=True, blocking_reviewers=None):
     with tempfile.TemporaryDirectory() as td:
         bindir = os.path.join(td, "bin"); os.makedirs(bindir)
         home = os.path.join(td, "home")
@@ -129,6 +129,8 @@ def run(*, labels="[]", checks="[]", reviews="[]", codoki_rc=0,
         env["REQUESTED_REVIEWERS_JSON"] = requested_reviewers
         env["CODOKI_RC"] = str(codoki_rc)
         env["PR_WATCH_POLL_INTERVAL"] = "0"
+        if blocking_reviewers is not None:
+            env["PR_WATCH_BLOCKING_REVIEWERS"] = blocking_reviewers
 
         p = subprocess.run(["bash", SCRIPT, "123", "owner/repo", str(timeout_secs)],
                            env=env, capture_output=True, text=True, timeout=30)
@@ -139,6 +141,19 @@ CR_APPROVED = '[{"user":{"login":"coderabbitai[bot]"},"state":"APPROVED","submit
 CR_DISMISSED = '[{"user":{"login":"coderabbitai[bot]"},"state":"DISMISSED","submitted_at":"2026-06-18T01:00:00Z"}]'
 SKIP_CHECK = '[{"name":"CodeRabbit","state":"SUCCESS","description":"Review skipped"}]'
 GREEN_CHECK = '[{"name":"ci","state":"SUCCESS","description":"Build passed"}]'
+
+# review-blocked fixtures (#195): the terminal must fire on ANY reviewer's latest
+# HEAD review being CHANGES_REQUESTED, not just CodeRabbit. submitted_at is >= the
+# stub COMMITTER_DATE so the head-date filter keeps them.
+CR_CHANGES = '[{"user":{"login":"coderabbitai[bot]"},"state":"CHANGES_REQUESTED","submitted_at":"2026-06-18T01:00:00Z"}]'
+GREPTILE_CHANGES = '[{"user":{"login":"greptile-apps[bot]"},"state":"CHANGES_REQUESTED","submitted_at":"2026-06-18T01:00:00Z"}]'
+HUMAN_CHANGES = '[{"user":{"login":"octocat"},"state":"CHANGES_REQUESTED","submitted_at":"2026-06-18T01:00:00Z"}]'
+MULTI_CHANGES = ('[{"user":{"login":"coderabbitai[bot]"},"state":"CHANGES_REQUESTED","submitted_at":"2026-06-18T01:00:00Z"},'
+                 '{"user":{"login":"octocat"},"state":"CHANGES_REQUESTED","submitted_at":"2026-06-18T01:30:00Z"}]')
+# A reviewer's earlier CHANGES_REQUESTED superseded by a later APPROVED on HEAD must
+# NOT block (latest-per-reviewer wins).
+SUPERSEDED_CHANGES = ('[{"user":{"login":"octocat"},"state":"CHANGES_REQUESTED","submitted_at":"2026-06-18T01:00:00Z"},'
+                      '{"user":{"login":"octocat"},"state":"APPROVED","submitted_at":"2026-06-18T02:00:00Z"}]')
 
 CR_REQUESTED = '{"users":[{"login":"coderabbitai[bot]"}]}'
 TRIGGER_COMMENT = '[{"body":"please @coderabbitai review this PR"}]'
@@ -218,6 +233,60 @@ def main():
     rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews=CR_APPROVED, codoki_rc=0)
     check("CR APPROVED + Codoki settled -> exit 0", rc == 0)
     check("emits 'settled' line", "settled head=" in out)
+
+    print("== #195: CR CHANGES_REQUESTED -> review-blocked (back-compat) ==")
+    rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews=CR_CHANGES)
+    check("CR CHANGES_REQUESTED -> exit 0", rc == 0)
+    check("emits 'review-blocked' line", "review-blocked head=" in out)
+    check("names CR in by=", "coderabbitai[bot]" in out)
+
+    print("== #195: non-CR bot (greptile) CHANGES_REQUESTED -> review-blocked ==")
+    rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews=GREPTILE_CHANGES)
+    check("greptile CHANGES_REQUESTED -> exit 0", rc == 0)
+    check("emits 'review-blocked' line", "review-blocked head=" in out)
+    check("names greptile in by=", "greptile-apps[bot]" in out)
+
+    print("== #195: HUMAN reviewer CHANGES_REQUESTED -> review-blocked (reviewer-agnostic) ==")
+    rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews=HUMAN_CHANGES)
+    check("human CHANGES_REQUESTED -> exit 0", rc == 0)
+    check("emits 'review-blocked' line", "review-blocked head=" in out)
+    check("names the human reviewer in by=", "octocat" in out)
+
+    print("== #195: MULTIPLE reviewers CHANGES_REQUESTED -> review-blocked names all ==")
+    rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews=MULTI_CHANGES)
+    check("multi CHANGES_REQUESTED -> exit 0", rc == 0)
+    check("names both reviewers in by=", "coderabbitai[bot]" in out and "octocat" in out)
+
+    print("== #195: superseded CHANGES_REQUESTED (later APPROVED on HEAD) -> settles, not blocked ==")
+    rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews=SUPERSEDED_CHANGES)
+    check("latest-per-reviewer APPROVED -> exit 0", rc == 0)
+    check("emits 'settled' (not review-blocked)", "settled head=" in out and "review-blocked" not in out)
+
+    print("== #195: PR_WATCH_BLOCKING_REVIEWERS restricts the set (excluded reviewer does NOT block) ==")
+    # Restrict blocking to CR only; a human CHANGES_REQUESTED is then NOT a blocker,
+    # so with green CI + clean mergeable the PR settles instead of routing to handle-review.
+    rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews=HUMAN_CHANGES,
+                       blocking_reviewers="coderabbitai[bot]")
+    check("restricted set excludes human -> exit 0", rc == 0)
+    check("emits 'settled' (human not in blocking set)", "settled head=" in out and "review-blocked" not in out)
+
+    print("== #195: PR_WATCH_BLOCKING_REVIEWERS restriction still fires for an IN-set reviewer ==")
+    rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews=CR_CHANGES,
+                       blocking_reviewers="coderabbitai[bot], greptile-apps[bot]")
+    check("in-set CR CHANGES_REQUESTED -> exit 0", rc == 0)
+    check("emits 'review-blocked' line", "review-blocked head=" in out)
+
+    print("== #195 (hostile-review regression): separator-only env must NOT hang -> match-any fallback ==")
+    # A separator-only value (",," / spaces) reduces to zero tokens. It must parse to
+    # the match-any sentinel [] (a single valid JSON array), NOT double-emit "[]\n[]"
+    # which broke --argjson every poll and hung the watch to timeout. With CR
+    # CHANGES_REQUESTED present, the fallback means review-blocked STILL fires.
+    for junk in (",,", "   ", " , , "):
+        rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews=CR_CHANGES,
+                           blocking_reviewers=junk, timeout_secs=2)
+        check(f"separator-only {junk!r} -> exit 0 (no hang)", rc == 0)
+        check(f"separator-only {junk!r} -> emits 'review-blocked'", "review-blocked head=" in out)
+        check(f"separator-only {junk!r} -> not a timeout", "timeout" not in err)
 
     print()
     if FAILS:

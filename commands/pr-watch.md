@@ -15,7 +15,7 @@ Wait for a pull request to reach a TERMINAL state. The script is silent during t
 
    Exit 0. Next action: `/merge-pr <pr>`.
 
-2. **`review-blocked head=<sha8> by=cr`** -- CodeRabbit's latest review on HEAD is CHANGES_REQUESTED. Distinct terminal because the next action differs (address feedback, not merge). Exit 0. Next action: `/handle-review <pr>`.
+2. **`review-blocked head=<sha8> by=<login[,login...]>`** -- the latest HEAD review from ANY reviewer (bot or human) is CHANGES_REQUESTED. Reviewer-agnostic (#195): not just CodeRabbit; the `by=` field lists every such reviewer's login. Distinct terminal because the next action differs (address feedback, not merge). Exit 0. Next action: `/handle-review <pr>`. The blocking set defaults to "any reviewer"; set `PR_WATCH_BLOCKING_REVIEWERS` to a comma/space-separated login list to restrict which reviewers can trip this terminal. `settled` is unchanged (still green + merge-ready); the rejected "stop on comment-count increment / not-necessarily-green" alternative is documented in #195.
 
 3. **`timeout: waited <secs>s pending=<list>`** (stderr) -- timeout elapsed. Exit 1. Re-arm with a longer timeout or check `gh pr view <pr>` manually.
 
