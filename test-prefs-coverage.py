@@ -219,6 +219,14 @@ def main():
     rc, out = run(r)
     check("parse error -> exit 2", rc == 2)
 
+    # 10. malformed-but-valid TOML shape: [[pref]] is not an array of tables ->
+    #     CONFIG exit 2 (fail closed, not a crash/exit 1).
+    r = setup({".prefs.toml": 'pref = "notatable"\n', "web/templates/x.templ": "o\n"},
+              {"web/templates/x.templ": "n\n"})
+    repos.append(r)
+    rc, out = run(r)
+    check("malformed [[pref]] shape -> CONFIG exit 2 (fail closed)", rc == 2 and "CONFIG" in out)
+
     for r in repos:
         shutil.rmtree(r, ignore_errors=True)
 

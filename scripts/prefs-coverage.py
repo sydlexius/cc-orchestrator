@@ -30,8 +30,13 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
     sys.exit(2)
 
 
-def sh(args):
-    return subprocess.run(args, capture_output=True, text=True)
+def sh(args, timeout=120):
+    # Bounded so a hung git op or a repo-defined list_cmd fails fast (rc 124)
+    # instead of burning the whole job budget.
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, "", f"timed out after {timeout}s")
 
 
 def resolve_base():
@@ -69,8 +74,20 @@ def main():
         print(f"prefs-coverage: .prefs.toml parse error: {e}", file=sys.stderr)
         return 2
 
+    # Fail CLOSED on malformed-but-valid TOML shapes. A raw crash would exit 1 and
+    # masquerade as a MISSING finding; config/shape errors must be a clean exit 2.
     prefs = cfg.get("pref", [])
     exempts = cfg.get("exempt", [])
+    source = cfg.get("source", {})
+    if not isinstance(prefs, list) or not all(isinstance(p, dict) for p in prefs):
+        print("prefs-coverage: CONFIG -- [[pref]] must be an array of tables.", file=sys.stderr)
+        return 2
+    if not isinstance(exempts, list) or not all(isinstance(e, dict) for e in exempts):
+        print("prefs-coverage: CONFIG -- [[exempt]] must be an array of tables.", file=sys.stderr)
+        return 2
+    if not isinstance(source, dict):
+        print("prefs-coverage: CONFIG -- [source] must be a table.", file=sys.stderr)
+        return 2
     if not prefs:
         print("prefs-coverage: .prefs.toml has no [[pref]] entries -- nothing to check.")
         return 0
@@ -78,9 +95,11 @@ def main():
     # DRIFT guard (best-effort): every [[pref]].key must exist in [source]. Only
     # enforced when [source].list_cmd emits the authoritative keys; otherwise the
     # human-read [source].file is a reviewer concern, not machine-checkable here.
-    src = cfg.get("source", {})
-    if src.get("list_cmd"):
-        r = sh(["bash", "-c", src["list_cmd"]])
+    if source.get("list_cmd"):
+        r = sh(["bash", "-c", source["list_cmd"]])
+        if r.returncode == 124:
+            print("prefs-coverage: CONFIG -- [source].list_cmd timed out.", file=sys.stderr)
+            return 2
         if r.returncode == 0:
             known = {x.strip() for x in r.stdout.splitlines() if x.strip()}
             # Only drift-check prefs that HAVE a key; a keyless [[pref]] is a CONFIG

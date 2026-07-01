@@ -226,7 +226,7 @@ verify = "data-motion|prefers-reduced-motion"
 severity = "medium"
 
 [[exempt]]
-surface = "web/templates/*errors*.templ"
+surface = "web/templates/errors/*.templ"
 prefs   = ["density", "thumbnail_size"]
 reason  = "static error pages; no spacing or thumbnail grid to vary"
 ```
