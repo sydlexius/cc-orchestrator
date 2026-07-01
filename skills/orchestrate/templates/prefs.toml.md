@@ -67,9 +67,9 @@ are simply OMITTED -- they have no rendered surface to cover.
 |-------------------|-------------------------------|--------------|--------------------------------|
 | `data-attr`       | An ancestor sets `[data-x]`; the surface consumes the driven CSS var | stillwater `density` | `mechanism = "[data-density]; consume var(--sw-density-*)"`, `verify = "var\\(--sw-density-"` |
 | `css-var`         | The surface consumes a CSS custom property directly | stillwater `bg_opacity` | `mechanism = "var(--sw-glass-bg)"`, `verify = "var\\(--sw-glass-bg"` |
-| `class`           | The surface carries a modifier class the pref toggles | stillwater `theme` (`.dark`) | `mechanism = ".dark selectors + var(--sw-content-*)"`, `verify = "\\bdark\\b\|var\\(--sw-content-"` |
+| `class`           | The surface carries a modifier class the pref toggles | stillwater `theme` (`.dark`) | `mechanism = ".dark selectors + var(--sw-content-*)"`, `verify = "var\\(--sw-content-"` |
 | `tailwind-variant`| Every relevant utility has a variant counterpart | media-reaper `theme` | `mechanism = "every color utility has a dark: counterpart"`, `verify = "dark:"` |
-| `store-selector`  | A component reads a store/state selector and derives output (code-grep; WEAKER static signal -- lean on the charter's rendered pass) | genogram `density` | `mechanism = "reads store.spacing; derives sizes"`, `verify = "store\\.spacing\|useSpacing"` |
+| `store-selector`  | A component reads a store/state selector and derives output (code-grep; WEAKER static signal -- lean on the charter's rendered pass) | genogram `density` | `mechanism = "reads store.spacing; derives sizes"`, `verify = "store\\.spacing"` |
 
 ---
 
