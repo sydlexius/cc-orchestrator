@@ -12,6 +12,13 @@ after all fixes are complete**. Never push per-comment.
 This command targets bot reviewer comments (logins ending with `[bot]`). For human
 reviewer comments, apply the same triage and fix discipline manually.
 
+**Which reviewers to expect.** **Codoki** (`codoki-pr-intelligence[bot]`) is the
+**primary auto-reviewer** -- it reviews every push on its own, so it is the
+reviewer to settle on by default. **CodeRabbit** is **opt-in / maintainer-allocated**:
+org-wide CR auto-review is OFF, so a CR review exists only when the maintainer has
+already triggered one. This command NEVER triggers a CR pass (see Step 1.25); a
+missing CR review is a normal state, not a problem to fix.
+
 **Codecov** (`codecov[bot]`) is **not** treated as a reviewer bot by this command.
 This applies only when codecov is active on the target repo; a repo with no
 coverage service posts no such comments and the whole coverage path is a no-op.
@@ -71,27 +78,47 @@ If no PR found, stop: "No open PR found for this branch."
 
 ---
 
-## Step 1.25 -- Ensure CodeRabbit review exists
+## Step 1.25 -- Determine whether CodeRabbit is expected (NEVER trigger it)
 
-CodeRabbit does not always automatically review PRs (e.g. when a draft is converted
-to ready), so its review may be missing entirely.
+**Triggering a CodeRabbit review is the maintainer's exclusive purview.** This
+command MUST NOT post `@coderabbitai review` / `@coderabbitai full review` (or
+any other bot-review trigger) under any circumstance -- not when a review is
+missing, not "to be safe", never. CR auto-review is OFF org-wide, so CR is
+**opt-in**: it reviews only when the maintainer has already allocated a pass.
+**Codoki** (`codoki-pr-intelligence[bot]`) is the primary auto-reviewer and
+reviews every PR on its own, so a missing CR review is a normal state, not a
+problem to fix.
 
-Check whether CodeRabbit has submitted any review on this PR:
+Detect whether a CR review is *expected* -- so Step 1.5 knows whether to wait
+for one -- **without triggering anything**:
 
 ```bash
-cr_reviews=$(gh api "repos/$repo/pulls/$pr_number/reviews" --jq '[.[] | select(.user.login == "coderabbitai[bot]")] | length')
+# CR is EXPECTED if ANY of: (a) it already reviewed this PR, (b) it is a
+# requested reviewer, or (c) a maintainer-posted `@coderabbitai review` trigger
+# comment already exists. This is read-only detection -- it posts nothing.
+#
+# All three use the REST API and match the `[bot]`-suffixed login, exactly like
+# the canonical scripts/pr-watch.sh (#173). Do NOT use `gh pr view --json` here:
+# its GraphQL logins drop the `[bot]` suffix (`coderabbitai`, not
+# `coderabbitai[bot]`), so a `[bot]`-suffixed match would silently never fire.
+cr_reviews=$(gh api "repos/$repo/pulls/$pr_number/reviews" \
+  --jq '[.[] | select(.user.login == "coderabbitai[bot]")] | length')            # (a)
+cr_requested=$(gh api "repos/$repo/pulls/$pr_number/requested_reviewers" \
+  --jq '[.users[].login] | index("coderabbitai[bot]") // empty')                 # (b)
+cr_triggered=$(gh api "repos/$repo/issues/$pr_number/comments" \
+  --jq '[.[] | select(.body | test("@coderabbitai\\s+(full\\s+)?review\\b"; "i"))] | length')  # (c)
 ```
 
-If `cr_reviews == 0`, trigger a full review:
+If none of those signals is present (`cr_reviews == 0` AND `cr_requested` empty
+AND `cr_triggered == 0`), CR is **not expected**: do NOT wait for it
+in Step 1.5 and do NOT trigger it. Triage whatever reviews already exist (Codoki
+as primary; CR only if it already reviewed). If a CR pass would help, you may
+note "a CR pass is available -- the maintainer can allocate one" and stop; never
+post the trigger yourself.
 
-```bash
-gh pr comment "$pr_number" --body "@coderabbitai review"
-```
-
-Print: "CodeRabbit review was missing -- triggered via @coderabbitai review."
-
-This must happen before the wait loop in Step 1.5 so the cooldown captures CodeRabbit's
-incoming comments.
+This mirrors `pr-watch.sh`'s opt-in CR logic (#173): waiting for -- or
+manufacturing -- a review that will never land is exactly the idle-hang that fix
+removed.
 
 ---
 
@@ -103,11 +130,15 @@ re-triaging when late comments arrive.
 
 **Readiness check:** A PR is ready for triage when BOTH conditions hold across two
 consecutive polls:
-1. No pending review requests for bot users (CodeRabbit)
+1. No pending review requests for bot users **that are expected** -- i.e. only
+   wait on CodeRabbit when Step 1.25 found it *expected* (already reviewed /
+   requested / maintainer-triggered). When CR is not expected, do not count it as
+   pending; Codoki and any other already-present bot are the reviewers to settle.
 2. Unreplied bot comment count is stable (same count on two consecutive checks)
 
-**Geometric cooldown:** After triggering reviews (or if reviews were already triggered),
-poll with increasing intervals: **15s → 30s → 60s → 120s**. At each interval:
+**Geometric cooldown:** Reviews are never triggered by this command (Step 1.25);
+this loop only *waits* for reviews already in flight. Poll with increasing
+intervals: **15s → 30s → 60s → 120s**. At each interval:
 
 ```bash
 pending=$(bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh --pending-only "$pr_number")
@@ -705,4 +736,5 @@ Assemble and print:
 - Resolved: CR resolve $cr_status; GraphQL threads (Copilot + Greptile + Codoki) $graphql_resolve_status
 ```
 
-CodeRabbit will review the push automatically.
+Codoki auto-reviews the push. CodeRabbit reviews only if the maintainer has
+allocated a pass -- this command never triggers one.

@@ -18,6 +18,5 @@ You operate against an EXISTING worktree. NEVER `cd` into it from Bash: an auto-
 ## Boundary (charter)
 - You may run builds/tests and Read. You CANNOT push, open/modify a PR, edit code, or merge.
 - On RED, hand the failing gate + log excerpt to the lead, who routes the fix to a PR-blind implementer. Do not fix it yourself (keep author and gate independent).
-- Skip any local CodeRabbit step unless the maintainer explicitly asks (cloud CR on push is the default reviewer).
 - HUMAN PROMPTS: never emit an AskUserQuestion or human-facing prompt - MESSAGE THE LEAD (sole human-facing channel; see SKILL.md invariant).
 - DELEGATE-OR-SUMMARIZE: keep your window lean - the long test/log output goes to a file (tee) and you report only the decision-relevant excerpt; offload any heavy investigation to a one-shot subagent that returns conclusions (see SKILL.md "Context discipline").

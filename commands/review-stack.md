@@ -6,7 +6,7 @@ allowed-tools: ["Bash", "Glob", "Grep", "Read", "Edit", "Write", "Agent", "Task"
 
 # Review Stack
 
-Find all PRs in a stack that have pending CodeRabbit reviews, then process them in
+Find all PRs in a stack that have pending bot reviews, then process them in
 dependency order using `/handle-review` discipline. Fixes cascade: after fixing a
 base PR, restack before handling the next PR up the chain.
 
@@ -41,7 +41,7 @@ if [ "$ARGUMENTS" = "--list" ]; then
 fi
 ```
 
-**Parallelism strategy:** Data gathering (trigger, poll, fetch, pre-triage) is parallelized
+**Parallelism strategy:** Data gathering (poll, fetch, pre-triage) is parallelized
 across PRs using foreground agents. Fixing is serial because base PR fixes cascade into
 dependent PRs via rebase.
 
@@ -114,7 +114,7 @@ Save the original branch name so you can return to it at the end.
 
 ---
 
-## Step 2 -- Parallel: trigger reviews, poll readiness, fetch comments
+## Step 2 -- Parallel: poll readiness, fetch comments
 
 After identifying the stack, launch **one foreground Agent per PR** in a single message
 (all agents in parallel). Each agent performs the full data-gathering pipeline for its PR.
@@ -125,22 +125,15 @@ Each agent receives this task:
 
 > You are gathering bot review data for PR #<number> in repo <repo>.
 >
-> **Step A -- Trigger CodeRabbit review if needed (with rate-limit awareness):**
+> **Step A -- NEVER trigger a CodeRabbit review.**
 >
-> ```bash
-> base=$(gh pr view <number> --json baseRefName --jq .baseRefName)
-> default=$(gh api "repos/<repo>" --jq .default_branch)
-> if [ "$base" != "$default" ]; then
->   cr_count=$(gh api "repos/<repo>/pulls/<number>/reviews" --paginate \
->     --jq '[.[] | select(.user.login == "coderabbitai[bot]")] | length')
->   if [ "$cr_count" -eq 0 ]; then
->     bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh --trigger-cr <number> <repo>
->   fi
-> fi
-> ```
->
-> The `--trigger-cr` flag checks for a dangling rate limit message, waits the
-> remaining time if needed, then posts `@coderabbitai review`.
+> Triggering a CR review is the maintainer's exclusive purview; this command
+> must never post `@coderabbitai review` (or invoke `--trigger-cr`). CR
+> auto-review is OFF org-wide, so CR is opt-in/maintainer-allocated -- a stacked
+> PR with no CR review is a normal state, not something to fix. **Codoki**
+> (`codoki-pr-intelligence[bot]`) is the primary auto-reviewer and reviews every
+> push on its own. Poll for and triage whatever reviews already exist; if a CR
+> pass would help, note it and let the maintainer allocate one.
 >
 > **Step B -- Poll for review readiness (geometric cooldown):**
 > Poll at 15s, 30s, 60s, 120s intervals. At each interval check:
