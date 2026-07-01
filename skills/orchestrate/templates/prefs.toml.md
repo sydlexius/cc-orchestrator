@@ -39,7 +39,7 @@ still exists.
 
 | Key        | Type   | Meaning |
 |------------|--------|---------|
-| `list_cmd` | string | (optional) A command that emits the authoritative pref keys, one per line (e.g. a codegen tool with a `--keys` flag). Preferred: it can never drift. |
+| `list_cmd` | array of string | (optional) An argv array run WITHOUT a shell (no `bash -c`, so a repo-defined command cannot inject shell metacharacters into CI) that emits the authoritative pref keys, one per line, e.g. `["go", "run", "./cmd/gen-prefs", "--keys"]`. Preferred over `file`: it can never drift. Bounded by a timeout; a non-string-array value is a CONFIG error. |
 | `file`     | string | (optional) A file a reviewer reads for the pref definitions (a schema, a typed model/registry, a settings struct). Human-read fallback when there is no `list_cmd`. |
 | `docs`     | string | (optional) A generated human reference (e.g. a `preferences.md`). |
 

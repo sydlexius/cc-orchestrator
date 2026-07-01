@@ -175,7 +175,7 @@ def main():
     # 6. DRIFT: a [[pref]].key absent from [source].list_cmd output
     drift_manifest = (
         "[source]\n"
-        "list_cmd = \"printf 'theme\\\\nfont_size\\\\n'\"\n\n"
+        'list_cmd = ["printf", "theme\\nfont_size\\n"]\n\n'  # argv, no shell
         + MANIFEST  # density is NOT in {theme, font_size}
     )
     r = setup({".prefs.toml": drift_manifest, "web/templates/logs.templ": "old\n"},
@@ -187,7 +187,7 @@ def main():
     # 7. no drift when the key IS in [source]
     ok_src = (
         "[source]\n"
-        "list_cmd = \"printf 'density\\\\ntheme\\\\n'\"\n\n"
+        'list_cmd = ["printf", "density\\ntheme\\n"]\n\n'  # argv, no shell
         + MANIFEST
     )
     r = setup({".prefs.toml": ok_src, "web/templates/logs.templ": "old\n"},
@@ -226,6 +226,14 @@ def main():
     repos.append(r)
     rc, out = run(r)
     check("malformed [[pref]] shape -> CONFIG exit 2 (fail closed)", rc == 2 and "CONFIG" in out)
+
+    # 11. list_cmd as a non-array (a shell string) -> CONFIG exit 2 (argv required; no shell)
+    bad_lc = '[source]\nlist_cmd = "printf density"\n\n' + MANIFEST
+    r = setup({".prefs.toml": bad_lc, "web/templates/logs.templ": "old\n"},
+              {"web/templates/logs.templ": HONORING})
+    repos.append(r)
+    rc, out = run(r)
+    check("list_cmd as a string (not argv array) -> CONFIG exit 2", rc == 2 and "CONFIG" in out)
 
     for r in repos:
         shutil.rmtree(r, ignore_errors=True)

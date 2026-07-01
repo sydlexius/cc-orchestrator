@@ -95,8 +95,17 @@ def main():
     # DRIFT guard (best-effort): every [[pref]].key must exist in [source]. Only
     # enforced when [source].list_cmd emits the authoritative keys; otherwise the
     # human-read [source].file is a reviewer concern, not machine-checkable here.
-    if source.get("list_cmd"):
-        r = sh(["bash", "-c", source["list_cmd"]])
+    lc = source.get("list_cmd")
+    if lc is not None:
+        # Run WITHOUT a shell: list_cmd is an argv array of strings, executed with
+        # shell=False (no `bash -c`). A PR-modified .prefs.toml therefore cannot inject
+        # shell metacharacters (pipes / redirects / ; / $()) into CI (#201). Strict type
+        # validation fails closed (exit 2) rather than crashing on a bad shape.
+        if not (isinstance(lc, list) and lc and all(isinstance(x, str) for x in lc)):
+            print("prefs-coverage: CONFIG -- [source].list_cmd must be a non-empty array "
+                  "of strings (argv; run without a shell).", file=sys.stderr)
+            return 2
+        r = sh(lc)
         if r.returncode == 124:
             print("prefs-coverage: CONFIG -- [source].list_cmd timed out.", file=sys.stderr)
             return 2
