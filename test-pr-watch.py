@@ -154,6 +154,20 @@ MULTI_CHANGES = ('[{"user":{"login":"coderabbitai[bot]"},"state":"CHANGES_REQUES
 # NOT block (latest-per-reviewer wins).
 SUPERSEDED_CHANGES = ('[{"user":{"login":"octocat"},"state":"CHANGES_REQUESTED","submitted_at":"2026-06-18T01:00:00Z"},'
                       '{"user":{"login":"octocat"},"state":"APPROVED","submitted_at":"2026-06-18T02:00:00Z"}]')
+# Supersession must survive INTERLEAVING: octocat CHANGES_REQUESTED, then ANOTHER
+# reviewer's event, then octocat APPROVED -- input NOT sorted by login. jq's group_by
+# collates all rows of a login into one group regardless of input order (verified:
+# group_by(.user.login) on this yields [[octocat,octocat],[coderabbitai]]), so
+# map(sort_by(.submitted_at)|last) still picks octocat's APPROVED -> no block. This is
+# the exact scenario a review flagged as a false "group_by needs pre-sort" bug (#205).
+INTERLEAVED_SUPERSEDED = ('[{"user":{"login":"octocat"},"state":"CHANGES_REQUESTED","submitted_at":"2026-06-18T01:00:00Z"},'
+                          '{"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED","submitted_at":"2026-06-18T01:15:00Z"},'
+                          '{"user":{"login":"octocat"},"state":"APPROVED","submitted_at":"2026-06-18T02:00:00Z"}]')
+# Same interleaving but octocat's LATEST is CHANGES_REQUESTED -> still blocks, and the
+# collated group means by= lists octocat exactly ONCE (no duplicate login).
+INTERLEAVED_STILL_BLOCKED = ('[{"user":{"login":"octocat"},"state":"CHANGES_REQUESTED","submitted_at":"2026-06-18T01:00:00Z"},'
+                             '{"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED","submitted_at":"2026-06-18T01:15:00Z"},'
+                             '{"user":{"login":"octocat"},"state":"CHANGES_REQUESTED","submitted_at":"2026-06-18T02:00:00Z"}]')
 
 CR_REQUESTED = '{"users":[{"login":"coderabbitai[bot]"}]}'
 TRIGGER_COMMENT = '[{"body":"please @coderabbitai review this PR"}]'
@@ -275,6 +289,19 @@ def main():
                        blocking_reviewers="coderabbitai[bot], greptile-apps[bot]")
     check("in-set CR CHANGES_REQUESTED -> exit 0", rc == 0)
     check("emits 'review-blocked' line", "review-blocked head=" in out)
+
+    print("== #205 (Codoki rebuttal): interleaved supersession clears the block (group_by collates) ==")
+    # octocat CR -> other reviewer -> octocat APPROVED, unsorted by login. group_by
+    # collates octocat's rows into one group so the later APPROVED wins -> settles.
+    rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews=INTERLEAVED_SUPERSEDED)
+    check("interleaved latest APPROVED -> exit 0", rc == 0)
+    check("emits 'settled' (not review-blocked)", "settled head=" in out and "review-blocked" not in out)
+
+    print("== #205 (Codoki rebuttal): interleaved still-blocked -> by= lists the login ONCE ==")
+    rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews=INTERLEAVED_STILL_BLOCKED)
+    check("interleaved latest CHANGES_REQUESTED -> exit 0", rc == 0)
+    check("emits 'review-blocked'", "review-blocked head=" in out)
+    check("by= lists octocat exactly once (no dup from split groups)", out.count("octocat") == 1)
 
     print("== #195 (hostile-review regression): separator-only env must NOT hang -> match-any fallback ==")
     # A separator-only value (",," / spaces) reduces to zero tokens. It must parse to
