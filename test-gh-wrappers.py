@@ -150,13 +150,10 @@ def main():
     # HOSTILE: a newline-bearing comment-id must be REJECTED whole (line-oriented bypass).
     rc, invoked = run_wrapper("gh-comment.sh", ["reply", "12", "5\n../../../repos/x/y/issues/1", "hi"], env)
     check("gh-comment reply rejects newline-bearing comment-id (rc2, no gh call)", rc == 2 and invoked == [])
-    # trigger-cr
-    rc, invoked = run_wrapper("gh-comment.sh", ["trigger-cr", "abc"], env)
-    check("gh-comment trigger-cr refuses non-numeric pr (rc2, no gh call)", rc == 2 and invoked == [])
+    # trigger-cr REMOVED (#192): the dead CR-trigger subcommand is now an unknown subcommand
+    # (exclusive-purview rule -- no agent-accessible CR trigger). It must make no gh call.
     rc, invoked = run_wrapper("gh-comment.sh", ["trigger-cr", "12"], env)
-    check("gh-comment trigger-cr valid -> POST issues comment with fixed CR body",
-          rc == 0 and "api -X POST repos/o/r/issues/12/comments" in " ".join(invoked)
-          and "body=@coderabbitai review" in " ".join(invoked))
+    check("gh-comment trigger-cr removed -> rejected, no gh call", rc != 0 and invoked == [])
     # inline (needs a HEAD sha; run inside this repo so git rev-parse HEAD works)
     for bad in (["inline", "abc", "--file", "a.py", "--line", "3", "hi"],
                 ["inline", "12", "--line", "3", "hi"],                       # no --file

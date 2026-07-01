@@ -18,6 +18,12 @@
 #                          Use ONLY after the 3-step gate: hostile review -> file
 #                          the issue -> drain (so #N already exists). Refuses if the
 #                          entry is missing or already drained.
+#   drain <entry> --killed [--issue N] --verdict "KILLED: <reason>"
+#                          KILLED/decline path (#197): a hostile review or the
+#                          maintainer rejected the entry, so no issue is filed.
+#                          --issue is OPTIONAL (numeric if supplied); writes a
+#                          distinct `DRAINED (KILLED) ...` breadcrumb. --verdict
+#                          still required (the drop reason).
 #   list                   List inbox/ entries (chronological via the ts prefix),
 #                          one per line. NEVER lists drained/.
 #
@@ -123,20 +129,33 @@ case "$sub" in
 
   drain)
     entry="${1:-}"
-    [ -n "$entry" ] || die "drain: usage: drain <entry> --issue N --verdict <text>"
+    [ -n "$entry" ] || die "drain: usage: drain <entry> --issue N --verdict <text> (or --killed [--issue N] --verdict <text>)"
     shift
     issue=""
     verdict=""
+    killed=0
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --issue) issue="${2:-}"; shift 2 ;;
         --verdict) verdict="${2:-}"; shift 2 ;;
-        *) die "drain: unknown arg '$1' (expected --issue N --verdict <text>)" ;;
+        --killed) killed=1; shift ;;
+        *) die "drain: unknown arg '$1' (expected --issue N --verdict <text>, or --killed --verdict <text>)" ;;
       esac
     done
-    case "$issue" in
-      ''|*[!0-9]*) die "drain: --issue must be a numeric issue number" ;;
-    esac
+    # KILLED/decline path (#197): a hostile review or the maintainer rejected the
+    # entry, so NO issue is filed -- --issue is OPTIONAL (numeric only if supplied).
+    # The normal issue-filed path is UNCHANGED: --issue required AND numeric. An
+    # explicit --killed flag (not a KILLED: verdict prefix) gates the relaxation, so a
+    # mistyped verdict can never silently drop the numeric-issue requirement.
+    if [ "$killed" -eq 1 ]; then
+      case "$issue" in
+        *[!0-9]*) die "drain: --issue must be numeric when supplied (--killed)" ;;
+      esac
+    else
+      case "$issue" in
+        ''|*[!0-9]*) die "drain: --issue must be a numeric issue number (or pass --killed for a rejection)" ;;
+      esac
+    fi
     [ -n "$verdict" ] || die "drain: --verdict <text> is required"
     # Reject path traversal: <entry> must be a bare inbox filename.
     case "$entry" in
@@ -168,9 +187,23 @@ case "$sub" in
       die "drain: '$entry' must be a single-link regular file (hardlink rejected)"
     fi
     # The claim is private now: append the breadcrumb, then move to cold storage.
-    printf '\nDRAINED -> #%s [%s]\n' "$issue" "$verdict" >>"$claim"
+    # Distinct breadcrumb for a KILLED drain so the drained/ audit record cannot be
+    # confused with an issue-filed one (an optional numeric --issue is still recorded).
+    if [ "$killed" -eq 1 ]; then
+      if [ -n "$issue" ]; then
+        printf '\nDRAINED (KILLED) -> #%s [%s]\n' "$issue" "$verdict" >>"$claim"
+      else
+        printf '\nDRAINED (KILLED) [%s]\n' "$verdict" >>"$claim"
+      fi
+    else
+      printf '\nDRAINED -> #%s [%s]\n' "$issue" "$verdict" >>"$claim"
+    fi
     mv -- "$claim" "$DRAINED/$entry"
-    echo "drained $entry -> #$issue"
+    if [ "$killed" -eq 1 ]; then
+      echo "drained $entry (KILLED)${issue:+ -> #$issue}"
+    else
+      echo "drained $entry -> #$issue"
+    fi
     ;;
 
   list)

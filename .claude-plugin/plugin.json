@@ -1,6 +1,6 @@
 {
   "name": "orchestrate",
-  "version": "0.56.0",
+  "version": "0.57.0",
   "description": "Lead-orchestrated multi-agent PR pipeline with a deterministic security floor and a cross-session resource registry. Ships the /orchestrate skill, the supporting slash commands, and the runtime scripts. The always-on floor stays a settings.json hook at a stable path (wired with consent by orchestrate-setup.py configure), never plugin-gated.",
   "author": {
     "name": "sydlexius"
