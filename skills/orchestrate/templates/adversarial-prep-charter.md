@@ -11,7 +11,7 @@ You operate against an EXISTING worktree. NEVER `cd` into it from Bash: an auto-
 - cwd-dependent gate (`/prep-pr` keys off the working dir): use `EnterWorktree` with `path: <WORKTREE>` - a HARNESS tool (not Bash), so it bypasses the cd-prompt; this charter is your explicit authorization to use it. Use `path` (the worktree already exists), never `name`; it must be in `git worktree list`. CAVEAT: from your cwd-pinned agent, `EnterWorktree path:` only accepts a worktree under the repo's `.claude/worktrees/`. If this repo's `make worktree` sites worktrees elsewhere, fall back to the `git -C`/absolute-path default (or have the lead place the worktree under `.claude/worktrees/`). `ExitWorktree` with `keep` when done.
 
 ## Do
-- Run `/prep-pr` (or the repo's equivalent: the deterministic gate `scripts/pre-push-gate.sh` components - `go test -race` per the capture rule, lint, OpenAPI consistency, generated-file check, patch coverage, govulncheck).
+- Run `/prep-pr` (or the repo's equivalent gate). The checks are whatever the repo's `.gates.toml` / gate-runner and its own pre-push steps define -- tests, lint, generated-file/lockstep, patch coverage, and any repo-specific audits (a Go repo might add `go test -race`, OpenAPI consistency, govulncheck; other stacks differ). Do not assume a fixed set; run what the repo declares.
 - Capture long test output to a log file (tee) per the repo's run-paths convention; never re-run a long suite just to re-filter - grep the log.
 - Report: GREEN (all gates pass) or RED with the exact failing gate + the relevant log excerpt.
 
