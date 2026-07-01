@@ -58,7 +58,8 @@ are simply OMITTED -- they have no rendered surface to cover.
 | `key`         | string | (req.)    | The pref name. MUST match a key from `[source]` (drift-checked). |
 | `applies_via` | string | (req.)    | The mechanism kind. One of the five below. |
 | `mechanism`   | string | (req.)    | Human-readable: the concrete token/attr/class/selector a surface wires into to honor the pref. |
-| `verify`      | string | (req.)    | A regex the consumer greps against the changed surface's markup/code. Presence => the surface plausibly honors the pref; absence => a finding (adjudicated per the exemption + hard-gate rules below). |
+| `surface`     | string | (req.)    | An `fnmatch` path glob naming which files this pref GOVERNS (the surfaces that must honor it), e.g. `web/templates/*.templ`. NOTE the `fnmatch` semantics: `*` matches across `/`, so a single-`*` glob already spans subdirectories (`web/templates/*.templ` matches `web/templates/a/b/x.templ`); do NOT use `**`. The consumer checks only the diff's changed files matching this glob -- a changed file outside it is not in scope for this pref. |
+| `verify`      | string | (req.)    | A regex the consumer greps against each governed, changed surface's markup/code. Presence => the surface plausibly honors the pref; absence => a finding (adjudicated per the exemption + hard-gate rules below). |
 | `severity`    | string | `medium`  | `high` / `medium` / `low` -- the finding severity when a surface misses this pref. |
 
 ### `applies_via` mechanisms (one real example of each, from surveyed repos)
@@ -83,7 +84,7 @@ a maintainer can challenge any exemption.
 
 | Key       | Type            | Meaning |
 |-----------|-----------------|---------|
-| `surface` | string          | A path glob (matched against the diff's changed-surface paths). |
+| `surface` | string          | An `fnmatch` path glob (matched against the diff's changed-surface paths; `*` spans `/`, so no `**`). |
 | `prefs`   | array of string | The pref keys this surface need not honor (must be `[[pref]].key`s). |
 | `reason`  | string  (req.)  | One line justifying the skip -- surfaced by the consumer and reviewable. |
 
@@ -102,7 +103,9 @@ reason  = "static text error pages; no spacing/typography surface to vary"
   DIRECTLY-CHANGED surface for `verify`. MISSING is a HARD failure UNLESS the
   surface matches an `[[exempt]]` block covering that pref (the reason is
   printed). No silent gaps; every miss is a fix or a justified exemption.
-- **Narrow surface.** Only the diff's directly-changed files are grepped
+- **Narrow surface.** For each pref, the consumer greps only the diff's
+  directly-changed files that match that pref's `surface` glob (a changed file
+  outside the glob is not in scope). Only directly-changed files are grepped
   (deterministic, language-agnostic). A pref honored via an included partial is a
   rare false positive -> resolve with an `[[exempt]]` reason. Include-graph
   resolution is a future enhancement. (Phase 2 should distinguish an
@@ -115,8 +118,24 @@ reason  = "static text error pages; no spacing/typography surface to vary"
   a weaker signal -- lean harder on the rendered pass there.
 - **Self-skip.** No `.prefs.toml` -> the check self-skips (not a failure).
 
-Phase 1 (this schema) defines the format and is validated by the worked example
-below; the enforcing consumer is Phase 2.
+## Wiring the consumer
+
+The enforcing consumer is `scripts/prefs-coverage.py` (bundled + deployed like
+the other helpers). It self-skips (exit 0) when no `.prefs.toml` exists, so it is
+safe to wire unconditionally. A consuming repo adds it as an opt-in `.gates.toml`
+`[prep_pr]` step that runs only when the manifest is present:
+
+```toml
+  [[prep_pr.steps]]
+  name = "prefs-coverage"
+  run = "python3 ~/.claude/scripts/prefs-coverage.py"   # or the plugin-resolved path
+  skip_if = ".prefs.toml"        # run only when a .prefs.toml exists at the repo root
+```
+
+Exit codes: `0` pass / self-skip / nothing-in-scope; `1` un-exempted MISSING (the
+hard gate); `2` config / drift / parse error (fails closed). The
+adversarial-review charter also reads the manifest directly (the USER-PREFERENCE
+COVERAGE dimension) for its static enumeration.
 
 ---
 
@@ -138,6 +157,7 @@ docs = "docs/site/src/reference/preferences.md"         # generated human refere
 key = "theme"          # data-theme + .dark
 applies_via = "class"
 mechanism = ".dark selectors + var(--sw-content-*/--sw-sidebar-*)"
+surface = "web/templates/*.templ"
 verify = "\\bdark\\b|var\\(--sw-content-|var\\(--sw-sidebar-"
 severity = "high"
 
@@ -145,6 +165,7 @@ severity = "high"
 key = "density"        # data-density
 applies_via = "data-attr"
 mechanism = "[data-density]; consume var(--sw-density-row-py|gap|card-py|detail-gap)"
+surface = "web/templates/*.templ"
 verify = "var\\(--sw-density-"
 severity = "high"
 
@@ -152,6 +173,7 @@ severity = "high"
 key = "font_family"    # data-font-family
 applies_via = "data-attr"
 mechanism = "[data-font-family]; font-family: var(--sw-font-sans/--sw-font-family)"
+surface = "web/templates/*.templ"
 verify = "var\\(--sw-font-(sans|family)"
 severity = "high"
 
@@ -159,6 +181,7 @@ severity = "high"
 key = "mono_font"      # data-mono
 applies_via = "data-attr"
 mechanism = "[data-mono]; font-family: var(--sw-font-mono) on kbd/ids/timestamps"
+surface = "web/templates/*.templ"
 verify = "var\\(--sw-font-mono"
 severity = "medium"
 
@@ -166,6 +189,7 @@ severity = "medium"
 key = "content_width"  # data-width
 applies_via = "data-attr"
 mechanism = "[data-width] main; max-width: var(--sw-content-max-width)"
+surface = "web/templates/*.templ"
 verify = "var\\(--sw-content-max-width"
 severity = "medium"
 
@@ -173,6 +197,7 @@ severity = "medium"
 key = "thumbnail_size" # data-thumbnail-size
 applies_via = "data-attr"
 mechanism = "[data-thumbnail-size]; var(--sw-thumb-size/--sw-thumb-grid-min)"
+surface = "web/templates/*grid*.templ"
 verify = "var\\(--sw-thumb-"
 severity = "low"
 
@@ -180,6 +205,7 @@ severity = "low"
 key = "lite_mode"      # data-lite (glass/blur)
 applies_via = "data-attr"
 mechanism = "[data-lite]; var(--sw-glass-blur) on .sw-glass/.glass-noise"
+surface = "web/templates/*.templ"
 verify = "var\\(--sw-glass-blur|sw-glass"
 severity = "low"
 
@@ -187,6 +213,7 @@ severity = "low"
 key = "bg_opacity"     # inline --sw-glass-bg
 applies_via = "css-var"
 mechanism = "var(--sw-glass-bg) on .sw-glass/.sw-card/.sw-sidebar"
+surface = "web/templates/*.templ"
 verify = "var\\(--sw-glass-bg"
 severity = "low"
 
@@ -194,11 +221,12 @@ severity = "low"
 key = "reduced_motion" # data-motion
 applies_via = "data-attr"
 mechanism = "animations gated by [data-motion] / @media (prefers-reduced-motion)"
+surface = "web/templates/*.templ"
 verify = "data-motion|prefers-reduced-motion"
 severity = "medium"
 
 [[exempt]]
-surface = "web/templates/**/errors/*.templ"
+surface = "web/templates/*errors*.templ"
 prefs   = ["density", "thumbnail_size"]
 reason  = "static error pages; no spacing or thumbnail grid to vary"
 ```
