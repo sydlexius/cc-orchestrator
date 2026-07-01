@@ -1,0 +1,36 @@
+# Release config for the /push-release skill (schema: the push-release command doc).
+# cc-orchestrator versions from the SKILL.md "**Version X.Y.Z**" line (the human
+# source of truth); plugin.json must move in lockstep (enforced by
+# test-version-lockstep.py). /push-release edits the SKILL.md line, then post_bump
+# syncs plugin.json.
+
+[versioning]
+file = "skills/orchestrate/SKILL.md"
+# {version} is the capture placeholder the skill substitutes.
+pattern = "**Version {version}**"
+# After the SKILL.md edit, re-read the version from SKILL.md and write it into
+# plugin.json so the two stay in lockstep, then assert the sync. Inline python3
+# (already a hard dep for every test-*.py harness -- no jq dependency added) so
+# this stays a config-only change; the JSON is edited structurally, not by line.
+post_bump = [
+  '''python3 -c "import json,re,pathlib,sys; t=pathlib.Path('skills/orchestrate/SKILL.md').read_text(encoding='utf-8'); m=re.search(r'\*\*Version ([0-9]+\.[0-9]+\.[0-9]+)\*\*', t); v=m.group(1) if m else sys.exit('ERROR: **Version X.Y.Z** line not found in SKILL.md'); p=pathlib.Path('.claude-plugin/plugin.json'); d=json.loads(p.read_text(encoding='utf-8')); d['version']=v; p.write_text(json.dumps(d,indent=2,ensure_ascii=False)+chr(10), encoding='utf-8')"''',
+  "python3 test-version-lockstep.py",
+]
+
+[build]
+working_dir = "."
+# The full gate set (same runner /prep-pr uses). Fails closed on any hard gate.
+pre_checks = ["python3 scripts/gate-runner.py"]
+
+[release_notes]
+# Heading for PRs with no matching label below.
+default_group = "Changes"
+# GitHub label -> release-notes section heading.
+[release_notes.group_labels]
+enhancement = "New Features"
+bug = "Bug Fixes"
+chore = "Maintenance"
+documentation = "Documentation"
+
+[release]
+tag_prefix = "v"

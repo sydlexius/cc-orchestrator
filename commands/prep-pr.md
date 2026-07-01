@@ -266,46 +266,26 @@ local gate then falls back to its default and can't perfectly match.
 
 ---
 
-## Step 3 -- OpenAPI consistency check (self-skipping)
+## Step 3 -- Repo-specific pre-push checks (owned by `.gates.toml`)
 
-**Self-skip when there is no OpenAPI surface.** This step applies only to repos
-that declare an HTTP API with an OpenAPI spec. Detect the signal first:
+Any check specific to the target repo's stack -- OpenAPI/spec consistency, a
+raw-error-leak lint, a dependency/vulnerability audit (`govulncheck` / `pip-audit`
+/ `npm audit` / `cargo audit`), a generated-file regeneration check (`templ
+generate`, `*.pb.go`, an OpenAPI client), a localization/vocabulary sweep, and so
+on -- is NOT hardcoded in this shared skill. It belongs in the repo's own
+`.gates.toml` `[[prep_pr.steps]]`, which the Step 2 gate-runner already ran (a
+step's `run` can be any diff-aware script, so even a "did the generated file
+regenerate?" check fits there).
 
-```bash
-if [ -d internal/api ]; then
-  echo "internal/api/ present -- run the OpenAPI consistency check below."
-else
-  echo "No internal/api/ -- OpenAPI consistency check skipped."
-fi
-```
+So there is nothing stack-specific to do here: if the repo declares such checks,
+Step 2 already enforced them; if it does not, there is nothing to run. Continue to
+Step 3b.
 
-If `internal/api/` is absent, SKIP this step and continue to Step 3b. The
-commands below are illustrative of the check a repo with an OpenAPI surface
-would run; adapt the path to the target repo's API package as detected.
-
-Run the AST-based consistency test first:
-
-```bash
-go test -count=1 -run TestOpenAPIConsistency -v ./internal/api/
-```
-
-If it fails, fix the reported spec drift before continuing.
-
-Then follow the semantic checks in `.claude/commands/check-openapi.md` against the
-PR-wide diff:
-
-```bash
-if git rev-parse --verify -q origin/main >/dev/null 2>&1; then base_ref=origin/main; else base_ref=main; fi
-base=$(git merge-base "$base_ref" HEAD)
-git diff "$base"..HEAD --name-only
-```
-
-Do not use `git diff main` directly -- that can include unrelated commits that landed
-on main after this branch was cut.
-
-Report findings using the same CRITICAL / IMPORTANT / OK format defined in that file.
-
-If any CRITICAL finding: stop. List what must be fixed.
+(This replaced a cluster of hardcoded stillwater-stack steps -- OpenAPI / Go
+error-leak / `govulncheck` / templ / i18n -- that merely self-skipped in every
+other repo. The one such check that cannot be expressed as a pass/fail gate step,
+an interactive new-axis/vocabulary sweep, is a repo-local concern that lives in
+that repo's own tooling, not the shared skill.)
 
 ---
 
@@ -335,142 +315,6 @@ languages) or silent behavior changes (in interpreted ones).
 
 ---
 
-## Step 3c -- Raw error leak check (self-skipping)
-
-**Self-skip when there are no API handler files.** This check targets HTTP
-handler response paths. Detect the signal first:
-
-```bash
-if compgen -G 'internal/api/handlers_*.go' >/dev/null 2>&1; then
-  echo "internal/api/handlers_*.go present -- run the raw-error-leak check below."
-else
-  echo "No internal/api/handlers_*.go -- raw-error-leak check skipped."
-fi
-```
-
-If no `internal/api/handlers_*.go` files exist, SKIP this step and continue to
-Step 3d. The check below is illustrative of a Go-handler repo; adapt the paths
-and patterns to the target repo's handler layer as detected.
-
-Check for raw internal error messages leaking to clients:
-
-```bash
-if git rev-parse --verify -q origin/main >/dev/null 2>&1; then base_ref=origin/main; else base_ref=main; fi
-base=$(git merge-base "$base_ref" HEAD)
-git diff "$base"..HEAD -- internal/api/handlers_*.go | grep '^+' | \
-  grep -E 'err\.(Error|String)\(\)|fmt\.(Sprintf|Errorf).*err[^o]' | \
-  grep -v 'slog\.\|logger\.\|log\.'
-```
-
-**Flag as IMPORTANT** if any handler response path includes raw `err.Error()` text.
-Client-visible messages must be generic; the full error belongs in a server-side `slog` call.
-
----
-
-## Step 3d -- Axis/state vocabulary drift check (self-skipping)
-
-**Self-skip when there is no i18n + template surface.** This check targets
-repos that pair backend state with user-facing localized copy. Detect the
-signal first:
-
-```bash
-if [ -d internal/i18n ] && [ -d web/templates ]; then
-  echo "internal/i18n/ + web/templates/ present -- run the vocabulary-drift check below."
-else
-  echo "No internal/i18n/ + web/templates/ -- vocabulary-drift check skipped."
-fi
-```
-
-If either `internal/i18n/` or `web/templates/` is absent, SKIP this step and
-continue to Step 3e. The grep patterns below are illustrative of a Go + templ +
-i18n repo; adapt them to the target repo's localization surface as detected.
-
-When a PR extends a multi-state system with a new axis, state, or mode, backend
-code is usually updated while user-facing copy (i18n keys, inline templ
-strings, templ code comments, hardcoded English in helper functions) silently
-retains the pre-expansion vocabulary. CodeRabbit flags these drift sites one
-or two per review round, costing multiple review cycles. See
-`feedback_axis_vocabulary_sweep.md` in memory for the failure-mode background.
-
-Detect candidate expansions in the diff:
-
-```bash
-if git rev-parse --verify -q origin/main >/dev/null 2>&1; then base_ref=origin/main; else base_ref=main; fi
-base=$(git merge-base "$base_ref" HEAD)
-
-# New enum/const values added in internal/ code
-new_consts=$(git diff "$base"..HEAD -- 'internal/**/*.go' | \
-  grep -E '^\+\s+[A-Z][A-Za-z]+\s+[A-Z][A-Za-z]+\s*=\s*"' | head -5)
-
-# New case labels in switch statements (both Go and templ)
-new_cases=$(git diff "$base"..HEAD -- 'internal/**/*.go' 'web/templates/**/*.templ' | \
-  grep -E '^\+\s+case\s+["A-Z]' | head -5)
-```
-
-If either variable is non-empty, the diff likely introduces a new state or
-axis. Report what was found and ask:
-
-"This diff appears to add a new state, axis, or enum value. Before pushing,
-sweep these surfaces for stale mono-axis vocabulary (the phrasings that were
-accurate before this PR added the new axis):
-
-  - `internal/i18n/locales/*.json` -- every key in the affected subsystem
-  - `web/templates/**/*.templ` -- both runtime strings AND code comments
-  - `web/templates/helpers.go` (and similar) -- hardcoded English in helper
-    functions that bypass `t(ctx, ...)`
-  - `aria-label`, `role`, and `alt` attributes embedded in .templ files
-
-Specifically grep for the pre-expansion terms, not the new ones -- the old
-vocabulary is what will read as incorrect after the axis lands. Proceed, or
-pause to sweep now? (sweep/proceed)"
-
-Wait for the answer. If "sweep": pause here. If "proceed": continue to Step 4.
-
-If both variables are empty: print "No new states/axes detected -- vocabulary
-drift check skipped." and continue.
-
----
-
-## Step 3e -- Vulnerability scan (self-skipping)
-
-**Self-skip when there is no Go module.** This step runs Go's `govulncheck`.
-Detect the signal first:
-
-```bash
-if [ -f go.mod ]; then
-  echo "go.mod present -- run the vulnerability scan below."
-else
-  echo "No go.mod -- govulncheck step skipped (run the target repo's own dependency-audit gate, if any)."
-fi
-```
-
-If `go.mod` is absent, SKIP this Go-specific scan. If the target repo declares
-its own dependency-audit gate (e.g. `pip-audit`, `npm audit`, `cargo audit`),
-that belongs in the Step 2 detected gate block, not here. Continue to Step 4a.
-
-When `go.mod` is present, run the vulnerability scan that mirrors the Security
-CI job. This is a **gate**. `make vulncheck` wraps `go run
-golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...`, the same pinned version CI
-installs, so a local pass means CI's govulncheck will pass too.
-
-```bash
-make vulncheck
-```
-
-- **Clean** (exit 0, "No vulnerabilities found.") -- continue.
-- **Findings** (non-zero exit) -- stop. govulncheck prints each advisory with a
-  `Fixed in:` version. For a Go **stdlib** advisory, bump the `go` directive in
-  `go.mod` to the fixed patch (every workflow reads `go-version-file: go.mod`,
-  and `GOTOOLCHAIN=auto` fetches it) and update the patch pin in
-  `docs/dev-setup.md`. For a **module** advisory, bump that dependency to the
-  fixed version. Re-run until clean before pushing.
-
-This is the one live-DB check intentionally kept OUT of the pre-push hook -- a
-fresh advisory can flip an unrelated push red with no code change, so it runs
-here, at the deliberate pre-PR gate, where that is acceptable.
-
----
-
 ## Step 4a -- Local hostile review
 
 Run an adversarial pre-push review of the diff. Dispatch a hostile-reviewer
@@ -495,29 +339,15 @@ Wait for the user's answer before continuing.
 
 ## Step 5 -- Generated-file / lockstep check (self-skipping)
 
-Detect which generated-file invariant the target repo has, and check only that
-one. Three branches; if no signal is present, skip the step.
+Like the stack-specific checks in Step 3, a repo's generated-file invariant
+("did the generated output regenerate after its source changed?") is best
+declared as a `.gates.toml` step and enforced in Step 2. The one invariant kept
+inline here is this plugin repo's own version lockstep, because it guards files
+this skill ships:
 
-**Branch A -- templ-generated code** (signal: `*.templ` files exist). Check
-that touched `*.templ` files regenerated their `*_templ.go` outputs:
-
-```bash
-if git rev-parse --verify -q origin/main >/dev/null 2>&1; then base_ref=origin/main; else base_ref=main; fi
-base=$(git merge-base "$base_ref" HEAD)
-templ_changed=$(git diff --name-only "$base"..HEAD -- '*.templ')
-generated_changed=$(git diff --name-only "$base"..HEAD -- '*_templ.go')
-
-if [ -n "$templ_changed" ] && [ -z "$generated_changed" ]; then
-  echo "ERROR: .templ files changed but *_templ.go files did not."
-  echo "Run 'templ generate' and stage the generated files before pushing."
-  exit 1
-fi
-```
-
-**Branch B -- version lockstep** (signal: `skills/orchestrate/SKILL.md` and
-`.claude-plugin/plugin.json` both exist -- the generated-file equivalent for
-this repo). The plugin manifest version must move in lockstep with the SKILL.md
-`**Version**` line:
+**Version lockstep** (signal: `skills/orchestrate/SKILL.md` and
+`.claude-plugin/plugin.json` both exist). The plugin manifest version must move in
+lockstep with the SKILL.md `**Version**` line:
 
 ```bash
 if [ -f skills/orchestrate/SKILL.md ] && [ -f .claude-plugin/plugin.json ]; then
@@ -528,13 +358,12 @@ fi
 If the lockstep harness fails (the two versions diverged), stop: bump both to
 the same value before pushing.
 
-**Branch C -- no signal.** If neither `*.templ` files nor the
-SKILL.md/plugin.json pair is present, the repo has no generated-file invariant
-this step knows about -- print "No generated-file invariant detected -- step
-skipped." and continue to Step 6. (Add the target repo's own generated-file
-check here as detected, e.g. `*.pb.go` from protobuf, an OpenAPI client, etc.)
+**No signal.** If the SKILL.md/plugin.json pair is absent, this repo is not the
+plugin repo -- print "No generated-file invariant detected -- step skipped." and
+continue to Step 6. (Any other generated-file check -- `*.pb.go`, an OpenAPI
+client, a templ regen -- belongs in the repo's `.gates.toml`, per Step 3.)
 
-If any branch's check exits with an error, stop and show the message.
+If the lockstep check exits with an error, stop and show the message.
 
 ---
 
