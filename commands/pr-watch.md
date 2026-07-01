@@ -39,7 +39,7 @@ CodeRabbit posts inline comments seconds AFTER its CI check transitions to SUCCE
 - `pr_number` -- if omitted, resolve from the current branch via `gh pr view`.
 - `timeout_secs=1800` (30 min). Bump to 3600 when test shards are slow or many waves are queued.
 
-The poll interval and reviewer set are not configurable -- the script polls every 30s and requires CodeRabbit. That is the only configuration that has ever been needed.
+The poll interval is not configurable -- the script polls every 30s. The `review-blocked` reviewer set defaults to ANY reviewer (bot or human) and is narrowed only via `PR_WATCH_BLOCKING_REVIEWERS` (see the `review-blocked` terminal above, #195); `settled` is unchanged and still gates on the CodeRabbit-opt-in + Codoki + CI + mergeable criteria.
 
 ## Step 1 -- Resolve PR number
 

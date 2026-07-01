@@ -76,6 +76,11 @@ Runtime (`scripts/`; canonical source is this repo):
   to the fresh binary. Keeps the leased UAT binary current (the SKILL.md "UAT EVERGREEN" mandate).
 - `scripts/planner_classify.py`, `scripts/uat-autobuild.sh`, `scripts/gh-*.sh` - the planner helper,
   the UAT auto-rebuild watcher, and the least-privilege gh wrappers.
+- `scripts/prefs-coverage.py` - opt-in UI-preference-coverage HARD-GATE (a repo enables it by adding a
+  `.prefs.toml` + a `.gates.toml` step; schema `skills/orchestrate/templates/prefs.toml.md`). For each
+  `[[pref]]` it greps the directly-changed governed surfaces for the pref's `verify` regex; a governed,
+  changed surface that misses the mechanism is a hard failure unless an `[[exempt]]` block covers it.
+  Executes `git` ONLY - a repo-declared `list_cmd` drift-check was dropped for RCE safety (#201).
 - `test-orchestrate-{guard,resources,setup}.py`, `test-planner-classify.py`, `test-gh-wrappers.py` -
   the proof harnesses (kept at repo root; dev tooling, not shipped in the skill).
 
@@ -160,8 +165,10 @@ drives `/plugin marketplace` update-detection, so they must never diverge. The C
     TO OPEN the PR, and its MERGE stays human.
   - GATES + hostile pre-push review are NEVER waived - autonomy waives the maintainer's APPROVAL, not the
     rigor (build + prep + hostile review green before ANY PR; a CR-required PR still requires a CR pass
-    before merge, and the lead triggers that pass ONLY on explicit per-instance maintainer authorization -
-    a `▶ NEEDS YOU` gate, like merge; never lead-initiated on a standing grant).
+    before merge, and the MAINTAINER triggers that pass themselves - the lead/agent NEVER posts
+    `@coderabbitai review` (it is the maintainer's EXCLUSIVE purview); the lead only SURFACES a
+    warranted pass as a `▶ NEEDS YOU` gate, like merge, and stops - never lead-initiated, not even
+    on per-instance authorization).
   - SELF-IMPOSED CARVE-OUT: a change that edits the deterministic floor / merge-policy / operating-model
     ITSELF routes for MAINTAINER MERGE even when it is "doc" (this file's operating-model + SKILL.md floor
     invariants qualify).
@@ -199,7 +206,9 @@ drives `/plugin marketplace` update-detection, so they must never diverge. The C
   2. THEN FILE THE ISSUE (only after step 1). A verified entry becomes a normal issue (template + agent
      hints + immediate CR steering per the SKILL.md DRAIN PROCEDURE); an unreproducible claim is still filed,
      framed as a KNOWLEDGE-GAP issue (never lose the signal); an entry the hostile review KILLS is drained
-     with a one-line drop reason as its `--verdict` (KILLED: <reason>), so the killed-entry record lives in `drained/`.
+     via `drain <entry> --killed --verdict "KILLED: <reason>"` (the `--killed` flag makes `--issue`
+     OPTIONAL - without it `drain` requires a numeric `--issue N` and rejects the killed form), so the
+     killed-entry record lives in `drained/`.
   3. THEN DRAIN THE ENTRY (only after step 2). The entry stays in `inbox/` until its issue number (or the
      KILLED drop reason) is recorded against it via `drain`. NEVER drain before the issue exists; NEVER file before the
      hostile review. This GATES the SKILL.md "TRIAGE RIGOR / DRAIN PROCEDURE"; if the two ever disagree, this

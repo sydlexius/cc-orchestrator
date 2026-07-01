@@ -24,7 +24,7 @@ steer it is NOT folded here. Until then the guard deny stays as a belt-and-suspe
 | any other read endpoint | GET | `gh-api-get.sh` |
 | CodeQL alert dismiss | PATCH | `gh-codeql-dismiss.sh` (dedicated) |
 | resolveReviewThread | GraphQL mutation | `gh-resolve-thread.sh` (dedicated) |
-| PR/issue comment (post / reply / inline / trigger-CR) | POST | `gh-comment.sh` (dedicated) |
+| PR/issue comment (post / reply / inline) | POST | `gh-comment.sh` (dedicated); the `trigger-cr` subcommand was REMOVED in #192 - no agent CR-trigger path exists |
 | CodeQL alert autofix request | POST | `gh-codeql-autofix.sh` (dedicated) |
 | branch ref delete (post-merge cleanup) | DELETE | `gh-delete-branch.sh` (dedicated) |
 
