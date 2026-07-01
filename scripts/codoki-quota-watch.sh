@@ -24,8 +24,8 @@
 # Detection of RATE-LIMITED keys on the exact HTML marker `<!-- CODOKI_RATE_LIMIT -->`
 # (verified live on PR #88), NOT `<!-- CODOKI_QUOTA -->`. The slot is parsed from
 # `Next available slot: **YYYY-MM-DD HH:MM:SS UTC**` as an ABSOLUTE UTC timestamp
-# (do NOT confuse with the RELATIVE "N minutes and N seconds" CodeRabbit format in
-# pr-unreplied-comments.sh --trigger-cr).
+# (do NOT confuse with the RELATIVE "N minutes and N seconds" format in CodeRabbit's
+# own rate-limit messages).
 #
 # Usage:
 #   codoki-quota-watch.sh <PR#> [owner/repo]

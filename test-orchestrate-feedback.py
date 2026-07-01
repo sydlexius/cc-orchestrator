@@ -147,6 +147,31 @@ def main():
         rc, out, err = run(md, ["drain", fname, "--issue", "149", "--verdict", "x"])
         check("re-drain (already drained) -> non-zero", rc != 0)
 
+        print("== drain KILLED path (#197): --issue optional w/ --killed, distinct breadcrumb ==")
+        # f2 and f3 are still in inbox (their earlier drain attempts failed validation).
+        rc, out, err = run(md, ["drain", f2, "--killed", "--verdict", "KILLED: maintainer rejected"])
+        check("killed drain w/o --issue -> exit 0", rc == 0)
+        check("killed entry left inbox/", f2 not in inbox_files(md))
+        check("killed entry now in drained/", f2 in drained_files(md))
+        kbody = open(os.path.join(md, "drained", f2)).read()
+        check("killed breadcrumb present + distinct", "DRAINED (KILLED)" in kbody and "KILLED: maintainer rejected" in kbody)
+        check("killed breadcrumb (no issue) has no '-> #' ref", "-> #" not in kbody)
+        # killed WITH an optional (numeric) --issue records the ref
+        rc, out, err = run(md, ["drain", f3, "--killed", "--issue", "42", "--verdict", "KILLED: dup of #42"])
+        check("killed drain w/ numeric --issue -> exit 0", rc == 0)
+        k3 = open(os.path.join(md, "drained", f3)).read()
+        check("killed w/ issue records 'DRAINED (KILLED) -> #42'", "DRAINED (KILLED) -> #42" in k3)
+        # a fresh entry: killed still rejects a non-numeric --issue and a missing --verdict
+        rc, out, err = run(md, ["add", "killcheck", "kc body"]); kc = out.strip()
+        rc, out, err = run(md, ["drain", kc, "--killed", "--issue", "abc", "--verdict", "x"])
+        check("killed w/ non-numeric --issue -> non-zero", rc != 0)
+        check("killed-rejected entry stays in inbox", kc in inbox_files(md))
+        rc, out, err = run(md, ["drain", kc, "--killed"])
+        check("killed w/o --verdict -> non-zero", rc != 0)
+        # normal (non-killed) path still requires a numeric --issue (unchanged)
+        rc, out, err = run(md, ["drain", kc, "--verdict", "x"])
+        check("non-killed w/o --issue -> non-zero (path unchanged)", rc != 0)
+
         print("== unknown subcommand refused ==")
         rc, out, err = run(md, ["frobnicate"])
         check("unknown subcommand -> non-zero", rc != 0)

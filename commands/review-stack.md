@@ -128,7 +128,7 @@ Each agent receives this task:
 > **Step A -- NEVER trigger a CodeRabbit review.**
 >
 > Triggering a CR review is the maintainer's exclusive purview; this command
-> must never post `@coderabbitai review` (or invoke `--trigger-cr`). CR
+> must never post `@coderabbitai review` (or invoke any CR-trigger). CR
 > auto-review is OFF org-wide, so CR is opt-in/maintainer-allocated -- a stacked
 > PR with no CR review is a normal state, not something to fix. **Codoki**
 > (`codoki-pr-intelligence[bot]`) is the primary auto-reviewer and reviews every

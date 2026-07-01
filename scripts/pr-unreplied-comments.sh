@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # pr-unreplied-comments.sh -- List unreplied bot review comments on a PR
 #
-# Usage: pr-unreplied-comments.sh [--wait] [--count-only] [--full] [--trigger-cr] [--latest-per-reviewer] [--coverage-only] [--allow-stale] [--check-resolved] [--audit] <pr_number> [repo]
+# Usage: pr-unreplied-comments.sh [--wait] [--count-only] [--full] [--latest-per-reviewer] [--coverage-only] [--allow-stale] [--check-resolved] [--audit] <pr_number> [repo]
 #
 # Options:
 #   --audit / --all        COMPLETE-COVERAGE audit mode (distinct from the default
@@ -17,14 +17,11 @@
 #                          can gate a "fully audited, nothing missed" claim. Uses
 #                          GraphQL (reviewThreads.isResolved) for thread resolution.
 #                          Mutually exclusive with --count-only / --pending-only /
-#                          --coverage-only / --trigger-cr (exits 1 on a bad combo).
+#                          --coverage-only (exits 1 on a bad combo).
 #   --wait                 Poll with geometric cooldown (15s/30s/60s/120s) until bot reviews
 #                          stabilize. Use after pushing to ensure all bot comments have landed.
 #   --count-only           Output only the count of unreplied comments (for scripting/polling).
 #   --full                 Output complete comment bodies instead of truncating to 120 chars.
-#   --trigger-cr           Trigger a CodeRabbit review. If rate-limited, wait the remaining
-#                          time (parsed from the most recent rate limit message) then post
-#                          @coderabbitai review. Exits after posting (skips comment detection).
 #   --latest-per-reviewer  For the review-body section, show only the most recent review
 #                          per reviewer. Suppresses accumulated summaries from earlier
 #                          rounds when the latest review has superseded them.
@@ -41,7 +38,7 @@
 #                          behind base, it prints a freshness section and exits 2 instead
 #                          of listing comments, forcing a rebase before triage. The
 #                          freshness gate does NOT run for --count-only / --pending-only /
-#                          --coverage-only / --trigger-cr (scripting/polling modes that
+#                          --coverage-only (scripting/polling modes that
 #                          should stay cheap and unblocking).
 #   --check-resolved       Also emit a non-fatal "UNRESOLVED-ADVISORY:" line for each
 #                          bot-rooted review thread whose isResolved is false (GraphQL-only
@@ -144,7 +141,6 @@ wait_mode=false
 count_only=false
 pending_only=false
 full_mode=false
-trigger_cr=false
 latest_per_reviewer=false
 coverage_only=false
 allow_stale=false
@@ -156,7 +152,6 @@ while [[ "${1:-}" == --* ]]; do
     --count-only) count_only=true; shift ;;
     --pending-only) pending_only=true; shift ;;
     --full) full_mode=true; shift ;;
-    --trigger-cr) trigger_cr=true; shift ;;
     --latest-per-reviewer) latest_per_reviewer=true; shift ;;
     --coverage-only) coverage_only=true; shift ;;
     --allow-stale) allow_stale=true; shift ;;
@@ -170,8 +165,8 @@ done
 # scripting early-exit modes is a usage error (their outputs are incompatible).
 if [ "$audit_mode" = true ]; then
   if [ "$count_only" = true ] || [ "$pending_only" = true ] || \
-     [ "$coverage_only" = true ] || [ "$trigger_cr" = true ]; then
-    echo "Usage: --audit is mutually exclusive with --count-only / --pending-only / --coverage-only / --trigger-cr" >&2
+     [ "$coverage_only" = true ]; then
+    echo "Usage: --audit is mutually exclusive with --count-only / --pending-only / --coverage-only" >&2
     exit 1
   fi
   # --check-resolved wires the same isResolved signal into the DEFAULT path; in
@@ -183,57 +178,9 @@ if [ "$audit_mode" = true ]; then
   fi
 fi
 
-pr_number="${1:?Usage: pr-unreplied-comments.sh [--wait] [--count-only] [--pending-only] [--trigger-cr] [--latest-per-reviewer] <pr_number> [repo]}"
+pr_number="${1:?Usage: pr-unreplied-comments.sh [--wait] [--count-only] [--pending-only] [--latest-per-reviewer] <pr_number> [repo]}"
 repo="${2:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"
 me=$(gh api user --jq .login)
-
-# --- Trigger CodeRabbit review with rate-limit awareness ---
-if [ "$trigger_cr" = true ]; then
-  # Check for the most recent rate limit message from CodeRabbit.
-  # Format: "Please wait **N minutes and N seconds**" with created_at timestamp.
-  rate_limit_comment=$(gh api "repos/$repo/issues/$pr_number/comments" --paginate \
-    --jq '[.[] | select(
-      .user.login == "coderabbitai[bot]" and
-      (.body | test("rate limited by coderabbit"; "i"))
-    )] | sort_by(.created_at) | last // empty')
-
-  if [ -n "$rate_limit_comment" ]; then
-    body=$(echo "$rate_limit_comment" | jq -r '.body')
-    created_at=$(echo "$rate_limit_comment" | jq -r '.created_at')
-
-    # Parse wait duration from "**N minutes and N seconds**" or "**N seconds**".
-    # Uses sed -nE (POSIX ERE) rather than grep -P: -P is a GNU extension and
-    # is absent on macOS/BSD grep, where it errors and the wait silently parses
-    # as zero. The minutes capture is anchored by the literal `**`; the seconds
-    # capture is anchored by a leading non-digit so a greedy `.*` cannot shrink
-    # a multi-digit value (e.g. "30 seconds") down to its last digit.
-    wait_minutes=$(printf '%s' "$body" | sed -nE 's/.*\*\*([0-9]+) minutes?.*/\1/p' | head -1)
-    wait_seconds=$(printf '%s' "$body" | sed -nE 's/.*[^0-9]([0-9]+) seconds?\*\*.*/\1/p' | head -1)
-    wait_minutes=${wait_minutes:-0}
-    wait_seconds=${wait_seconds:-0}
-    total_wait=$(( wait_minutes * 60 + wait_seconds ))
-
-    if [ "$total_wait" -gt 0 ]; then
-      # Calculate elapsed time since the rate limit message was posted.
-      created_epoch=$(date -d "$created_at" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%SZ" "$created_at" +%s 2>/dev/null || echo 0)
-      now_epoch=$(date +%s)
-      elapsed=$(( now_epoch - created_epoch ))
-      remaining=$(( total_wait - elapsed + 10 ))  # +10s buffer
-
-      if [ "$remaining" -gt 0 ]; then
-        echo "CodeRabbit rate-limited. Waiting ${remaining}s (${wait_minutes}m${wait_seconds}s limit, ${elapsed}s elapsed, +10s buffer)..."
-        sleep "$remaining"
-      else
-        echo "Rate limit expired (${elapsed}s elapsed, ${total_wait}s limit). Proceeding."
-      fi
-    fi
-  fi
-
-  echo "Triggering CodeRabbit review on PR #$pr_number..."
-  gh api "repos/$repo/issues/$pr_number/comments" -f body="@coderabbitai review" --silent
-  echo "Done. CodeRabbit review triggered."
-  exit 0
-fi
 
 # --- Core function: count unreplied bot comments ---
 count_unreplied() {

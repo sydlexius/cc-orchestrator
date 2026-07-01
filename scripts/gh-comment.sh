@@ -6,7 +6,6 @@
 #   reply    <pr> <comment-id> <body>                     -> POST pulls/<pr>/comments/<id>/replies
 #   inline   <pr> --file <path> --line <n> [--side S] <body>
 #                                                         -> POST pulls/<pr>/comments (review comment)
-#   trigger-cr <pr>                                       -> POST issues/<pr>/comments "@coderabbitai review"
 #
 # Construction guarantee: every endpoint is built ONLY from validated numerics (pr, comment-id,
 # line) and fixed literals; the BODY (and file path) are passed as DATA via -f/-F fields and are
@@ -56,7 +55,7 @@ resolve_head_sha() {
 }
 
 sub="${1:-}"
-[ -n "$sub" ] || die "usage: gh-comment.sh <post|reply|inline|trigger-cr> ..."
+[ -n "$sub" ] || die "usage: gh-comment.sh <post|reply|inline> ..."
 shift
 
 case "$sub" in
@@ -77,14 +76,6 @@ case "$sub" in
     [ -n "$body" ] || die "reply: body is required"
     repo="$(resolve_repo)"
     exec gh api -X POST "repos/${repo}/pulls/${pr}/comments/${cid}/replies" -f "body=${body}"
-    ;;
-
-  trigger-cr)
-    [ "$#" -eq 1 ] || die "usage: gh-comment.sh trigger-cr <pr>"
-    pr="${1:-}"
-    is_num "$pr" || die "trigger-cr: pr must be numeric (got: ${pr})"
-    repo="$(resolve_repo)"
-    exec gh api -X POST "repos/${repo}/issues/${pr}/comments" -f "body=@coderabbitai review"
     ;;
 
   inline)
@@ -132,6 +123,6 @@ case "$sub" in
     ;;
 
   *)
-    die "unknown subcommand '${sub}' (use post|reply|inline|trigger-cr)"
+    die "unknown subcommand '${sub}' (use post|reply|inline)"
     ;;
 esac

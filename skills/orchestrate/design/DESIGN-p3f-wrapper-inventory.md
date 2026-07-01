@@ -44,12 +44,13 @@ check-runs, code-scanning). pr-triage remains READ-ONLY by charter and uses only
   then `gh api -X PATCH repos/<repo>/code-scanning/alerts/<n>` with the fixed dismiss payload.
 - **`gh-resolve-thread.sh <thread-id>`** - validates `thread-id` is a GitHub node id; then a
   FIXED `resolveReviewThread` GraphQL mutation.
-- **`gh-comment.sh <post|reply|inline|trigger-cr> ...`** - dedicated PR/issue COMMENT poster.
+- **`gh-comment.sh <post|reply|inline> ...`** - dedicated PR/issue COMMENT poster.
   `post <pr> <body>` -> `POST issues/<pr>/comments`; `reply <pr> <comment-id> <body>` ->
   `POST pulls/<pr>/comments/<comment-id>/replies`; `inline <pr> --file <p> --line <n> [--side
-  RIGHT|LEFT] <body>` -> `POST pulls/<pr>/comments` with body+commit_id(HEAD)+path+line+side;
-  `trigger-cr <pr>` -> `POST issues/<pr>/comments` with the fixed body `@coderabbitai review`.
-  Validates pr/comment-id/line numeric, side in {RIGHT,LEFT}; the body/path are DATA (-f/-F
+  RIGHT|LEFT] <body>` -> `POST pulls/<pr>/comments` with body+commit_id(HEAD)+path+line+side.
+  (A dead `trigger-cr` subcommand that posted `@coderabbitai review` was REMOVED in #192 --
+  the exclusive-purview rule forbids an agent CR-trigger; a maintainer-authorized trigger uses
+  the generic `post`.) Validates pr/comment-id/line numeric, side in {RIGHT,LEFT}; the body/path are DATA (-f/-F
   fields), never interpolated into the endpoint or the (fixed POST) method; refuses any
   caller-supplied -X/--method or unknown flag. Resolves repo + HEAD sha internally.
 - **`gh-codeql-autofix.sh <alert-number> [repo]`** - validates `alert-number` is numeric; then
