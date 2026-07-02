@@ -91,7 +91,7 @@ disambiguate from the `/ralph-loop` skill) + `DESIGN-*`/`PLAN-*`/`ROADMAP-*` (un
 ## Gates (run locally; CI enforces them)
 
 The AUTHORITATIVE gate definition is now `.gates.toml` at the repo root (read by
-`scripts/gate-runner.py`; `/prep-pr`, `/handle-review`, `/review-stack`, and the
+`scripts/gate-runner.py`; `/orchestrate:prep-pr`, `/orchestrate:handle-review`, `/orchestrate:review-stack`, and the
 optional `scripts/pre-push-hook.sh` all delegate to that one runner). Run the
 whole set with `python3 scripts/gate-runner.py`. The command listing below is
 kept for human reference and is DERIVED from `.gates.toml` (keep the two in
@@ -130,7 +130,7 @@ cc-orchestrator uses Semantic Versioning. The authoritative current version is t
 `/reload-skills` surfaces it and symlink-vs-loaded drift is detectable). Bump it on any material
 change to the skill, templates, or runtime: PATCH for a fix, MINOR for a new rule/feature/charter
 addition, MAJOR for a breaking charter or deterministic-floor change. Tag releases `vX.Y.Z`
-(annotated) at the merge that ships them - the `/push-release` skill cuts the tag + a GitHub
+(annotated) at the merge that ships them - the `/orchestrate:push-release` skill cuts the tag + a GitHub
 Release whose notes are auto-generated from the merged PRs (no maintained changelog file - git
 history + the per-tag Release notes are the record, matching the GitHub-auto-gen preference).
 Keep the SKILL.md version line and the git tag in lockstep.
