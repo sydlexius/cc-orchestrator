@@ -337,7 +337,7 @@ if [ "$is_push_clause" -eq 1 ]; then
   if printf '%s' "$cmd" | grep -q 'prep-pr-ok'; then
     exit 0
   fi
-  echo "BLOCKED: git push must be preceded by /prep-pr (gate + review + squash). If you have already run the gate this turn, append the literal comment # prep-pr-ok to override." >&2
+  echo "BLOCKED: git push must be preceded by /orchestrate:prep-pr (gate + review + squash). If you have already run the gate this turn, append the literal comment # prep-pr-ok to override." >&2
   exit 2
 fi
 
