@@ -86,6 +86,12 @@ HELPER_NAMES = (
     "pr-watch.sh", "pr-unreplied-comments.sh", "pr-read-comments.sh", "reply-comment.sh",
     "resolve-threads.sh", "cleanup-worktree.sh", "patch-coverage.sh", "pr-codeql-autofixes.sh",
     "safe-push.sh", "gate-runner.py", "pre-push-hook.sh", "prefs-coverage.py",
+    # ship-gate-preflight.sh is a LIVE dependency at the stable path: pr-watch.sh and
+    # codoki-quota-watch.sh invoke ${HOME}/.claude/scripts/ship-gate-preflight.sh as the
+    # CODOKI settlement oracle behind an `[ -x ]` gate. Omitting it here left a stale,
+    # non-executable copy that silently disabled the oracle (#216). issue-watch.sh is the
+    # issue-side counterpart to pr-watch.sh and is invoked from the stable path the same way (#217).
+    "ship-gate-preflight.sh", "issue-watch.sh",
 )
 # The _helper_deploy_action results that warrant an actual deploy write (vs. None / informational).
 HELPER_DEPLOY_ACTIONS = ("deploy", "refresh", "replace-symlink", "replace-broken-symlink")
