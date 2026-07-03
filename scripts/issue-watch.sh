@@ -186,10 +186,14 @@ while :; do
     # creation) so in --author mode a self-editing CR Coding Plan wins even if the
     # author posted an ancillary comment first -- otherwise the oldest new comment
     # would latch and mask the plan (hostile-review finding).
+    # Author match tolerates the GitHub App `[bot]` suffix: the REST API login for
+    # an app is `<name>[bot]` (e.g. coderabbitai[bot]), so a bare `--author
+    # coderabbitai` must still match -- otherwise the flagship plan-ready case
+    # never fires and hangs to timeout (Copilot #218).
     new_comment=$(printf '%s' "$comments_json" | jq -r --arg base ",$base_ids," --arg author "$author" '
       [ .[]
         | select((",\(.id),") as $k | ($base | contains($k)) | not)
-        | select($author == "" or (.user.login == $author)) ]
+        | select($author == "" or (.user.login == $author) or (.user.login == ($author + "[bot]"))) ]
       | (if length > 0 then (.[-1] | "\(.id)\t\(.user.login)") else "" end)
     ' 2>/dev/null)
 

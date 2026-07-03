@@ -58,7 +58,11 @@ def clamp(seq):
 def emit(data):
     if "--jq" in args:
         expr = args[args.index("--jq") + 1]
-        p = subprocess.run(["jq", "-r", expr], input=data, capture_output=True, text=True)
+        try:
+            p = subprocess.run(["jq", "-r", expr], input=data, capture_output=True, text=True)
+        except FileNotFoundError:
+            sys.stderr.write("jq not found\n")
+            sys.exit(127)
         # Propagate jq failure (missing binary / bad expr) instead of masking it as
         # empty output + exit 0, which would produce false baselines (Codoki #218).
         if p.returncode != 0:
@@ -192,6 +196,19 @@ rc, out, err = run(
 )
 check("plan-ready: fires only after the author comment stabilizes", rc == 0 and "plan-ready issue=42 author=coderabbitai id=9" in out)
 check("plan-ready: prints the stabilized body", "Plan FINAL" in out and "writing..." not in out)
+
+# --- REGRESSION (Copilot #218): --author <bare> matches the `<bare>[bot]` REST login ---
+rc, out, err = run(
+    [OPEN0, OPEN0, OPEN0],
+    [
+        [],
+        [comment(11, "coderabbitai[bot]", "Coding Plan")],
+        [comment(11, "coderabbitai[bot]", "Coding Plan")],
+    ],
+    ["--author", "coderabbitai"],  # bare name must match the [bot]-suffixed login
+)
+check("--author bare name matches the [bot]-suffixed App login",
+      rc == 0 and "plan-ready issue=42 author=coderabbitai[bot] id=11" in out)
 
 # --- --author ignores a non-target author's comment ---
 rc, out, err = run(

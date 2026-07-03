@@ -27,6 +27,8 @@ When several signals move in one poll the priority is: closed, then the comment 
 
 A CR issue Coding Plan lands as ONE comment that self-edits over ~10-15 min, so firing on first appearance would surface a half-written plan. `--author <login>` narrows the comment trigger to that author AND auto-stabilizes: once a new comment from `<login>` appears, the loop keeps polling until its body is byte-identical across two consecutive polls, then emits `plan-ready`. `closed` still fires immediately regardless of `--author`.
 
+`--author` tolerates the GitHub App `[bot]` suffix: pass the bare name (`--author coderabbitai`) and it matches the actual REST login `coderabbitai[bot]` as well.
+
 Note (2026-07 org state): with CR auto-review OFF org-wide (#214), CodeRabbit does NOT auto-post an issue Coding Plan; a plan appears only when the maintainer explicitly requests a CR pass. So `--author coderabbitai` is for watching a MAINTAINER-triggered plan, not an auto-arriving one.
 
 ## Args
