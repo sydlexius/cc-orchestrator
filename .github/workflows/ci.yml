@@ -60,13 +60,41 @@ jobs:
         run: pip install ruff
 
       # Platform-independent lint: run once, on Linux. (jq is preinstalled on both runners.)
-      # shellcheck is pinned to v0.11.0 via the official koalaman image, digest-pinned
-      # (linux/amd64) for immutability per the repo SHA-pin convention, so a clean local
-      # `shellcheck` v0.11.0 gate predicts CI (the SC2015 drift that motivated #165). The
-      # image ENTRYPOINT is /bin/shellcheck, so the 22-file list passes straight through.
+      # shellcheck is pinned to v0.11.0. On GitHub-hosted runners we run it via the official
+      # koalaman image, digest-pinned (linux/amd64) for immutability per the repo SHA-pin
+      # convention. On self-hosted runners there is no Docker daemon by design, so we use the
+      # shellcheck v0.11.0 binary baked into the outatime-runner image - keep that image's
+      # SHELLCHECK_VERSION in lockstep with this digest. Either path predicts a clean local
+      # `shellcheck` v0.11.0 gate (the SC2015 drift that motivated #165).
       - name: shellcheck v0.11.0 (security guard + runtime scripts)
         if: runner.os == 'Linux'
-        run: docker run --rm -v "$GITHUB_WORKSPACE:/mnt" -w /mnt koalaman/shellcheck@sha256:b9389b73c8f26f710a7171cb7d8848a34a9c1e07a7865e727c9ec4ce99f9a83f scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-feedback.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh # v0.11.0
+        run: |
+          scripts=(
+            scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-feedback.sh
+            scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh
+            scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh
+            scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/stale-branch-sweep.sh
+            scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/pr-unreplied-comments.sh
+            scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh
+            scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh
+            scripts/safe-push.sh scripts/pre-push-hook.sh
+          )
+          if [ "${{ runner.environment }}" = "self-hosted" ]; then
+            # No Docker daemon here, so lint with the shellcheck baked into the
+            # outatime-runner image. Assert the pinned version so a stale image fails
+            # loudly rather than silently linting with a different version.
+            want=0.11.0
+            have=$(shellcheck --version 2>/dev/null | awk '/^version:/{print $2}')
+            if [ "$have" != "$want" ]; then
+              echo "::error::self-hosted shellcheck '$have' != pinned '$want'; rebuild the outatime-runner image (SHELLCHECK_VERSION)"
+              exit 1
+            fi
+            shellcheck "${scripts[@]}"
+          else
+            docker run --rm -v "$GITHUB_WORKSPACE:/mnt" -w /mnt \
+              koalaman/shellcheck@sha256:b9389b73c8f26f710a7171cb7d8848a34a9c1e07a7865e727c9ec4ce99f9a83f \
+              "${scripts[@]}"
+          fi
 
       - name: ruff (F,E741)
         if: runner.os == 'Linux'
