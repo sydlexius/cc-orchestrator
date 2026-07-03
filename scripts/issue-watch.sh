@@ -136,6 +136,18 @@ fetch_comments() {
   printf '%s' "$raw" | jq -s 'add // []' 2>/dev/null
 }
 
+# emit_set_delta EVENT BASE_SET CUR_SET -- print the terminal line
+# "EVENT issue=<n> +added... -removed..." for two comma-joined sorted sets.
+# Shared by the labeled and assignees terminals (CR #218: was duplicated).
+emit_set_delta() {
+  local event="$1" base_set="$2" cur_set="$3" added removed
+  added=$(comm -13 <(printf '%s' "$base_set" | tr ',' '\n' | sort) \
+                   <(printf '%s' "$cur_set" | tr ',' '\n' | sort) | sed '/^$/d' | sed 's/^/+/')
+  removed=$(comm -23 <(printf '%s' "$base_set" | tr ',' '\n' | sort) \
+                     <(printf '%s' "$cur_set" | tr ',' '\n' | sort) | sed '/^$/d' | sed 's/^/-/')
+  echo "$event issue=$issue $(printf '%s %s' "$added" "$removed" | tr '\n' ' ' | tr -s ' ' | sed 's/ $//')"
+}
+
 # ---------------------------------------------------------------------------
 # Polling loop
 # ---------------------------------------------------------------------------
@@ -222,21 +234,13 @@ while :; do
 
     # (3) labels changed.
     if [ "$cur_labels" != "$base_labels" ]; then
-      added=$(comm -13 <(printf '%s' "$base_labels" | tr ',' '\n' | sort) \
-                       <(printf '%s' "$cur_labels" | tr ',' '\n' | sort) | sed '/^$/d' | sed 's/^/+/')
-      removed=$(comm -23 <(printf '%s' "$base_labels" | tr ',' '\n' | sort) \
-                         <(printf '%s' "$cur_labels" | tr ',' '\n' | sort) | sed '/^$/d' | sed 's/^/-/')
-      echo "labeled issue=$issue $(printf '%s %s' "$added" "$removed" | tr '\n' ' ' | tr -s ' ' | sed 's/ $//')"
+      emit_set_delta labeled "$base_labels" "$cur_labels"
       exit 0
     fi
 
     # (4) assignees changed.
     if [ "$cur_assignees" != "$base_assignees" ]; then
-      added=$(comm -13 <(printf '%s' "$base_assignees" | tr ',' '\n' | sort) \
-                       <(printf '%s' "$cur_assignees" | tr ',' '\n' | sort) | sed '/^$/d' | sed 's/^/+/')
-      removed=$(comm -23 <(printf '%s' "$base_assignees" | tr ',' '\n' | sort) \
-                         <(printf '%s' "$cur_assignees" | tr ',' '\n' | sort) | sed '/^$/d' | sed 's/^/-/')
-      echo "assigned issue=$issue $(printf '%s %s' "$added" "$removed" | tr '\n' ' ' | tr -s ' ' | sed 's/ $//')"
+      emit_set_delta assigned "$base_assignees" "$cur_assignees"
       exit 0
     fi
 
