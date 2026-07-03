@@ -728,7 +728,7 @@ def main():
         # NEVER touches the real ~/.claude/scripts. Without these overrides the deploy would default
         # to ~/.claude/scripts and mutate the operator's real environment during the test.
         cscripts = os.path.join(td, "deployed-scripts")
-        cbundle_scripts = os.path.dirname(SCRIPT)  # the real scripts/ dir (has all 9 helpers)
+        cbundle_scripts = os.path.dirname(SCRIPT)  # the real scripts/ dir (has all bundled helpers)
         # Pin the shadow-narrowing cascade scan to THIS fixture (cs) so configure's
         # cascade-wide narrowing never reaches the real ~/.claude cascade.
         cov = {"ORCHESTRATE_SETTINGS": cs, "ORCHESTRATE_TEMPLATES_DIR": ctpl,
@@ -778,15 +778,15 @@ def main():
         check("configure REFUSES to overwrite an unparseable settings.json (no clobber)",
               rc == 1 and "refusing to touch" in out and open(cs).read().startswith("{not"))
 
-    # #133: configure --apply DEPLOYS the 9 bundled PR-lifecycle helpers to the stable SCRIPTS_DIR
+    # #133: configure --apply DEPLOYS the bundled PR-lifecycle helpers to the stable SCRIPTS_DIR
     # path (Option A), retiring claude-kit symlinks; doctor WARNs (never FAILs) on a stale copy.
     HELPERS = ("pr-watch.sh", "pr-unreplied-comments.sh", "pr-read-comments.sh", "reply-comment.sh",
                "resolve-threads.sh", "cleanup-worktree.sh", "patch-coverage.sh",
-               "pr-codeql-autofixes.sh", "safe-push.sh")
+               "pr-codeql-autofixes.sh", "safe-push.sh", "ship-gate-preflight.sh", "issue-watch.sh")
     GUARD_HOOK = {"matcher": "Bash", "hooks": [{"type": "command",
                   "command": 'bash "$HOME/.claude/scripts/orchestrate-guard.sh"'}]}
     with tempfile.TemporaryDirectory() as td:
-        # Bundled helper SOURCE fixture: 9 distinct stub files named exactly as the real helpers.
+        # Bundled helper SOURCE fixture: distinct stub files named exactly as the real helpers.
         hbundle = os.path.join(td, "hbundle"); os.makedirs(hbundle)
         for name in HELPERS:
             open(os.path.join(hbundle, name), "w").write(f"#!/usr/bin/env bash\n# fixture {name}\necho {name}\n")
@@ -807,14 +807,18 @@ def main():
         rc, out = run(["configure"], env_overrides=hov)
         check("#133: dry-run previews helper DEPLOY, writes NOTHING",
               rc == 0 and "PR-lifecycle helper script(s)" in out and not os.path.exists(hdest))
-        # Fresh deploy: all 9 land, executable, byte-identical to the bundled source.
+        # Fresh deploy: all land, executable, byte-identical to the bundled source.
         rc, out = run(["configure", "--apply", "--yes"], env_overrides=hov)
         deployed_ok = all(
             os.path.isfile(os.path.join(hdest, n))
             and open(os.path.join(hdest, n), "rb").read() == open(os.path.join(hbundle, n), "rb").read()
             and bool(os.stat(os.path.join(hdest, n)).st_mode & 0o111)
             for n in HELPERS)
-        check("#133: configure --apply deploys all 9 helpers (executable, content matches)", rc == 0 and deployed_ok)
+        check("#133: configure --apply deploys all bundled helpers (executable, content matches)", rc == 0 and deployed_ok)
+        # #216: ship-gate-preflight.sh (the CODOKI oracle) is among the deployed helpers, executable.
+        _sgp = os.path.join(hdest, "ship-gate-preflight.sh")
+        check("#216: ship-gate-preflight.sh deploys to the stable path AND is executable",
+              os.path.isfile(_sgp) and bool(os.stat(_sgp).st_mode & 0o111))
         # Idempotent re-run: nothing actionable, no failure.
         rc, out = run(["configure", "--apply", "--yes"], env_overrides=hov)
         check("#133: configure is idempotent once helpers deployed (no helper deploy line)",
