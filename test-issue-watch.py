@@ -20,6 +20,7 @@ Run: python3 test-issue-watch.py
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -58,6 +59,11 @@ def emit(data):
     if "--jq" in args:
         expr = args[args.index("--jq") + 1]
         p = subprocess.run(["jq", "-r", expr], input=data, capture_output=True, text=True)
+        # Propagate jq failure (missing binary / bad expr) instead of masking it as
+        # empty output + exit 0, which would produce false baselines (Codoki #218).
+        if p.returncode != 0:
+            sys.stderr.write(p.stderr)
+            sys.exit(p.returncode)
         sys.stdout.write(p.stdout)
     else:
         sys.stdout.write(data)
@@ -249,6 +255,21 @@ rc, out, err = run_raw(["notanumber", REPO])
 check("setup: non-numeric issue exits 2", rc == 2 and "setup error" in err)
 rc, out, err = run_raw([])
 check("setup: no args exits 2 (usage)", rc == 2)
+
+# --- setup: jq missing -> fail fast (Codoki #218), not a silent timeout ---
+with tempfile.TemporaryDirectory() as td:
+    bind = os.path.join(td, "bin")
+    os.makedirs(bind)
+    # A gh stub is present so the gh check passes; jq is absent from this PATH so
+    # the jq check must trip. PATH is bind-only (no jq); bash is invoked by its
+    # absolute path so the restricted PATH doesn't hide the interpreter itself.
+    open(os.path.join(bind, "gh"), "w").write("#!/bin/sh\nexit 0\n")
+    os.chmod(os.path.join(bind, "gh"), 0o755)
+    env = dict(os.environ)
+    env["PATH"] = bind
+    p = subprocess.run([shutil.which("bash"), SCRIPT, ISSUE, REPO], capture_output=True, text=True, env=env, timeout=30)
+    check("setup: jq missing exits 2 with a clear error (not a silent timeout)",
+          p.returncode == 2 and "jq" in p.stderr)
 
 print()
 if FAILS:

@@ -55,6 +55,13 @@ if ! command -v gh >/dev/null 2>&1; then
   echo "setup error: gh (GitHub CLI) is required but not installed" >&2
   exit 2
 fi
+# jq is used on every poll (state + comment parsing); without it each poll would
+# look like a transient error and the watch would time out silently. Fail fast
+# with a clear setup error instead (Codoki #218).
+if ! command -v jq >/dev/null 2>&1; then
+  echo "setup error: jq is required but not installed" >&2
+  exit 2
+fi
 
 # ---------------------------------------------------------------------------
 # Argument parsing
