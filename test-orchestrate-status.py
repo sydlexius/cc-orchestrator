@@ -219,6 +219,26 @@ def main():
     check("gh pr list failure -> non-zero exit", rc != 0)
     check("gh pr list failure -> stderr names the problem", "list" in err.lower() or "flight" in err.lower())
 
+    # Per-PR `gh pr view` failure -> a "#N ERROR" line, loop continues, exit 0.
+    # (No PRVIEW_7_JSON env -> stub returns "{}", but --json fields on {} succeed;
+    #  to force a view FAILURE we point at a PR the stub errors on via an empty doc
+    #  that fails the jq. Simpler: an explicit PR with no view env yields "{}", which
+    #  the jq handles -> not an error. So drive a real failure: request a PR whose
+    #  view doc is invalid JSON.)
+    rc, out, err, calls = run(["7", "owner/repo"], views={"7": "not-json"})
+    check("gh pr view failure -> '#7 ERROR' line", "#7 ERROR" in out)
+    check("gh pr view failure -> loop continues, exit 0", rc == 0)
+
+    # Unrecognized argument -> usage error, exit 1.
+    rc, out, err, calls = run(["v2"])
+    check("junk arg 'v2' -> exit 1", rc == 1)
+    check("junk arg -> stderr names it", "unrecognized" in err.lower())
+
+    # --help -> usage to stdout, exit 0, no gh calls.
+    rc, out, err, calls = run(["--help"])
+    check("--help -> exit 0", rc == 0)
+    check("--help -> prints usage, no gh calls", "Usage" in (out + err) and calls == [])
+
     # READ-ONLY: every gh call is a read verb; no mutation flag ever issued.
     rc, out, err, calls = run(
         [],
