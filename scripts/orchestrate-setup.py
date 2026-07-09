@@ -54,6 +54,13 @@ BUNDLED_GUARD = os.environ.get("ORCHESTRATE_BUNDLED_GUARD",
 STEER = os.environ.get("ORCHESTRATE_STEER", os.path.join(HOME, ".claude", "scripts", "orchestrate-steer.sh"))
 BUNDLED_STEER = os.environ.get("ORCHESTRATE_BUNDLED_STEER",
     os.path.join(os.path.dirname(os.path.realpath(__file__)), "orchestrate-steer.sh"))
+# The PostToolUse context-budget meter (#228) - a SEPARATE advisory + fail-open script. Deployed to
+# the stable CTXMETER path the same Option-A way and wired as ONE PostToolUse hook. Advisory +
+# opt-out-able (`configure --no-ctxmeter`), so doctor only ever WARNs about it, never FAILs.
+CTXMETER = os.environ.get("ORCHESTRATE_CTXMETER",
+    os.path.join(HOME, ".claude", "scripts", "orchestrate-context-meter.sh"))
+BUNDLED_CTXMETER = os.environ.get("ORCHESTRATE_BUNDLED_CTXMETER",
+    os.path.join(os.path.dirname(os.path.realpath(__file__)), "orchestrate-context-meter.sh"))
 # Script-relative: under the plugin layout this script lives in scripts/ and the templates ship
 # beside the skill at skills/orchestrate/templates/, so resolve them relative to the script
 # (realpath resolves any ~/.claude/scripts deploy symlink to the real plugin/repo location). A
@@ -161,6 +168,17 @@ STEER_HOOK_BLOCKS = [
      "hooks": [{"type": "command", "command": STEER_HOOK_COMMAND}]}
     for m in ("Edit", "Write", "Bash")
 ]
+
+# The PostToolUse context-budget meter hook (#228). ONE PostToolUse block matching all tools ("*")
+# so the meter accumulates every tool call's I/O proxy. Fail-OPEN command form (mirrors the steer
+# hook): `[ -r <meter> ] && bash <meter> || true` so a missing/unreadable deployed script returns 0
+# (never blocks a tool) and emits no per-call "No such file" noise - matching the meter's own
+# "exit 0 ALWAYS" advisory contract. Advisory + opt-out-able (--no-ctxmeter). Shared as one constant
+# so the present() detection exact-matches the SAME string configure writes.
+CTXMETER_HOOK_COMMAND = ('[ -r "$HOME/.claude/scripts/orchestrate-context-meter.sh" ] && '
+                         'bash "$HOME/.claude/scripts/orchestrate-context-meter.sh" || true')
+CTXMETER_HOOK_BLOCK = {"matcher": "*",
+                       "hooks": [{"type": "command", "command": CTXMETER_HOOK_COMMAND}]}
 
 # The SessionStart advisory hook (#162). At session start it runs `orchestrate-setup.py init`, a
 # READ-ONLY scan that surfaces a `gh pr *` merge-gate-shadow advisory to stdout (injected into the
@@ -345,6 +363,77 @@ def check_steer(settings):
         return _emit(WARN, "; ".join(msgs) + " - run `orchestrate-setup.py configure --apply` "
                            "(or `--no-steer` to skip the advisory steering)")
     return _emit(PASS, "advisory steering hooks wired + deployed steer matches the bundled copy")
+
+
+def _missing_ctxmeter_hook_block(settings):
+    """[CTXMETER_HOOK_BLOCK] if the PostToolUse meter hook is not yet wired, else []. Exact
+    (matcher+type+command) match against the canonical CTXMETER_HOOK_COMMAND so a stale path or a
+    disabled line no longer counts as wired (mirrors _missing_steer_hook_blocks)."""
+    hooks = (settings or {}).get("hooks") or {}
+    post = (hooks.get("PostToolUse") or [])
+    expected = CTXMETER_HOOK_COMMAND
+    for b in post:
+        if (b or {}).get("matcher") == CTXMETER_HOOK_BLOCK["matcher"]:
+            for h in ((b or {}).get("hooks") or []):
+                if (h or {}).get("type") == "command" and (h or {}).get("command") == expected:
+                    return []
+    return [CTXMETER_HOOK_BLOCK]
+
+
+def _ctxmeter_deploy_action():
+    """What `configure` must do to put the bundled meter at the stable CTXMETER path. Mirrors
+    _steer_deploy_action: 'missing-source' | 'deploy' | 'refresh' | None."""
+    if not os.path.isfile(BUNDLED_CTXMETER):
+        return "missing-source"
+    if not os.path.exists(CTXMETER):
+        return "deploy"
+    if not _files_identical(BUNDLED_CTXMETER, CTXMETER):
+        return "refresh"
+    return None
+
+
+def _deploy_ctxmeter():
+    """Copy the bundled meter to the stable CTXMETER path, executable. Caller gated on --apply +
+    consent. Atomic temp-then-replace, mirroring _deploy_steer. Returns (ok, message)."""
+    try:
+        os.makedirs(os.path.dirname(CTXMETER), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CTXMETER), prefix=".orch-ctxmeter-")
+        os.close(fd)
+        try:
+            shutil.copy2(BUNDLED_CTXMETER, tmp)
+            os.chmod(tmp, os.stat(tmp).st_mode | 0o111)
+            os.replace(tmp, CTXMETER)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return True, f"deployed the context-budget meter -> {CTXMETER}"
+    except OSError as e:
+        return False, f"FAILED to deploy the context-budget meter to {CTXMETER}: {e}"
+
+
+def check_ctxmeter(settings):
+    """Doctor check for the advisory PostToolUse context-budget meter (#228). WARN (never FAIL) when
+    the hook is not wired or the deployed meter is stale/uncomparable - the meter is opt-out-able and
+    advisory, so its absence is never a hard fail. PASS when the hook is wired + the deployed meter
+    matches the bundled copy. Stays read-only."""
+    missing = _missing_ctxmeter_hook_block(settings)
+    action = _ctxmeter_deploy_action()
+    msgs = []
+    if missing:
+        msgs.append("advisory context-budget meter hook (PostToolUse) not wired")
+    if action == "deploy":
+        msgs.append(f"deployed meter script missing at {CTXMETER}")
+    elif action == "refresh":
+        msgs.append(f"deployed meter script at {CTXMETER} is STALE vs the bundled copy")
+    elif action == "missing-source":
+        msgs.append(f"bundled meter source missing at {BUNDLED_CTXMETER}")
+    if msgs:
+        return _emit(WARN, "; ".join(msgs) + " - run `orchestrate-setup.py configure --apply` "
+                           "(or `--no-ctxmeter` to skip the advisory meter)")
+    return _emit(PASS, "advisory context-budget meter wired + deployed meter matches the bundled copy")
 
 
 def _session_init_hook_present(settings):
@@ -1104,7 +1193,7 @@ def cmd_doctor(args):
     repo_status, _head = check_repo_main(getattr(args, "repo", None))
     results = [check_agent_teams(settings), check_tmux(),
                check_guard_wired(settings), check_guard_healthy(), check_guard_stale(),
-               check_helpers_stale(), check_steer(settings),
+               check_helpers_stale(), check_steer(settings), check_ctxmeter(settings),
                check_session_init_hook(settings),
                repo_status, check_allowlist(settings),
                check_merge_gate_shadows(), check_slack_channel(), check_slack_bot_user_id()]
@@ -1535,6 +1624,13 @@ def cmd_configure(args):
     steer_on = not getattr(args, "no_steer", False) and steer_action != "missing-source"
     steer_blocks_to_add = _missing_steer_hook_blocks(settings) if steer_on else []
     steer_deploy_needed = steer_on and steer_action in ("deploy", "refresh")
+    # #228: advisory PostToolUse context-budget meter. Skipped with --no-ctxmeter, and gated on the
+    # bundled meter source existing (never wire a hook pointing at a script we cannot deploy). Mirrors
+    # the steer wiring exactly. ctxmeter_action drives the deploy; ctxmeter_blocks the settings wiring.
+    ctxmeter_action = _ctxmeter_deploy_action()  # 'deploy' | 'refresh' | 'missing-source' | None
+    ctxmeter_on = not getattr(args, "no_ctxmeter", False) and ctxmeter_action != "missing-source"
+    ctxmeter_blocks_to_add = _missing_ctxmeter_hook_block(settings) if ctxmeter_on else []
+    ctxmeter_deploy_needed = ctxmeter_on and ctxmeter_action in ("deploy", "refresh")
     # #162: deploy THIS script to the stable path so the SessionStart `init` hook calls a stable
     # entry point, and refresh it on drift (stale shadow-detection logic must never persist). Wire
     # the SessionStart advisory hook the same idempotent way as the steer hooks.
@@ -1545,9 +1641,9 @@ def cmd_configure(args):
     session_init_ok = setup_action != "missing-source"
     add_session_init = session_init_ok and not _session_init_hook_present(settings)
     deploy_needed = (guard_action in ("deploy", "refresh") or bool(helpers_actionable)
-                     or steer_deploy_needed or setup_deploy_needed)
+                     or steer_deploy_needed or ctxmeter_deploy_needed or setup_deploy_needed)
     settings_changes = (add_hook or bool(missing_allow) or bool(steer_blocks_to_add)
-                        or add_session_init)
+                        or bool(ctxmeter_blocks_to_add) or add_session_init)
 
     if not settings_changes and not deploy_needed:
         if guard_action == "missing-source":
@@ -1561,6 +1657,9 @@ def cmd_configure(args):
         if not getattr(args, "no_steer", False) and steer_action == "missing-source":
             print(f"configure: WARNING - the bundled steer script {BUNDLED_STEER} is missing; skipping "
                   "the advisory steering hooks (the rest still applies).", file=sys.stderr)
+        if not getattr(args, "no_ctxmeter", False) and ctxmeter_action == "missing-source":
+            print(f"configure: WARNING - the bundled meter script {BUNDLED_CTXMETER} is missing; "
+                  "skipping the advisory context-budget meter (the rest still applies).", file=sys.stderr)
         return _narrow_merge_gate_shadows(args.apply, args.yes)
 
     if settings_changes:
@@ -1573,6 +1672,9 @@ def cmd_configure(args):
         for b in steer_blocks_to_add:
             print(f"  hooks.PreToolUse += {json.dumps(b)}")
             print("    (advisory WARN-level steering; opt out with --no-steer)")
+        for b in ctxmeter_blocks_to_add:
+            print(f"  hooks.PostToolUse += {json.dumps(b)}")
+            print("    (#228: advisory context-budget meter; opt out with --no-ctxmeter)")
         if add_session_init:
             print(f"  hooks.SessionStart += {json.dumps(SESSION_INIT_HOOK_BLOCK)}")
             print("    (#162: advisory merge-gate-shadow surfacing at session start; read-only)")
@@ -1595,12 +1697,19 @@ def cmd_configure(args):
         verb = "DEPLOY" if steer_action == "deploy" else "REFRESH (stale)"
         print(f"configure will {verb} the steering hook:")
         print(f"  {BUNDLED_STEER} -> {STEER}")
+    if ctxmeter_deploy_needed:
+        verb = "DEPLOY" if ctxmeter_action == "deploy" else "REFRESH (stale)"
+        print(f"configure will {verb} the context-budget meter:")
+        print(f"  {BUNDLED_CTXMETER} -> {CTXMETER}")
     if guard_action == "missing-source":
         print(f"configure: WARNING - the bundled guard {BUNDLED_GUARD} is missing; cannot deploy "
               "the floor guard (the rest still applies).", file=sys.stderr)
     if not getattr(args, "no_steer", False) and steer_action == "missing-source":
         print(f"configure: WARNING - the bundled steer script {BUNDLED_STEER} is missing; skipping "
               "the advisory steering hooks (the rest still applies).", file=sys.stderr)
+    if not getattr(args, "no_ctxmeter", False) and ctxmeter_action == "missing-source":
+        print(f"configure: WARNING - the bundled meter script {BUNDLED_CTXMETER} is missing; skipping "
+              "the advisory context-budget meter (the rest still applies).", file=sys.stderr)
     _emit_helper_warnings(helper_missing, helper_unreadable)
 
     if not args.apply:
@@ -1630,6 +1739,8 @@ def cmd_configure(args):
             settings.setdefault("permissions", {}).setdefault("allow", []).extend(missing_allow)
         if steer_blocks_to_add:
             settings.setdefault("hooks", {}).setdefault("PreToolUse", []).extend(steer_blocks_to_add)
+        if ctxmeter_blocks_to_add:
+            settings.setdefault("hooks", {}).setdefault("PostToolUse", []).extend(ctxmeter_blocks_to_add)
         if add_session_init:
             settings.setdefault("hooks", {}).setdefault("SessionStart", []).append(SESSION_INIT_HOOK_BLOCK)
         try:
@@ -1640,9 +1751,9 @@ def cmd_configure(args):
             return 1
         backup_note = f" (backup: {SETTINGS}.bak)" if status == "ok" else ""
         print(f"configure: wrote {SETTINGS}{backup_note}.")
-        if add_hook or steer_blocks_to_add or add_session_init:
-            print("RESTART the Claude Code session for the new PreToolUse hook(s) to load "
-                  "(PreToolUse hooks load at session start).")
+        if add_hook or steer_blocks_to_add or ctxmeter_blocks_to_add or add_session_init:
+            print("RESTART the Claude Code session for the new hook(s) to load "
+                  "(hooks load at session start).")
 
     # Guard deploy is a filesystem copy, independent of (and after) the settings write.
     if guard_action in ("deploy", "refresh"):
@@ -1654,6 +1765,13 @@ def cmd_configure(args):
     # #95: steer deploy - the same Option-A filesystem copy to the stable STEER path.
     if steer_deploy_needed:
         ok, msg = _deploy_steer()
+        print(f"configure: {msg}")
+        if not ok:
+            return 1
+
+    # #228: context-budget meter deploy - the same Option-A filesystem copy to the stable CTXMETER path.
+    if ctxmeter_deploy_needed:
+        ok, msg = _deploy_ctxmeter()
         print(f"configure: {msg}")
         if not ok:
             return 1
@@ -1716,6 +1834,9 @@ def main():
     c.add_argument("--no-steer", action="store_true",
                    help="skip the advisory WARN-level steering hooks (#95); the deny-floor guard is "
                         "always wired regardless")
+    c.add_argument("--no-ctxmeter", action="store_true",
+                   help="skip the advisory PostToolUse context-budget meter (#228); the deny-floor "
+                        "guard is always wired regardless")
 
     args = p.parse_args()
     return {"doctor": cmd_doctor, "up": cmd_up, "down": cmd_down,

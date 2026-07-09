@@ -62,6 +62,12 @@ def run(args, *, env_overrides=None, tmux=True):
     # steering explicitly override ORCHESTRATE_BUNDLED_STEER / ORCHESTRATE_STEER via env_overrides.
     env["ORCHESTRATE_BUNDLED_STEER"] = "/nonexistent/orchestrate-steer-bundled.sh"
     env["ORCHESTRATE_STEER"] = "/nonexistent/orchestrate-steer-deployed.sh"
+    # #228 CTXMETER ISOLATION: same treatment as steer - point the bundled meter source at a
+    # non-existent path by DEFAULT so an unrelated configure test never wires the PostToolUse meter
+    # hook nor deploys the meter script (reads as 'missing-source' -> skipped). Tests exercising the
+    # meter override ORCHESTRATE_BUNDLED_CTXMETER / ORCHESTRATE_CTXMETER via env_overrides.
+    env["ORCHESTRATE_BUNDLED_CTXMETER"] = "/nonexistent/orchestrate-context-meter-bundled.sh"
+    env["ORCHESTRATE_CTXMETER"] = "/nonexistent/orchestrate-context-meter-deployed.sh"
     # #162 SETUP/INIT ISOLATION: by DEFAULT point the bundled setup source at a non-existent path so
     # an unrelated configure test never deploys the setup script to the real ~/.claude/scripts NOR
     # wires the SessionStart init hook (setup reads as 'missing-source' -> deploy skipped + wiring
@@ -946,6 +952,100 @@ def main():
         check("#95: a missing bundled steer source WARNs + wires no steering hooks (no crash)",
               "steer script" in out and "missing" in out.lower() and steer_matchers(s4) == set())
 
+    # #228: configure wires the PostToolUse context-budget meter + deploys the meter script (Option
+    # A); --no-ctxmeter opts out; doctor WARNs (never FAILs) when the meter is missing. Mirrors #95.
+    def ctxmeter_matchers(path):
+        s = json.load(open(path))
+        post = s.get("hooks", {}).get("PostToolUse", [])
+        return {b["matcher"] for b in post for h in b.get("hooks", [])
+                if "orchestrate-context-meter.sh" in h.get("command", "")}
+    with tempfile.TemporaryDirectory() as td:
+        cmbundle = os.path.join(td, "orchestrate-context-meter.sh")
+        open(cmbundle, "w").write("#!/usr/bin/env bash\n# fixture meter\nexit 0\n"); os.chmod(cmbundle, 0o755)
+        cmdest = os.path.join(td, "deployed", "orchestrate-context-meter.sh")
+        cmguard = os.path.join(td, "guard.sh"); write_stub_guard(cmguard)  # GUARD==BUNDLED -> current
+        cmscripts = os.path.join(td, "scripts"); os.makedirs(cmscripts)    # SCRIPTS_DIR==BUNDLED -> no helper action
+        for name in HELPERS:
+            open(os.path.join(cmscripts, name), "w").write(f"#!/usr/bin/env bash\n# {name}\n")
+        cmtpl = os.path.join(td, "tpl"); os.makedirs(cmtpl)
+        open(os.path.join(cmtpl, "required-permissions.md"), "w").write(
+            "## Needed allow-list entries\n- `Bash(x *)`\n")
+
+        def cm_fresh(fn):
+            p = os.path.join(td, fn)
+            json.dump({"hooks": {"PreToolUse": [GUARD_HOOK]}, "permissions": {"allow": ["Bash(x *)"]}},
+                      open(p, "w"))
+            return p
+
+        def cmov(settings_path, meter_bundle=cmbundle, meter_dest=cmdest):
+            return {"ORCHESTRATE_SETTINGS": settings_path, "ORCHESTRATE_TEMPLATES_DIR": cmtpl,
+                    "ORCHESTRATE_SETTINGS_FILES": settings_path,
+                    "ORCHESTRATE_GUARD": cmguard, "ORCHESTRATE_BUNDLED_GUARD": cmguard,
+                    "ORCHESTRATE_SCRIPTS_DIR": cmscripts, "ORCHESTRATE_BUNDLED_SCRIPTS_DIR": cmscripts,
+                    "ORCHESTRATE_CTXMETER": meter_dest, "ORCHESTRATE_BUNDLED_CTXMETER": meter_bundle}
+
+        # Dry-run previews the meter wiring + deploy, writes nothing.
+        c1 = cm_fresh("c1.json")
+        rc, out = run(["configure"], env_overrides=cmov(c1))
+        check("#228: dry-run previews the context-budget meter hook + DEPLOY, writes nothing",
+              rc == 0 and "context-budget meter" in out and not os.path.exists(cmdest)
+              and ctxmeter_matchers(c1) == set())
+        # --apply wires the PostToolUse "*" hook + deploys the meter script (executable).
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=cmov(c1))
+        meter_deployed = (os.path.isfile(cmdest)
+                          and open(cmdest, "rb").read() == open(cmbundle, "rb").read()
+                          and bool(os.stat(cmdest).st_mode & 0o111))
+        check("#228: configure --apply wires the PostToolUse meter hook + deploys the meter script",
+              rc == 0 and ctxmeter_matchers(c1) == {"*"} and meter_deployed)
+        # Idempotent: second --apply makes no meter change.
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=cmov(c1))
+        check("#228: configure is idempotent once the meter is wired (no new meter hook line)",
+              rc == 0 and "context-budget meter" not in out)
+        # --no-ctxmeter omits the meter hook AND does not deploy the meter script.
+        c2 = cm_fresh("c2.json")
+        cmdest2 = os.path.join(td, "deployed2", "orchestrate-context-meter.sh")
+        rc, out = run(["configure", "--apply", "--yes", "--no-ctxmeter"],
+                      env_overrides=cmov(c2, meter_dest=cmdest2))
+        check("#228: --no-ctxmeter omits the meter hook and does not deploy the meter script",
+              rc == 0 and ctxmeter_matchers(c2) == set() and not os.path.exists(cmdest2))
+        # doctor WARNs (never FAILs) when the meter is not wired; names the configure remedy.
+        c3 = cm_fresh("c3.json")  # guard wired, meter absent + not deployed
+        rc, out = run(["doctor"], env_overrides=cmov(c3, meter_dest=os.path.join(td, "nope.sh")), tmux=True)
+        check("#228: doctor WARNs (not FAILs) when the meter hook is missing + names the remedy",
+              "[WARN]" in out and "context-budget meter hook (PostToolUse) not wired" in out
+              and "configure --apply" in out and "[FAIL] advisory context-budget meter" not in out)
+        # Missing bundled meter source: WARN, no crash, no meter hook wired.
+        c4 = cm_fresh("c4.json")
+        rc, out = run(["configure", "--apply", "--yes"],
+                      env_overrides=cmov(c4, meter_bundle=os.path.join(td, "no-meter-src.sh")))
+        check("#228: a missing bundled meter source WARNs + wires no meter hook (no crash)",
+              "meter script" in out and "missing" in out.lower() and ctxmeter_matchers(c4) == set())
+
+    with tempfile.TemporaryDirectory() as td:
+        sbundle = os.path.join(td, "orchestrate-steer.sh")
+        open(sbundle, "w").write("#!/usr/bin/env bash\n# fixture steer\nexit 0\n"); os.chmod(sbundle, 0o755)
+        sdest = os.path.join(td, "deployed", "orchestrate-steer.sh")
+        sguard = os.path.join(td, "guard.sh"); write_stub_guard(sguard)
+        hscripts = os.path.join(td, "scripts"); os.makedirs(hscripts)
+        for name in HELPERS:
+            open(os.path.join(hscripts, name), "w").write(f"#!/usr/bin/env bash\n# {name}\n")
+        stpl = os.path.join(td, "tpl"); os.makedirs(stpl)
+        open(os.path.join(stpl, "required-permissions.md"), "w").write(
+            "## Needed allow-list entries\n- `Bash(x *)`\n")
+
+        def fresh_settings(fn):
+            p = os.path.join(td, fn)
+            json.dump({"hooks": {"PreToolUse": [GUARD_HOOK]}, "permissions": {"allow": ["Bash(x *)"]}},
+                      open(p, "w"))
+            return p
+
+        def sov(settings_path, steer_bundle=sbundle, steer_dest=sdest):
+            return {"ORCHESTRATE_SETTINGS": settings_path, "ORCHESTRATE_TEMPLATES_DIR": stpl,
+                    "ORCHESTRATE_SETTINGS_FILES": settings_path,
+                    "ORCHESTRATE_GUARD": sguard, "ORCHESTRATE_BUNDLED_GUARD": sguard,
+                    "ORCHESTRATE_SCRIPTS_DIR": hscripts, "ORCHESTRATE_BUNDLED_SCRIPTS_DIR": hscripts,
+                    "ORCHESTRATE_STEER": steer_dest, "ORCHESTRATE_BUNDLED_STEER": steer_bundle}
+
         # --- PR #136 CR round-1 fixes (#95 hardening) -------------------------------------------
         # The canonical fail-open command that configure now writes (must mirror STEER_HOOK_COMMAND
         # in orchestrate-setup.py exactly). present() exact-matches against THIS string.
@@ -1003,7 +1103,7 @@ def main():
         s_rn = fresh_settings("s_rn.json")  # guard wired, helpers current, allow satisfied -> only steer adds
         rc, out = run(["configure", "--apply", "--yes"], env_overrides=sov(s_rn))
         check("#95 F5: restart notice fires for a steer-only hook add (no guard add)",
-              "RESTART" in out and "PreToolUse hook(s) to load" in out
+              "RESTART" in out and "hooks load at session start" in out
               and steer_exact_matchers(s_rn) == {"Edit", "Write", "Bash"})
 
     # #162: read-only `init` SessionStart advisory. STRICTLY read-only (settings byte-identical
