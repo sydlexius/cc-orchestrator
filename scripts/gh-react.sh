@@ -102,7 +102,7 @@ fi
 # --- Resolve the LATEST Codoki summary comment ------------------------------
 # Fetch issue-level comments (a GET; --paginate merges pages into one JSON array).
 # A gh failure here is a hard, LOUD error (never a silent skip).
-issue_comments="$(gh api "repos/${repo}/issues/${pr}/comments" --paginate 2>/dev/null)" \
+issue_comments="$(gh api "repos/${repo}/issues/${pr}/comments" --paginate)" \
   || die "could not fetch issue comments for PR #${pr} (${repo}) -- ack state UNVERIFIABLE (LOUD failure, not 'n/a')"
 
 # Resolve the Codoki review-SUMMARY comment, identifying it (in order):
@@ -164,21 +164,26 @@ if [ -z "$summary_id" ]; then
 fi
 is_num "$summary_id" || die "resolved a non-numeric summary id ('${summary_id}')"
 
-reactions="$(gh api "repos/${repo}/issues/comments/${summary_id}/reactions" --paginate 2>/dev/null)" \
+reactions="$(gh api "repos/${repo}/issues/comments/${summary_id}/reactions" --paginate)" \
   || die "could not read reactions on Codoki summary ${summary_id} (PR #${pr} ${repo}) -- ack state UNVERIFIABLE (LOUD failure)"
 
 # A NON-BOT reaction is any +1/-1 whose reacting login does NOT end in "[bot]".
-nonbot_plus="$(jq -r '[ .[] | select(.content == "+1") | select(((.user.login // "") | endswith("[bot]")) | not) ] | length' <<<"$reactions" 2>/dev/null || echo 0)"
-nonbot_minus="$(jq -r '[ .[] | select(.content == "-1") | select(((.user.login // "") | endswith("[bot]")) | not) ] | length' <<<"$reactions" 2>/dev/null || echo 0)"
+# A jq error here means malformed reactions JSON -> die LOUDLY (the module's
+# tool-failure contract), NOT a silent degrade to 0 that would read as unacked.
+nonbot_plus="$(jq -r '[ .[] | select(.content == "+1") | select(((.user.login // "") | endswith("[bot]")) | not) ] | length' <<<"$reactions")" \
+  || die "could not parse reactions on Codoki summary ${summary_id} -- ack state UNVERIFIABLE"
+nonbot_minus="$(jq -r '[ .[] | select(.content == "-1") | select(((.user.login // "") | endswith("[bot]")) | not) ] | length' <<<"$reactions")" \
+  || die "could not parse reactions on Codoki summary ${summary_id} -- ack state UNVERIFIABLE"
 
 # An @codoki reply = a NON-BOT issue comment mentioning @codoki, posted at/after
-# the summary. Required to satisfy a -1 (rebut).
+# the summary. Required to satisfy a -1 (rebut). A jq error here dies loudly too.
 codoki_reply="$(jq -r --arg since "$summary_created" '
   [ .[]
     | select(((.user.login // "") | endswith("[bot]")) | not)
     | select((.body // "") | test("@codoki"; "i"))
     | select($since == "" or (.created_at >= $since)) ] | length
-' <<<"$issue_comments" 2>/dev/null || echo 0)"
+' <<<"$issue_comments")" \
+  || die "could not parse issue comments for the @codoki-reply check -- ack state UNVERIFIABLE"
 
 if [ "${nonbot_plus:-0}" -gt 0 ]; then
   echo "CODOKI-ACK: acked -- non-bot 👍 on Codoki summary ${summary_id} (PR #${pr} ${repo})"

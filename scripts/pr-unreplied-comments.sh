@@ -480,8 +480,8 @@ if [ "$audit_mode" = true ]; then
 
   audit_all=$(jq -n --argjson f "$findings" --argjson s "$summaries" '$f + $s')
 
-  printf '%-9s %-34s %-32s %-8s %-9s\n' "TYPE" "AUTHOR" "LOCATION" "REPLIED" "RESOLVED"
-  # RESOLVED column doubles as the ACK column for issue-level summaries (#234): a
+  printf '%-9s %-34s %-32s %-8s %-12s\n' "TYPE" "AUTHOR" "LOCATION" "REPLIED" "RESOLVED/ACK"
+  # RESOLVED/ACK column doubles as the ACK column for issue-level summaries (#234): a
   # Codoki summary shows ACKED / UNACKED (its ack has no thread to resolve), while
   # findings keep yes/NO thread-resolution and non-ack summaries show n-a.
   echo "$audit_all" | jq -r '.[] | [

@@ -38,10 +38,13 @@ def check(label, ok):
 
 # gh stub: GET -> serve JSON (apply --jq via real jq); mutation (-X POST) -> log argv.
 GH_STUB = r'''#!/usr/bin/env python3
-import os, sys, subprocess
+import json, os, re, sys, subprocess
 args = sys.argv[1:]
 ISSUE = os.environ.get("ISSUE_JSON", "[]")
 REACTIONS = os.environ.get("REACTIONS_JSON", "[]")
+# Per-comment-id reactions: {"<id>": [<reactions>]} -- lets a test give the REAL
+# summary and a non-summary comment DIFFERENT reactions (the #234 false-pass proof).
+REACTIONS_BY_ID = json.loads(os.environ.get("REACTIONS_BY_ID_JSON", "{}"))
 GH_FAIL = os.environ.get("GH_FAIL", "")
 
 def emit(data):
@@ -70,6 +73,9 @@ for a in args:
     if a.startswith("repos/"):
         endpoint = a; break
 if "/reactions" in endpoint:
+    m = re.search(r"/comments/(\d+)/reactions", endpoint)
+    if m and m.group(1) in REACTIONS_BY_ID:
+        emit(json.dumps(REACTIONS_BY_ID[m.group(1)]))
     emit(REACTIONS)
 if endpoint.endswith("/comments") and "/issues/" in endpoint:
     emit(ISSUE)
@@ -78,7 +84,7 @@ emit("[]")
 '''
 
 
-def run(args, *, issue="[]", reactions="[]", gh_fail=False, repo="owner/repo"):
+def run(args, *, issue="[]", reactions="[]", reactions_by_id=None, gh_fail=False, repo="owner/repo"):
     """Invoke gh-react.sh with a stubbed gh. Returns (rc, stdout, stderr, posted_argv)."""
     with tempfile.TemporaryDirectory() as td:
         bindir = os.path.join(td, "bin"); os.makedirs(bindir)
@@ -91,6 +97,9 @@ def run(args, *, issue="[]", reactions="[]", gh_fail=False, repo="owner/repo"):
         env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
         env["ISSUE_JSON"] = issue
         env["REACTIONS_JSON"] = reactions
+        if reactions_by_id is not None:
+            import json as _json
+            env["REACTIONS_BY_ID_JSON"] = _json.dumps(reactions_by_id)
         env["GH_LOG"] = log
         if repo is not None:
             env["GITHUB_REPOSITORY"] = repo
@@ -194,13 +203,16 @@ def main():
 
     # #234 hostile-review MEDIUM (false-PASS closure): a NON-summary Codoki comment
     # is NEWER and carries a stray +1, while the REAL summary (id 9001) is unacked.
-    # The resolver must pick the real summary (marker), NOT the acked non-summary.
+    # Reactions are keyed PER COMMENT ID (CR #253): +1 only on the non-summary 8800,
+    # nothing on the real summary 9001 -> proves the resolver reads the SUMMARY's
+    # reactions (empty -> unacked), never the non-summary's stray +1.
     rc, out, err, _ = run(["codoki-ack", "5"],
                           issue=issue_arr(SUMMARY_MARKED, CODOKI_NONSUMMARY),
-                          reactions="[]")
+                          reactions_by_id={"8800": [{"content": "+1", "user": {"login": "sydlexius"}}],
+                                           "9001": []})
     check("non-summary Codoki comment NOT selected; real summary (9001) wins",
           rc == 0 and "summary 9001" in out and "8800" not in out)
-    check("non-summary + unacked real summary -> unacked (false-PASS closed)",
+    check("stray +1 on the non-summary is NOT counted; real summary -> unacked (false-PASS closed)",
           "unacked" in out)
 
     # No marker AND no header on ANY Codoki comment -> refuse to guess: no-summary
@@ -211,11 +223,6 @@ def main():
           rc == 0 and "no-summary" in out)
     check("no recognizable summary but Codoki commented -> loud drift WARNING",
           "format may have changed" in err.lower() or "recognized review summary" in err.lower())
-
-    # gh failure resolving the summary -> LOUD nonzero (never silent 'not applicable').
-    rc, out, err, _ = run(["codoki-ack", "5"], gh_fail=True)
-    check("gh failure in read -> nonzero, loud stderr",
-          rc != 0 and ("codoki" in err.lower() or "gh" in err.lower()))
 
     # gh failure resolving the summary -> LOUD nonzero (never silent 'not applicable').
     rc, out, err, _ = run(["codoki-ack", "5"], gh_fail=True)

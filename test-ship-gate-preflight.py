@@ -178,6 +178,9 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         env["HELPER_ARGV_LOG"] = argfile
         env["HELPER_CALLS_LOG"] = counter
         env["CODOKI_ACK_VERDICT"] = codoki_ack_verdict
+        # Clear any inherited CODOKI_ACK_FAIL first, then set ONLY when this case
+        # asks for it -- otherwise a caller's env var would fail every case (CR #253).
+        env.pop("CODOKI_ACK_FAIL", None)
         if codoki_ack_fail:
             env["CODOKI_ACK_FAIL"] = "1"
 
