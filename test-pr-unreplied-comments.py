@@ -25,6 +25,7 @@ skipped (no real repo needed).
 
 Run: python3 test-pr-unreplied-comments.py
 """
+import json
 import os
 import subprocess
 import sys
@@ -52,6 +53,7 @@ GRAPHQL = os.environ.get("GRAPHQL_JSON", '{"data":{"repository":{"pullRequest":{
 GRAPHQL_NEXT = os.environ.get("GRAPHQL_NEXT", "")
 HEAD_SHA = os.environ.get("HEAD_SHA", "abcdef1234567890abcdef1234567890abcdef12")
 COMMITTER_DATE = os.environ.get("COMMITTER_DATE", "2026-06-18T00:00:00Z")
+CHECK_RUNS = os.environ.get("CHECK_RUNS_JSON", '{"total_count":0,"check_runs":[]}')
 PULL = '{"head":{"sha":"%s"}}' % HEAD_SHA
 COMMIT = '{"commit":{"committer":{"date":"%s"}}}' % COMMITTER_DATE
 
@@ -89,6 +91,11 @@ if endpoint.endswith("/comments") and "/pulls/" in endpoint:
     emit(INLINE)
 if endpoint.endswith("/comments") and "/issues/" in endpoint:
     emit(ISSUE)
+# The check-runs endpoint (repos/O/R/commits/SHA/check-runs?per_page=100) also
+# contains "/commits/", so it MUST be matched before the generic committer-date
+# branch. Match on substring (a ?query may follow the /check-runs path).
+if "/check-runs" in endpoint:
+    emit(CHECK_RUNS)
 if "/commits/" in endpoint:
     emit(COMMIT)
 emit(PULL)
@@ -96,7 +103,8 @@ emit(PULL)
 
 
 def run(args, *, inline="[]", reviews="[]", issue="[]", graphql=None,
-        graphql_next=None, committer_date="2026-06-18T00:00:00Z", me="testuser"):
+        graphql_next=None, committer_date="2026-06-18T00:00:00Z", me="testuser",
+        check_runs=None):
     with tempfile.TemporaryDirectory() as td:
         bindir = os.path.join(td, "bin"); os.makedirs(bindir)
         gh = os.path.join(bindir, "gh")
@@ -114,6 +122,8 @@ def run(args, *, inline="[]", reviews="[]", issue="[]", graphql=None,
             env["GRAPHQL_JSON"] = graphql
         if graphql_next is not None:
             env["GRAPHQL_NEXT"] = graphql_next
+        if check_runs is not None:
+            env["CHECK_RUNS_JSON"] = check_runs
         p = subprocess.run(["bash", SCRIPT] + args + ["123", "owner/repo"],
                            env=env, capture_output=True, text=True, timeout=20)
         return p.returncode, p.stdout, p.stderr
@@ -350,6 +360,46 @@ def main():
     check("multi-page advisory: page-1 unresolved thread surfaced", "p1.sh:1" in out)
     check("multi-page advisory: page-2 unresolved thread surfaced (pagination followed)", "p2.sh:2" in out)
     check("multi-page advisory: exit 0", rc == 0)
+
+    print("== #239 coverage advisory: gate on the codecov/patch CHECK-RUN, not the comment glyph ==")
+    # The codecov comment prints a leading :x: whenever ANY patch line is uncovered,
+    # INDEPENDENT of whether the patch threshold passed. Deriving threshold_state from
+    # that glyph made a passing gate read "fail" and spuriously paused /merge-pr.
+    # The gating truth is the codecov/patch check-run conclusion.
+    CODECOV_XMARK = (
+        '[{"id":555,"user":{"login":"codecov[bot]"},"created_at":"2026-07-06T00:00:00Z",'
+        '"body":":x: Patch coverage is `87.20000%` with `16 lines` in your changes missing coverage.\\n'
+        'See [report](https://app.codecov.io/gh/o/r/pull/1)."}]'
+    )
+    CR_PATCH_PASS = '{"total_count":1,"check_runs":[{"name":"codecov/patch","status":"completed","conclusion":"success"}]}'
+    CR_PATCH_FAIL = '{"total_count":1,"check_runs":[{"name":"codecov/patch","status":"completed","conclusion":"failure"}]}'
+    CR_NO_CODECOV = '{"total_count":1,"check_runs":[{"name":"gates (ubuntu-latest)","status":"completed","conclusion":"success"}]}'
+
+    # Core bug: :x: glyph in the comment BUT the codecov/patch check-run PASSED -> not fail.
+    rc, out, err = run(["--coverage-only"], issue=CODECOV_XMARK, check_runs=CR_PATCH_PASS)
+    adv = json.loads(out)
+    check("glyph :x: but codecov/patch check-run success -> threshold_state=pass (not fail)",
+          adv.get("threshold_state") == "pass")
+    check("comment glyph preserved as advisory-only comment_glyph=uncovered",
+          adv.get("comment_glyph") == "uncovered")
+    check("patch_pct still parsed from the comment (87.2)", adv.get("patch_pct") == 87.2)
+    check("coverage-only exit 0", rc == 0)
+
+    # Genuine gating failure: the codecov/patch check-run itself failed -> fail (still gates).
+    rc, out, err = run(["--coverage-only"], issue=CODECOV_XMARK, check_runs=CR_PATCH_FAIL)
+    adv = json.loads(out)
+    check("codecov/patch check-run failure -> threshold_state=fail", adv.get("threshold_state") == "fail")
+
+    # No gating codecov signal: comment present but NO codecov/patch check-run -> none (advisory-only, no pause).
+    rc, out, err = run(["--coverage-only"], issue=CODECOV_XMARK, check_runs=CR_NO_CODECOV)
+    adv = json.loads(out)
+    check("no codecov/patch check-run -> threshold_state=none (advisory-only, never a gating fail)",
+          adv.get("threshold_state") == "none")
+
+    # No codecov comment at all -> status none (unchanged contract).
+    rc, out, err = run(["--coverage-only"], issue="[]", check_runs=CR_PATCH_PASS)
+    adv = json.loads(out)
+    check("no codecov comment -> status=none (unchanged)", adv.get("status") == "none")
 
     print()
     if FAILS:

@@ -233,17 +233,30 @@ count_pending_reviewers() {
 }
 
 # --- Core function: build the codecov coverage advisory ---
-# Parses the latest codecov[bot] issue comment on the PR and extracts:
-#   - patch_pct: the "Patch coverage is `NN.NN%`" value (float, or null)
-#   - threshold_state: "pass" | "fail" | "unknown" based on the leading
-#                      emoji (:white_check_mark: / :x: / other)
+# Parses the latest codecov[bot] issue comment on the PR for informational fields,
+# then derives the GATING threshold_state from the codecov/patch CHECK-RUN (not the
+# comment). Fields:
+#   - patch_pct: the "Patch coverage is `NN.NN%`" value (float, or null) -- from the comment
+#   - threshold_state: "pass" | "fail" | "none" -- from the codecov/patch check-run
+#                      conclusion on the PR head SHA. This is the ONLY gating signal.
+#   - comment_glyph: "pass" | "uncovered" | "unknown" -- ADVISORY ONLY, from the leading
+#                    emoji on the comment's patch line. NOT a gate (see #239 below).
 #   - report_url: the first link to app.codecov.io found in the body
 #   - comment_id: the GitHub issue comment id (for linking)
 # Prints a JSON object. Returns {"status":"none"} when codecov has not
 # posted on this PR. This is informational only and never contributes to
 # the unreplied-comment count.
+#
+# #239: codecov prints a leading :x: on the patch line WHENEVER any patch line is
+# uncovered -- independent of whether the patch THRESHOLD passed. Deriving the gating
+# state from that glyph made a passing gate read "fail" and spuriously paused /merge-pr
+# (a wasted maintainer round-trip on every PR with any uncovered patch line). The gating
+# truth is the codecov/patch check-run conclusion, read via the check-runs API (NOT the
+# legacy commits/<sha>/status endpoint, which codecov leaves empty). The comment glyph is
+# retained as advisory-only context under comment_glyph.
 build_coverage_advisory() {
-  local issue_comments codecov_comment body comment_id patch_pct threshold_state report_url
+  local issue_comments codecov_comment body comment_id patch_pct comment_glyph report_url
+  local script_dir head_sha patch_conclusion threshold_state
 
   issue_comments=$(gh api "repos/$repo/issues/$pr_number/comments" --paginate 2>/dev/null || echo '[]')
   codecov_comment=$(echo "$issue_comments" | jq '[.[] | select(.user.login == "codecov[bot]")] | sort_by(.created_at) | last // empty')
@@ -263,15 +276,40 @@ build_coverage_advisory() {
   patch_pct=$(echo "$body" | grep -oE 'Patch coverage is[[:space:]]+`[0-9]+\.?[0-9]*%`' | head -1 \
     | grep -oE '[0-9]+\.?[0-9]*' | head -1)
 
-  # Threshold state from the leading status emoji on the patch-coverage line.
-  # :white_check_mark: signals pass; :x: signals fail; absence signals unknown.
+  # Comment glyph -- ADVISORY ONLY (#239). :white_check_mark: => pass; :x: => uncovered
+  # patch lines present (NOT a threshold failure); absence => unknown. Never gates.
   if echo "$body" | grep -q ':white_check_mark:.*[Pp]atch coverage'; then
-    threshold_state="pass"
+    comment_glyph="pass"
   elif echo "$body" | grep -q ':x:.*[Pp]atch coverage'; then
-    threshold_state="fail"
+    comment_glyph="uncovered"
   else
-    threshold_state="unknown"
+    comment_glyph="unknown"
   fi
+
+  # GATING threshold_state: the codecov/patch check-run conclusion on the PR head SHA.
+  # New reads go through the read-only gh-api-get.sh wrapper (least privilege; GET-only,
+  # no allow-list broadening). gh-api-get.sh is co-located (both are bundled PR-lifecycle
+  # helpers deployed to the same dir). A lookup miss/error degrades to "none" (advisory-
+  # only, never a spurious gating "fail"); a genuine regression is still blocked upstream
+  # by the required coverage CI check via the CI-green / ship-gate gate.
+  script_dir=$(unset CDPATH; cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || script_dir="."
+  head_sha=$("$script_dir/gh-api-get.sh" "repos/$repo/pulls/$pr_number" --jq '.head.sha' 2>/dev/null || echo "")
+  patch_conclusion=""
+  if [ -n "$head_sha" ]; then
+    # per_page=100 (single page, no --paginate concat) covers commits with many
+    # checks; codecov/patch on a later default page would otherwise read as absent.
+    patch_conclusion=$("$script_dir/gh-api-get.sh" "repos/$repo/commits/$head_sha/check-runs?per_page=100" \
+      --jq '[.check_runs[] | select(.name == "codecov/patch")] | max_by(.started_at) | .conclusion // empty' 2>/dev/null || echo "")
+  fi
+  case "$patch_conclusion" in
+    success)
+      threshold_state="pass" ;;
+    failure|cancelled|timed_out|action_required|startup_failure|stale)
+      threshold_state="fail" ;;
+    *)
+      # not found / pending / neutral / skipped: no gating codecov signal -> advisory-only.
+      threshold_state="none" ;;
+  esac
 
   # First codecov report URL in the body.
   report_url=$(echo "$body" | grep -oE 'https://app\.codecov\.io/[^)"[:space:]]+' | head -1 || true)
@@ -280,10 +318,12 @@ build_coverage_advisory() {
     --arg status "present" \
     --arg pct "${patch_pct:-}" \
     --arg state "$threshold_state" \
+    --arg glyph "$comment_glyph" \
     --arg url "${report_url:-}" \
     --argjson id "$comment_id" \
     '{status: $status, patch_pct: (if $pct == "" then null else ($pct | tonumber) end),
-      threshold_state: $state, report_url: (if $url == "" then null else $url end),
+      threshold_state: $state, comment_glyph: $glyph,
+      report_url: (if $url == "" then null else $url end),
       comment_id: $id}'
 }
 
