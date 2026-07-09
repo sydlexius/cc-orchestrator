@@ -50,7 +50,10 @@ fi
 # gh's) so a real list failure propagates and we can fail LOUD.
 if [ "${#prs[@]}" -eq 0 ]; then
   repo_flag=(); [ -n "$repo" ] && repo_flag=(--repo "$repo")
-  if ! pr_list_out=$(gh pr list "${repo_flag[@]}" --state open --json number --jq '.[].number' 2>/dev/null); then
+  # Do NOT suppress gh's stderr on this loud-fail path: its diagnostic (auth /
+  # missing repo context / rate limit) is the actual root cause, and swallowing it
+  # behind the generic message below makes the exit-2 undebuggable. Let it bubble.
+  if ! pr_list_out=$(gh pr list "${repo_flag[@]}" --state open --json number --jq '.[].number'); then
     echo "orchestrate-status: could not determine the in-flight PR set (gh pr list failed)" >&2
     exit 2
   fi
