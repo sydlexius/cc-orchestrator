@@ -262,6 +262,26 @@ def main():
     rc, out, err = run(["--audit", "--count-only"])
     check("audit + --count-only -> exit 1 (mutually exclusive)", rc == 1)
 
+    print("== #234 --audit: Codoki summary ACKED vs UNACKED ==")
+    # The Codoki issue-level summary is informational (never gates the exit code),
+    # but its ack state is now surfaced from the embedded reactions counts: a +1 or
+    # -1 reaction => ACKED, none => UNACKED. Non-fatal in both directions (exit 0).
+    codoki_acked = ('[{"user":{"login":"codoki-pr-intelligence[bot]"},'
+                    '"body":"Review Status: Safe","created_at":"x","updated_at":"x",'
+                    '"reactions":{"total_count":1,"+1":1,"-1":0}}]')
+    rc, out, err = run(["--audit"], graphql=g_ok, issue=codoki_acked)
+    check("audit: Codoki summary with a reaction -> ACKED in the table",
+          "ACKED" in out and "UNACKED" not in out)
+    check("audit: Codoki ACKED does not flip the exit (still 0)", rc == 0)
+
+    codoki_unacked = ('[{"user":{"login":"codoki-pr-intelligence[bot]"},'
+                      '"body":"Review Status: Safe","created_at":"x","updated_at":"x",'
+                      '"reactions":{"total_count":0,"+1":0,"-1":0}}]')
+    rc, out, err = run(["--audit"], graphql=g_ok, issue=codoki_unacked)
+    check("audit: Codoki summary with no reaction -> UNACKED in the table",
+          "UNACKED" in out)
+    check("audit: Codoki UNACKED does not flip the exit (still 0, informational)", rc == 0)
+
     print("== #132 --audit no-silent-caps: >100-thread pagination ==")
     # A PR with MORE than one page of review threads. The OLD code stopped at
     # reviewThreads(first:100) with no pageInfo check, so it could SILENTLY

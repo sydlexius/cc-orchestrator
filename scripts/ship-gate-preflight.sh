@@ -25,7 +25,8 @@
 #   Exit codes:
 #     0  PASS  - all gates green (full mode: every check terminal+acceptable AND
 #               0 actionable review-body findings AND reviewDecision not an active
-#               CHANGES_REQUESTED; codoki-only: Codoki settled OK).
+#               CHANGES_REQUESTED AND the Codoki root-summary ack is met-or-absent
+#               (#234); codoki-only: Codoki settled OK).
 #     1  USAGE - bad/missing arguments.
 #     2  BLOCK - a gate failed, OR any lookup/parse error (gh/jq/helper failure).
 #               BLOCK is the fail-closed code: an unknown state is ALWAYS a block.
@@ -320,5 +321,46 @@ case "$review_decision" in
     exit 2 ;;
 esac
 
-echo "RESULT: PASS -- all checks green, 0 actionable review-body findings, reviewDecision=${review_decision:-<none>} (not an active CHANGES_REQUESTED). [#$pr $repo]"
+# --- CODOKI-ROOT-ACK GATE (#234; FULL mode only) ---------------------------
+# The merge-ready bar carries a review-response clause the thread-resolution +
+# unreplied-comments checks CANNOT see: the 👍/👎 ack on Codoki's ISSUE-LEVEL
+# review-SUMMARY comment (author login codoki-pr-intelligence[bot]). That comment
+# has no isResolved and never appears in a reviewThreads query, so a merge-ready
+# path once reported CLEAN while the ack was unmet. gh-react.sh is the canonical,
+# least-privilege reader of that ack state. ACK RULE (settled): satisfaction = ANY
+# NON-BOT login's +1/-1 on the LATEST summary (a -1 also needs an @codoki reply);
+# NO summary => PASS (never fail-closed on absence). FAIL CLOSED on a missing/
+# erroring reader (the ack cannot be verified), mirroring the review-gate posture.
+# Deliberately NOT in --codoki-only mode (that stays a pure check-rollup signal).
+reactor="${HOME}/.claude/scripts/gh-react.sh"
+if [ ! -x "$reactor" ]; then
+  echo "BLOCK: gh-react.sh not found/executable at $reactor (cannot verify the Codoki root ack)." >&2
+  echo "RESULT: BLOCK -- Codoki ack unverifiable. [#$pr $repo]" >&2
+  exit 2
+fi
+ack_out="$("$reactor" codoki-ack "$pr" "$repo" 2>&1)" || {
+  echo "BLOCK: gh-react.sh codoki-ack failed for #$pr (cannot verify the Codoki root ack; fail closed)." >&2
+  echo "  --- gh-react output ---" >&2
+  printf '%s\n' "$ack_out" | tail -n 3 >&2
+  echo "RESULT: BLOCK -- Codoki ack unverifiable. [#$pr $repo]" >&2
+  exit 2
+}
+# Parse the 'CODOKI-ACK: <verdict>' line. no-summary/acked -> pass; unacked ->
+# BLOCK; anything unrecognized -> fail closed.
+ack_verdict="$(printf '%s\n' "$ack_out" \
+  | sed -n 's/.*CODOKI-ACK:[[:space:]]*\([A-Za-z-]*\).*/\1/p' | tail -n1)"
+case "$ack_verdict" in
+  no-summary|acked) : ;;
+  unacked)
+    echo "BLOCK: Codoki root-summary ack is UNMET on #$pr (react 👍/👎 via gh-react.sh codoki-ack $pr --react +1|-1; a 👎 rebut also needs an @codoki reply)." >&2
+    printf '%s\n' "$ack_out" | tail -n 1 >&2
+    echo "RESULT: BLOCK -- Codoki root ack unmet. [#$pr $repo]" >&2
+    exit 2 ;;
+  *)
+    echo "BLOCK: gh-react.sh returned an unrecognized ack verdict '${ack_verdict:-<none>}' on #$pr (cannot verify the Codoki root ack)." >&2
+    echo "RESULT: BLOCK -- Codoki ack unverifiable. [#$pr $repo]" >&2
+    exit 2 ;;
+esac
+
+echo "RESULT: PASS -- all checks green, 0 actionable review-body findings, reviewDecision=${review_decision:-<none>} (not an active CHANGES_REQUESTED), Codoki root ack ${ack_verdict}. [#$pr $repo]"
 exit 0

@@ -463,18 +463,33 @@ if [ "$audit_mode" = true ]; then
         } ]')
 
   # SUMMARIES: issue-level bot review comments (informational; no thread to resolve).
+  # ACK STATE (#234): the Codoki summary (author codoki-pr-intelligence[bot]) carries
+  # a 👍/👎 ROOT-SUMMARY ack that lives ONLY as a reaction (no isResolved, absent from
+  # reviewThreads). Surface it from the embedded reactions counts: any +1 or -1 =>
+  # ack=true (ACKED), else ack=false (UNACKED). This is INFORMATIONAL here (the exit
+  # code is unchanged; the AUTHORITATIVE block is ship-gate-preflight.sh, which reads
+  # the reacting logins via gh-react.sh to enforce the NON-BOT rule). Other bot
+  # summaries have no ack surface -> ack=null (rendered "n-a").
   summaries=$(echo "$issue_comments_audit" | jq -c --argjson bots "$audit_bots" '
     [ .[] | select((.user.login // "") as $l | $bots | index($l))
       | { type: "summary", author: .user.login, location: "(issue-level)",
-          replied: null, resolved: null } ]')
+          replied: null, resolved: null,
+          ack: (if (.user.login // "") == "codoki-pr-intelligence[bot]"
+                then (((.reactions."+1" // 0) + (.reactions."-1" // 0)) > 0)
+                else null end) } ]')
 
   audit_all=$(jq -n --argjson f "$findings" --argjson s "$summaries" '$f + $s')
 
   printf '%-9s %-34s %-32s %-8s %-9s\n' "TYPE" "AUTHOR" "LOCATION" "REPLIED" "RESOLVED"
+  # RESOLVED column doubles as the ACK column for issue-level summaries (#234): a
+  # Codoki summary shows ACKED / UNACKED (its ack has no thread to resolve), while
+  # findings keep yes/NO thread-resolution and non-ack summaries show n-a.
   echo "$audit_all" | jq -r '.[] | [
     .type, .author, .location,
     (if .replied == true then "yes" elif .replied == false then "NO" else "n-a" end),
-    (if .resolved == true then "yes" elif .resolved == false then "NO" else "n-a" end)
+    (if .type == "summary" and .ack == true then "ACKED"
+     elif .type == "summary" and .ack == false then "UNACKED"
+     elif .resolved == true then "yes" elif .resolved == false then "NO" else "n-a" end)
   ] | @tsv' | while IFS=$'\t' read -r a_type a_author a_loc a_rep a_res; do
     printf '%-9s %-34s %-32s %-8s %-9s\n' "$a_type" "$a_author" "$a_loc" "$a_rep" "$a_res"
   done

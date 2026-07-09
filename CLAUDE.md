@@ -58,7 +58,8 @@ Runtime (`scripts/`; canonical source is this repo):
   [--apply]` is the consent-based path that wires the floor hook + missing allow-list entries into
   settings.json, DEPLOYS the bundled guard to the stable `~/.claude/scripts/` path (so a fresh
   plugin install has a working floor; idempotent, refreshes a stale copy, warns on a missing source),
-  DEPLOYS the 12 bundled PR-lifecycle helpers the same Option-A way (#133; retiring any claude-kit
+  DEPLOYS the 13 bundled PR-lifecycle helpers the same Option-A way (#133; #234 added
+  `gh-react.sh`; retiring any claude-kit
   symlink, backed up to `<dest>.bak`), and (unless `--no-steer`) DEPLOYS + wires the advisory
   steering hook `orchestrate-steer.sh` for Edit/Write/Bash (#95; doctor only ever WARNs about it),
   DEPLOYS this script to the stable path + wires a read-only SessionStart `init` advisory hook (#162;
@@ -91,7 +92,12 @@ Runtime (`scripts/`; canonical source is this repo):
   `--validate <schema> <file.json>` CLI (exit 0 valid / 1 invalid / 2 usage). Extra keys allowed
   (forward-compat). Human doc: `skills/orchestrate/templates/schemas.md`. Prerequisite for #229/#230.
 - `scripts/planner_classify.py`, `scripts/uat-autobuild.sh`, `scripts/gh-*.sh` - the planner helper,
-  the UAT auto-rebuild watcher, and the least-privilege gh wrappers.
+  the UAT auto-rebuild watcher, and the least-privilege gh wrappers. `gh-react.sh codoki-ack`
+  (#234) is the canonical reader/actuator of the Codoki ROOT-SUMMARY ack (the 👍/👎 reaction on
+  Codoki's issue-level review-summary comment - a surface with no `isResolved` that never appears
+  in `reviewThreads`); `ship-gate-preflight.sh` FULL mode now BLOCKs when a Codoki summary exists
+  with no NON-BOT ack (a 👎 rebut also needs an `@codoki` reply), PASSES on no-summary, and
+  `pr-unreplied-comments.sh --audit` surfaces the summary's ACKED/UNACKED state (informational).
 - `scripts/prefs-coverage.py` - opt-in UI-preference-coverage HARD-GATE (a repo enables it by adding a
   `.prefs.toml` + a `.gates.toml` step; schema `skills/orchestrate/templates/prefs.toml.md`). For each
   `[[pref]]` it greps the directly-changed governed surfaces for the pref's `verify` regex; a governed,
@@ -130,8 +136,8 @@ clean-worktree check, so an unchanged committed tree skips re-running it
 `skills/orchestrate/templates/gates.toml.md`.
 
 ```sh
-shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
-ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-planner-classify.py test-gh-wrappers.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py
+shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
+ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py
 ./scripts/orchestrate-guard.sh --self-test    # MUST use ./ - the self-test re-invokes "$0";
                                               # `bash scripts/orchestrate-guard.sh` makes $0 a bare name -> 127
 ./scripts/orchestrate-steer.sh --self-test    # advisory WARN-level steering hook (#95)
@@ -146,6 +152,7 @@ python3 test-orchestrate-status.py
 python3 test-orchestrate-schemas.py
 python3 test-planner-classify.py
 python3 test-gh-wrappers.py
+python3 test-gh-react.py
 python3 test-ship-gate-preflight.py
 python3 test-pr-unreplied-comments.py
 python3 test-pr-read-comments.py
