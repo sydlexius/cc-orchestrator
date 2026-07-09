@@ -292,14 +292,14 @@ build_coverage_advisory() {
   # helpers deployed to the same dir). A lookup miss/error degrades to "none" (advisory-
   # only, never a spurious gating "fail"); a genuine regression is still blocked upstream
   # by the required coverage CI check via the CI-green / ship-gate gate.
-  script_dir=$(unset CDPATH; cd -- "$(dirname -- "$0")" && pwd)
+  script_dir=$(unset CDPATH; cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || script_dir="."
   head_sha=$("$script_dir/gh-api-get.sh" "repos/$repo/pulls/$pr_number" --jq '.head.sha' 2>/dev/null || echo "")
   patch_conclusion=""
   if [ -n "$head_sha" ]; then
     # per_page=100 (single page, no --paginate concat) covers commits with many
     # checks; codecov/patch on a later default page would otherwise read as absent.
     patch_conclusion=$("$script_dir/gh-api-get.sh" "repos/$repo/commits/$head_sha/check-runs?per_page=100" \
-      --jq '[.check_runs[] | select(.name == "codecov/patch")] | last | .conclusion // empty' 2>/dev/null || echo "")
+      --jq '[.check_runs[] | select(.name == "codecov/patch")] | max_by(.started_at) | .conclusion // empty' 2>/dev/null || echo "")
   fi
   case "$patch_conclusion" in
     success)
