@@ -548,6 +548,42 @@ def test_receipt_steps_records_match():
               orchestrate_schemas.validate("gate-receipt/v1", r) == [])
 
 
+def test_receipt_malformed_form_b_config_error():
+    # CR #251 nitpick: exercise --receipt on a MALFORMED Form B step (a config
+    # error -> rc=2, distinct from a gate pass/fail). The receipt is STILL written
+    # (result=fail, since rc != 0), steps[] holds whatever ran BEFORE the bad step,
+    # the malformed step is not recorded, and the receipt stays schema-valid.
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        cfg = """\
+[prep_pr]
+  [[prep_pr.steps]]
+  name = "ran-first"
+  run = "sh -c 'exit 0'"
+  [[prep_pr.steps]]
+  name = "bad-required"
+  run = "sh -c 'exit 0'"
+  required = "not-a-bool"
+"""
+        write(root, ".gates.toml", cfg)
+        git_commit(root)
+        head = git_head(root)
+        rpath = os.path.join(root, "receipt.json")
+        rc, out = run_runner(root, args=("--receipt", rpath))
+        check("receipt(config-error): gate exits 2 (config error)", rc == 2)
+        check("receipt(config-error): receipt STILL written", os.path.isfile(rpath))
+        r = _load_receipt(rpath)
+        check("receipt(config-error): result == fail (rc != 0)", r.get("result") == "fail")
+        check("receipt(config-error): real commit_sha (== HEAD)", r.get("commit_sha") == head)
+        by_name = {s["name"]: s["result"] for s in r.get("steps", [])}
+        check("receipt(config-error): steps[] holds the step run before the error",
+              by_name.get("ran-first") == "pass")
+        check("receipt(config-error): the malformed step is NOT recorded",
+              "bad-required" not in by_name)
+        check("receipt(config-error): still schema-valid",
+              orchestrate_schemas.validate("gate-receipt/v1", r) == [])
+
+
 def test_receipt_non_git_fail_open():
     # A dir that is NOT a git repo: git rev-parse HEAD fails -> no receipt, but
     # the gate's own exit code is UNCHANGED (receipt is a byproduct).
@@ -737,7 +773,8 @@ def main():
         test_fallback_basics_python, test_fallback_basics_python_fail,
         test_fallback_terminal_fail_open, test_no_claude_gates_block_falls_through,
         test_receipt_schema_valid_on_pass, test_receipt_result_fail_still_written,
-        test_receipt_steps_records_match, test_receipt_non_git_fail_open,
+        test_receipt_steps_records_match, test_receipt_malformed_form_b_config_error,
+        test_receipt_non_git_fail_open,
         test_memoize_pure_step_skipped_second_run, test_memoize_dirty_worktree_reruns,
         test_memoize_untracked_input_reruns,
         test_memoize_impure_step_never_cached, test_memoize_failing_pure_not_cached,
