@@ -17,7 +17,7 @@
 
   [[prep_pr.steps]]
   name = "ruff"
-  run = "ruff check --select F,E741 scripts/orchestrate-*.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-planner-classify.py test-gh-wrappers.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py"
+  run = "ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-planner-classify.py test-gh-wrappers.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py"
   skip_if_absent = "ruff"
 
   [[prep_pr.steps]]
@@ -59,6 +59,10 @@
   [[prep_pr.steps]]
   name = "test-orchestrate-status"
   run = "python3 test-orchestrate-status.py"
+
+  [[prep_pr.steps]]
+  name = "test-orchestrate-schemas"
+  run = "python3 test-orchestrate-schemas.py"
 
   [[prep_pr.steps]]
   name = "test-planner-classify"
