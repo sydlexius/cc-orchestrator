@@ -236,9 +236,13 @@ fi
 # "STOP: head branch is behind base" section to STDOUT) when the PR branch is
 # BEHIND base -- a DETERMINISTIC condition, not a transient. That base-freshness
 # STOP is irrelevant to THIS gate: the oracle counts actionable review-body
-# findings, which are readable regardless of base-freshness, and the
-# up-to-date-with-base concern is ALREADY covered by the separate
-# mergeStateStatus / check gates above. Without --allow-stale the helper's
+# findings, which are readable regardless of base-freshness. Base-freshness is
+# DELIBERATELY out of this oracle's scope -- it queries only
+# `statusCheckRollup,reviewDecision` (see the `gh pr view --json` call above) and never reads
+# mergeStateStatus, so there is no base-freshness gate HERE to lean on. That
+# concern is owned at the lead-presentation layer instead (SKILL.md #235: never
+# present a ship-gate on this oracle's PASS alone; after any rebase re-run the
+# authoritative enumeration against current HEAD). Without --allow-stale the helper's
 # behind-base exit 2 would mask as a generic "helper failed" and BLOCK every
 # behind-base PR (#178). The combined stdout+stderr is captured to a temp file
 # (the helper's diagnostic lines land on stdout) so a genuine failure surfaces
