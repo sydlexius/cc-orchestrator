@@ -28,7 +28,9 @@ import sys
 
 # Anchors are implicit under re.fullmatch below; NOT `^...$` -- with re.match a `$`
 # matches before a trailing newline, so a 41-char "….\n" SHA would validate (#225 hostile-review LOW).
-_SHA40 = r"[0-9a-f]{40}"
+# Case-insensitive hex: git emits lowercase, but a valid SHA is a valid SHA either
+# case; validating FORMAT (not canonicalization) avoids false-negative rejects (Codoki #250).
+_SHA40 = r"[0-9a-fA-F]{40}"
 
 
 def _f(type_, required=True, enum=None, const=None, pattern=None, items=None,

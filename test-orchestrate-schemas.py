@@ -23,6 +23,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MODULE_PATH = os.path.join(HERE, "scripts", "orchestrate_schemas.py")
 
 spec = importlib.util.spec_from_file_location("orchestrate_schemas", MODULE_PATH)
+if spec is None or spec.loader is None:
+    sys.exit(f"cannot load orchestrate_schemas from {MODULE_PATH}")
 S = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(S)
 
@@ -156,7 +158,7 @@ def main():
     check("CLI invalid -> exit 1", rc == 1)
     check("CLI invalid -> prints the error", "result" in out)
     rc, out = cli("bogus/v1", {})
-    check("CLI unknown schema -> nonzero exit", rc != 0)
+    check("CLI unknown schema -> exit 1 (a validation failure, not usage)", rc == 1)
     # exit 2 = usage / unreadable file (a distinct documented code shell callers branch on).
     p = subprocess.run([sys.executable, MODULE_PATH, "--validate", "gate-receipt/v1",
                         os.path.join(HERE, "does-not-exist-xyz.json")], capture_output=True, text=True)
