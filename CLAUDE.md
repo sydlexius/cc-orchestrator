@@ -114,6 +114,21 @@ kept for human reference and is DERIVED from `.gates.toml` (keep the two in
 sync); it is also the fallback gate-runner would run if `.gates.toml` were
 removed.
 
+Two optional gate-runner flags (both OFF by default, ZERO behavior change when
+absent; #229): `--receipt <path>` writes a schema-validated `gate-receipt/v1`
+receipt (from `scripts/orchestrate_schemas.py`) as a BYPRODUCT of the real gate
+run - `{commit_sha, tree_sha, worktree, result (pass|fail chosen from the tool's
+own exit code), steps[], producer}`, atomic `os.replace`, FAIL-OPEN (a receipt
+failure never changes the gate exit code; a non-git dir just skips it). The floor
+is NEVER taught to read the receipt. `--memoize-dir <dir>` opts into conservative
+PURE-oracle memoization: a `.gates.toml` step marked `pure = true` (explicit
+allowlist; default false) whose PASS is memoized keyed on `HEAD^{tree}` + a live
+clean-worktree check, so an unchanged committed tree skips re-running it
+(`[MEMO] <name>: cached pass`). PASS-only, fail-open (a dirty tree / non-pure step
+/ any git error just re-runs); git-diff / `ship-gate-preflight` /
+`pr-unreplied-comments` steps are excluded (they flip at constant HEAD). See
+`skills/orchestrate/templates/gates.toml.md`.
+
 ```sh
 shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
 ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-planner-classify.py test-gh-wrappers.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py

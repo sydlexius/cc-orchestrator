@@ -60,9 +60,50 @@ Per-step keys:
 | `required`       | bool    | `true`  | `true` (or omitted): a non-zero exit is a HARD failure -- the runner stops and exits non-zero. `false`: a non-zero exit is a SOFT failure -- the runner prints `[FAIL]` (warn), keeps going, and does NOT fail the overall run on this step alone. |
 | `skip_if_absent` | string  | (none)  | A binary / tool name. If it is NOT found on `PATH` (`shutil.which`), the step is SKIPPED (`[SKIP] <name>: <tool> not on PATH`), not failed. For an optional linter/tool whose absence should not block. |
 | `skip_if`        | string  | (none)  | A glob (evaluated recursively from the repo root). If the glob matches ZERO files, the step is SKIPPED (`[SKIP] <name>: no files match <glob>`). Absence-based: skip when there is nothing to check (e.g. skip a UI lint when `web/**` matches nothing). |
+| `pure`           | bool    | `false` | Opt into pure-oracle memoization (see below). Mark `true` ONLY for a step whose result is a pure function of the COMMITTED TREE -- a static analysis / self-contained test suite over tracked files that reads nothing else. It is an explicit allowlist: a step is memoizable ONLY if it declares `pure = true`. Default (`false`/omitted) = never memoized. |
 
 Predicate evaluation order: `skip_if_absent` and `skip_if` are both evaluated
 BEFORE the command runs. If either triggers a skip, `run` is not executed.
+
+### Pure-oracle memoization (`pure = true` + `--memoize-dir`)
+
+`gate-runner.py --memoize-dir <dir>` (OFF by default; absent = ZERO behavior
+change) memoizes the PASS of `pure = true` steps, keyed on the committed tree, so
+a repeated gate run over an unchanged tree can SKIP re-running an expensive pure
+oracle instead of paying for it again.
+
+Rules (deliberately conservative -- a memo bug can only cause a re-run, never a
+false pass):
+
+- A step is memoized ONLY when `--memoize-dir` is set AND the step declares
+  `pure = true` AND the committed tree resolves (`git rev-parse HEAD^{tree}`) AND
+  a LIVE clean-worktree check passes (`git status --porcelain` is EMPTY -- no
+  staged, unstaged, OR untracked changes).
+- **Untracked files count as DIRTY** (they defeat memoization). This is a
+  safety property: a `pure` step that discovers files by glob (a linter or test
+  over a directory) reads untracked files as INPUTS, and untracked files are the
+  normal state of in-progress work; a diff-only clean check would memo-pass while
+  an untracked input that fails the step sits on disk. Because untracked files
+  block memoization, **the `--memoize-dir` MUST live OUTSIDE the worktree or be
+  gitignored** (`--porcelain` hides gitignored files) -- an in-repo cache dir
+  would itself show as untracked and nothing would ever be memoizable.
+- Cache key = `sha256(tree \0 name \0 run)`; the cache file holds the literal
+  `pass`. A hit logs `[MEMO] <name>: cached pass (tree <sha7>)` and counts the
+  step as passed WITHOUT running it.
+- PASS ONLY is memoized. A FAILING step is never cached and always re-runs, so
+  the user always sees a real failure's output.
+- FAIL-OPEN everywhere: any git error, a dirty/untracked tree, a non-pure step,
+  or `--memoize-dir` absent => the step runs normally with no cache read/write.
+
+**EXCLUSIONS -- never mark these `pure = true`:** git-diff-based steps (they read
+the index/worktree), `ship-gate-preflight`, and `pr-unreplied-comments` (they read
+LIVE GitHub). All of these can flip at a constant HEAD, so a tree-keyed cache
+would be unsound; leave them non-pure so they always re-run.
+
+**Caveat:** memoization keys on the committed TREE only and assumes a fixed
+toolchain within the memo window. A `shellcheck` / `ruff` / `python` version bump
+at a constant tree is NOT detected -- clear `<dir>` (or leave the toolchain fixed)
+across a memo window.
 
 ---
 
