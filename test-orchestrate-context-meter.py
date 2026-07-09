@@ -37,10 +37,16 @@ def run_meter(session_id="s", tool_input=None, tool_response=None, *, ctxmeter_d
     env["ORCHESTRATE_CTXMETER_DIR"] = ctxmeter_dir
     if budget is not None:
         env["ORCHESTRATE_CONTEXT_BUDGET_TOKENS"] = str(budget)
+    else:
+        env.pop("ORCHESTRATE_CONTEXT_BUDGET_TOKENS", None)
     if warn_pct is not None:
         env["ORCHESTRATE_CTXMETER_WARN_PCT"] = str(warn_pct)
+    else:
+        env.pop("ORCHESTRATE_CTXMETER_WARN_PCT", None)
     if hard_pct is not None:
         env["ORCHESTRATE_CTXMETER_HARD_PCT"] = str(hard_pct)
+    else:
+        env.pop("ORCHESTRATE_CTXMETER_HARD_PCT", None)
     if path is not None:
         env["PATH"] = path
     if raw_stdin is not None:
