@@ -237,8 +237,8 @@ fi
 # BEHIND base -- a DETERMINISTIC condition, not a transient. That base-freshness
 # STOP is irrelevant to THIS gate: the oracle counts actionable review-body
 # findings, which are readable regardless of base-freshness. Base-freshness is
-# DELIBERATELY out of this oracle's scope -- it queries only statusCheckRollup +
-# reviewDecision (see the `gh pr view --json` call above) and never reads
+# DELIBERATELY out of this oracle's scope -- it queries only
+# `statusCheckRollup,reviewDecision` (see the `gh pr view --json` call above) and never reads
 # mergeStateStatus, so there is no base-freshness gate HERE to lean on. That
 # concern is owned at the lead-presentation layer instead (SKILL.md #235: never
 # present a ship-gate on this oracle's PASS alone; after any rebase re-run the
