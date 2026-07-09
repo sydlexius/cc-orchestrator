@@ -71,41 +71,45 @@ the autofix / fix, or dismiss genuine false positives via the documented
 ### Coverage status check (advisory, not blocking)
 
 This step is OPTIONAL and only applies when the target repo uses a coverage
-service that posts commit statuses (codecov being the common one). It is not
-assumed present: a repo with no coverage integration (this one included) posts
-no `codecov/*` status, and this step self-skips cleanly with nothing to report.
+service (codecov being the common one). It is not assumed present: a repo with
+no coverage integration posts no codecov signal, and this step self-skips cleanly
+with nothing to report.
 
-When codecov IS active it posts two contexts: `codecov/patch` (patch-level
-coverage vs. threshold) and `codecov/project` (overall project coverage vs.
-threshold).
+The `--coverage-only` readout from Step 1 already carries the one gating signal:
+`threshold_state`, derived from the **`codecov/patch` check-run** conclusion on the
+head SHA (NOT the codecov comment glyph, NOT the legacy `commits/<sha>/status`
+endpoint -- see #239). Do NOT do a separate coverage read here; use that JSON.
 
-```bash
-head_sha=$(gh pr view $pr_number --json headRefOid --jq .headRefOid)
-codecov_status=$(gh api "repos/$repo/commits/$head_sha/status" \
-  --jq '[.statuses[] | select(.context | test("^codecov/"; "i"))
-         | {context, state, description}]')
-echo "$codecov_status" | jq
-```
+`threshold_state` values and how to treat them:
 
-If any `codecov/*` context is in state `failure` or the coverage advisory
-reports `threshold_state: fail`: **warn, do not block**. Coverage failures
-are a policy signal for the author, not a correctness gate. Print:
+- `fail` -- the `codecov/patch` check-run itself FAILED (a real patch-coverage gate
+  failure). **Warn, do not block** (coverage is a policy signal, not a correctness
+  gate). Print:
 
-```text
-Coverage advisory: patch coverage <pct>% is below threshold.
-Report: <url>
+  ```text
+  Coverage advisory: the codecov/patch gate failed on this PR (patch coverage <pct>%).
+  Report: <url>
 
-Merging anyway is fine if the coverage regression is intentional or the
-missing lines are in generated code. Cancel and add tests if not. Proceed?
-(yes / cancel / show-report)
-```
+  Merging anyway is fine if the coverage regression is intentional or the
+  missing lines are in generated code. Cancel and add tests if not. Proceed?
+  (yes / cancel / show-report)
+  ```
 
-Default to waiting for explicit confirmation. If the user chose to proceed
-in a prior conversation turn, do not re-prompt.
+  Default to waiting for explicit confirmation. If the user chose to proceed in a
+  prior conversation turn, do not re-prompt.
 
-If no `codecov/*` status is posted (the `$codecov_status` array is empty) or
-the threshold state is `pass`, skip this prompt entirely -- the absent-signal
-case is a SKIP, never a block.
+- `pass` / `none` / `unknown`, or `status: none` -- **SKIP this prompt entirely.**
+  Do NOT pause or prompt the maintainer. `none` means there is no gating codecov
+  check-run (advisory-only); `pass` means the patch gate passed. A codecov comment
+  that shows uncovered lines (its `comment_glyph` is `uncovered`) is NOT a gate
+  failure and MUST NOT trigger a prompt -- that mixed signal was the #239 spurious
+  pause. The absent-signal case is a SKIP, never a block.
+
+Merge safety is unaffected: a genuine coverage regression that the repo treats as
+required (e.g. a `Coverage Floor Check` CI check) is still enforced by the CI-green
+gate inside `ship-gate-preflight.sh` (statusCheckRollup), which STOPPED the merge in
+Step 1 above before this advisory ever runs. This advisory only decides whether to
+prompt on a non-required coverage signal; it never widens what can merge.
 
 ---
 
@@ -323,3 +327,5 @@ acknowledge that cleanup ran:
 
 Display "N/A" for Coverage when `--coverage-only` returned `{"status":"none"}`
 (no coverage service on the repo) -- a missing coverage signal is not a failure.
+When `threshold_state` is `none` (codecov commented but posts no gating
+`codecov/patch` check-run), show `<patch_pct>% (advisory-only)` -- also not a failure.
