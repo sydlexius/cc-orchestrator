@@ -74,13 +74,20 @@ def unknowntype(name, status="COMPLETED", conclusion="SUCCESS", typename="Unknow
 
 def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         unreplied_fail=False, unreplied_missing=False, unreplied_raw=None,
-        unreplied_fail_until=0):
-    """Invoke the oracle with stubbed gh + pr-unreplied-comments.sh.
+        unreplied_fail_until=0, codoki_ack_verdict="no-summary",
+        codoki_ack_fail=False, codoki_ack_missing=False):
+    """Invoke the oracle with stubbed gh + pr-unreplied-comments.sh + gh-react.sh.
     Returns (exit_code, stdout, stderr, argv) where argv is the recorded helper
     argv content (one line per invocation, read back from the log) -- used to
     assert the oracle passes --allow-stale and to drive the retry cases.
     UNREPLIED_FAIL_UNTIL=N makes the stub exit 2 on its first N invocations
-    (counted via a counter file) then succeed, exercising the bounded retry."""
+    (counted via a counter file) then succeed, exercising the bounded retry.
+
+    The Codoki-root-ack gate (#234, FULL mode only) reads gh-react.sh, also
+    stubbed under $HOME/.claude/scripts. codoki_ack_verdict drives the stub's
+    'CODOKI-ACK: <verdict>' line (default 'no-summary' so pre-#234 cases still
+    PASS); codoki_ack_fail=True makes it exit 2 (tool failure -> oracle BLOCKs);
+    codoki_ack_missing=True omits the stub entirely (missing -> oracle BLOCKs)."""
     with tempfile.TemporaryDirectory() as td:
         bindir = os.path.join(td, "bin"); os.makedirs(bindir)
         home = os.path.join(td, "home")
@@ -140,6 +147,22 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
                 )
             os.chmod(helper, 0o755)
 
+        # Stub gh-react.sh (the #234 Codoki-root-ack reader), unless simulating it
+        # missing. Emits a 'CODOKI-ACK: <verdict>' line and exits 0; CODOKI_ACK_FAIL
+        # makes it exit 2 (tool failure -> oracle must BLOCK).
+        if not codoki_ack_missing:
+            reactor = os.path.join(helper_dir, "gh-react.sh")
+            with open(reactor, "w") as f:
+                f.write(
+                    "#!/usr/bin/env bash\n"
+                    "set -eu\n"
+                    "if [ -n \"${CODOKI_ACK_FAIL:-}\" ]; then\n"
+                    "  echo 'gh-react: simulated failure -- ack UNVERIFIABLE' >&2; exit 2\n"
+                    "fi\n"
+                    "echo \"CODOKI-ACK: ${CODOKI_ACK_VERDICT:-no-summary} -- stub\"\n"
+                )
+            os.chmod(reactor, 0o755)
+
         env = dict(os.environ)
         env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
         env["HOME"] = home
@@ -154,6 +177,12 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         env["UNREPLIED_FAIL_UNTIL"] = str(unreplied_fail_until)
         env["HELPER_ARGV_LOG"] = argfile
         env["HELPER_CALLS_LOG"] = counter
+        env["CODOKI_ACK_VERDICT"] = codoki_ack_verdict
+        # Clear any inherited CODOKI_ACK_FAIL first, then set ONLY when this case
+        # asks for it -- otherwise a caller's env var would fail every case (CR #253).
+        env.pop("CODOKI_ACK_FAIL", None)
+        if codoki_ack_fail:
+            env["CODOKI_ACK_FAIL"] = "1"
 
         p = subprocess.run([ORACLE] + args, env=env, capture_output=True, text=True, timeout=30)
         try:
@@ -355,6 +384,41 @@ def main():
                    fixture_json=rollup(checkrun("Codoki PR Review", "COMPLETED", "SUCCESS"),
                                        review_decision="CHANGES_REQUESTED"))
     check("--codoki-only ignores reviewDecision=CHANGES_REQUESTED -> exit 0", rc == 0)
+
+    print("== #234 FULL MODE: Codoki-root-ack gate ==")
+    # No Codoki summary -> ack gate PASSES (never fail-closed on absence).
+    rc, _, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN,
+                      unreplied_findings=0, codoki_ack_verdict="no-summary")
+    check("no Codoki summary + all green -> exit 0 (ack gate passes on absence)", rc == 0)
+    # Summary present but UNACKED -> BLOCK.
+    rc, _, err, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN,
+                        unreplied_findings=0, codoki_ack_verdict="unacked")
+    check("Codoki summary present but UNACKED -> exit 2 (block)", rc == 2)
+    check("BLOCK message names the unmet Codoki ack",
+          "codoki" in err.lower() and "ack" in err.lower())
+    # Non-bot ack present (acked) -> PASS.
+    rc, _, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN,
+                      unreplied_findings=0, codoki_ack_verdict="acked")
+    check("Codoki summary ACKED (non-bot +1/-1) -> exit 0 (pass)", rc == 0)
+    # gh-react tool failure -> BLOCK (fail closed; never a silent skip).
+    rc, _, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN,
+                      unreplied_findings=0, codoki_ack_fail=True)
+    check("gh-react ack-read failure -> exit 2 (fail closed)", rc == 2)
+    # gh-react missing -> BLOCK (cannot verify the ack).
+    rc, _, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN,
+                      unreplied_findings=0, codoki_ack_missing=True)
+    check("gh-react missing -> exit 2 (ack unverifiable, fail closed)", rc == 2)
+    # --codoki-only must NOT run the ack gate: an UNACKED verdict is irrelevant there
+    # (settlement mode is a pure check-rollup signal). Codoki check green -> PASS.
+    rc, _, _, _ = run(["1", "owner/repo", "--codoki-only"],
+                      fixture_json=rollup(checkrun("Codoki PR Review", "COMPLETED", "SUCCESS")),
+                      codoki_ack_verdict="unacked")
+    check("--codoki-only ignores the ack gate (UNACKED verdict) -> exit 0", rc == 0)
+    # --codoki-only also PASSes with gh-react missing (proves the ack gate is skipped).
+    rc, _, _, _ = run(["1", "owner/repo", "--codoki-only"],
+                      fixture_json=rollup(checkrun("Codoki PR Review", "COMPLETED", "SUCCESS")),
+                      codoki_ack_missing=True)
+    check("--codoki-only skips the ack gate (gh-react missing still PASS)", rc == 0)
 
     print("== USAGE ==")
     rc, _, _, _ = run([], fixture_json=ALL_GREEN)

@@ -99,6 +99,10 @@ HELPER_NAMES = (
     # non-executable copy that silently disabled the oracle (#216). issue-watch.sh is the
     # issue-side counterpart to pr-watch.sh and is invoked from the stable path the same way (#217).
     "ship-gate-preflight.sh", "issue-watch.sh",
+    # gh-react.sh is a LIVE dependency the same way: ship-gate-preflight.sh's FULL-mode
+    # Codoki-root-ack gate invokes ${HOME}/.claude/scripts/gh-react.sh behind an `[ -x ]`
+    # gate and FAILS CLOSED when it is absent (#234). It must deploy or the ack gate blocks.
+    "gh-react.sh",
 )
 # The _helper_deploy_action results that warrant an actual deploy write (vs. None / informational).
 HELPER_DEPLOY_ACTIONS = ("deploy", "refresh", "replace-symlink", "replace-broken-symlink")
