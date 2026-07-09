@@ -98,7 +98,9 @@ endpoint -- see #239). Do NOT do a separate coverage read here; use that JSON.
   Default to waiting for explicit confirmation. If the user chose to proceed in a
   prior conversation turn, do not re-prompt.
 
-- `pass` / `none` / `unknown`, or `status: none` -- **SKIP this prompt entirely.**
+- `pass` / `none` (i.e. any state other than `fail`), or `status: none` -- **SKIP
+  this prompt entirely.** Only `fail` ever pauses; `build_coverage_advisory` emits
+  exactly `pass | fail | none`.
   Do NOT pause or prompt the maintainer. `none` means there is no gating codecov
   check-run (advisory-only); `pass` means the patch gate passed. A codecov comment
   that shows uncovered lines (its `comment_glyph` is `uncovered`) is NOT a gate
