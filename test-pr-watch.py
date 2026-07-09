@@ -47,6 +47,19 @@ def check(label, ok):
 HEAD_SHA = "a" * 40
 COMMITTER_DATE = "2026-06-18T00:00:00Z"
 
+# Two DISTINCT roles for pr-watch.sh's timeout arg, kept separate to avoid a flake:
+#   SETTLE_TIMEOUT  -- a settle/review-blocked case reaches its terminal in ~2 poll
+#     iterations and EXITS immediately, so this value is only a safety ceiling and is
+#     never actually waited out; it must be generous. Each iteration forks ~11 `gh`
+#     stubs (each a Python cold-start) + jq, so ~1.3s locally but multiples of that on
+#     a loaded CI runner. A tight ceiling (the old shared `timeout_secs=2`) let the
+#     settle work race its own deadline and time out to exit 1 -- the ubuntu-only flake.
+#   PENDING_TIMEOUT -- a timeout-EXPECTED case (asserts exit 1 + a `pending=` token)
+#     spins until the deadline, so here the timeout IS the wall-clock duration and must
+#     stay short. (PR_WATCH_POLL_INTERVAL=0 keeps the loop fast in both roles.)
+SETTLE_TIMEOUT = 15
+PENDING_TIMEOUT = 2
+
 GH_STUB = r'''#!/usr/bin/env python3
 import os, sys, subprocess
 args = sys.argv[1:]
@@ -98,7 +111,7 @@ emit(PULL)
 
 def run(*, labels="[]", checks="[]", reviews="[]", codoki_rc=0,
         requested_reviewers='{"users":[]}', comments="[]", issue_comments="[]",
-        timeout_secs=2, expect_fast=True, blocking_reviewers=None):
+        timeout_secs=SETTLE_TIMEOUT, blocking_reviewers=None):
     with tempfile.TemporaryDirectory() as td:
         bindir = os.path.join(td, "bin"); os.makedirs(bindir)
         home = os.path.join(td, "home")
@@ -194,31 +207,31 @@ def main():
     print("== #173: idle CR -- no review, no norabbit, no trigger, not requested -> settles ==")
     # The exact bug: auto-review OFF means CR posts NO check at all, so the old
     # opt-out logic waited the full timeout. Opt-in: no positive evidence -> satisfied.
-    rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews="[]", timeout_secs=2)
+    rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews="[]", timeout_secs=SETTLE_TIMEOUT)
     check("idle CR + green CI + Codoki settled -> exit 0 (not a timeout)", rc == 0)
     check("emits 'settled' line", "settled head=" in out)
     check("pending list never names cr-review", "cr-review" not in err)
 
     print("== #173: @coderabbitai review trigger comment present -> waits for CR ==")
     rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews="[]",
-                       issue_comments=TRIGGER_COMMENT, timeout_secs=2)
+                       issue_comments=TRIGGER_COMMENT, timeout_secs=PENDING_TIMEOUT)
     check("triggered, no review yet -> exit 1 (timeout, not settled)", rc == 1)
     check("pending names cr-review", "cr-review" in err)
 
     print("== #173: @coderabbitai full review trigger comment present -> waits for CR ==")
     rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews="[]",
-                       issue_comments=TRIGGER_FULL_COMMENT, timeout_secs=2)
+                       issue_comments=TRIGGER_FULL_COMMENT, timeout_secs=PENDING_TIMEOUT)
     check("full-review triggered, no review yet -> exit 1 (timeout)", rc == 1)
     check("pending names cr-review", "cr-review" in err)
 
     print("== #173: CR in requested_reviewers -> waits for CR ==")
     rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews="[]",
-                       requested_reviewers=CR_REQUESTED, timeout_secs=2)
+                       requested_reviewers=CR_REQUESTED, timeout_secs=PENDING_TIMEOUT)
     check("CR requested, no review yet -> exit 1 (timeout)", rc == 1)
     check("pending names cr-review", "cr-review" in err)
 
     print("== #173: existing DISMISSED CR review -> still expected, waits (no regression) ==")
-    rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews=CR_DISMISSED, timeout_secs=2)
+    rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews=CR_DISMISSED, timeout_secs=PENDING_TIMEOUT)
     check("DISMISSED review present -> exit 1 (timeout, stays pending)", rc == 1)
     check("pending names cr-review", "cr-review" in err)
 
@@ -226,20 +239,20 @@ def main():
     # `@coderabbitai resolve`/`summary` engage CR WITHOUT requesting a review, so
     # they must not re-introduce the false-wait. Only review-triggering forms count.
     rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews="[]",
-                       issue_comments=RESOLVE_COMMENT, timeout_secs=2)
+                       issue_comments=RESOLVE_COMMENT, timeout_secs=SETTLE_TIMEOUT)
     check("resolve-only comment -> exit 0 (settles, not triggered)", rc == 0)
     check("emits 'settled' line", "settled head=" in out)
     check("pending list never names cr-review", "cr-review" not in err)
 
     print("== #173 (live-UAT bug): CR's OWN comment quoting @coderabbitai review does NOT trigger -> settles ==")
     rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews="[]",
-                       issue_comments=CR_BOILERPLATE_COMMENT, timeout_secs=2)
+                       issue_comments=CR_BOILERPLATE_COMMENT, timeout_secs=SETTLE_TIMEOUT)
     check("CR-authored boilerplate -> exit 0 (settles, not a trigger)", rc == 0)
     check("pending list never names cr-review", "cr-review" not in err)
 
     print("== #110: Codoki not settled (oracle exit 2) -> stays pending ==")
     rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews=CR_APPROVED,
-                       codoki_rc=2, timeout_secs=2)
+                       codoki_rc=2, timeout_secs=PENDING_TIMEOUT)
     check("Codoki oracle exit 2 -> exit 1 (timeout, not settled)", rc == 1)
     check("pending names codoki-check", "codoki-check" in err)
 
@@ -310,7 +323,7 @@ def main():
     # CHANGES_REQUESTED present, the fallback means review-blocked STILL fires.
     for junk in (",,", "   ", " , , "):
         rc, out, err = run(labels="[]", checks=GREEN_CHECK, reviews=CR_CHANGES,
-                           blocking_reviewers=junk, timeout_secs=2)
+                           blocking_reviewers=junk, timeout_secs=SETTLE_TIMEOUT)
         check(f"separator-only {junk!r} -> exit 0 (no hang)", rc == 0)
         check(f"separator-only {junk!r} -> emits 'review-blocked'", "review-blocked head=" in out)
         check(f"separator-only {junk!r} -> not a timeout", "timeout" not in err)
