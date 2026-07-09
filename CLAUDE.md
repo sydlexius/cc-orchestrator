@@ -7,7 +7,10 @@ it runs on. This file is hand-maintained (no `/init`); keep it accurate and lean
 ## >> ON SESSION START / RESUME: read SESSION-STATE.md FIRST <<
 
 `SESSION-STATE.md` (in this repo root; gitignored, machine-local) is the running checkpoint -
-the top banner has current status + the next actions. Read it before doing anything when the
+the top banner has current status + the next actions. It holds only NON-DERIVABLE intent +
+pointers (#222); reboot-durable derivables (in-flight PRs via `gh pr list`, worktrees via
+`git worktree list`) are RECONSTRUCTED on demand, not mirrored, and judgment findings keep a
+durable home (the mirror-rule carve-out). Read it before doing anything when the
 user says "pick up where we left off", "resume orchestrator work", "continue orchestrator", or
 otherwise asks to continue. It supersedes any stale detail below it in that file.
 
