@@ -7,6 +7,8 @@
 # Each line:
 #   #<num> <state> checks:<GREEN|RED|PENDING|NONE> review:<decision|none> \
 #     merge:<mergeStateStatus|?> unreplied:<N|?>  <title>
+# The title is truncated to the first 60 characters (codepoint-based under a
+# UTF-8 locale) with a trailing "…" when longer, to keep the line compact.
 # composed from a SINGLE `gh pr view` (state / checks / review / merge) plus
 # `pr-unreplied-comments.sh --count-only` (the unreplied-finding count).
 #
@@ -108,6 +110,11 @@ for n in "${prs[@]}"; do
     fi
   fi
 
+  # Compact display title: first 60 chars (codepoint-based under a UTF-8 locale)
+  # plus an ellipsis when the title is longer, so truncation is visible.
+  disp_title="$title"
+  [ "${#title}" -gt 60 ] && disp_title="${title:0:60}…"
+
   printf '#%s %s checks:%s review:%s merge:%s unreplied:%s  %s\n' \
-    "$n" "$state" "$checks" "$review" "$merge" "$unrep" "${title:0:60}"
+    "$n" "$state" "$checks" "$review" "$merge" "$unrep" "$disp_title"
 done

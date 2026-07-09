@@ -234,6 +234,23 @@ def main():
     check("junk arg 'v2' -> exit 1", rc == 1)
     check("junk arg -> stderr names it", "unrecognized" in err.lower())
 
+    # Long title -> truncated to 60 chars + ellipsis; short title -> verbatim.
+    long_title = "x" * 90
+    rc, out, err, calls = run(
+        ["5", "owner/repo"],
+        views={"5": view(title=long_title, rollup=[cr("g", "SUCCESS")])},
+        unreplied={"5": 0},
+    )
+    l5 = line_for(out, "5") or ""
+    check("long title -> truncated to 60 chars + ellipsis", ("x" * 60 + "…") in l5)
+    check("long title -> NOT the full 90 chars", ("x" * 61) not in l5)
+    rc, out, err, calls = run(
+        ["6", "owner/repo"],
+        views={"6": view(title="short one", rollup=[cr("g", "SUCCESS")])},
+        unreplied={"6": 0},
+    )
+    check("short title -> no ellipsis", "…" not in (line_for(out, "6") or ""))
+
     # --help -> usage to stdout, exit 0, no gh calls.
     rc, out, err, calls = run(["--help"])
     check("--help -> exit 0", rc == 0)
