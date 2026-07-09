@@ -418,14 +418,19 @@ def _memo_is_pass(memo_file):
 def _memo_write_pass(memo_file):
     """Atomically record a PASS. Fail-open: a write error only warns (the gate
     already ran and passed; a missing cache entry just re-runs next time)."""
+    tmp = f"{memo_file}.tmp.{os.getpid()}"
     try:
         os.makedirs(os.path.dirname(memo_file), exist_ok=True)
-        tmp = f"{memo_file}.tmp.{os.getpid()}"
         with open(tmp, "w", encoding="utf-8") as f:
             f.write("pass\n")
         os.replace(tmp, memo_file)
     except OSError as e:
         warn(f"could not write memo cache {memo_file}: {e}")
+        # Mirror _atomic_write_json: don't leave a *.tmp.<pid> behind on failure.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 # --- Gate receipt (--receipt) ----------------------------------------------
