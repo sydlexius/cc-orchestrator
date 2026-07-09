@@ -20,6 +20,7 @@ Run: python3 test-orchestrate-context-meter.py
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -127,8 +128,7 @@ def main():
         # working while every external tool the body needs (cat/jq/...) is absent.
         bindir = os.path.join(d, "bin")
         os.makedirs(bindir, exist_ok=True)
-        bash_path = subprocess.run(["command", "-v", "bash"], capture_output=True, text=True,
-                                   shell=False, executable="/bin/bash").stdout.strip() or "/bin/bash"
+        bash_path = shutil.which("bash") or "/bin/bash"
         os.symlink(bash_path, os.path.join(bindir, "bash"))
         rc, err, out = run_meter("notools", tool_response=body(3000), ctxmeter_dir=d,
                                  budget=1000, path=bindir)

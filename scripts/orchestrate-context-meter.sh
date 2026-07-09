@@ -100,8 +100,10 @@ run_meter() {
 }
 
 # --- self-test: feed synthetic payloads through a throwaway state dir and assert threshold-once. ---
-# Used by setup/doctor to catch a silently broken meter. Prints PASS/FAIL. Runs BEFORE the fail-open
-# EXIT trap is installed so a genuine assertion failure can exit non-zero.
+# Run by the gate runner / CI (.gates.toml `ctxmeter-self-test` step) to catch a silently broken
+# meter, and available to run by hand; doctor only checks that the hook is WIRED + the deployed copy
+# is current, it does NOT run this self-test. Prints PASS/FAIL. Runs BEFORE the fail-open EXIT trap
+# is installed so a genuine assertion failure can exit non-zero.
 if [ "${1:-}" = "--self-test" ]; then
   set +e
   st_dir=$(mktemp -d 2>/dev/null) || { echo "orchestrate-context-meter self-test FAIL: mktemp" >&2; exit 1; }
