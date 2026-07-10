@@ -239,6 +239,27 @@ Never end cleanup with a version-bumping merge left un-released.
 
 ---
 
+## Step 8b -- Disk-pressure advisory (df-only; never cleans)
+
+Cleanup is a natural moment to surface disk pressure, but a merge must NEVER trigger a cache
+wipe (build caches are machine-global; wiping one mid-build in a sibling worktree/CI job corrupts
+that build). So this step is a single cheap `df` check that prints at most one advisory line and
+cleans nothing. Reclaiming is on-demand via `/reclaim-cache`.
+
+```bash
+if [ -f scripts/cache-reclaim.sh ]; then PL=scripts/cache-reclaim.sh
+elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/cache-reclaim.sh" ]; then PL="${CLAUDE_PLUGIN_ROOT}/scripts/cache-reclaim.sh"
+else PL=""; fi
+[ -n "$PL" ] && bash "$PL" --nudge || true
+```
+
+`--nudge` reads `df` only (no `du` scan, no clean), prints "Disk N% full - run /reclaim-cache ..."
+when the home volume is >= 90% full (override `RECLAIM_NUDGE_PCT`), and is silent otherwise. It
+always exits 0, so it never affects cleanup. If the line appears, surface it to the user and
+suggest `/reclaim-cache`; do not reclaim anything here.
+
+---
+
 ## Step 9 -- Summary
 
 Report:

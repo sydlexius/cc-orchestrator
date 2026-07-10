@@ -125,6 +125,21 @@ Runtime (`scripts/`; canonical source is this repo):
   (never blocks) into the `/prep-pr` PR-body + `new-issue` issue-body draft flows; the advisory
   call-site soft-skips on exit 2, so a user without the machine-local tooling is never gated. Reached
   via the repo-local / `${CLAUDE_PLUGIN_ROOT}/scripts/` path (no stable-path deployment needed).
+- `scripts/cache-reclaim.sh` - the `/reclaim-cache` helper: report-first build-cache disk reclaim.
+  Default REPORTS `df` + the reclaimable caches (npm global cache; per-project Rust `target/` dirs
+  found by scanning for a `target/` with a sibling `Cargo.toml` - the real Rust hog, regenerable;
+  cargo registry, report-only behind the `cargo-cache` plugin) with the exact toolchain command for
+  each. `--nudge` is `df`-ONLY (one advisory line at >=90% full, else silent) and is what
+  post-merge-cleanup calls (a merge NEVER cleans - a global cache wiped mid-build in a sibling
+  worktree corrupts it). `--yes <name|rust-project-path>` reclaims ONLY named targets via the
+  toolchain's own clean (`npm cache verify`/`clean --force`, `cargo clean --manifest-path`) - NEVER a
+  hand-rolled `rm` (registry/modcache files are read-only; only
+  the toolchain deletes them). GO is intentionally omitted: no surgical reclaim (build cache
+  self-trims; `go clean -modcache` is a full wipe). Reads-only in report/nudge; the operational modes
+  fail OPEN (report/nudge/reclaim each exit 0, so the post-merge `--nudge` can never abort cleanup) -
+  only a malformed invocation (unknown flag / bare trailing `--yes`/`--root`) exits 2; no gh/git/
+  network mutation, no floor/allow-list change. Design + 2 hostile-review passes:
+  `scratchpad`/design notes (concurrency-wipe hazard, wrong-signal, go-misdiagnosis all caught).
 - `scripts/prefs-coverage.py` - opt-in UI-preference-coverage HARD-GATE (a repo enables it by adding a
   `.prefs.toml` + a `.gates.toml` step; schema `skills/orchestrate/templates/prefs.toml.md`). For each
   `[[pref]]` it greps the directly-changed governed surfaces for the pref's `verify` regex; a governed,
@@ -163,8 +178,8 @@ clean-worktree check, so an unchanged committed tree skips re-running it
 `skills/orchestrate/templates/gates.toml.md`.
 
 ```sh
-shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
-ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py
+shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
+ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py
 ./scripts/orchestrate-guard.sh --self-test    # MUST use ./ - the self-test re-invokes "$0";
                                               # `bash scripts/orchestrate-guard.sh` makes $0 a bare name -> 127
 ./scripts/orchestrate-steer.sh --self-test    # advisory WARN-level steering hook (#95)
@@ -194,6 +209,7 @@ python3 test-gate-runner.py
 python3 test-prefs-coverage.py
 python3 test-prose-lint.py
 python3 test-resolve-threads.py
+python3 test-cache-reclaim.py
 ```
 
 ## Versioning
