@@ -42,13 +42,17 @@ Runtime (`scripts/`; canonical source is this repo):
   a SOLO/non-marker session is never Tier-2-gated. Fails OPEN on any internal error. Threat model
   = honest bot on the obvious path, NOT adversarial evasion (it is a guardrail, not a sandbox).
 - `scripts/orchestrate-steer.sh` - the advisory WARN-level steering hook (#95), SEPARATE from the
-  deny-floor guard. Exit 0 ALWAYS (never blocks); emits a `STEER:` nudge to stderr on three rules:
+  deny-floor guard. Exit 0 ALWAYS (never blocks); emits a `STEER:` nudge to stderr on four rules:
   (1) a marker-gated mid-run edit of a canonical file (SKILL.md/templates/guard/steer) -> log
-  feedback instead; (2) a raw `gh api` mutation not via a `gh-*` wrapper -> use the wrapper;
+  feedback instead (gated OFF for a `Read` so wiring the hook for Read never nags a reader);
+  (2) a raw `gh api` mutation not via a `gh-*` wrapper -> use the wrapper;
   (3) a raw `gh pr comment`/`gh pr create` -> canonical path (reply-comment.sh/gh-comment.sh; /prep-pr)
-  (#159; canonical-steering only - `merge` and the allow-listed lifecycle subcommands are NOT flagged).
+  (#159; canonical-steering only - `merge` and the allow-listed lifecycle subcommands are NOT flagged);
+  (4) a redundant re-`Read` of a path already read this session with unchanged mtime+size -> skip the
+  Read (#226; stateful per-session state keyed on the stdin `session_id`, marker-independent, advisory
+  so the post-compaction re-read exception stays valid).
   Wired
-  for Edit/Write/Bash PreToolUse by `configure` (deployed Option-A like the guard); never duplicates
+  for Edit/Write/Bash/Read PreToolUse by `configure` (deployed Option-A like the guard); never duplicates
   or weakens a guard deny; opt out with `configure --no-steer`. Fails SILENT-OPEN.
 - `orchestrate-resources.py` - cross-session port + data-dir lease allocator (flock-atomic JSON
   state). `stillwater` profile emits SW_* env (lease JSON on STDOUT, eval-able exports on STDERR);
@@ -61,7 +65,7 @@ Runtime (`scripts/`; canonical source is this repo):
   DEPLOYS the 13 bundled PR-lifecycle helpers the same Option-A way (#133; #234 added
   `gh-react.sh`; retiring any claude-kit
   symlink, backed up to `<dest>.bak`), and (unless `--no-steer`) DEPLOYS + wires the advisory
-  steering hook `orchestrate-steer.sh` for Edit/Write/Bash (#95; doctor only ever WARNs about it),
+  steering hook `orchestrate-steer.sh` for Edit/Write/Bash/Read (#95/#226; doctor only ever WARNs about it),
   DEPLOYS this script to the stable path + wires a read-only SessionStart `init` advisory hook (#162;
   the `init` subcommand reuses the single `_scan_merge_gate_shadows` matcher to surface a `gh pr *`
   merge-gate shadow at session start - READ-ONLY, SILENT on a clean cascade, exit 0 on every path

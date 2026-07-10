@@ -5,16 +5,24 @@
 # distinct script preserves the floor's integrity (the guard stays pure hard-deny) and lets the
 # steering be disabled (`configure --no-steer`) without touching deny logic.
 #
-# Two rules (#95):
+# Rules (#95, #159, #226):
 #   (1) MID-RUN CANONICAL EDIT (marker-gated): an Edit/Write whose target resolves to a canonical
 #       file (SKILL.md, templates/*, orchestrate-guard.sh, orchestrate-steer.sh) while THIS session's
 #       orchestrate marker is fresh -> WARN: log feedback to the mailbox, do not edit mid-run.
 #       Enforces [[orchestrate-no-mid-run-canonical-edits]]. Marker-gated so a teammate editing those
 #       files in its OWN worktree during a sanctioned PR build (a different $TMUX key, so no marker)
-#       is NOT warned - only the lead editing them mid-run in the marker-active session is.
+#       is NOT warned - only the lead editing them mid-run in the marker-active session is. Gated OFF
+#       for a `Read` tool call (a Read carries a file_path too) so wiring the hook for Read never
+#       turns reading a canonical file into a spurious "do not edit" nag.
 #   (2) RAW GH-API MUTATION -> WRAPPER: a Bash command invoking `gh api` with a MUTATION flag
 #       (-X/--method, -f/-F/--field/--raw-field/--input) directly on the command line and NOT via a
 #       gh-* wrapper script -> WARN: use the gh-* wrapper. Marker-independent (steer every session).
+#   (3) RAW GH PR comment/create -> CANONICAL PATH: `gh pr comment`/`gh pr create` on the command
+#       line -> WARN toward reply-comment.sh/gh-comment.sh / /prep-pr. Marker-independent (#159).
+#   (4) REDUNDANT RE-READ -> WARN (#226): a 2nd+ `Read` of a path already read THIS session with an
+#       unchanged mtime+size -> WARN: the content is already in context, skip the Read. Stateful
+#       (per-session, keyed on the stdin session_id), marker-independent, advisory only. The valid
+#       exception (post-compaction re-read) is why this is a WARN and never a deny.
 #
 # These COMPLEMENT the guard's denies; they NEVER duplicate or weaken them (all WARN, exit 0). The
 # guard already DENIES push-to-main, bare force, --no-verify, gh --admin, and marker-gated merge;
@@ -57,8 +65,25 @@ if [ "${1:-}" = "--self-test" ]; then
     { [ "$st_rc" -eq 0 ] && printf '%s' "$st_out" | grep -q 'STEER'; } \
       || st_fail="gh-pr rule (create) (rc=$st_rc out=$st_out)"
   fi
+  # (4) read-dedup: a 2nd Read of an unchanged path (same session) must WARN at exit 0; the 1st is
+  # silent. Uses an isolated temp state dir + file so the self-test never touches real read state.
   if [ -z "$st_fail" ]; then
-    echo "orchestrate-steer self-test PASS (raw gh-api + raw gh pr comment/create mutations warned, exit 0)"
+    st_tmp=$(mktemp -d 2>/dev/null) || st_tmp=""
+    if [ -n "$st_tmp" ]; then
+      st_f="$st_tmp/f"; : > "$st_f"
+      st_payload='{"tool_name":"Read","session_id":"selftest","tool_input":{"file_path":"'"$st_f"'"}}'
+      printf '%s' "$st_payload" | ORCHESTRATE_READ_STATE_DIR="$st_tmp/state" "$0" >/dev/null 2>&1
+      st_out=$(printf '%s' "$st_payload" | ORCHESTRATE_READ_STATE_DIR="$st_tmp/state" "$0" 2>&1); st_rc=$?
+      { [ "$st_rc" -eq 0 ] && printf '%s' "$st_out" | grep -q 'STEER'; } \
+        || st_fail="read-dedup rule (rc=$st_rc out=$st_out)"
+      rm -rf "$st_tmp" 2>/dev/null
+    else
+      # mktemp failed: do NOT let the PASS line falsely claim the read-dedup sub-check ran.
+      st_fail="read-dedup rule (mktemp -d failed; sub-check could not run)"
+    fi
+  fi
+  if [ -z "$st_fail" ]; then
+    echo "orchestrate-steer self-test PASS (raw gh-api + raw gh pr comment/create mutations + read-dedup warned, exit 0)"
     exit 0
   fi
   echo "orchestrate-steer self-test FAIL: expected a STEER warn at exit 0, got $st_fail" >&2
@@ -71,8 +96,15 @@ stdin_json=""
 if [ ! -t 0 ]; then
   stdin_json=$(cat 2>/dev/null)
 fi
+# tool_name + session_id live at the stdin TOP LEVEL (not inside tool_input), so they are available
+# only via the real PreToolUse stdin payload - the $TOOL_INPUT env fallback carries neither, which is
+# fine: the read-dedup rule (which needs both) simply cannot fire on that channel (fail-open).
+tool_name=""
+session_id=""
 if [ -n "$stdin_json" ]; then
   tool_input_json=$(printf '%s' "$stdin_json" | jq -c '.tool_input // empty' 2>/dev/null)
+  tool_name=$(printf '%s' "$stdin_json" | jq -r '.tool_name // empty' 2>/dev/null)
+  session_id=$(printf '%s' "$stdin_json" | jq -r '.session_id // empty' 2>/dev/null)
 fi
 if [ -z "$tool_input_json" ] && [ -n "${TOOL_INPUT:-}" ]; then
   tool_input_json="$TOOL_INPUT"
@@ -150,9 +182,57 @@ marker_active() {
   [ "$age_h" -lt "$TTL_HOURS" ]
 }
 
+# A redundant re-Read: a 2nd+ Read of a path already read THIS session whose mtime+size are unchanged
+# (so the content is already in-context; the harness itself prints "file state is current"). Stateful,
+# per-session, keyed on the stdin session_id - a different mechanism than the stateless command grep.
+# Returns 0 (warn) ONLY on an unchanged repeat; records the fingerprint every time. Cheap by design:
+# mtime+size, never a content hash (hashing every read file on the hot path would add per-call latency
+# for no dedup gain - an mtime bump already means the content changed). Fails-open (silent) on any
+# missing input, a stat failure (nonexistent/unreadable path), or a state-write failure.
+READ_STATE_DIR="${ORCHESTRATE_READ_STATE_DIR:-${TMPDIR:-/tmp}/orchestrate-read-state}"
+is_redundant_reread() {
+  local p="$1" sid="$2" fp sess_key sess_dir key rec prior
+  [ -n "$p" ] && [ -n "$sid" ] || return 1
+  # Fingerprint = "mtime size"; a stat failure (missing/unreadable) means we cannot dedup -> silent.
+  # ACCEPTED LIMITATION (F30-class, fail-SAFE): stat mtime is 1-second granular on both GNU (%Y) and
+  # BSD (%m), so a file MODIFIED within the same wall-clock second as a prior read - then re-read -
+  # keeps an unchanged fingerprint and draws a SPURIOUS advisory WARN. Harmless (a nudge, never a
+  # deny, never data loss) and vanishingly rare (real edits/rebuilds land seconds later); sub-second
+  # precision is not portable across GNU/BSD, so this is documented rather than chased.
+  fp=$(stat -c '%Y %s' -- "$p" 2>/dev/null || stat -f '%m %z' -- "$p" 2>/dev/null) || return 1
+  [ -n "$fp" ] || return 1
+  # Per-session dir keyed on a sanitized session_id; per-path file keyed on a cksum of the path
+  # (collision-tolerant: a rare clash only ever mutes/mis-fires an ADVISORY warn).
+  sess_key=$(printf '%s' "$sid" | LC_ALL=C tr -c 'A-Za-z0-9' '_')
+  sess_dir="$READ_STATE_DIR/$sess_key"
+  # No in-hook prune (hostile-review #1): the state store carries NO recursive-delete path. Each
+  # entry is a ~15-byte fingerprint file under a per-session dir in ${TMPDIR:-/tmp}, which the OS
+  # reaps; active pruning of sibling dirs would be a destructive footgun (a mis-pointed
+  # ORCHESTRATE_READ_STATE_DIR could delete unrelated files) that buys negligible hygiene for a
+  # tiny, tmp-resident, self-limiting store. So we only ever create our own session dir, never
+  # delete anything.
+  mkdir -p "$sess_dir" 2>/dev/null || return 1
+  key=$(printf '%s' "$p" | cksum | cut -d' ' -f1)
+  rec="$sess_dir/$key"
+  prior=""
+  [ -f "$rec" ] && prior=$(cat -- "$rec" 2>/dev/null)
+  # Record the current fingerprint for next time (idempotent; identical write on a repeat).
+  printf '%s' "$fp" > "$rec" 2>/dev/null || return 1
+  # Warn only when this exact fingerprint was already on record (a prior unchanged read this session).
+  [ -n "$prior" ] && [ "$prior" = "$fp" ]
+}
+
 # --- dispatch (at most one rule fires; a tool call carries a file_path XOR a command) -------------
-# (1) canonical-edit WARN: marker-gated.
-if [ -n "$file_path" ] && is_canonical_path "$file_path" && marker_active; then
+# (0) read-dedup WARN: only a `Read` tool call, marker-independent. Placed before the canonical-edit
+# rule so a Read never falls through to it (and the canonical rule is itself gated off for Read below).
+if [ "$tool_name" = "Read" ] && [ -n "$file_path" ] && is_redundant_reread "$file_path" "$session_id"; then
+  emit_warn "Redundant re-Read: '$file_path' was already read this session and is unchanged (mtime/size) - its content is already in context; skip the Read (post-compaction re-read is the valid exception)."
+fi
+
+# (1) canonical-edit WARN: marker-gated. tool_name=='Read' is excluded so wiring the hook for Read
+# does not turn a canonical-file READ into a spurious "do not edit mid-run" nag (an empty tool_name -
+# the $TOOL_INPUT env channel - is NOT "Read", so the existing env-channel behavior is preserved).
+if [ "$tool_name" != "Read" ] && [ -n "$file_path" ] && is_canonical_path "$file_path" && marker_active; then
   emit_warn "Canonical symlinked file - log skill/charter/guard feedback via orchestrate-feedback.sh add (~/.claude/orchestrate-feedback/) and triage via PR; do not edit mid-run."
 fi
 
