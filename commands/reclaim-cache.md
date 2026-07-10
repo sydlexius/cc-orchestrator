@@ -30,13 +30,27 @@ If `PL` is empty, stop here (the helper is not available). Every command below i
 
 ## Step 2 -- Report (always first)
 
-Run the report. By default it scans the current repo for Rust `target/` dirs; pass
-`--root <dir>` (e.g. `--root ~/Developer`) to scan a wider tree. It measures the npm cache,
+First, parse an optional scan root from `$ARGUMENTS` (the user may pass `--root <dir>`, e.g.
+`--root ~/Developer`, to scan a wider tree than the current repo):
+
+```bash
+root=""
+case " $ARGUMENTS " in
+  *" --root "*) root=$(printf '%s' "$ARGUMENTS" | awk '{for(i=1;i<NF;i++) if($i=="--root"){print $(i+1); exit}}') ;;
+esac
+```
+
+Run the report. By default it scans the current repo for Rust `target/` dirs; the `--root <dir>`
+above widens the scan. It measures the npm cache,
 each Rust project's `target/` dir (the real Rust disk hog, regenerable), and the cargo
 registry, and prints the exact toolchain command to reclaim each - it does NOT clean anything.
 
 ```bash
-[ -n "$PL" ] && bash "$PL" --report ${root:+--root "$root"}
+# Pass --root only when a scan root was requested; build the args explicitly (a
+# `${root:+--root "$root"}` one-liner collapses "--root <path>" into a single arg).
+if [ -n "$PL" ]; then
+  if [ -n "${root:-}" ]; then bash "$PL" --report --root "$root"; else bash "$PL" --report; fi
+fi
 ```
 
 Present the report to the user. Point out the biggest reclaimable items and note that npm and
@@ -53,7 +67,9 @@ When they name targets, pass them to `--yes` as a comma-separated list. Each is 
 - `npm` -> `npm cache verify` (light GC, keeps the cache working)
 - `npm=force` -> `npm cache clean --force` (full wipe; only if verify didn't reclaim enough)
 - a Rust project directory path (as printed in the report) -> `cargo clean` for that project
-- `cargo-registry` -> `cargo cache --autoclean` (only if the `cargo-cache` plugin is installed)
+- `cargo-registry` -> **report-only**: the helper prints the `cargo cache --autoclean` command for
+  you to run yourself (it never mutates the registry; install the plugin once with
+  `cargo install cargo-cache`)
 
 ```bash
 bash "$PL" --yes "<name-or-path>[,<name-or-path>...]"

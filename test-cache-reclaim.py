@@ -8,7 +8,7 @@ hand-rolled rm), a `target/` is listed only WITH a sibling Cargo.toml, --nudge i
 path fails open (exit 0).
 
 Invoked via `bash scripts/cache-reclaim.sh` so +x is not required to test."""
-import os, subprocess, sys, tempfile
+import os, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WRAPPER = os.path.join(HERE, "scripts", "cache-reclaim.sh")
@@ -64,7 +64,8 @@ def run(args, extra_env=None, cwd=None):
     """Run the helper with stubbed df/du/npm/cargo on PATH. Returns (rc, out, calls) where `calls`
     is a list of [tool, *argv] lists parsed from the NUL-separated stub log."""
     stubdir = make_stubdir()
-    log = tempfile.mktemp()
+    fd, log = tempfile.mkstemp()  # atomically created (no mktemp TOCTOU); stubs >> append to it
+    os.close(fd)
     env = dict(os.environ)
     # Keep real `find`/`bash` reachable: prepend stubdir but retain the system PATH.
     env["PATH"] = stubdir + os.pathsep + env["PATH"]
@@ -94,7 +95,8 @@ def run(args, extra_env=None, cwd=None):
                 i = j
             else:
                 i += 1
-        os.remove(log)
+    os.path.exists(log) and os.remove(log)
+    shutil.rmtree(stubdir, ignore_errors=True)  # don't leak the per-run stub dir (Codoki/Copilot)
     return rc, out, calls
 
 
@@ -156,6 +158,12 @@ def main():
     check("5b --yes target -> cargo clean --manifest-path proj", called(calls, "cargo", "clean", "--manifest-path", proj))
     check("5c --yes target -> no rm in output/behavior", "rm -rf" not in out)
 
+    # 5d. --yes <proj>/target (a path whose PARENT holds Cargo.toml) resolves to the project manifest
+    #     and cleans it (the report prints <proj>, but a <proj>/target path must also work).
+    rc, out, calls = run(["--yes", os.path.join(proj, "target")])
+    check("5d --yes <proj>/target -> cargo clean on the project manifest",
+          called(calls, "cargo", "clean", "--manifest-path", os.path.join(proj, "Cargo.toml")))
+
     # 6. --yes npm -> light `npm cache verify`; --yes npm=force -> `npm cache clean --force`.
     rc, out, calls = run(["--yes", "npm"], extra_env={"NPM_CACHE_DIR": "/tmp/fake-npm"})
     check("6a --yes npm -> npm cache verify (light)", called(calls, "npm", "cache", "verify"))
@@ -195,9 +203,11 @@ def main():
     check("11a --yes '*' -> exit 0", rc == 0)
     check("11b --yes '*' -> NO cargo clean (glob not expanded to projects)", not called(calls, "cargo", "clean"))
 
-    # 12. cargo-registry with the cargo-cache plugin PRESENT -> runs `cargo cache --autoclean`.
+    # 12. cargo-registry is REPORT-ONLY: --yes cargo-registry NEVER mutates (no autoclean) even with
+    #     the cargo-cache plugin present; it prints the command for the user to run instead.
     rc, out, calls = run(["--yes", "cargo-registry"], extra_env={"CARGO_CACHE_PRESENT": "1"})
-    check("12 cargo-registry present -> cargo cache --autoclean", called(calls, "cargo", "autoclean"))
+    check("12a cargo-registry present -> still NO autoclean (report-only)", not called(calls, "cargo", "autoclean"))
+    check("12b cargo-registry -> prints the 'cargo cache --autoclean' command", "cargo cache --autoclean" in out)
 
     # 13. --root pointing at a nonexistent dir -> report still exits 0 (fail-open), no crash.
     rc, out, calls = run(["--report", "--root", "/no/such/dir/xyz"])

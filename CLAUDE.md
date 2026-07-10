@@ -132,11 +132,13 @@ Runtime (`scripts/`; canonical source is this repo):
   each. `--nudge` is `df`-ONLY (one advisory line at >=90% full, else silent) and is what
   post-merge-cleanup calls (a merge NEVER cleans - a global cache wiped mid-build in a sibling
   worktree corrupts it). `--yes <name|rust-project-path>` reclaims ONLY named targets via the
-  toolchain's own clean (`npm cache verify`/`clean --force`, `cargo clean --manifest-path`,
-  `cargo cache --autoclean`) - NEVER a hand-rolled `rm` (registry/modcache files are read-only; only
+  toolchain's own clean (`npm cache verify`/`clean --force`, `cargo clean --manifest-path`) - NEVER a
+  hand-rolled `rm` (registry/modcache files are read-only; only
   the toolchain deletes them). GO is intentionally omitted: no surgical reclaim (build cache
-  self-trims; `go clean -modcache` is a full wipe). Reads-only in report/nudge; fails OPEN (always
-  exit 0); no gh/git/network mutation, no floor/allow-list change. Design + 2 hostile-review passes:
+  self-trims; `go clean -modcache` is a full wipe). Reads-only in report/nudge; the operational modes
+  fail OPEN (report/nudge/reclaim each exit 0, so the post-merge `--nudge` can never abort cleanup) -
+  only a malformed invocation (unknown flag / bare trailing `--yes`/`--root`) exits 2; no gh/git/
+  network mutation, no floor/allow-list change. Design + 2 hostile-review passes:
   `scratchpad`/design notes (concurrency-wipe hazard, wrong-signal, go-misdiagnosis all caught).
 - `scripts/prefs-coverage.py` - opt-in UI-preference-coverage HARD-GATE (a repo enables it by adding a
   `.prefs.toml` + a `.gates.toml` step; schema `skills/orchestrate/templates/prefs.toml.md`). For each

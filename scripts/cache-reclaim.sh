@@ -16,9 +16,10 @@
 #                                                     npm            -> npm cache verify   (light GC)
 #                                                     npm=force      -> npm cache clean --force (full)
 #                                                     <rust proj dir> -> cargo clean --manifest-path <dir>/Cargo.toml
-#                                                     cargo-registry -> cargo cache --autoclean (only if
-#                                                                       the cargo-cache plugin is installed;
-#                                                                       else a skip + install hint)
+#                                                     cargo-registry -> REPORT-ONLY: prints the
+#                                                                       'cargo cache --autoclean' command to
+#                                                                       run yourself (the helper never
+#                                                                       mutates the registry)
 #
 # Targets (extensible): npm (global cache), cargo-target (per-project target/ dirs -- the real Rust
 # disk hog, regenerable, LOCAL to each repo), cargo-registry (report-only behind cargo-cache). Go is
@@ -26,9 +27,11 @@
 # is a full wipe, not a trim).
 #
 # Safety: reads only in report/nudge mode; the sole mutation is a --yes-gated toolchain clean. Every
-# path is quoted and skipped if empty/missing. Fails OPEN -- a du/tool error is caught per-target and
-# the script always exits 0, so it can never break a caller (e.g. post-merge-cleanup). No gh/git/
-# network mutation, no allow-list/floor change.
+# path is quoted and skipped if empty/missing. The OPERATIONAL modes fail OPEN -- a du/tool error is
+# caught per-target and report/nudge/reclaim each exit 0, so they can never break a caller (the
+# `--nudge` call in post-merge-cleanup cannot abort cleanup). Only a MALFORMED INVOCATION (an unknown
+# flag, or a bare trailing --yes/--root with no value) exits 2. No gh/git/network mutation, no
+# allow-list/floor change.
 #
 # Canonical source: cc-orchestrator repo root; reached repo-local or via ${CLAUDE_PLUGIN_ROOT}/scripts.
 set -uo pipefail   # deliberately NOT -e: a du/tool failure must skip that target, never abort.
@@ -122,20 +125,29 @@ reclaim_one() {
   local n="$1"
   case "$n" in
     npm)
-      command -v npm >/dev/null 2>&1 && npm cache verify || echo "cache-reclaim: npm not found; skipped 'npm'" >&2 ;;
+      # Distinguish "npm absent" from "npm ran but the clean failed" -- an `A && B || C` chain would
+      # misreport a clean failure as "npm not found".
+      if command -v npm >/dev/null 2>&1; then
+        npm cache verify || echo "cache-reclaim: 'npm cache verify' failed" >&2
+      else echo "cache-reclaim: npm not found; skipped 'npm'" >&2; fi ;;
     npm=force)
-      command -v npm >/dev/null 2>&1 && npm cache clean --force || echo "cache-reclaim: npm not found; skipped 'npm=force'" >&2 ;;
+      if command -v npm >/dev/null 2>&1; then
+        npm cache clean --force || echo "cache-reclaim: 'npm cache clean --force' failed" >&2
+      else echo "cache-reclaim: npm not found; skipped 'npm=force'" >&2; fi ;;
     cargo-registry)
-      if command -v cargo >/dev/null 2>&1 && cargo cache --version >/dev/null 2>&1; then
-        cargo cache --autoclean
-      else
-        echo "cache-reclaim: the cargo-cache plugin is not installed; run 'cargo install cargo-cache' to reclaim the registry. skipped 'cargo-registry'" >&2
-      fi ;;
+      # REPORT-ONLY by design: the surgical tool (`cargo cache --autoclean`, which removes the
+      # regenerable extracted registry/src) is optional, and we never hand-roll an rm -- so the helper
+      # does NOT mutate the registry. Print the command for the user to run themselves.
+      echo "cache-reclaim: cargo-registry is report-only; to reclaim it yourself run 'cargo cache --autoclean' (install once with 'cargo install cargo-cache'). skipped." >&2 ;;
     *)
-      # Otherwise treat as a Rust project directory; require a Cargo.toml so we never clean a
-      # non-Rust path. Accept either the project dir itself or a path whose parent holds Cargo.toml.
-      if command -v cargo >/dev/null 2>&1 && [ -d "$n" ] && [ -f "$n/Cargo.toml" ]; then
-        cargo clean --manifest-path "$n/Cargo.toml"
+      # Otherwise treat as a Rust project: accept EITHER the project dir itself (holds Cargo.toml)
+      # OR a path whose parent holds it (e.g. the `<proj>/target` printed in the report), and clean
+      # that project's manifest. Require a Cargo.toml so a non-Rust path is never cleaned.
+      local manifest=""
+      if [ -f "$n/Cargo.toml" ]; then manifest="$n/Cargo.toml"
+      elif [ -f "$(dirname "$n")/Cargo.toml" ]; then manifest="$(dirname "$n")/Cargo.toml"; fi
+      if command -v cargo >/dev/null 2>&1 && [ -n "$manifest" ]; then
+        cargo clean --manifest-path "$manifest"
       else
         echo "cache-reclaim: unknown reclaim target '$n' (expected: npm, npm=force, cargo-registry, or a Rust project dir containing Cargo.toml); skipped" >&2
       fi ;;
