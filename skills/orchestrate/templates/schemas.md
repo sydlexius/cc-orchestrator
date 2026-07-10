@@ -95,9 +95,10 @@ Reply: `thread_id` string; `disposition` `merge-safe\|rebut\|fix`; `reply_text` 
 ### Finding channel helper (`scripts/finding_channel.py`, #230)
 
 The channel's two slices are managed by `finding_channel.py`, the deterministic
-guard over the review<->fix loop (design #6). It never mutates the repo or the
-remote (its only network op is a read-only `git fetch`) and never touches the
-allow-list. Subcommands:
+guard over the review<->fix loop (design #6). It never mutates the REMOTE and
+never changes the repo's working tree, index, or history; its only network op is
+`git fetch`, read-only to the remote (it may update the local object DB +
+remote-tracking refs, nothing else). It never touches the allow-list. Subcommands:
 
 - `validate <fix-list|reply-slice> <file.json>` -- schema validate PLUS channel
   invariants a bare schema cannot express: `round >= 1`; an `addressed` finding

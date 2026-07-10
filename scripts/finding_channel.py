@@ -9,8 +9,10 @@ The adv-review <-> implementer loop hands findings across a schema-typed channel
                            reply_text}; the implementer never sees it.
 
 This helper is the DETERMINISTIC guard over that channel. It NEVER mutates the
-target repo or the remote (its only network op is a read-only `git fetch`) and it
-NEVER touches GitHub or the allow-list. Subcommands:
+REMOTE and NEVER changes the target repo's working tree, index, or history; its
+only network op is `git fetch`, which is read-only to the remote (it only updates
+the local object DB + remote-tracking refs, not your branches or working tree).
+It NEVER touches GitHub or the allow-list. Subcommands:
 
   validate <fix-list|reply-slice> <file.json>
       Schema-validate (via orchestrate_schemas) PLUS channel invariants a bare
@@ -161,8 +163,18 @@ def _now():
 # --- git plumbing (read-only; check=False, inspect returncode) --------------
 
 def _git(repo, *args):
-    """`git -C repo <args>`. Returns (rc, stdout_stripped)."""
-    proc = subprocess.run(["git", "-C", repo, *args],
+    """`git -C repo <args>`, NON-INTERACTIVE. Returns (rc, stdout_stripped).
+
+    ls-remote/fetch against an auth-required origin would otherwise block on a
+    credential prompt and hang the guard indefinitely (Codoki #255). Force
+    GIT_TERMINAL_PROMPT=0 (never prompt for HTTP creds) and default SSH to
+    BatchMode (fail fast instead of prompting) so an unreachable/auth-required
+    remote fails fast to the 'error' verdict (exit 2, safe-block) rather than
+    stalling the pipeline. This preserves the read-only behavior."""
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env.setdefault("GIT_SSH_COMMAND", "ssh -oBatchMode=yes")
+    proc = subprocess.run(["git", "-C", repo, *args], env=env,
                           capture_output=True, text=True, check=False)
     return proc.returncode, proc.stdout.strip()
 

@@ -181,6 +181,57 @@ def test_validate_fix_disposition_empty_reply_text():
         check("validate: fix disposition w/ empty reply_text -> exit 1", rc == 1)
 
 
+def test_validate_fix_disposition_whitespace_reply_text():
+    # Codoki suggestion: a 'fix' reply whose reply_text is whitespace-only must
+    # fail the invariant (exercises the .strip() path, not just empty-string).
+    with tempfile.TemporaryDirectory() as root:
+        bad = good_reply_slice()
+        bad["replies"]["F1"]["reply_text"] = "   \t\n "
+        p = write_json(os.path.join(root, "r.json"), bad)
+        rc, out = run("validate", "reply-slice", p)
+        check("validate: fix disposition w/ whitespace-only reply_text -> exit 1",
+              rc == 1)
+
+
+def test_liveness_zero_deadline_is_usage_exit2():
+    with tempfile.TemporaryDirectory() as root:
+        p = write_json(os.path.join(root, "f.json"), {})
+        rc, out = run("liveness", p, "--deadline-secs", "0")
+        check("liveness: --deadline-secs 0 -> exit 2 (usage)", rc == 2)
+
+
+def test_liveness_nonint_deadline_is_usage_exit2():
+    with tempfile.TemporaryDirectory() as root:
+        p = write_json(os.path.join(root, "f.json"), {})
+        rc, out = run("liveness", p, "--deadline-secs", "abc")
+        check("liveness: non-integer --deadline-secs -> exit 2 (usage)", rc == 2)
+
+
+def test_git_calls_are_non_interactive():
+    # Codoki hardening: git subprocesses must be non-interactive so ls-remote/fetch
+    # cannot hang on a credential prompt. Shim `git` on PATH to record its env; the
+    # first git call (rev-parse in guard-reply) must carry GIT_TERMINAL_PROMPT=0.
+    with tempfile.TemporaryDirectory() as root:
+        bindir = os.path.join(root, "bin")
+        os.makedirs(bindir)
+        envlog = os.path.join(root, "git-env.log")
+        shim = os.path.join(bindir, "git")
+        with open(shim, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\nenv > %r\nexit 1\n" % envlog)
+        os.chmod(shim, 0o755)
+        env = dict(os.environ)
+        env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+        subprocess.run([sys.executable, HELPER, "guard-reply", "--repo", root,
+                        "--branch", "b", "--finding", "F1", "--sha", "abc",
+                        "--no-fetch"], env=env, capture_output=True, text=True)
+        recorded = ""
+        if os.path.exists(envlog):
+            with open(envlog, encoding="utf-8") as f:
+                recorded = f.read()
+        check("git calls set GIT_TERMINAL_PROMPT=0 (non-interactive, no hang)",
+              "GIT_TERMINAL_PROMPT=0" in recorded)
+
+
 def test_validate_missing_file():
     with tempfile.TemporaryDirectory() as root:
         rc, out = run("validate", "fix-list", os.path.join(root, "nope.json"))
@@ -480,6 +531,10 @@ def main():
         test_validate_schema_error_surfaced, test_validate_round_lt_1,
         test_validate_addressed_without_sha, test_validate_duplicate_ids,
         test_validate_fix_disposition_empty_reply_text,
+        test_validate_fix_disposition_whitespace_reply_text,
+        test_liveness_zero_deadline_is_usage_exit2,
+        test_liveness_nonint_deadline_is_usage_exit2,
+        test_git_calls_are_non_interactive,
         test_validate_missing_file, test_validate_unknown_kind,
         test_liveness_missing, test_liveness_fresh, test_liveness_slow,
         test_liveness_stalled, test_liveness_dead,

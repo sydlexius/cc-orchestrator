@@ -102,8 +102,11 @@ Runtime (`scripts/`; canonical source is this repo):
   `guard-slice` (THE pre-reply guardrail: a `fix` reply's `fix_sha` must be PUSHED to
   `origin/<branch>` AND bound to its finding by a `Finding-Id:` commit trailer - ancestry alone is
   insufficient; a reachable-but-branch-absent remote is `not pushed` (exit 1), an UNREACHABLE remote
-  is exit 2 (safe-block), never a stale false-pass). Reads git + JSON ONLY - no repo/remote mutation
-  (its one network op is a read-only `git fetch`), no `gh`, no allow-list broadening. Exit 0/1/2.
+  is exit 2 (safe-block), never a stale false-pass). Reads git + JSON ONLY - no REMOTE mutation and no
+  working-tree/index/history change (its one network op is `git fetch`, read-only to the remote: it may
+  update the local object DB + remote-tracking refs, nothing else; git calls are non-interactive via
+  GIT_TERMINAL_PROMPT=0 so an auth-required origin fails fast instead of hanging), no `gh`, no
+  allow-list broadening. Exit 0/1/2.
 - `scripts/planner_classify.py`, `scripts/uat-autobuild.sh`, `scripts/gh-*.sh` - the planner helper,
   the UAT auto-rebuild watcher, and the least-privilege gh wrappers. `gh-react.sh codoki-ack`
   (#234) is the canonical reader/actuator of the Codoki ROOT-SUMMARY ack (the 👍/👎 reaction on
