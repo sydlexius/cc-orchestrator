@@ -32,19 +32,21 @@ case "${1:-}" in
   -h|--help) awk 'NR==1{next} /^#/{sub(/^#[[:space:]]?/,""); print; next} {exit}' "$0"; exit 0 ;;
 esac
 
+# Single source of truth for the usage line, printed to STDERR (it is a diagnostic, not
+# program output). EVERY operator error below routes through it so they stay consistent and
+# can't drift: the --bot missing-pattern error, the arg-count guard, and the numeric-arg checks.
+usage() { echo "Usage: $0 [--bot <pattern>] <pr> <comment-db-id...>" >&2; }
+
 bot_pattern='copilot|greptile|codoki'
 if [ "${1:-}" = "--bot" ]; then
   if [ -z "${2:-}" ]; then
-    echo "Error: --bot requires a regex pattern argument."
+    usage
+    echo "--bot requires a regex pattern argument" >&2
     exit 1
   fi
   bot_pattern="$2"
   shift 2
 fi
-
-# Single source of truth for the usage line (the count guard and the numeric-arg validation
-# below both route through it, so they can't drift).
-usage() { echo "Usage: $0 [--bot <pattern>] <pr> <comment-db-id...>"; }
 
 if [ "${#}" -lt 2 ]; then
   usage

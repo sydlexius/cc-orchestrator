@@ -6,7 +6,7 @@ fails with a usage error + exit 1 BEFORE any gh/GraphQL call (empty gh log == no
 while numeric args pass validation and reach the (stubbed) gh path unchanged.
 
 Invoked via `bash scripts/resolve-threads.sh` so +x is not required to test."""
-import os, shutil, subprocess, sys, tempfile
+import os, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WRAPPER = os.path.join(HERE, "scripts", "resolve-threads.sh")
@@ -33,28 +33,30 @@ def check(name, cond):
 
 
 def run(args):
-    """Run resolve-threads.sh with a stubbed gh. Returns (rc, stdout+stderr, gh_argv_list)."""
-    d = tempfile.mkdtemp()
-    ghstub = os.path.join(d, "gh")
-    log = os.path.join(d, "ghlog")
-    with open(ghstub, "w") as f:
-        f.write(GH_STUB)
-    os.chmod(ghstub, 0o755)
-    env = dict(os.environ)
-    env["PATH"] = d + os.pathsep + env["PATH"]
-    env["GH_LOG"] = log
-    try:
-        p = subprocess.run(["bash", WRAPPER, *args], env=env, capture_output=True,
-                           text=True, timeout=15)
-        rc, out = p.returncode, p.stdout + p.stderr
-    except subprocess.TimeoutExpired:
-        rc, out = 124, "TIMEOUT"
-    argv = []
-    if os.path.exists(log):
-        with open(log, "rb") as f:
-            argv = [a.decode() for a in f.read().split(b"\0") if a]
-    shutil.rmtree(d, ignore_errors=True)  # don't accumulate per-run temp dirs in /tmp (Codoki)
-    return rc, out, argv
+    """Run resolve-threads.sh with a stubbed gh. Returns (rc, stdout+stderr, gh_argv_list).
+
+    The stub dir lives in a TemporaryDirectory context (auto-cleaned on return, matching the
+    repo convention e.g. test-gh-react.py) so repeated runs leave no stray temp dirs behind."""
+    with tempfile.TemporaryDirectory() as d:
+        ghstub = os.path.join(d, "gh")
+        log = os.path.join(d, "ghlog")
+        with open(ghstub, "w") as f:
+            f.write(GH_STUB)
+        os.chmod(ghstub, 0o755)
+        env = dict(os.environ)
+        env["PATH"] = d + os.pathsep + env["PATH"]
+        env["GH_LOG"] = log
+        try:
+            p = subprocess.run(["bash", WRAPPER, *args], env=env, capture_output=True,
+                               text=True, timeout=15)
+            rc, out = p.returncode, p.stdout + p.stderr
+        except subprocess.TimeoutExpired:
+            rc, out = 124, "TIMEOUT"
+        argv = []
+        if os.path.exists(log):
+            with open(log, "rb") as f:
+                argv = [a.decode() for a in f.read().split(b"\0") if a]
+        return rc, out, argv
 
 
 def main():
@@ -102,6 +104,11 @@ def main():
     # 6. the pre-existing arg-COUNT guard still fires (too few args).
     rc, out, argv = run(["242"])
     check("6 too-few-args -> exit 1 (count guard intact)", rc == 1 and "Usage:" in out)
+
+    # 7. --bot with no pattern -> exit 1 AND routes through usage() (consistent operator-error hint).
+    rc, out, argv = run(["--bot"])
+    check("7a --bot missing pattern -> exit 1", rc == 1)
+    check("7b --bot missing pattern -> shows usage", "Usage:" in out)
 
     print()
     if FAILS:
