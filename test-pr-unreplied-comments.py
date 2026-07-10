@@ -421,6 +421,198 @@ def main():
     adv = json.loads(out)
     check("no codecov comment -> status=none (unchanged)", adv.get("status") == "none")
 
+    print("== #252 --itemized: one checkable line per UNADDRESSED finding across all 3 classes ==")
+    # An unreplied inline bot comment. path/line must match the GraphQL thread node
+    # below so the resolved lookup keys off path AND line.
+    ITEM_INLINE = (
+        '[{"id":501,"user":{"login":"coderabbitai[bot]"},"in_reply_to_id":null,'
+        '"path":"foo.sh","original_line":42,"commit_id":"abcdef1234567",'
+        '"body":"Potential issue: fix this bug\\nmore detail"}]'
+    )
+    # A review-body nitpick with an actionable body and NO inline thread.
+    ITEM_REVIEW = (
+        '[{"id":111,"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T02:00:00Z",'
+        '"body":"**Actionable comments posted: 1**\\n\\nsome finding"}]'
+    )
+    # An issue-level actionable Codoki comment.
+    ITEM_ISSUE = (
+        '[{"id":701,"user":{"login":"codoki-pr-intelligence[bot]"},'
+        '"created_at":"2026-06-18T01:00:00Z","updated_at":"2026-06-18T01:00:00Z",'
+        '"body":"### Codoki PR Review\\nHigh: something"}]'
+    )
+    # Resolved is keyed on the thread ROOT comment fullDatabaseId (== the REST inline
+    # comment id 501), NOT path+line (#256 CR Major: line drifts on rebase).
+    G_ITEM_UNRESOLVED = (
+        '{"data":{"repository":{"pullRequest":{"reviewThreads":{'
+        '"pageInfo":{"hasNextPage":false},'
+        '"nodes":[{"isResolved":false,"path":"foo.sh","line":42,'
+        '"comments":{"nodes":[{"fullDatabaseId":"501","author":{"login":"coderabbitai"}}]}}]}}}}}'
+    )
+    G_ITEM_RESOLVED = (
+        '{"data":{"repository":{"pullRequest":{"reviewThreads":{'
+        '"pageInfo":{"hasNextPage":false},'
+        '"nodes":[{"isResolved":true,"path":"foo.sh","line":42,'
+        '"comments":{"nodes":[{"fullDatabaseId":"501","author":{"login":"coderabbitai"}}]}}]}}}}}'
+    )
+
+    # (a) review-body-only -> a "review-body | ... | (body) |" line with resolved:n/a.
+    rc, out, err = run(["--itemized", "--allow-stale"], reviews=ITEM_REVIEW)
+    check("itemized: review-body nitpick -> 'review-body |' line present",
+          any(ln.startswith("review-body |") for ln in out.splitlines()))
+    check("itemized: review-body line marks (body) and resolved:n/a",
+          any(ln.startswith("review-body |") and "(body)" in ln and "resolved:n/a" in ln
+              for ln in out.splitlines()))
+    check("itemized: review-body carries the NOTE about no inline thread / re-review",
+          "NOTE:" in out and "re-review" in out)
+    check("itemized: review-body exit 0", rc == 0)
+
+    # (b) inline unreplied comment -> "inline | ... | path:line |" with resolved from GraphQL.
+    rc, out, err = run(["--itemized", "--allow-stale"], inline=ITEM_INLINE,
+                       graphql=G_ITEM_UNRESOLVED)
+    inline_lines = [ln for ln in out.splitlines() if ln.startswith("inline |")]
+    check("itemized: inline unreplied -> 'inline | ... | foo.sh:42 |' line",
+          any("foo.sh:42" in ln for ln in inline_lines))
+    check("itemized: inline strips the [bot] suffix from the author",
+          any(ln.startswith("inline | coderabbitai |") for ln in inline_lines))
+    check("itemized: matching GraphQL isResolved=false -> resolved:no",
+          any("resolved:no" in ln for ln in inline_lines))
+    check("itemized: inline exit 0", rc == 0)
+
+    rc, out, err = run(["--itemized", "--allow-stale"], inline=ITEM_INLINE,
+                       graphql=G_ITEM_RESOLVED)
+    check("itemized: matching GraphQL isResolved=true -> resolved:yes",
+          any(ln.startswith("inline |") and "resolved:yes" in ln for ln in out.splitlines()))
+
+    # (c) issue-level actionable -> "issue-level | ... | (issue) |" line.
+    rc, out, err = run(["--itemized", "--allow-stale"], issue=ITEM_ISSUE)
+    check("itemized: issue-level actionable -> 'issue-level | ... | (issue) |' line",
+          any(ln.startswith("issue-level |") and "(issue)" in ln for ln in out.splitlines()))
+    check("itemized: issue-level exit 0", rc == 0)
+
+    # (d) all three classes present -> all three line types emitted.
+    rc, out, err = run(["--itemized", "--allow-stale"], inline=ITEM_INLINE,
+                       reviews=ITEM_REVIEW, issue=ITEM_ISSUE, graphql=G_ITEM_UNRESOLVED)
+    lines = out.splitlines()
+    check("itemized: all three -> inline line present",
+          any(ln.startswith("inline |") for ln in lines))
+    check("itemized: all three -> review-body line present",
+          any(ln.startswith("review-body |") for ln in lines))
+    check("itemized: all three -> issue-level line present",
+          any(ln.startswith("issue-level |") for ln in lines))
+    check("itemized: order is inline, then review-body, then issue-level",
+          ([ln.split(" |")[0] for ln in lines
+            if ln.startswith(("inline |", "review-body |", "issue-level |"))]
+           == ["inline", "review-body", "issue-level"]))
+    check("itemized: all three exit 0", rc == 0)
+
+    # (e) clean PR -> header with 0 findings, exit 0, no finding lines.
+    rc, out, err = run(["--itemized", "--allow-stale"])
+    check("itemized: clean PR header says 0 finding(s)",
+          "Itemized triage checklist: 0 finding(s)" in out)
+    check("itemized: clean PR emits no finding lines",
+          not any(ln.startswith(("inline |", "review-body |", "issue-level |"))
+                  for ln in out.splitlines()))
+    check("itemized: clean PR exit 0", rc == 0)
+
+    # (f) --itemized --count-only -> usage error, exit 1, "mutually exclusive".
+    rc, out, err = run(["--itemized", "--count-only"])
+    check("itemized + --count-only -> exit 1 (mutually exclusive)",
+          rc == 1 and "mutually exclusive" in err)
+
+    # (g) excerpt skips leading HTML noise (real bots lead with an HTML comment /
+    # <details> marker) so the checklist line carries the actual finding, not noise.
+    ITEM_ISSUE_HTML = (
+        '[{"id":702,"user":{"login":"codoki-pr-intelligence[bot]"},'
+        '"created_at":"2026-06-18T01:00:00Z","updated_at":"2026-06-18T01:00:00Z",'
+        '"body":"<!-- CODOKI_REVIEW_COMMENT -->\\n### Codoki PR Review\\nHigh: real finding"}]'
+    )
+    rc, out, err = run(["--itemized", "--allow-stale"], issue=ITEM_ISSUE_HTML)
+    il = next((ln for ln in out.splitlines() if ln.startswith("issue-level |")), "")
+    check("itemized: issue-level excerpt skips the HTML-comment marker",
+          "<!--" not in il and "Codoki PR Review" in il)
+    ITEM_REVIEW_HTML = (
+        '[{"id":112,"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T02:00:00Z",'
+        '"body":"<details>\\n<summary>Nitpick comments (1)</summary>\\n**Actionable comments posted: 2**"}]'
+    )
+    rc, out, err = run(["--itemized", "--allow-stale"], reviews=ITEM_REVIEW_HTML)
+    rl = next((ln for ln in out.splitlines() if ln.startswith("review-body |")), "")
+    excerpt = rl.split(" | ")[3] if rl.count(" | ") >= 3 else rl
+    check("itemized: review-body excerpt strips HTML tags (no raw < or >)",
+          "<" not in excerpt and ">" not in excerpt and "Nitpick comments" in excerpt)
+
+    # (h) HIGH (hostile #1): a CR review body carrying "Outside diff range comments (N)"
+    # contributes N+1 to the header count -- the review-body line MUST annotate that
+    # subtotal so header == visible accounting (no silent omission of the N sub-findings).
+    ITEM_REVIEW_OUTSIDE = (
+        '[{"id":113,"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T02:00:00Z",'
+        '"body":"**Actionable comments posted: 1**\\n<summary>Outside diff range comments (6)</summary>"}]'
+    )
+    rc, out, err = run(["--itemized", "--allow-stale"], reviews=ITEM_REVIEW_OUTSIDE)
+    check("itemized: header counts the 6 outside-diff sub-findings (7 total)",
+          "7 finding(s)" in out)
+    rl = next((ln for ln in out.splitlines() if ln.startswith("review-body |")), "")
+    check("itemized: review-body line annotates its outside-diff subtotal (+6)",
+          "outside-diff" in rl and "6" in rl)
+
+    # (i) MEDIUM (hostile #2): --itemized --audit must be a usage error, not silently audit.
+    rc, out, err = run(["--itemized", "--audit"])
+    check("itemized + --audit -> exit 1 (mutually exclusive)",
+          rc == 1 and "mutually exclusive" in err)
+
+    # (j) LOW (hostile #3): a literal '|' in a body must not corrupt the pipe columns.
+    ITEM_INLINE_PIPE = (
+        '[{"id":502,"user":{"login":"coderabbitai[bot]"},"in_reply_to_id":null,'
+        '"path":"a.sh","original_line":10,"commit_id":"abcdef1234567",'
+        '"body":"use a | b pipe here"}]'
+    )
+    rc, out, err = run(["--itemized", "--allow-stale"], inline=ITEM_INLINE_PIPE,
+                       graphql=G_ITEM_UNRESOLVED)
+    il = next((ln for ln in out.splitlines() if ln.startswith("inline |")), "")
+    check("itemized: a '|' in the body does not add columns (exactly 5 fields)",
+          len(il.split(" | ")) == 5 and il.split(" | ")[4].startswith("replied:"))
+
+    # (k) NIT (hostile #4): an HTML comment containing '>' should not leak into the excerpt.
+    ITEM_ISSUE_GTCOMMENT = (
+        '[{"id":703,"user":{"login":"codoki-pr-intelligence[bot]"},'
+        '"created_at":"2026-06-18T01:00:00Z","updated_at":"2026-06-18T01:00:00Z",'
+        '"body":"<!-- a > b noise -->\\nreal finding text"}]'
+    )
+    rc, out, err = run(["--itemized", "--allow-stale"], issue=ITEM_ISSUE_GTCOMMENT)
+    il = next((ln for ln in out.splitlines() if ln.startswith("issue-level |")), "")
+    check("itemized: HTML comment containing '>' does not leak into excerpt",
+          "noise" not in il and "real finding text" in il)
+
+    # (l) NIT (hostile #5): [bot] suffix stripped on ALL three classes' authors.
+    rc, out, err = run(["--itemized", "--allow-stale"], reviews=ITEM_REVIEW, issue=ITEM_ISSUE)
+    check("itemized: review-body author strips [bot]",
+          any(ln.startswith("review-body | coderabbitai |") for ln in out.splitlines()))
+    check("itemized: issue-level author strips [bot]",
+          any(ln.startswith("issue-level | codoki-pr-intelligence |") for ln in out.splitlines()))
+
+    # (m) MAJOR (CR #256): resolved is keyed on the comment ID, NOT path+line, so a
+    # rebase that moves the thread's current `line` away from the comment's original
+    # line must NOT break the match (path+line matching would drop to resolved:? here).
+    G_ITEM_LINEDRIFT = (
+        '{"data":{"repository":{"pullRequest":{"reviewThreads":{'
+        '"pageInfo":{"hasNextPage":false},'
+        '"nodes":[{"isResolved":true,"path":"foo.sh","line":999,'  # line drifted from 42
+        '"comments":{"nodes":[{"fullDatabaseId":"501","author":{"login":"coderabbitai"}}]}}]}}}}}'
+    )
+    rc, out, err = run(["--itemized", "--allow-stale"], inline=ITEM_INLINE,
+                       graphql=G_ITEM_LINEDRIFT)
+    check("itemized: resolved matches by comment ID despite line drift (rebase-safe)",
+          any(ln.startswith("inline |") and "resolved:yes" in ln for ln in out.splitlines()))
+
+    # (n) Nitpick (CR #256): a GraphQL failure for --itemized renders inline resolved:?.
+    rc, out, err = run(["--itemized", "--allow-stale"], inline=ITEM_INLINE,
+                       graphql="not-json")
+    check("itemized: GraphQL failure -> inline resolved:? (best-effort degrade)",
+          any(ln.startswith("inline |") and "resolved:?" in ln for ln in out.splitlines()))
+    check("itemized: GraphQL failure does not change exit (still 0)", rc == 0)
+
     print()
     if FAILS:
         print(f"FAILED ({len(FAILS)}):"); [print("  - " + f) for f in FAILS]; sys.exit(1)
