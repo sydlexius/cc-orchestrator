@@ -207,35 +207,88 @@ def test_liveness_nonint_deadline_is_usage_exit2():
         check("liveness: non-integer --deadline-secs -> exit 2 (usage)", rc == 2)
 
 
+def _record_git_env(root, extra_env=None):
+    """Shim `git` on PATH so it records its env and exits 1; run a guard-reply
+    (whose first git call is rev-parse) and return the recorded env text."""
+    bindir = os.path.join(root, "bin")
+    os.makedirs(bindir, exist_ok=True)
+    envlog = os.path.join(root, "git-env.log")
+    shim = os.path.join(bindir, "git")
+    with open(shim, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\nenv > %r\nexit 1\n" % envlog)
+    os.chmod(shim, 0o755)
+    env = dict(os.environ)
+    env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+    if extra_env:
+        env.update(extra_env)
+    subprocess.run([sys.executable, HELPER, "guard-reply", "--repo", root,
+                    "--branch", "b", "--finding", "F1", "--sha", "abc", "--no-fetch"],
+                   env=env, capture_output=True, text=True)
+    if os.path.exists(envlog):
+        with open(envlog, encoding="utf-8") as f:
+            return f.read()
+    return ""
+
+
+def _ssh_cmd_line(recorded):
+    for line in recorded.splitlines():
+        if line.startswith("GIT_SSH_COMMAND="):
+            return line[len("GIT_SSH_COMMAND="):]
+    return None
+
+
 def test_git_calls_are_non_interactive():
     # Codoki hardening: git subprocesses must be non-interactive so ls-remote/fetch
-    # cannot hang on a credential prompt. Shim `git` on PATH to record its env; the
-    # first git call (rev-parse in guard-reply) must carry GIT_TERMINAL_PROMPT=0.
+    # cannot hang on a credential prompt. The first git call must carry
+    # GIT_TERMINAL_PROMPT=0 and a BatchMode SSH command.
     with tempfile.TemporaryDirectory() as root:
-        bindir = os.path.join(root, "bin")
-        os.makedirs(bindir)
-        envlog = os.path.join(root, "git-env.log")
-        shim = os.path.join(bindir, "git")
-        with open(shim, "w", encoding="utf-8") as f:
-            f.write("#!/bin/sh\nenv > %r\nexit 1\n" % envlog)
-        os.chmod(shim, 0o755)
-        env = dict(os.environ)
-        env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
-        subprocess.run([sys.executable, HELPER, "guard-reply", "--repo", root,
-                        "--branch", "b", "--finding", "F1", "--sha", "abc",
-                        "--no-fetch"], env=env, capture_output=True, text=True)
-        recorded = ""
-        if os.path.exists(envlog):
-            with open(envlog, encoding="utf-8") as f:
-                recorded = f.read()
+        recorded = _record_git_env(root)
         check("git calls set GIT_TERMINAL_PROMPT=0 (non-interactive, no hang)",
               "GIT_TERMINAL_PROMPT=0" in recorded)
+        check("git calls default GIT_SSH_COMMAND to BatchMode",
+              "batchmode=yes" in (_ssh_cmd_line(recorded) or "").lower())
+
+
+def test_git_ssh_command_preset_without_batchmode_gets_it():
+    # Codoki High: a parent env pre-setting GIT_SSH_COMMAND WITHOUT BatchMode must
+    # still be made non-interactive -- inject -oBatchMode=yes, preserving the user's
+    # command (identity file / port / wrapper).
+    with tempfile.TemporaryDirectory() as root:
+        recorded = _record_git_env(root, {"GIT_SSH_COMMAND": "ssh -i /tmp/k"})
+        ssh = _ssh_cmd_line(recorded) or ""
+        check("preset GIT_SSH_COMMAND w/o BatchMode -> BatchMode injected",
+              "batchmode=yes" in ssh.lower())
+        check("preset GIT_SSH_COMMAND w/o BatchMode -> user's command preserved",
+              "-i /tmp/k" in ssh)
+
+
+def test_git_ssh_command_preset_with_batchmode_not_doubled():
+    with tempfile.TemporaryDirectory() as root:
+        preset = "ssh -oBatchMode=yes -i /tmp/k"
+        recorded = _record_git_env(root, {"GIT_SSH_COMMAND": preset})
+        ssh = _ssh_cmd_line(recorded) or ""
+        check("preset GIT_SSH_COMMAND w/ BatchMode -> not double-appended",
+              ssh == preset)
 
 
 def test_validate_missing_file():
     with tempfile.TemporaryDirectory() as root:
         rc, out = run("validate", "fix-list", os.path.join(root, "nope.json"))
         check("validate: missing file -> exit 2 (IO)", rc == 2)
+
+
+def test_validate_invalid_utf8_is_io_exit2():
+    # CR: invalid UTF-8 bytes raise UnicodeDecodeError (a ValueError subclass, NOT
+    # OSError/JSONDecodeError) -- _load must catch it so it stays in the exit-2 IO
+    # contract instead of crashing out with a traceback (exit 1).
+    with tempfile.TemporaryDirectory() as root:
+        p = os.path.join(root, "bad.json")
+        with open(p, "wb") as f:
+            f.write(b'\xff\xfe\xff not valid utf-8')
+        rc, out = run("validate", "fix-list", p)
+        check("validate: invalid UTF-8 file -> exit 2 (IO, not a crash)", rc == 2)
+        check("validate: invalid UTF-8 -> 'cannot read' message",
+              "cannot read" in out.lower())
 
 
 def test_validate_unknown_kind():
@@ -535,7 +588,10 @@ def main():
         test_liveness_zero_deadline_is_usage_exit2,
         test_liveness_nonint_deadline_is_usage_exit2,
         test_git_calls_are_non_interactive,
-        test_validate_missing_file, test_validate_unknown_kind,
+        test_git_ssh_command_preset_without_batchmode_gets_it,
+        test_git_ssh_command_preset_with_batchmode_not_doubled,
+        test_validate_missing_file, test_validate_invalid_utf8_is_io_exit2,
+        test_validate_unknown_kind,
         test_liveness_missing, test_liveness_fresh, test_liveness_slow,
         test_liveness_stalled, test_liveness_dead,
         test_guard_reply_pass, test_guard_reply_short_sha_normalized,

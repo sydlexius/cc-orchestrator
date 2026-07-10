@@ -60,7 +60,10 @@ def _load(path):
     try:
         with open(path, encoding="utf-8") as fh:
             return json.load(fh), None
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+        # UnicodeDecodeError (invalid UTF-8 bytes) is a ValueError, NOT an
+        # OSError/JSONDecodeError -- catch it so malformed bytes stay in the
+        # documented exit-2 IO contract instead of crashing out (CR #255).
         _err(f"cannot read {path}: {e}")
         return None, 2
 
@@ -173,7 +176,17 @@ def _git(repo, *args):
     stalling the pipeline. This preserves the read-only behavior."""
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
-    env.setdefault("GIT_SSH_COMMAND", "ssh -oBatchMode=yes")
+    # GIT_TERMINAL_PROMPT=0 stops HTTP credential prompts but NOT an SSH
+    # password / host-key prompt -- that needs BatchMode. If the parent env
+    # already sets GIT_SSH_COMMAND (a custom identity/port/wrapper) WITHOUT
+    # BatchMode, appending it preserves their command while still guaranteeing
+    # non-interactive behavior (Codoki #255 High); an explicit BatchMode (yes or
+    # no) is left untouched so a user can deliberately opt back into prompts.
+    ssh_cmd = env.get("GIT_SSH_COMMAND")
+    if not ssh_cmd:
+        env["GIT_SSH_COMMAND"] = "ssh -oBatchMode=yes"
+    elif "batchmode" not in ssh_cmd.lower():
+        env["GIT_SSH_COMMAND"] = ssh_cmd + " -oBatchMode=yes"
     proc = subprocess.run(["git", "-C", repo, *args], env=env,
                           capture_output=True, text=True, check=False)
     return proc.returncode, proc.stdout.strip()
