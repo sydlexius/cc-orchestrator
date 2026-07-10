@@ -224,10 +224,14 @@ is_redundant_reread() {
   # fingerprint writes. `-m` is applied per level (not `-p -m`, which SC2174-flags as ignoring
   # intermediates); a custom deep ORCHESTRATE_READ_STATE_DIR with missing parents simply fails open
   # (no dedup) rather than creating loose-permissioned intermediates. Fail-open (return 1 -> silent).
+  # `-m 700` only applies on CREATE; a PRE-EXISTING dir we own could still be group/other-writable
+  # (created earlier under a permissive umask), which -O would not catch and which lets a group member
+  # symlink/clobber inside. So after verifying ownership, ENFORCE 700 with chmod on every level (CR/
+  # Codoki review-round: never operate in a group/other-writable state dir). All steps fail-open.
   mkdir -m 700 "$READ_STATE_DIR" 2>/dev/null
-  [ -d "$READ_STATE_DIR" ] && [ -O "$READ_STATE_DIR" ] || return 1
+  [ -d "$READ_STATE_DIR" ] && [ -O "$READ_STATE_DIR" ] && chmod 700 "$READ_STATE_DIR" 2>/dev/null || return 1
   mkdir -m 700 "$sess_dir" 2>/dev/null
-  [ -d "$sess_dir" ] && [ -O "$sess_dir" ] || return 1
+  [ -d "$sess_dir" ] && [ -O "$sess_dir" ] && chmod 700 "$sess_dir" 2>/dev/null || return 1
   key=$(printf '%s' "$p" | cksum | cut -d' ' -f1)
   rec="$sess_dir/$key"
   prior=""

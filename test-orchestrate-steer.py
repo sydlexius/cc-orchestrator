@@ -288,6 +288,16 @@ def main():
                             session_id="sess-C", read_state_dir=state_dir)
         check("read-dedup: repeated Edit (not Read) -> no read-dedup WARN", rcE == 0 and not warned(eE))
 
+        # HARDENING (CR/Codoki review-round): a pre-existing, owned-but-group/other-writable state dir
+        # is forced to 700, so we never write fingerprints into a dir others can symlink/clobber in.
+        gw_dir = os.path.join(rtd, "group-writable-state")
+        os.makedirs(gw_dir)
+        os.chmod(gw_dir, 0o770)
+        run_steer({"file_path": target}, channel="stdin", tool_name="Read",
+                  session_id="sess-GW", read_state_dir=gw_dir)
+        check("read-dedup: pre-existing group-writable state dir is forced to 700",
+              (os.stat(gw_dir).st_mode & 0o777) == 0o700)
+
         # A nonexistent / unstattable path cannot be fingerprinted -> silent, never warns.
         ghost = os.path.join(rtd, "does-not-exist.txt")
         run_steer({"file_path": ghost}, channel="stdin", tool_name="Read",
