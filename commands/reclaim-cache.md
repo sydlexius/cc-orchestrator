@@ -36,7 +36,10 @@ First, parse an optional scan root from `$ARGUMENTS` (the user may pass `--root 
 ```bash
 root=""
 case " $ARGUMENTS " in
-  *" --root "*) root=$(printf '%s' "$ARGUMENTS" | awk '{for(i=1;i<NF;i++) if($i=="--root"){print $(i+1); exit}}') ;;
+  # Take everything after "--root " as the value (parameter expansion, so an
+  # embedded space is preserved -- awk field-splitting would truncate "~/My Dev"
+  # to "~/My"), then drop any following " --flag ..." tail.
+  *" --root "*) root=${ARGUMENTS#*--root }; root=${root%% --*} ;;
 esac
 ```
 
