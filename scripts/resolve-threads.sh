@@ -32,10 +32,16 @@ case "${1:-}" in
   -h|--help) awk 'NR==1{next} /^#/{sub(/^#[[:space:]]?/,""); print; next} {exit}' "$0"; exit 0 ;;
 esac
 
+# Single source of truth for the usage line, printed to STDERR (it is a diagnostic, not
+# program output). EVERY operator error below routes through it so they stay consistent and
+# can't drift: the --bot missing-pattern error, the arg-count guard, and the numeric-arg checks.
+usage() { echo "Usage: $0 [--bot <pattern>] <pr> <comment-db-id...>" >&2; }
+
 bot_pattern='copilot|greptile|codoki'
 if [ "${1:-}" = "--bot" ]; then
   if [ -z "${2:-}" ]; then
-    echo "Error: --bot requires a regex pattern argument."
+    usage
+    echo "--bot requires a regex pattern argument" >&2
     exit 1
   fi
   bot_pattern="$2"
@@ -43,7 +49,7 @@ if [ "${1:-}" = "--bot" ]; then
 fi
 
 if [ "${#}" -lt 2 ]; then
-  echo "Usage: $0 [--bot <pattern>] <pr> <comment-db-id...>"
+  usage
   exit 1
 fi
 
@@ -54,6 +60,23 @@ fi
 
 pr="$1"
 shift
+
+# Validate the positionals are numeric BEFORE any gh/GraphQL call, so an operator arg-shape
+# error fails loudly with a usage hint instead of a raw `jq --argjson` crash (a non-numeric
+# comment-db-id, e.g. a repo slug where an id belongs) or a confusing server-side GraphQL
+# error (a non-numeric <pr> interpolated into `pullRequest(number: $pr)` -- the pr/slug swap).
+# Whole-string `case`-glob check (grep-independent, rejects an embedded newline too), matching
+# the is_num style used in the gh-* wrappers. --bot's pattern is an intentional regex, never
+# validated here. This only fails EARLIER and more loudly; the resolve/`--bot` logic is unchanged.
+case "$pr" in
+  ''|*[!0-9]*) usage; echo "pr must be numeric, got: $pr" >&2; exit 1 ;;
+esac
+for db_id in "$@"; do
+  case "$db_id" in
+    ''|*[!0-9]*) usage; echo "comment-db-id must be numeric, got: $db_id" >&2; exit 1 ;;
+  esac
+done
+
 repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || {
   echo "Error: could not determine repository. Run from inside a git repo with a GitHub remote."
   exit 1
