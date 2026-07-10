@@ -94,7 +94,7 @@ if [ -z "$file" ] || [ "$file" = "-" ]; then
   input="$tmp_in"
   [ -n "$label" ] || label="(draft)"
 else
-  [ -f "$file" ] || die "cannot read draft: $file"
+  { [ -f "$file" ] && [ -r "$file" ]; } || die "cannot read draft: $file"
   input="$file"
   [ -n "$label" ] || label="$file"
 fi
@@ -103,10 +103,39 @@ fi
 # label rewrite touches only the finding lines. Preserve the client's exit code.
 tmp_out="$(mktemp -t prose-lint-out.XXXXXX)"
 tmp_err="$(mktemp -t prose-lint-err.XXXXXX)"
+
+# Build the client argv as an ARRAY so no token is subject to word-splitting/globbing (the
+# earlier unquoted ${no_autostart:+...} form was fragile).
+client_args=(--profile "$profile")
+[ -n "$no_autostart" ] && client_args+=(--no-autostart)
+client_args+=("$input")
+
+# Bound the client run so a hung/slow LanguageTool server cannot stall this advisory pre-post
+# check indefinitely. `timeout` is OPTIONAL (stock macOS lacks it; coreutils ships `gtimeout`);
+# when neither is present we run unbounded -- no regression vs. before. A timeout maps to the
+# "cannot check" exit 2 (same class as server-unreachable). Override the bound via
+# PROSE_LINT_TIMEOUT (seconds).
+timeout_bin=""
+if command -v timeout >/dev/null 2>&1; then timeout_bin="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then timeout_bin="gtimeout"; fi
+tmo="${PROSE_LINT_TIMEOUT:-60}"
+
 set +e
-"$venv_py" "$client" ${no_autostart:+$no_autostart} --profile "$profile" "$input" >"$tmp_out" 2>"$tmp_err"
-rc=$?
+if [ -n "$timeout_bin" ]; then
+  "$timeout_bin" "$tmo" "$venv_py" "$client" "${client_args[@]}" >"$tmp_out" 2>"$tmp_err"
+  rc=$?
+else
+  "$venv_py" "$client" "${client_args[@]}" >"$tmp_out" 2>"$tmp_err"
+  rc=$?
+fi
 set -e
+
+# timeout(1) exits 124 when it kills the command -> report as cannot-check (2), loudly. The
+# client's own exit codes are only 0/1/2, so 124 unambiguously means the bound fired.
+if [ "$rc" = 124 ]; then
+  echo "prose-lint: LanguageTool client timed out after ${tmo}s (set PROSE_LINT_TIMEOUT to adjust)" >&2
+  rc=2
+fi
 
 # Rewrite the leading "input:" path column to the label on each finding line (literal, not
 # regex -- awk index()/substr() treat `input` as a plain string).

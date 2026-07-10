@@ -58,9 +58,21 @@ the same grammar/style checking as committed Markdown. This is **advisory** -- i
 prints findings but never blocks issue creation.
 
 ```bash
-if [ -f scripts/prose-lint.sh ]; then PL=scripts/prose-lint.sh; else PL="${CLAUDE_PLUGIN_ROOT}/scripts/prose-lint.sh"; fi
-bash "$PL" --profile docs --label "(issue-body)" /tmp/gh-issue-body.md
-pl_rc=$?
+# Locate the helper without assuming ${CLAUDE_PLUGIN_ROOT} is set (an unset var would expand
+# to "/scripts/prose-lint.sh"). Capture the exit code with `|| pl_rc=$?` so a non-zero result
+# can NEVER abort the caller under `set -e` -- this check is strictly advisory.
+PL=""
+if [ -f scripts/prose-lint.sh ]; then
+  PL=scripts/prose-lint.sh
+elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/prose-lint.sh" ]; then
+  PL="${CLAUDE_PLUGIN_ROOT}/scripts/prose-lint.sh"
+fi
+pl_rc=0
+if [ -n "$PL" ]; then
+  bash "$PL" --profile docs --label "(issue-body)" /tmp/gh-issue-body.md || pl_rc=$?
+else
+  echo "prose-lint skipped (helper not found)"; pl_rc=2
+fi
 ```
 
 Interpret `pl_rc`:

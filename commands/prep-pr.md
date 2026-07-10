@@ -558,9 +558,21 @@ committed Markdown. This is **advisory** -- it prints findings but never blocks
 the PR:
 
 ```bash
-if [ -f scripts/prose-lint.sh ]; then PL=scripts/prose-lint.sh; else PL="${CLAUDE_PLUGIN_ROOT}/scripts/prose-lint.sh"; fi
-printf '%s' "$body" | bash "$PL" --profile docs --label "(pr-body)"
-pl_rc=$?
+# Locate the helper without assuming ${CLAUDE_PLUGIN_ROOT} is set (an unset var would expand
+# to "/scripts/prose-lint.sh"). Capture the exit code with `|| pl_rc=$?` so a non-zero result
+# can NEVER abort the caller under `set -e` -- this check is strictly advisory.
+PL=""
+if [ -f scripts/prose-lint.sh ]; then
+  PL=scripts/prose-lint.sh
+elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/prose-lint.sh" ]; then
+  PL="${CLAUDE_PLUGIN_ROOT}/scripts/prose-lint.sh"
+fi
+pl_rc=0
+if [ -n "$PL" ]; then
+  printf '%s' "$body" | bash "$PL" --profile docs --label "(pr-body)" || pl_rc=$?
+else
+  echo "prose-lint skipped (helper not found)"; pl_rc=2
+fi
 ```
 
 (If the body was written to a file, pass that path instead of piping.) Interpret

@@ -32,6 +32,8 @@ case "$content" in
   *BLOCKME*)    echo "$inp:1: [ERROR] LOCAL_EM_DASH Em-dash: prefer a dash, comma, or parentheses."; exit 1 ;;
   *ADVISORYME*) echo "$inp:2: [warn] PASSIVE_VOICE Consider active voice."; exit 0 ;;
   *SERVERDOWN*) echo "prose-check: LanguageTool server unreachable" >&2; exit 2 ;;
+  *RAWTIMEOUT*) exit 124 ;;   # simulate what timeout(1) returns when it kills a hung client
+  *HANG*)       sleep 30; exit 0 ;;   # real hang; a bounded PROSE_LINT_TIMEOUT must cut it off
   *)            exit 0 ;;
 esac
 """
@@ -62,7 +64,8 @@ def make_tooling(present=True):
 def run(args, tooling_dir, stdin=None, extra_env=None):
     """Run the wrapper. Returns (rc, stdout, stderr, argv_list) where argv_list is the exact
     list of args the fake client was called with (empty if never called)."""
-    argv_log = tempfile.mktemp()
+    fd, argv_log = tempfile.mkstemp()  # atomically created (no mktemp TOCTOU); the fake client >> appends
+    os.close(fd)
     env = dict(os.environ)
     env["PROSE_TOOLING_DIR"] = tooling_dir
     env["FAKE_ARGV_LOG"] = argv_log
@@ -128,6 +131,19 @@ def main():
     check("4d nonexistent file -> loud stderr", "cannot read" in err.lower())
     check("4e nonexistent file -> client never invoked", argv == [])
 
+    # 4f. an UNREADABLE regular file -> exit 2 ("cannot check"), NOT a fall-through to the client
+    # (guards the -f-only vs -r readability gap). Skipped under root, which bypasses file perms.
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        check("4f unreadable file -> exit 2 (SKIPPED under root)", True)
+    else:
+        f = write_draft("BLOCKME but unreadable.\n")
+        os.chmod(f, 0o000)
+        rc, out, err, argv = run([f], tooling)
+        os.chmod(f, 0o600)  # restore so cleanup can remove it
+        os.remove(f)
+        check("4f unreadable file -> exit 2", rc == 2)
+        check("4g unreadable file -> client never invoked", argv == [])
+
     # 5. not configured: PROSE_TOOLING_DIR points at a dir with no client/venv -> exit 2, clear msg
     empty = make_tooling(present=False)
     f = write_draft("Anything BLOCKME.\n")
@@ -152,7 +168,8 @@ def main():
     check("7 '-' reads stdin -> exit 1", rc == 1)
 
     # 8. --label overrides the displayed path
-    rc, out, err, argv = run(["--label", "PR-body", f := write_draft("BLOCKME here.\n")], tooling)
+    f = write_draft("BLOCKME here.\n")  # assign first (no walrus -- keep <3.8 compatibility)
+    rc, out, err, argv = run(["--label", "PR-body", f], tooling)
     check("8a --label rewrites path column", out.startswith("PR-body:"))
     os.remove(f)
 
@@ -169,6 +186,24 @@ def main():
     rc, out, err, argv = run([f], tooling)
     check("10 default --profile docs forwarded", "docs" in argv)
     os.remove(f)
+
+    # 11. a 124 exit from the client (what timeout(1) returns on kill) maps to cannot-check (2)
+    f = write_draft("Draft RAWTIMEOUT token.\n")
+    rc, out, err, argv = run([f], tooling)
+    check("11a client-124 -> wrapper exit 2 (cannot-check)", rc == 2)
+    check("11b client-124 -> loud 'timed out' on stderr", "timed out" in err.lower())
+    os.remove(f)
+
+    # 12. a REAL bounded timeout: a hanging client cut off by a small PROSE_LINT_TIMEOUT -> exit 2.
+    # Guarded: only meaningful when a timeout/gtimeout binary exists (stock macOS lacks it).
+    import shutil
+    if shutil.which("timeout") or shutil.which("gtimeout"):
+        f = write_draft("Draft HANG token.\n")
+        rc, out, err, argv = run([f], tooling, extra_env={"PROSE_LINT_TIMEOUT": "1"})
+        check("12 real hang cut off by PROSE_LINT_TIMEOUT -> exit 2", rc == 2)
+        os.remove(f)
+    else:
+        check("12 real timeout (SKIPPED -- no timeout/gtimeout binary)", True)
 
     print()
     if FAILS:
