@@ -91,3 +91,30 @@ Reply: `thread_id` string; `disposition` `merge-safe\|rebut\|fix`; `reply_text` 
   "replies": {"F1": {"thread_id": "PRRT_x", "disposition": "fix",
                      "reply_text": "fixed in abc123"}} }
 ```
+
+### Finding channel helper (`scripts/finding_channel.py`, #230)
+
+The channel's two slices are managed by `finding_channel.py`, the deterministic
+guard over the review<->fix loop (design #6). It never mutates the repo or the
+remote (its only network op is a read-only `git fetch`) and never touches the
+allow-list. Subcommands:
+
+- `validate <fix-list|reply-slice> <file.json>` -- schema validate PLUS channel
+  invariants a bare schema cannot express: `round >= 1`; an `addressed` finding
+  carries a `fix_sha`; finding ids are unique; a `fix` reply carries `reply_text`.
+- `liveness <file> --deadline-secs N` -- an mtime SIGNAL (`fresh|slow|stalled|dead|missing`)
+  so the lead tells a slow writer from a dead one; exit 0 for any present file,
+  exit 1 only for `missing`.
+- `guard-reply --repo P --branch B --finding ID --sha SHA [--no-fetch]` -- THE
+  pre-reply guardrail: exit 0 only if `SHA` is an ancestor of `origin/B` (PUSHED)
+  AND bound to the finding by a `Finding-Id: ID` commit trailer (ancestry alone is
+  insufficient). A reachable-but-branch-absent remote is `not pushed` (exit 1); an
+  UNREACHABLE remote is `cannot prove pushed` (exit 2, safe-block) -- never a stale
+  false-pass.
+- `guard-slice --repo P --branch B --fix-list F <reply-slice.json> [--no-fetch]` --
+  batch guard-reply over every `fix` disposition, looking up each finding's `fix_sha`
+  in the paired fix-list. The LEAD runs this before actuating a reply-slice.
+
+The `Finding-Id:` trailer is authored by the PR-blind implementer (it has the ids
+from the fix-list, learns nothing about the PR). Exit convention: 0 ok/pass, 1 a
+check failed, 2 usage / IO error.
