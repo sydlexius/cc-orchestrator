@@ -551,6 +551,37 @@ above: mark `[x]` when that step passed or self-skipped as not-applicable, leave
 `[ ]` when it needs user/reviewer attention (screenshots and manual UAT always
 stay `[ ]` -- the agent cannot capture or perform them).
 
+**Advisory prose-lint before create.** Once the body text is assembled (however
+it will be passed -- `--body` or `--body-file`), run it through the shared
+prose-lint helper so the PR body gets the same grammar/style checking as
+committed Markdown. This is **advisory** -- it prints findings but never blocks
+the PR:
+
+```bash
+# Locate the helper without assuming ${CLAUDE_PLUGIN_ROOT} is set (an unset var would expand
+# to "/scripts/prose-lint.sh"). Capture the exit code with `|| pl_rc=$?` so a non-zero result
+# can NEVER abort the caller under `set -e` -- this check is strictly advisory.
+PL=""
+if [ -f scripts/prose-lint.sh ]; then
+  PL=scripts/prose-lint.sh
+elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/prose-lint.sh" ]; then
+  PL="${CLAUDE_PLUGIN_ROOT}/scripts/prose-lint.sh"
+fi
+pl_rc=0
+if [ -n "$PL" ]; then
+  printf '%s' "$body" | bash "$PL" --profile docs --label "(pr-body)" || pl_rc=$?
+else
+  echo "prose-lint skipped (helper not found)"; pl_rc=2
+fi
+```
+
+(If the body was written to a file, pass that path instead of piping.) Interpret
+`pl_rc`: `0` clean/advisory -> continue; `1` a blocking finding was printed ->
+surface it and offer to revise the wording before creating, but do **not** gate;
+`2` prose-tooling not installed / server down -> print "prose-lint skipped (not
+configured / server unreachable)" and continue. Never block `gh pr create` on a
+prose finding.
+
 **Do NOT add** a "Generated with Claude Code" footer in the body unless the
 target repo's template includes one. Humans use the same template, and an
 unsolicited footer is repo-meta noise (per `feedback_use_pr_template`).

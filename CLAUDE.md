@@ -114,6 +114,17 @@ Runtime (`scripts/`; canonical source is this repo):
   in `reviewThreads`); `ship-gate-preflight.sh` FULL mode now BLOCKs when a Codoki summary exists
   with no NON-BOT ack (a 👎 rebut also needs an `@codoki` reply), PASSES on no-summary, and
   `pr-unreplied-comments.sh --audit` surfaces the summary's ACKED/UNACKED state (informational).
+- `scripts/prose-lint.sh` - the outward-draft prose-lint adapter (#219). A THIN wrapper over
+  `~/Developer/prose-tooling`'s `bin/prose_check.py` (reuses, does NOT reimplement, the Markdown-aware
+  LanguageTool client + house-style config), so the prose cc-orchestrator EMITS (issue/PR bodies,
+  comments) gets the same grammar/style checking as committed Markdown. Takes a draft file or stdin,
+  rewrites the output path column to a `--label`, passes the client's exit contract through (0 clean/
+  advisory, 1 blocking, 2 cannot-check = server-unreachable OR prose-tooling-not-installed - always a
+  loud stderr, never a silent skip). Reads a draft + runs one fixed LOCAL command; no `gh`, no git/
+  network mutation, no allow-list/floor change; stdin temp is 0600, cleaned on EXIT. Wired ADVISORY
+  (never blocks) into the `/prep-pr` PR-body + `new-issue` issue-body draft flows; the advisory
+  call-site soft-skips on exit 2, so a user without the machine-local tooling is never gated. Reached
+  via the repo-local / `${CLAUDE_PLUGIN_ROOT}/scripts/` path (no stable-path deployment needed).
 - `scripts/prefs-coverage.py` - opt-in UI-preference-coverage HARD-GATE (a repo enables it by adding a
   `.prefs.toml` + a `.gates.toml` step; schema `skills/orchestrate/templates/prefs.toml.md`). For each
   `[[pref]]` it greps the directly-changed governed surfaces for the pref's `verify` regex; a governed,
@@ -152,8 +163,8 @@ clean-worktree check, so an unchanged committed tree skips re-running it
 `skills/orchestrate/templates/gates.toml.md`.
 
 ```sh
-shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
-ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py
+shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
+ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py
 ./scripts/orchestrate-guard.sh --self-test    # MUST use ./ - the self-test re-invokes "$0";
                                               # `bash scripts/orchestrate-guard.sh` makes $0 a bare name -> 127
 ./scripts/orchestrate-steer.sh --self-test    # advisory WARN-level steering hook (#95)
@@ -181,6 +192,7 @@ python3 test-stale-branch-sweep.py
 python3 test-codoki-quota-watch.py
 python3 test-gate-runner.py
 python3 test-prefs-coverage.py
+python3 test-prose-lint.py
 ```
 
 ## Versioning

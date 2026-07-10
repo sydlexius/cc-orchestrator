@@ -51,6 +51,41 @@ Write the fully populated template to `/tmp/gh-issue-body.md`.
 
 ---
 
+## Step 4b -- Advisory prose-lint (never blocks)
+
+Run the drafted body through the shared prose-lint helper so the issue text gets
+the same grammar/style checking as committed Markdown. This is **advisory** -- it
+prints findings but never blocks issue creation.
+
+```bash
+# Locate the helper without assuming ${CLAUDE_PLUGIN_ROOT} is set (an unset var would expand
+# to "/scripts/prose-lint.sh"). Capture the exit code with `|| pl_rc=$?` so a non-zero result
+# can NEVER abort the caller under `set -e` -- this check is strictly advisory.
+PL=""
+if [ -f scripts/prose-lint.sh ]; then
+  PL=scripts/prose-lint.sh
+elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/prose-lint.sh" ]; then
+  PL="${CLAUDE_PLUGIN_ROOT}/scripts/prose-lint.sh"
+fi
+pl_rc=0
+if [ -n "$PL" ]; then
+  bash "$PL" --profile docs --label "(issue-body)" /tmp/gh-issue-body.md || pl_rc=$?
+else
+  echo "prose-lint skipped (helper not found)"; pl_rc=2
+fi
+```
+
+Interpret `pl_rc`:
+- `0` -- clean or advisory-only. Continue.
+- `1` -- a blocking finding was printed. Surface it to the user and offer to fix
+  the wording, but do **not** gate: "prose-lint flagged the above; want me to
+  revise the body before creating? (revise / create as-is)". Honor either answer.
+- `2` -- prose-tooling is not installed or its server is down. Print
+  "prose-lint skipped (not configured / server unreachable)" and continue. The
+  check is a best-effort nicety, never a hard dependency of `new-issue`.
+
+---
+
 ## Step 5 -- Create the issue
 
 Map the type to its label:
