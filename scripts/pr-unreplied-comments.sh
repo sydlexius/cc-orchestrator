@@ -50,15 +50,16 @@
 #                          one stderr note. Mutually exclusive with --audit (which already
 #                          reports per-finding resolution). Suppressed in --count-only.
 #   --itemized             CHECKLIST display mode (#252). Prints ONE checkable
-#                          pipe-delimited line per UNADDRESSED bot finding across ALL
-#                          THREE classes -- inline threads, review-BODY findings, and
-#                          issue-level actionable comments -- so no class can be
-#                          dropped by an inline-only glance. Each line is
+#                          pipe-delimited line per ACTIONABLE bot finding across ALL
+#                          THREE classes -- inline threads and review-BODY findings are
+#                          UNREPLIED-filtered; issue-level actionable comments have no
+#                          reply thread so they are always listed (replied:n/a) -- so no
+#                          class can be dropped by an inline-only glance. Each line is
 #                          "<class> | <user> | <loc> | <excerpt> | replied:<..> resolved:<..>";
 #                          inline lines carry a per-thread resolved yes/no/? (matched
 #                          by path+line via GraphQL). A REPORT, not a gate: a non-empty
 #                          list still exits 0. Mutually exclusive with --count-only /
-#                          --pending-only / --coverage-only (exits 1 on a bad combo).
+#                          --pending-only / --coverage-only / --audit (exits 1 on a bad combo).
 #
 # Checks four comment types:
 #   1. Inline review comments (PR diff comments)      -- reply_type: "inline"   (use 3-arg reply-comment.sh)
@@ -391,10 +392,10 @@ fetch_review_thread_nodes() {
           }
         }' 2>/dev/null) || return 1
     ftn_page_nodes=$(echo "$ftn_page" | jq -c '.data.repository.pullRequest.reviewThreads.nodes // []' 2>/dev/null) || return 1
-    ftn_nodes=$(jq -n --argjson acc "$ftn_nodes" --argjson new "$ftn_page_nodes" '$acc + $new')
-    ftn_has_next=$(echo "$ftn_page" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage // false')
+    ftn_nodes=$(jq -n --argjson acc "$ftn_nodes" --argjson new "$ftn_page_nodes" '$acc + $new' 2>/dev/null) || return 1
+    ftn_has_next=$(echo "$ftn_page" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage // false' 2>/dev/null) || return 1
     [ "$ftn_has_next" = "true" ] || break
-    ftn_cursor=$(echo "$ftn_page" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // empty')
+    ftn_cursor=$(echo "$ftn_page" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // empty' 2>/dev/null) || return 1
     [ -n "$ftn_cursor" ] || return 1
   done
   printf '%s\n' "$ftn_nodes"
@@ -889,14 +890,18 @@ if [ "$itemized" = true ]; then
             | gsub("[[:space:]]+"; " ")
             | gsub("^[ >#*]+"; "") | sub("[ *]+$"; ""))
       | map(select(. != "")) | (.[0] // "") | .[0:60]);
-    [ .[] | select(.id as $id | $ids | any(. == $id)) ] | .[]
+    # Build a (path\nline)->isResolved index ONCE (O(n+m)) instead of scanning all
+    # thread nodes per inline comment (O(n*m)). `reverse` before from_entries keeps
+    # the FIRST matching node on a (rare) duplicate path:line, as the old scan did.
+    ( $nodes | reverse | map({key: "\(.path // "")\n\(.line // -1)", value: .isResolved})
+      | from_entries ) as $ridx
+    | [ .[] | select(.id as $id | $ids | any(. == $id)) ] | .[]
     | (.user.login | sub("\\[bot\\]$"; "")) as $u
     | (.path // "?") as $p
     | (.original_line // 0) as $ln
     | ( if $ok != "true" then "?"
-        else ( [ $nodes[] | select((.path // "") == $p and ((.line // -1)) == $ln) ]
-               | (.[0] // null)
-               | if . == null then "?" elif .isResolved == true then "yes" else "no" end )
+        else ( $ridx["\($p)\n\($ln)"]
+               | if . == null then "?" elif . == true then "yes" else "no" end )
         end ) as $res
     | "inline | \($u) | \($p):\($ln) | \(excerpt(.body)) | replied:no resolved:\($res)"'
 

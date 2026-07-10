@@ -295,7 +295,7 @@ else
 fi
 
 if [ "$findings" -gt 0 ]; then
-  echo "BLOCK: $findings actionable review-body finding(s) unaddressed on #$pr -- run 'pr-unreplied-comments.sh --itemized $pr' for the itemized breakdown." >&2
+  echo "BLOCK: $findings actionable review-body finding(s) unaddressed on #$pr -- run '$helper --itemized --allow-stale $pr $repo' for the itemized breakdown." >&2
   echo "RESULT: BLOCK -- $findings actionable review-body finding(s). [#$pr $repo]" >&2
   exit 2
 fi
