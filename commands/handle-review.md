@@ -156,6 +156,25 @@ immediately.
 
 ## Step 2 -- Fetch all review comments
 
+**Enumerate EVERY finding first (MANDATORY).** Before any per-class reading, run
+the itemized checklist -- it prints ONE checkable line per UNADDRESSED finding
+across ALL THREE classes (inline threads, review-BODY findings, issue-level
+actionable comments), so no class can be dropped by an inline-only glance. Triage
+against THIS complete list, never against a glance at inline comments alone:
+
+```bash
+bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh --itemized "$pr_number"
+```
+
+Each line is `<class> | <user> | <loc> | <excerpt> | replied:<..> resolved:<..>`.
+A **review-body** finding has NO inline thread to resolve: it clears only when the
+finding is addressed AND the reviewer re-reviews a fresh SHA (a maintainer
+re-trigger for CodeRabbit) -- so it stays on the checklist until that re-review
+lands, even after you fix and push. Work every line to closure before claiming the
+review is triaged.
+
+Then pull the full bodies per class for the actual fixes:
+
 ```bash
 # Unreplied inline comments (truncated first line -- good for triage overview).
 # The default output also includes a "Coverage advisory" section when

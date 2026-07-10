@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # pr-unreplied-comments.sh -- List unreplied bot review comments on a PR
 #
-# Usage: pr-unreplied-comments.sh [--wait] [--count-only] [--full] [--latest-per-reviewer] [--coverage-only] [--allow-stale] [--check-resolved] [--audit] <pr_number> [repo]
+# Usage: pr-unreplied-comments.sh [--wait] [--count-only] [--full] [--latest-per-reviewer] [--coverage-only] [--allow-stale] [--check-resolved] [--audit] [--itemized] <pr_number> [repo]
 #
 # Options:
 #   --audit / --all        COMPLETE-COVERAGE audit mode (distinct from the default
@@ -49,6 +49,16 @@
 #                          ADVISORY: never changes the exit code; a query error degrades to
 #                          one stderr note. Mutually exclusive with --audit (which already
 #                          reports per-finding resolution). Suppressed in --count-only.
+#   --itemized             CHECKLIST display mode (#252). Prints ONE checkable
+#                          pipe-delimited line per UNADDRESSED bot finding across ALL
+#                          THREE classes -- inline threads, review-BODY findings, and
+#                          issue-level actionable comments -- so no class can be
+#                          dropped by an inline-only glance. Each line is
+#                          "<class> | <user> | <loc> | <excerpt> | replied:<..> resolved:<..>";
+#                          inline lines carry a per-thread resolved yes/no/? (matched
+#                          by path+line via GraphQL). A REPORT, not a gate: a non-empty
+#                          list still exits 0. Mutually exclusive with --count-only /
+#                          --pending-only / --coverage-only (exits 1 on a bad combo).
 #
 # Checks four comment types:
 #   1. Inline review comments (PR diff comments)      -- reply_type: "inline"   (use 3-arg reply-comment.sh)
@@ -146,6 +156,7 @@ coverage_only=false
 allow_stale=false
 audit_mode=false
 check_resolved=false
+itemized=false
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
     --wait) wait_mode=true; shift ;;
@@ -157,9 +168,27 @@ while [[ "${1:-}" == --* ]]; do
     --allow-stale) allow_stale=true; shift ;;
     --audit|--all) audit_mode=true; shift ;;
     --check-resolved) check_resolved=true; shift ;;
+    --itemized) itemized=true; shift ;;
     *) echo "Unknown flag: $1"; exit 1 ;;
   esac
 done
+
+# --itemized is a human-readable one-line-per-finding CHECKLIST display mode; it is
+# incompatible with the numeric/scripting early-exit modes (their outputs replace the
+# full enumeration --itemized needs). Combining them is a usage error.
+if [ "$itemized" = true ]; then
+  if [ "$count_only" = true ] || [ "$pending_only" = true ] || \
+     [ "$coverage_only" = true ] || [ "$audit_mode" = true ]; then
+    echo "Usage: --itemized is mutually exclusive with --count-only / --pending-only / --coverage-only / --audit" >&2
+    exit 1
+  fi
+  # Force full bodies into the three arrays so the itemized excerpt() can skip the
+  # leading HTML-comment / <details> noise real bots emit and surface the first line
+  # of actual prose (the truncated non-full body_expr keeps only that noise). The
+  # verbose display blocks are suppressed in itemized mode, so this only affects the
+  # data excerpt() reads, never any printed JSON.
+  full_mode=true
+fi
 
 # --audit is a distinct complete-coverage mode; combining it with the gating /
 # scripting early-exit modes is a usage error (their outputs are incompatible).
@@ -178,7 +207,7 @@ if [ "$audit_mode" = true ]; then
   fi
 fi
 
-pr_number="${1:?Usage: pr-unreplied-comments.sh [--wait] [--count-only] [--pending-only] [--latest-per-reviewer] <pr_number> [repo]}"
+pr_number="${1:?Usage: pr-unreplied-comments.sh [--wait] [--count-only] [--pending-only] [--latest-per-reviewer] [--itemized] <pr_number> [repo]}"
 repo="${2:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"
 me=$(gh api user --jq .login)
 
@@ -325,6 +354,51 @@ build_coverage_advisory() {
       threshold_state: $state, comment_glyph: $glyph,
       report_url: (if $url == "" then null else $url end),
       comment_id: $id}'
+}
+
+# --- Core function: fetch every reviewThread node (paginated) ----------------
+# Echoes the accumulated reviewThreads.nodes JSON array (each node carries
+# isResolved / path / line / comments(first:1){author}) and returns 0 on success;
+# echoes nothing and returns 1 on any lookup / parse / cursor error. Shared by the
+# --check-resolved advisory (unchanged behavior) and the --itemized resolved
+# lookup. BEST-EFFORT: the callers decide how to degrade on a nonzero return (the
+# --check-resolved advisory prints a stderr note; --itemized renders resolved "?").
+fetch_review_thread_nodes() {
+  local ftn_owner ftn_name ftn_nodes ftn_cursor ftn_page ftn_page_nodes ftn_has_next
+  local ftn_cursor_arg
+  ftn_owner="${repo%%/*}"
+  ftn_name="${repo##*/}"
+  ftn_nodes='[]'
+  ftn_cursor='null'
+  while : ; do
+    if [ "$ftn_cursor" = "null" ]; then
+      ftn_cursor_arg=(-F cursor=null)
+    else
+      ftn_cursor_arg=(-f cursor="$ftn_cursor")
+    fi
+    # shellcheck disable=SC2016  # GraphQL $owner/$name/$pr/$cursor are query variables, NOT shell expansions.
+    ftn_page=$(gh api graphql \
+      -f owner="$ftn_owner" -f name="$ftn_name" -F pr="$pr_number" "${ftn_cursor_arg[@]}" \
+      -f query='
+        query($owner:String!,$name:String!,$pr:Int!,$cursor:String){
+          repository(owner:$owner,name:$name){
+            pullRequest(number:$pr){
+              reviewThreads(first:100,after:$cursor){
+                pageInfo{ hasNextPage endCursor }
+                nodes{ isResolved path line comments(first:1){ nodes{ author{ login } } } }
+              }
+            }
+          }
+        }' 2>/dev/null) || return 1
+    ftn_page_nodes=$(echo "$ftn_page" | jq -c '.data.repository.pullRequest.reviewThreads.nodes // []' 2>/dev/null) || return 1
+    ftn_nodes=$(jq -n --argjson acc "$ftn_nodes" --argjson new "$ftn_page_nodes" '$acc + $new')
+    ftn_has_next=$(echo "$ftn_page" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage // false')
+    [ "$ftn_has_next" = "true" ] || break
+    ftn_cursor=$(echo "$ftn_page" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // empty')
+    [ -n "$ftn_cursor" ] || return 1
+  done
+  printf '%s\n' "$ftn_nodes"
+  return 0
 }
 
 # --- Pending-only mode: just print pending bot reviewer count and exit ---
@@ -628,7 +702,7 @@ unreplied_ids=$(jq -n --argjson bot "$bot_ids" --argjson replied "$my_reply_targ
 inline_count=$(echo "$unreplied_ids" | jq 'length')
 
 if [ "$inline_count" -gt 0 ]; then
-  if [ "$count_only" = false ]; then
+  if [ "$count_only" = false ] && [ "$itemized" = false ]; then
     echo "=== Unreplied inline review comments: $inline_count (HEAD: $head_sha) ==="
     echo ""
     if [ "$full_mode" = true ]; then
@@ -745,7 +819,7 @@ review_body_count=$(echo "$review_bodies" | jq 'length')
 review_body_findings=$(( review_body_count + outside_diff_sum ))
 
 if [ "$review_body_findings" -gt 0 ]; then
-  if [ "$count_only" = false ]; then
+  if [ "$count_only" = false ] && [ "$itemized" = false ]; then
     echo "=== Review-body comments with actionable findings: $review_body_findings ==="
     echo ""
     echo "$review_bodies"
@@ -773,13 +847,94 @@ actionable_issue=$(echo "$issue_comments" | jq --arg me "$me" '[.[] | select(
 issue_count=$(echo "$actionable_issue" | jq 'length')
 
 if [ "$issue_count" -gt 0 ]; then
-  if [ "$count_only" = false ]; then
+  if [ "$count_only" = false ] && [ "$itemized" = false ]; then
     echo "=== Actionable issue-level bot comments: $issue_count ==="
     echo ""
     echo "$actionable_issue"
     echo ""
   fi
   found=$((found + issue_count))
+fi
+
+# --- Itemized checklist mode (#252) ------------------------------------------
+# Emit ONE checkable pipe-delimited line per UNADDRESSED bot finding across ALL
+# THREE classes (inline threads, review-BODY findings, issue-level actionable
+# comments), so no class can be dropped by an inline-only glance. This is a
+# REPORT/checklist, not a gate: a non-empty list still exits 0. Placed here, after
+# all three arrays are computed, so it reuses them verbatim; it exits before the
+# merge-blocker / coverage / stale / summary sections.
+if [ "$itemized" = true ]; then
+  # RESOLVED lookup (best-effort): fetch every reviewThread once and match each
+  # inline finding by path AND line. A fetch failure renders resolved as "?".
+  itemized_nodes='[]'
+  if it_fetch=$(fetch_review_thread_nodes); then
+    itemized_nodes="$it_fetch"
+    itemized_resolved_ok=true
+  else
+    itemized_resolved_ok=false
+  fi
+
+  echo "=== Itemized triage checklist: $found finding(s) (HEAD: $head_sha) ==="
+
+  # Inline findings (unreplied). resolved comes from matching thread nodes by
+  # path AND line; "?" when the GraphQL fetch failed OR no thread node matches.
+  echo "$all_comments" | jq -r \
+    --argjson ids "$unreplied_ids" \
+    --argjson nodes "$itemized_nodes" \
+    --arg ok "$itemized_resolved_ok" '
+    def excerpt($b): (($b // "") | split("\n")
+      | map(gsub("<!--.*?-->"; "")         # HTML comments (lazy; the body may contain >)
+            | gsub("<[^>]*>"; "")          # HTML tags
+            | gsub("\\|"; "/")             # a literal pipe would corrupt the | columns
+            | gsub("[[:space:]]+"; " ")
+            | gsub("^[ >#*]+"; "") | sub("[ *]+$"; ""))
+      | map(select(. != "")) | (.[0] // "") | .[0:60]);
+    [ .[] | select(.id as $id | $ids | any(. == $id)) ] | .[]
+    | (.user.login | sub("\\[bot\\]$"; "")) as $u
+    | (.path // "?") as $p
+    | (.original_line // 0) as $ln
+    | ( if $ok != "true" then "?"
+        else ( [ $nodes[] | select((.path // "") == $p and ((.line // -1)) == $ln) ]
+               | (.[0] // null)
+               | if . == null then "?" elif .isResolved == true then "yes" else "no" end )
+        end ) as $res
+    | "inline | \($u) | \($p):\($ln) | \(excerpt(.body)) | replied:no resolved:\($res)"'
+
+  # Review-body findings: no inline thread to resolve -> resolved:n/a.
+  echo "$review_bodies" | jq -r '
+    def excerpt($b): (($b // "") | split("\n")
+      | map(gsub("<!--.*?-->"; "")         # HTML comments (lazy; the body may contain >)
+            | gsub("<[^>]*>"; "")          # HTML tags
+            | gsub("\\|"; "/")             # a literal pipe would corrupt the | columns
+            | gsub("[[:space:]]+"; " ")
+            | gsub("^[ >#*]+"; "") | sub("[ *]+$"; ""))
+      | map(select(. != "")) | (.[0] // "") | .[0:60]);
+    .[]
+    | (.user | sub("\\[bot\\]$"; "")) as $u
+    # A CR review body can carry N "Outside diff range comments (N)" sub-findings that
+    # count toward the header total but have no separate array element; annotate the
+    # line with that subtotal so the header count == the visible accounting (#252 core).
+    | ([.body | scan("Outside diff range comments \\(([0-9]+)\\)")] | flatten | map(tonumber) | add // 0) as $od
+    | "review-body | \($u) | (body) | \(excerpt(.body))\(if $od > 0 then " [+\($od) outside-diff]" else "" end) | replied:no resolved:n/a"'
+
+  # Issue-level actionable bot comments: no thread, no reply surface -> n/a both.
+  echo "$actionable_issue" | jq -r '
+    def excerpt($b): (($b // "") | split("\n")
+      | map(gsub("<!--.*?-->"; "")         # HTML comments (lazy; the body may contain >)
+            | gsub("<[^>]*>"; "")          # HTML tags
+            | gsub("\\|"; "/")             # a literal pipe would corrupt the | columns
+            | gsub("[[:space:]]+"; " ")
+            | gsub("^[ >#*]+"; "") | sub("[ *]+$"; ""))
+      | map(select(. != "")) | (.[0] // "") | .[0:60]);
+    .[] | (.user | sub("\\[bot\\]$"; "")) as $u
+    | "issue-level | \($u) | (issue) | \(excerpt(.body)) | replied:n/a resolved:n/a"'
+
+  # Review-body findings have no inline thread; each clears only when addressed AND
+  # the reviewer re-reviews a fresh SHA (a maintainer re-trigger for CodeRabbit).
+  if [ "$review_body_count" -gt 0 ]; then
+    echo "NOTE: review-body findings have no inline thread to resolve; each clears only when addressed AND the reviewer re-reviews a fresh SHA (a maintainer re-trigger for CodeRabbit)."
+  fi
+  exit 0
 fi
 
 # 4. CHANGES_REQUESTED merge blockers
@@ -800,7 +955,7 @@ blocking_reviews=$(echo "$all_reviews" | jq '[.[] | select('"$BOT_LOGIN_FILTER"'
 blocker_count=$(echo "$blocking_reviews" | jq 'length')
 
 if [ "$blocker_count" -gt 0 ]; then
-  if [ "$count_only" = false ]; then
+  if [ "$count_only" = false ] && [ "$itemized" = false ]; then
     echo "=== CHANGES_REQUESTED merge blockers: $blocker_count ==="
     echo ""
     echo "$blocking_reviews"
@@ -816,7 +971,7 @@ fi
 # caller sees the patch coverage state without mistaking it for an action
 # item. Omitted from --count-only output so the advisory cannot leak into
 # a readiness-check numeric value.
-if [ "$count_only" = false ]; then
+if [ "$count_only" = false ] && [ "$itemized" = false ]; then
   coverage_json=$(build_coverage_advisory)
   coverage_status=$(echo "$coverage_json" | jq -r '.status')
   if [ "$coverage_status" = "present" ]; then
@@ -843,7 +998,7 @@ fi
 # ONLY: prints a parseable "STALE-ADVISORY:" line and does NOT change the exit
 # code, so callers that branch on a non-zero exit are unaffected. Suppressed in
 # --count-only (numeric-only) output.
-if [ "$count_only" = false ]; then
+if [ "$count_only" = false ] && [ "$itemized" = false ]; then
   head_full_sha=$(gh api "repos/$repo/pulls/$pr_number" --jq '.head.sha' 2>/dev/null || echo "")
   head_committer_date=$(gh api "repos/$repo/commits/$head_full_sha" --jq '.commit.committer.date' 2>/dev/null || echo "")
   if [ -n "$head_full_sha" ] && [ -n "$head_committer_date" ]; then
@@ -878,38 +1033,14 @@ fi
 # comments(first:1) and has no >100-comments overflow case. Opt-in via
 # --check-resolved; suppressed in --count-only (numeric-only) output.
 if [ "$check_resolved" = true ] && [ "$count_only" = false ]; then
-  cr_owner="${repo%%/*}"
-  cr_name="${repo##*/}"
-  cr_nodes='[]'
-  cr_cursor='null'
-  cr_ok=true
-  while : ; do
-    if [ "$cr_cursor" = "null" ]; then
-      cr_cursor_arg=(-F cursor=null)
-    else
-      cr_cursor_arg=(-f cursor="$cr_cursor")
-    fi
-    # shellcheck disable=SC2016  # GraphQL $owner/$name/$pr/$cursor are query variables, NOT shell expansions.
-    cr_page=$(gh api graphql \
-      -f owner="$cr_owner" -f name="$cr_name" -F pr="$pr_number" "${cr_cursor_arg[@]}" \
-      -f query='
-        query($owner:String!,$name:String!,$pr:Int!,$cursor:String){
-          repository(owner:$owner,name:$name){
-            pullRequest(number:$pr){
-              reviewThreads(first:100,after:$cursor){
-                pageInfo{ hasNextPage endCursor }
-                nodes{ isResolved path line comments(first:1){ nodes{ author{ login } } } }
-              }
-            }
-          }
-        }' 2>/dev/null) || { cr_ok=false; break; }
-    cr_page_nodes=$(echo "$cr_page" | jq -c '.data.repository.pullRequest.reviewThreads.nodes // []' 2>/dev/null) || { cr_ok=false; break; }
-    cr_nodes=$(jq -n --argjson acc "$cr_nodes" --argjson new "$cr_page_nodes" '$acc + $new')
-    cr_has_next=$(echo "$cr_page" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage // false')
-    [ "$cr_has_next" = "true" ] || break
-    cr_cursor=$(echo "$cr_page" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // empty')
-    [ -n "$cr_cursor" ] || { cr_ok=false; break; }
-  done
+  # Pagination extracted to fetch_review_thread_nodes() (#252); behavior unchanged:
+  # a successful fetch yields the accumulated nodes, any error degrades to the
+  # stderr note below (this advisory NEVER changes the exit code).
+  if cr_nodes=$(fetch_review_thread_nodes); then
+    cr_ok=true
+  else
+    cr_ok=false
+  fi
   if [ "$cr_ok" = true ]; then
     echo "$cr_nodes" | jq -r --argjson bots "$BOT_LOGINS_JSON" '
       def isbot($l): ($bots | index($l)) or ($bots | index($l + "[bot]"));
