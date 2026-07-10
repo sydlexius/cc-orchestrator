@@ -30,9 +30,12 @@ def _key(tmux):
 
 
 def run_steer(tool_input, *, channel, marker_active=False, tmux=DEFAULT_TMUX, ttl_hours=24,
-              stale_self=False):
+              stale_self=False, tool_name="Bash", session_id=None, read_state_dir=None):
     """Invoke the steer hook. Returns (exit_code, stderr). channel in {'stdin','env'}.
-    tool_input is the dict passed as .tool_input (e.g. {'file_path': ...} or {'command': ...})."""
+    tool_input is the dict passed as .tool_input (e.g. {'file_path': ...} or {'command': ...}).
+    tool_name + session_id populate the stdin TOP-LEVEL fields (the env channel carries neither,
+    mirroring the real PreToolUse payload); read_state_dir pins the read-dedup state store so a
+    test controls per-session read tracking (Rule 4)."""
     with tempfile.TemporaryDirectory() as td:
         floor_dir = os.path.join(td, "orchestrate-floor.d")
         os.makedirs(floor_dir, exist_ok=True)
@@ -46,6 +49,7 @@ def run_steer(tool_input, *, channel, marker_active=False, tmux=DEFAULT_TMUX, tt
         env = dict(os.environ)
         env["ORCHESTRATE_FLOOR_DIR"] = floor_dir
         env["ORCHESTRATE_FLOOR_TTL_HOURS"] = str(ttl_hours)
+        env["ORCHESTRATE_READ_STATE_DIR"] = read_state_dir or os.path.join(td, "read-state")
         if tmux is None:
             env.pop("TMUX", None)
         else:
@@ -53,7 +57,10 @@ def run_steer(tool_input, *, channel, marker_active=False, tmux=DEFAULT_TMUX, tt
         env.pop("TOOL_INPUT", None)
         stdin_data = ""
         if channel == "stdin":
-            stdin_data = json.dumps({"tool_name": "Bash", "tool_input": tool_input})
+            payload = {"tool_name": tool_name, "tool_input": tool_input}
+            if session_id is not None:
+                payload["session_id"] = session_id
+            stdin_data = json.dumps(payload)
         elif channel == "env":
             env["TOOL_INPUT"] = json.dumps(tool_input)
         p = subprocess.run([STEER], input=stdin_data, env=env,
@@ -219,6 +226,94 @@ def main():
         {"command": "gh pr list && echo create the changelog"}, marker_active=False)
     check("accepted FP: gh pr read + standalone 'create' word -> WARN (documented)",
           rc_ok and warned_all)
+
+    # ---- Rule 4: read-dedup advisory WARN (marker-independent, #226) ----
+    # A 2nd+ Read of a path already read THIS session with UNCHANGED mtime/size warns; the first
+    # read, a read after the file changed, a read with no session_id, and a non-Read tool never do.
+    with tempfile.TemporaryDirectory() as rtd:
+        state_dir = os.path.join(rtd, "read-state")
+        target = os.path.join(rtd, "some-file.txt")
+        with open(target, "w") as fh:
+            fh.write("hello\n")
+
+        def read_call(path, *, sid="sess-A", tname="Read"):
+            return run_steer({"file_path": path}, channel="stdin", tool_name=tname,
+                             session_id=sid, read_state_dir=state_dir)
+
+        rc1, e1 = read_call(target)
+        check("read-dedup: 1st Read of a path -> silent (records state)", rc1 == 0 and not warned(e1))
+        rc2, e2 = read_call(target)
+        check("read-dedup: 2nd Read of an UNCHANGED path -> WARN, exit 0", rc2 == 0 and warned(e2))
+        rc3, e3 = read_call(target)
+        check("read-dedup: 3rd unchanged Read still WARNs (idempotent)", rc3 == 0 and warned(e3))
+
+        # After the file changes (newer mtime), the re-read is legitimate -> silent, then re-arms.
+        newer = time.time() + 5
+        os.utime(target, (newer, newer))
+        rc4, e4 = read_call(target)
+        check("read-dedup: Read after mtime change -> silent (content changed, legit re-read)",
+              rc4 == 0 and not warned(e4))
+        rc5, e5 = read_call(target)
+        check("read-dedup: next unchanged Read after the change WARNs again", rc5 == 0 and warned(e5))
+
+        # ACCEPTED FP (F30-class, fail-safe): a same-mtime + same-SIZE change (a modification within
+        # the prior read's 1-second stat granularity) is indistinguishable from an unchanged file, so
+        # the re-read draws a spurious advisory WARN. Documented, not a bug (a nudge, never a deny).
+        orig = os.stat(target).st_mtime
+        with open(target, "w") as fh:
+            fh.write("world\n")            # same length as "hello\n" -> unchanged size
+        os.utime(target, (orig, orig))     # force mtime back -> same fingerprint despite new content
+        rcFP, eFP = read_call(target)
+        check("read-dedup: same-second same-size change -> spurious WARN (accepted F30-class FP)",
+              rcFP == 0 and warned(eFP))
+        newer2 = time.time() + 9           # move past the collision window for the remaining cases
+        os.utime(target, (newer2, newer2))
+        read_call(target)                  # re-arm the fingerprint for this session
+
+        # A different session_id does not inherit session A's read history.
+        rc6, e6 = read_call(target, sid="sess-B")
+        check("read-dedup: first Read in a DIFFERENT session -> silent (per-session state)",
+              rc6 == 0 and not warned(e6))
+
+        # No session_id -> cannot track -> never warns (fail-open), even on a repeat read.
+        run_steer({"file_path": target}, channel="stdin", tool_name="Read", read_state_dir=state_dir)
+        rc7, e7 = run_steer({"file_path": target}, channel="stdin", tool_name="Read",
+                            read_state_dir=state_dir)
+        check("read-dedup: no session_id -> silent even on a repeat Read", rc7 == 0 and not warned(e7))
+
+        # A non-Read tool carrying a file_path (env channel / no tool_name) never triggers dedup.
+        run_steer({"file_path": target}, channel="stdin", tool_name="Edit",
+                  session_id="sess-C", read_state_dir=state_dir)
+        rcE, eE = run_steer({"file_path": target}, channel="stdin", tool_name="Edit",
+                            session_id="sess-C", read_state_dir=state_dir)
+        check("read-dedup: repeated Edit (not Read) -> no read-dedup WARN", rcE == 0 and not warned(eE))
+
+        # HARDENING (CR/Codoki review-round): a pre-existing, owned-but-group/other-writable state dir
+        # is forced to 700, so we never write fingerprints into a dir others can symlink/clobber in.
+        gw_dir = os.path.join(rtd, "group-writable-state")
+        os.makedirs(gw_dir)
+        os.chmod(gw_dir, 0o770)
+        run_steer({"file_path": target}, channel="stdin", tool_name="Read",
+                  session_id="sess-GW", read_state_dir=gw_dir)
+        check("read-dedup: pre-existing group-writable state dir is forced to 700",
+              (os.stat(gw_dir).st_mode & 0o777) == 0o700)
+
+        # A nonexistent / unstattable path cannot be fingerprinted -> silent, never warns.
+        ghost = os.path.join(rtd, "does-not-exist.txt")
+        run_steer({"file_path": ghost}, channel="stdin", tool_name="Read",
+                  session_id="sess-D", read_state_dir=state_dir)
+        rcG, eG = run_steer({"file_path": ghost}, channel="stdin", tool_name="Read",
+                            session_id="sess-D", read_state_dir=state_dir)
+        check("read-dedup: unstattable path -> silent on repeat (fail-open)", rcG == 0 and not warned(eG))
+
+    # REGRESSION (#226): a Read of a CANONICAL file must NOT trip the Rule-1 canonical-edit WARN
+    # (tool_name=='Read' gates Rule 1 off) - reading SKILL.md mid-run is fine; only EDITING warns.
+    with tempfile.TemporaryDirectory() as rtd2:
+        rcC, eC = run_steer({"file_path": "/home/u/repo/skills/orchestrate/SKILL.md"}, channel="stdin",
+                            tool_name="Read", session_id="sess-R", marker_active=True,
+                            read_state_dir=os.path.join(rtd2, "s"))
+        check("read-dedup: Read of a canonical file + marker -> no canonical-EDIT warn (tool_name=Read)",
+              rcC == 0 and "do not edit mid-run" not in eC)
 
     # Empty payload -> silent, exit 0 (fail-open).
     rc, err = run_steer({}, channel="stdin")
