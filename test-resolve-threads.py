@@ -6,7 +6,7 @@ fails with a usage error + exit 1 BEFORE any gh/GraphQL call (empty gh log == no
 while numeric args pass validation and reach the (stubbed) gh path unchanged.
 
 Invoked via `bash scripts/resolve-threads.sh` so +x is not required to test."""
-import os, subprocess, sys, tempfile
+import os, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WRAPPER = os.path.join(HERE, "scripts", "resolve-threads.sh")
@@ -53,6 +53,7 @@ def run(args):
     if os.path.exists(log):
         with open(log, "rb") as f:
             argv = [a.decode() for a in f.read().split(b"\0") if a]
+    shutil.rmtree(d, ignore_errors=True)  # don't accumulate per-run temp dirs in /tmp (Codoki)
     return rc, out, argv
 
 
@@ -78,6 +79,12 @@ def main():
     check("3a mixed valid/invalid ids -> exit 1", rc == 1)
     check("3b mixed -> names the bad arg", "notanid" in out)
     check("3c mixed -> gh NEVER called", argv == [])
+
+    # 3b. an embedded newline in an id is rejected (the whole-string case-glob matches per
+    #     character, so a value like "12\n34" that a line-oriented grep would pass is caught).
+    rc, out, argv = run(["242", "12\n34"])
+    check("3d newline-bearing id -> exit 1", rc == 1)
+    check("3e newline-bearing id -> gh NEVER called", argv == [])
 
     # 4. happy path: numeric pr + numeric id passes validation and reaches gh (stub returns
     #    empty threads -> 'Skipped ... not found'), exit 0. The resolve logic is unchanged.
