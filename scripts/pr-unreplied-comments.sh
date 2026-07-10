@@ -386,7 +386,7 @@ fetch_review_thread_nodes() {
             pullRequest(number:$pr){
               reviewThreads(first:100,after:$cursor){
                 pageInfo{ hasNextPage endCursor }
-                nodes{ isResolved path line comments(first:1){ nodes{ author{ login } } } }
+                nodes{ isResolved path line comments(first:1){ nodes{ fullDatabaseId author{ login } } } }
               }
             }
           }
@@ -865,21 +865,27 @@ fi
 # all three arrays are computed, so it reuses them verbatim; it exits before the
 # merge-blocker / coverage / stale / summary sections.
 if [ "$itemized" = true ]; then
-  # RESOLVED lookup (best-effort): fetch every reviewThread once and match each
-  # inline finding by path AND line. A fetch failure renders resolved as "?".
+  # RESOLVED lookup (best-effort): fetch every reviewThread ONCE and match each inline
+  # finding by its review-comment ID (rebase-safe). SKIPPED when there are no inline
+  # findings to resolve (the result would be unused, #256 CR). A fetch failure -> "?".
   itemized_nodes='[]'
-  if it_fetch=$(fetch_review_thread_nodes); then
-    itemized_nodes="$it_fetch"
-    itemized_resolved_ok=true
-  else
-    itemized_resolved_ok=false
+  itemized_resolved_ok=true
+  if [ "$inline_count" -gt 0 ]; then
+    if it_fetch=$(fetch_review_thread_nodes); then
+      itemized_nodes="$it_fetch"
+    else
+      itemized_resolved_ok=false
+    fi
   fi
 
   echo "=== Itemized triage checklist: $found finding(s) (HEAD: $head_sha) ==="
 
-  # Inline findings (unreplied). resolved comes from matching thread nodes by
-  # path AND line; "?" when the GraphQL fetch failed OR no thread node matches.
-  echo "$all_comments" | jq -r \
+  # ONE jq invocation (excerpt() defined once, no cross-class drift) emitting the three
+  # classes IN ORDER: inline (unreplied), then review-body, then issue-level.
+  jq -n -r \
+    --argjson inline "$all_comments" \
+    --argjson reviewbody "$review_bodies" \
+    --argjson issue "$actionable_issue" \
     --argjson ids "$unreplied_ids" \
     --argjson nodes "$itemized_nodes" \
     --arg ok "$itemized_resolved_ok" '
@@ -890,49 +896,32 @@ if [ "$itemized" = true ]; then
             | gsub("[[:space:]]+"; " ")
             | gsub("^[ >#*]+"; "") | sub("[ *]+$"; ""))
       | map(select(. != "")) | (.[0] // "") | .[0:60]);
-    # Build a (path\nline)->isResolved index ONCE (O(n+m)) instead of scanning all
-    # thread nodes per inline comment (O(n*m)). `reverse` before from_entries keeps
-    # the FIRST matching node on a (rare) duplicate path:line, as the old scan did.
-    ( $nodes | reverse | map({key: "\(.path // "")\n\(.line // -1)", value: .isResolved})
-      | from_entries ) as $ridx
-    | [ .[] | select(.id as $id | $ids | any(. == $id)) ] | .[]
-    | (.user.login | sub("\\[bot\\]$"; "")) as $u
-    | (.path // "?") as $p
-    | (.original_line // 0) as $ln
-    | ( if $ok != "true" then "?"
-        else ( $ridx["\($p)\n\($ln)"]
-               | if . == null then "?" elif . == true then "yes" else "no" end )
-        end ) as $res
-    | "inline | \($u) | \($p):\($ln) | \(excerpt(.body)) | replied:no resolved:\($res)"'
-
-  # Review-body findings: no inline thread to resolve -> resolved:n/a.
-  echo "$review_bodies" | jq -r '
-    def excerpt($b): (($b // "") | split("\n")
-      | map(gsub("<!--.*?-->"; "")         # HTML comments (lazy; the body may contain >)
-            | gsub("<[^>]*>"; "")          # HTML tags
-            | gsub("\\|"; "/")             # a literal pipe would corrupt the | columns
-            | gsub("[[:space:]]+"; " ")
-            | gsub("^[ >#*]+"; "") | sub("[ *]+$"; ""))
-      | map(select(. != "")) | (.[0] // "") | .[0:60]);
-    .[]
-    | (.user | sub("\\[bot\\]$"; "")) as $u
+    # (review-comment fullDatabaseId)->isResolved index, built ONCE. Keyed on the thread
+    # ROOT comment id (== the REST comment id), NOT path+line: `line` tracks the current
+    # diff line while a comment carries its creation-time position, so a rebase would
+    # misattribute isResolved and duplicate path:line pairs would collide (#256 CR Major).
+    ( $nodes | map(select(.comments.nodes[0].fullDatabaseId != null))
+      | map({key: (.comments.nodes[0].fullDatabaseId | tostring), value: .isResolved})
+      | from_entries ) as $ridx |
+    ( $inline | [ .[] | select(.id as $id | $ids | any(. == $id)) ] | .[]
+      | (.user.login | sub("\\[bot\\]$"; "")) as $u
+      | (.path // "?") as $p
+      | (.original_line // 0) as $ln
+      | ( if $ok != "true" then "?"
+          else ( $ridx[(.id | tostring)]
+                 | if . == null then "?" elif . == true then "yes" else "no" end )
+          end ) as $res
+      | "inline | \($u) | \($p):\($ln) | \(excerpt(.body)) | replied:no resolved:\($res)" ),
     # A CR review body can carry N "Outside diff range comments (N)" sub-findings that
-    # count toward the header total but have no separate array element; annotate the
-    # line with that subtotal so the header count == the visible accounting (#252 core).
-    | ([.body | scan("Outside diff range comments \\(([0-9]+)\\)")] | flatten | map(tonumber) | add // 0) as $od
-    | "review-body | \($u) | (body) | \(excerpt(.body))\(if $od > 0 then " [+\($od) outside-diff]" else "" end) | replied:no resolved:n/a"'
-
-  # Issue-level actionable bot comments: no thread, no reply surface -> n/a both.
-  echo "$actionable_issue" | jq -r '
-    def excerpt($b): (($b // "") | split("\n")
-      | map(gsub("<!--.*?-->"; "")         # HTML comments (lazy; the body may contain >)
-            | gsub("<[^>]*>"; "")          # HTML tags
-            | gsub("\\|"; "/")             # a literal pipe would corrupt the | columns
-            | gsub("[[:space:]]+"; " ")
-            | gsub("^[ >#*]+"; "") | sub("[ *]+$"; ""))
-      | map(select(. != "")) | (.[0] // "") | .[0:60]);
-    .[] | (.user | sub("\\[bot\\]$"; "")) as $u
-    | "issue-level | \($u) | (issue) | \(excerpt(.body)) | replied:n/a resolved:n/a"'
+    # count toward the header total but have no separate array element; annotate the line
+    # with that subtotal so the header count == the visible accounting (#252 core).
+    ( $reviewbody | .[]
+      | (.user | sub("\\[bot\\]$"; "")) as $u
+      | ([.body | scan("Outside diff range comments \\(([0-9]+)\\)")] | flatten | map(tonumber) | add // 0) as $od
+      | "review-body | \($u) | (body) | \(excerpt(.body))\(if $od > 0 then " [+\($od) outside-diff]" else "" end) | replied:no resolved:n/a" ),
+    ( $issue | .[]
+      | (.user | sub("\\[bot\\]$"; "")) as $u
+      | "issue-level | \($u) | (issue) | \(excerpt(.body)) | replied:n/a resolved:n/a" )'
 
   # Review-body findings have no inline thread; each clears only when addressed AND
   # the reviewer re-reviews a fresh SHA (a maintainer re-trigger for CodeRabbit).

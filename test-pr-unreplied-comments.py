@@ -441,17 +441,19 @@ def main():
         '"created_at":"2026-06-18T01:00:00Z","updated_at":"2026-06-18T01:00:00Z",'
         '"body":"### Codoki PR Review\\nHigh: something"}]'
     )
+    # Resolved is keyed on the thread ROOT comment fullDatabaseId (== the REST inline
+    # comment id 501), NOT path+line (#256 CR Major: line drifts on rebase).
     G_ITEM_UNRESOLVED = (
         '{"data":{"repository":{"pullRequest":{"reviewThreads":{'
         '"pageInfo":{"hasNextPage":false},'
         '"nodes":[{"isResolved":false,"path":"foo.sh","line":42,'
-        '"comments":{"nodes":[{"author":{"login":"coderabbitai"}}]}}]}}}}}'
+        '"comments":{"nodes":[{"fullDatabaseId":"501","author":{"login":"coderabbitai"}}]}}]}}}}}'
     )
     G_ITEM_RESOLVED = (
         '{"data":{"repository":{"pullRequest":{"reviewThreads":{'
         '"pageInfo":{"hasNextPage":false},'
         '"nodes":[{"isResolved":true,"path":"foo.sh","line":42,'
-        '"comments":{"nodes":[{"author":{"login":"coderabbitai"}}]}}]}}}}}'
+        '"comments":{"nodes":[{"fullDatabaseId":"501","author":{"login":"coderabbitai"}}]}}]}}}}}'
     )
 
     # (a) review-body-only -> a "review-body | ... | (body) |" line with resolved:n/a.
@@ -589,6 +591,27 @@ def main():
           any(ln.startswith("review-body | coderabbitai |") for ln in out.splitlines()))
     check("itemized: issue-level author strips [bot]",
           any(ln.startswith("issue-level | codoki-pr-intelligence |") for ln in out.splitlines()))
+
+    # (m) MAJOR (CR #256): resolved is keyed on the comment ID, NOT path+line, so a
+    # rebase that moves the thread's current `line` away from the comment's original
+    # line must NOT break the match (path+line matching would drop to resolved:? here).
+    G_ITEM_LINEDRIFT = (
+        '{"data":{"repository":{"pullRequest":{"reviewThreads":{'
+        '"pageInfo":{"hasNextPage":false},'
+        '"nodes":[{"isResolved":true,"path":"foo.sh","line":999,'  # line drifted from 42
+        '"comments":{"nodes":[{"fullDatabaseId":"501","author":{"login":"coderabbitai"}}]}}]}}}}}'
+    )
+    rc, out, err = run(["--itemized", "--allow-stale"], inline=ITEM_INLINE,
+                       graphql=G_ITEM_LINEDRIFT)
+    check("itemized: resolved matches by comment ID despite line drift (rebase-safe)",
+          any(ln.startswith("inline |") and "resolved:yes" in ln for ln in out.splitlines()))
+
+    # (n) Nitpick (CR #256): a GraphQL failure for --itemized renders inline resolved:?.
+    rc, out, err = run(["--itemized", "--allow-stale"], inline=ITEM_INLINE,
+                       graphql="not-json")
+    check("itemized: GraphQL failure -> inline resolved:? (best-effort degrade)",
+          any(ln.startswith("inline |") and "resolved:?" in ln for ln in out.splitlines()))
+    check("itemized: GraphQL failure does not change exit (still 0)", rc == 0)
 
     print()
     if FAILS:
