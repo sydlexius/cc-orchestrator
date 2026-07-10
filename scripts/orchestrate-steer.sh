@@ -72,10 +72,17 @@ if [ "${1:-}" = "--self-test" ]; then
     if [ -n "$st_tmp" ]; then
       st_f="$st_tmp/f"; : > "$st_f"
       st_payload='{"tool_name":"Read","session_id":"selftest","tool_input":{"file_path":"'"$st_f"'"}}'
-      printf '%s' "$st_payload" | ORCHESTRATE_READ_STATE_DIR="$st_tmp/state" "$0" >/dev/null 2>&1
-      st_out=$(printf '%s' "$st_payload" | ORCHESTRATE_READ_STATE_DIR="$st_tmp/state" "$0" 2>&1); st_rc=$?
-      { [ "$st_rc" -eq 0 ] && printf '%s' "$st_out" | grep -q 'STEER'; } \
-        || st_fail="read-dedup rule (rc=$st_rc out=$st_out)"
+      # 1st read MUST be silent (asserted, not discarded - else a "1st read warns" regression would
+      # slip through and the PASS message would be misleading).
+      st_out1=$(printf '%s' "$st_payload" | ORCHESTRATE_READ_STATE_DIR="$st_tmp/state" "$0" 2>&1); st_rc1=$?
+      { [ "$st_rc1" -eq 0 ] && ! printf '%s' "$st_out1" | grep -q 'STEER'; } \
+        || st_fail="read-dedup rule 1st-read-not-silent (rc=$st_rc1 out=$st_out1)"
+      # 2nd read of the unchanged path MUST warn at exit 0.
+      if [ -z "$st_fail" ]; then
+        st_out=$(printf '%s' "$st_payload" | ORCHESTRATE_READ_STATE_DIR="$st_tmp/state" "$0" 2>&1); st_rc=$?
+        { [ "$st_rc" -eq 0 ] && printf '%s' "$st_out" | grep -q 'STEER'; } \
+          || st_fail="read-dedup rule (rc=$st_rc out=$st_out)"
+      fi
       rm -rf "$st_tmp" 2>/dev/null
     else
       # mktemp failed: do NOT let the PASS line falsely claim the read-dedup sub-check ran.
@@ -211,7 +218,16 @@ is_redundant_reread() {
   # ORCHESTRATE_READ_STATE_DIR could delete unrelated files) that buys negligible hygiene for a
   # tiny, tmp-resident, self-limiting store. So we only ever create our own session dir, never
   # delete anything.
-  mkdir -p "$sess_dir" 2>/dev/null || return 1
+  # PREDICTABLE-TEMP-PATH HARDENING (CR): the default lives under the world-writable shared /tmp, so
+  # create each level owner-only (-m 700) and REFUSE to write into a dir we do not own (-O) - defends
+  # against a local attacker pre-creating or symlinking `orchestrate-read-state` to redirect the
+  # fingerprint writes. `-m` is applied per level (not `-p -m`, which SC2174-flags as ignoring
+  # intermediates); a custom deep ORCHESTRATE_READ_STATE_DIR with missing parents simply fails open
+  # (no dedup) rather than creating loose-permissioned intermediates. Fail-open (return 1 -> silent).
+  mkdir -m 700 "$READ_STATE_DIR" 2>/dev/null
+  [ -d "$READ_STATE_DIR" ] && [ -O "$READ_STATE_DIR" ] || return 1
+  mkdir -m 700 "$sess_dir" 2>/dev/null
+  [ -d "$sess_dir" ] && [ -O "$sess_dir" ] || return 1
   key=$(printf '%s' "$p" | cksum | cut -d' ' -f1)
   rec="$sess_dir/$key"
   prior=""
@@ -223,7 +239,7 @@ is_redundant_reread() {
 }
 
 # --- dispatch (at most one rule fires; a tool call carries a file_path XOR a command) -------------
-# (0) read-dedup WARN: only a `Read` tool call, marker-independent. Placed before the canonical-edit
+# (4) read-dedup WARN: only a `Read` tool call, marker-independent. Evaluated before the canonical-edit
 # rule so a Read never falls through to it (and the canonical rule is itself gated off for Read below).
 if [ "$tool_name" = "Read" ] && [ -n "$file_path" ] && is_redundant_reread "$file_path" "$session_id"; then
   emit_warn "Redundant re-Read: '$file_path' was already read this session and is unchanged (mtime/size) - its content is already in context; skip the Read (post-compaction re-read is the valid exception)."
