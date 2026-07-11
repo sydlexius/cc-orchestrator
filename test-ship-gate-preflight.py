@@ -676,6 +676,15 @@ def main():
     check("#275: Codoki ack unmet -> REASON ack UNMET, exit 2",
           rc == 2 and "Codoki root-summary ack is UNMET" in (out + err))
 
+    # Codoki ack UNVERIFIABLE (reader failed) -> honest NOTE, not a silent skip.
+    rc, out, err, _ = run(["7", "owner/repo", "--diagnose"],
+                          fixture_json=diag_fixture(state="OPEN", mss="CLEAN", review_decision="APPROVED",
+                                                    contexts=[checkrun("ci", "COMPLETED", "SUCCESS")]),
+                          protection=prot_fixture(required_contexts=["ci"]),
+                          threads_json=threads_doc(resolved=1), codoki_ack_fail=True)
+    check("#275: Codoki ack unverifiable -> NOTE (not silent), exit 0",
+          rc == 0 and "could not be verified" in (out + err))
+
     # Draft.
     rc, out, err, _ = run(["7", "owner/repo", "--diagnose"],
                           fixture_json=diag_fixture(mss="DRAFT", is_draft=True,

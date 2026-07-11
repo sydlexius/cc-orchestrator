@@ -231,10 +231,14 @@ if [ "$diagnose" = true ]; then
   # (6) Codoki root-summary ack (reuse the canonical reader).
   reactor="${HOME}/.claude/scripts/gh-react.sh"
   if [ -x "$reactor" ]; then
-    ack_out="$("$reactor" codoki-ack "$pr" "$repo" 2>/dev/null || true)"
+    ack_rc=0; ack_out="$("$reactor" codoki-ack "$pr" "$repo" 2>/dev/null)" || ack_rc=$?
     av="$(printf '%s\n' "$ack_out" | sed -n 's/.*CODOKI-ACK:[[:space:]]*\([A-Za-z-]*\).*/\1/p' | tail -n1)"
     if [ "$av" = "unacked" ]; then
       echo "REASON: Codoki root-summary ack is UNMET (react via gh-react.sh codoki-ack $pr --react +1|-1; a 👎 also needs an @codoki reply)."; reasons=$((reasons+1))
+    elif [ "$ack_rc" -ne 0 ] || [ -z "$av" ]; then
+      # Honest about what the diagnostic could NOT check (the ack reader failed),
+      # rather than silently emitting no signal. Advisory NOTE, not a counted REASON.
+      echo "NOTE: Codoki root-summary ack state could not be verified (gh-react.sh exit ${ack_rc}); check it manually if the PR is Codoki-reviewed."
     fi
   fi
 
