@@ -2,10 +2,15 @@
 # resource registry. Conventions mirrored from sydlexius/stillwater (pinned action SHAs,
 # least-privilege permissions, persist-credentials: false, concurrency).
 #
-# Runs on BOTH ubuntu and macos: the guard ships on macOS (BSD `stat -f`) but must also
-# work on Linux (GNU `stat -c`), and the first CI run caught exactly that divergence -
-# so both platform branches are validated here. shellcheck/ruff are platform-independent,
-# so they run once (on ubuntu); the harnesses + self-test run on both.
+# Runs the ubuntu leg on EVERY event. The macos leg validates the guard's BSD `stat -f`
+# branch (vs Linux's GNU `stat -c`) - the first CI run caught exactly that divergence - but
+# it joins the matrix ONLY on the trusted, low-frequency events push-to-main / workflow_dispatch
+# (see the matrix `os:` comment). Rationale: this is a PRIVATE repo on a free org, so its macos
+# minutes bill against the 2,000-min allowance at a 10x multiplier; running macos on every PR
+# push was the entire monthly draw. The BSD branch is still validated at merge (push to main)
+# and on demand (workflow_dispatch); PRs validate the ubuntu/GNU branch every time.
+# shellcheck/ruff are platform-independent, so they run once (on ubuntu); the harnesses +
+# self-test run on whichever legs are active.
 name: CI
 
 on:
@@ -44,7 +49,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # macOS joins the matrix ONLY on an EXPLICIT allowlist of trusted, low-frequency
+        # triggers - push (to main) or workflow_dispatch - never on pull_request. Same
+        # allowlist-not-negation shape as the runs-on routing below (a future trigger added
+        # to `on:` cannot silently pull the billed macOS leg into every PR). On a PR the
+        # matrix is ubuntu-only, so the BSD `stat -f` branch is validated at merge + on
+        # demand, not on every PR push (the 10x private-repo macOS-minutes draw). To
+        # validate the macOS branch BEFORE merging a guard change that touches the stat
+        # path, trigger this workflow via workflow_dispatch on the branch.
+        os: >-
+          ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+              && fromJSON('["ubuntu-latest","macos-latest"]')
+              || fromJSON('["ubuntu-latest"]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
