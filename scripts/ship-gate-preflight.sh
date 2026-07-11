@@ -16,10 +16,21 @@
 #     <pr>          PR number (required).
 #     [owner/repo]  Repo slug (optional; resolved from `gh repo view` if omitted).
 #   Flags:
-#     --codoki-only            Settlement mode for pr-watch.sh: check ONLY whether
-#                              the Codoki check has COMPLETED with an acceptable
-#                              conclusion. Skips the full enumeration AND skips
-#                              pr-unreplied-comments.sh.
+#     --codoki-only            Settlement mode: check ONLY whether the Codoki check
+#                              has COMPLETED with an acceptable conclusion. A MISSING
+#                              check BLOCKS (strict). Skips the full enumeration AND
+#                              pr-unreplied-comments.sh. Used by codoki-quota-watch.sh
+#                              (rate-limit recovery), which needs the strict contract.
+#     --codoki-gate            LIVENESS variant for pr-watch.sh (#237): like
+#                              --codoki-only, but Codoki-AUTO-REVIEW-OFF aware. A
+#                              MISSING check is "satisfied" (exit 0) UNLESS Codoki is
+#                              actually expected (a manual `@codoki` trigger comment is
+#                              present) -> then it BLOCKs (exit 2) awaiting the check. So
+#                              an untriggered PR with no Codoki check never wedges
+#                              pr-watch (the auto-review-off default), while a genuinely
+#                              triggered one still waits. Present-but-unsettled/failed
+#                              still BLOCKs. Fails toward SATISFIED on lookup error
+#                              (liveness, not the merge gate).
 #     --codoki-pattern <name>  Override the Codoki check name to match in
 #                              --codoki-only mode (default: "Codoki PR Review").
 #     --diagnose | --why       READ-ONLY diagnosis mode (#275): on a non-mergeable
@@ -94,12 +105,14 @@ set -euo pipefail
 ACCEPTABLE_CONCLUSIONS='["SUCCESS","NEUTRAL","SKIPPED"]'
 
 codoki_only=false
+codoki_gate=false
 diagnose=false
 codoki_pattern="Codoki PR Review"
 args=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --codoki-only) codoki_only=true; shift ;;
+    --codoki-gate) codoki_gate=true; shift ;;
     --diagnose|--why) diagnose=true; shift ;;
     --codoki-pattern)
       if [ "$#" -lt 2 ]; then
@@ -116,7 +129,7 @@ done
 pr="${args[0]:-}"
 repo="${args[1]:-}"
 if [ -z "$pr" ]; then
-  echo "usage: ship-gate-preflight.sh <pr> [owner/repo] [--codoki-only] [--codoki-pattern <name>] [--diagnose|--why]" >&2
+  echo "usage: ship-gate-preflight.sh <pr> [owner/repo] [--codoki-only|--codoki-gate] [--codoki-pattern <name>] [--diagnose|--why]" >&2
   exit 1
 fi
 
@@ -290,10 +303,28 @@ if ! jq -e . >/dev/null 2>&1 <<<"$json"; then
   exit 2
 fi
 
-if [ "$codoki_only" = true ]; then
-  # Settlement mode: ONLY the Codoki check must be COMPLETED with an acceptable
-  # conclusion. Missing / incomplete / failed -> BLOCK. (StatusContext-shaped
-  # Codoki entries are also accepted via the same name/state mapping.)
+# codoki_review_triggered -- true (exit 0) when there is POSITIVE evidence Codoki
+# WILL review this PR even though its check has not posted yet: a NON-Codoki author
+# posted an `@codoki` mention (the manual review request, now that org auto-review is
+# OFF). Excludes Codoki's OWN comments (its summaries can quote `@codoki`), mirroring
+# cr_was_triggered in pr-watch.sh (#173). FAILS toward NOT-triggered (returns 1) on any
+# gh/jq error: this backs a LIVENESS gate (--codoki-gate), so an ambiguous state must
+# NOT wedge pr-watch waiting for a review that may never come (the merge gate is the
+# fail-closed backstop, not this). Trigger-syntax assumption: a bare `@codoki` mention
+# counts; tune the regex if Codoki adopts an explicit subcommand.
+codoki_review_triggered() {
+  gh api --paginate "repos/$repo/issues/$pr/comments" 2>/dev/null \
+    | jq -s 'add // []' 2>/dev/null \
+    | jq -e '[ .[]
+        | select(((.user.login // "") != "codoki-pr-intelligence[bot]")
+                 and ((.body // "") | test("@codoki(?![a-z0-9._-])"; "i"))) ]
+             | length > 0' >/dev/null 2>&1
+}
+
+if [ "$codoki_only" = true ] || [ "$codoki_gate" = true ]; then
+  # Settlement verdict shared by both modes: is the `Codoki PR Review` check present
+  # and COMPLETED with an acceptable conclusion? -> OK / MISSING / BAD:<detail>.
+  # (StatusContext-shaped Codoki entries are accepted via the same name/state mapping.)
   verdict="$(jq -r --arg pat "$codoki_pattern" --argjson ok "$ACCEPTABLE_CONCLUSIONS" '
     [ (.statusCheckRollup // [])[]
       | { name: (.name // .context // "unknown"),
@@ -310,10 +341,33 @@ if [ "$codoki_only" = true ]; then
     echo "BLOCK: jq parse of statusCheckRollup failed (#$pr)" >&2
     exit 2
   }
+
+  # --codoki-gate (#237): Codoki-AUTO-REVIEW-OFF-aware MERGE-READINESS gate. A MISSING
+  # Codoki check is a reason to WAIT only when Codoki is actually EXPECTED (a manual
+  # @codoki trigger is present); with auto-review OFF and no trigger, Codoki is NOT
+  # expected, the requirement is SATISFIED, and pr-watch must not hang on a check that
+  # will never post. --codoki-only keeps its STRICT "is it settled" contract unchanged
+  # (codoki-quota-watch.sh depends on it). This is a deliberate LIVENESS inversion of
+  # the fail-closed FULL-mode posture; the FULL-mode merge gate stays the backstop.
+  if [ "$codoki_gate" = true ] && [ "$verdict" = "MISSING" ]; then
+    if codoki_review_triggered; then
+      verdict="EXPECTED"      # @codoki triggered; check not posted yet -> wait
+    else
+      verdict="NOT-EXPECTED"  # auto-review off + untriggered -> satisfied, do not wait
+    fi
+  fi
+
   case "$verdict" in
     OK)
       echo "RESULT: PASS -- Codoki check '$codoki_pattern' settled (COMPLETED, acceptable conclusion). [#$pr $repo]"
       exit 0 ;;
+    NOT-EXPECTED)
+      echo "RESULT: PASS -- Codoki not expected on #$pr (auto-review off, no @codoki trigger, no check present); requirement satisfied. [#$pr $repo]"
+      exit 0 ;;
+    EXPECTED)
+      echo "BLOCK: Codoki review triggered (@codoki) on #$pr but its check has not posted yet. Not settled." >&2
+      echo "RESULT: BLOCK -- Codoki triggered, awaiting its check. [#$pr $repo]" >&2
+      exit 2 ;;
     MISSING)
       echo "BLOCK: Codoki check '$codoki_pattern' not found in statusCheckRollup (#$pr). Not settled." >&2
       echo "RESULT: BLOCK -- Codoki not settled. [#$pr $repo]" >&2

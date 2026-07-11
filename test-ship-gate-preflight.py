@@ -138,7 +138,7 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         unreplied_fail=False, unreplied_missing=False, unreplied_raw=None,
         unreplied_fail_until=0, codoki_ack_verdict="no-summary",
         codoki_ack_fail=False, codoki_ack_missing=False,
-        threads_json="__DEFAULT__", threads_fail=False, protection=None):
+        threads_json="__DEFAULT__", threads_fail=False, protection=None, comments=None):
     """Invoke the oracle with stubbed gh + pr-unreplied-comments.sh + gh-react.sh.
     Returns (exit_code, stdout, stderr, argv) where argv is the recorded helper
     argv content (one line per invocation, read back from the log) -- used to
@@ -172,6 +172,9 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
                 "    if [ -n \"${THREADS_FAIL:-}\" ]; then echo 'gh api graphql: simulated failure' >&2; exit 1; fi\n"
                 "    printf '%s' \"${FIXTURE_THREADS:-}\"; exit 0;;\n"
                 "  repo) echo 'owner/repo'; exit 0;;\n"
+                "  *comments)\n"
+                "    # `gh api repos/.../issues/<pr>/comments` (#237 @codoki-trigger detector).\n"
+                "    printf '%s' \"${FIXTURE_COMMENTS:-[]}\"; exit 0;;\n"
                 "  *protection)\n"
                 "    # `gh api repos/.../branches/<base>/protection` (#275 --diagnose). Empty\n"
                 "    # FIXTURE_PROTECTION simulates a 403 (no admin scope) so the degradation\n"
@@ -246,6 +249,9 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         env.pop("FIXTURE_PROTECTION", None)
         if protection is not None:
             env["FIXTURE_PROTECTION"] = protection
+        env.pop("FIXTURE_COMMENTS", None)
+        if comments is not None:
+            env["FIXTURE_COMMENTS"] = comments
         env.pop("THREADS_FAIL", None)
         if threads_fail:
             env["THREADS_FAIL"] = "1"
@@ -415,6 +421,42 @@ def main():
     rc, _, _, _ = run(["1", "owner/repo", "--codoki-only"],
                    fixture_json=rollup(statusctx("Codoki PR Review", "SUCCESS")))
     check("--codoki-only: StatusContext Codoki SUCCESS -> exit 0", rc == 0)
+
+    print("== CODOKI-GATE MODE (#237, auto-review-off aware) ==")
+    no_codoki = rollup(checkrun("ci", "COMPLETED", "SUCCESS"))  # no Codoki check present
+    C_TRIGGER = '[{"user":{"login":"sydlexius"},"body":"@codoki review please"}]'
+    C_BOTQUOTE = ('[{"user":{"login":"codoki-pr-intelligence[bot]"},'
+                  '"body":"Reply with @codoki to request another review."}]')
+    # THE HANG FIX: missing Codoki check + no @codoki trigger -> NOT expected -> exit 0
+    # (auto-review off; pr-watch must not wait forever).
+    rc, out, _, _ = run(["1", "owner/repo", "--codoki-gate"], fixture_json=no_codoki, comments="[]")
+    check("--codoki-gate: missing check + no trigger -> exit 0 (not expected, no hang)",
+          rc == 0 and "not expected" in out.lower())
+    # Missing check but a NON-bot @codoki trigger present -> expected -> exit 2 (wait).
+    rc, _, _, _ = run(["1", "owner/repo", "--codoki-gate"], fixture_json=no_codoki, comments=C_TRIGGER)
+    check("--codoki-gate: missing check + @codoki trigger -> exit 2 (expected, wait)", rc == 2)
+    # @codoki appears ONLY in Codoki's own comment -> not a trigger -> exit 0.
+    rc, _, _, _ = run(["1", "owner/repo", "--codoki-gate"], fixture_json=no_codoki, comments=C_BOTQUOTE)
+    check("--codoki-gate: @codoki only in Codoki's own comment -> exit 0 (bot quote excluded)", rc == 0)
+    # An email/domain like foo@codoki.example.com must NOT be read as a trigger.
+    C_EMAIL = '[{"user":{"login":"sydlexius"},"body":"ping me at ops@codoki.example.com about this"}]'
+    rc, _, _, _ = run(["1", "owner/repo", "--codoki-gate"], fixture_json=no_codoki, comments=C_EMAIL)
+    check("--codoki-gate: @codoki.<domain> email is NOT a trigger -> exit 0", rc == 0)
+    # Codoki check present + settled OK -> exit 0 (same as --codoki-only).
+    rc, _, _, _ = run(["1", "owner/repo", "--codoki-gate"],
+                   fixture_json=rollup(checkrun("Codoki PR Review", "COMPLETED", "SUCCESS")))
+    check("--codoki-gate: Codoki settled OK -> exit 0", rc == 0)
+    # Codoki check present but IN_PROGRESS -> exit 2 (wait), even with no trigger.
+    rc, _, _, _ = run(["1", "owner/repo", "--codoki-gate"],
+                   fixture_json=rollup(checkrun("Codoki PR Review", "IN_PROGRESS", None)), comments="[]")
+    check("--codoki-gate: Codoki check present but IN_PROGRESS -> exit 2 (wait)", rc == 2)
+    # Codoki check present + FAILURE -> exit 2.
+    rc, _, _, _ = run(["1", "owner/repo", "--codoki-gate"],
+                   fixture_json=rollup(checkrun("Codoki PR Review", "COMPLETED", "FAILURE")))
+    check("--codoki-gate: Codoki check FAILURE -> exit 2", rc == 2)
+    # REGRESSION: --codoki-only stays STRICT (missing -> exit 2), unchanged by #237.
+    rc, _, _, _ = run(["1", "owner/repo", "--codoki-only"], fixture_json=no_codoki, comments=C_TRIGGER)
+    check("regression: --codoki-only missing check -> exit 2 (strict, ignores trigger)", rc == 2)
 
     print("== FULL MODE: reviewDecision gate (#117, coupled with findings) ==")
     green_ctx = (checkrun("ci", "COMPLETED", "SUCCESS"), statusctx("buildkite", "SUCCESS"))
