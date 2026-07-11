@@ -553,6 +553,12 @@ def main():
     rc, _o, _e = run_guard("gh pr merge --squash --match-head-commit " + VSHA, marker_active=True,
                            channel="stdin", merge_token=_tok(pr=265, sha=VSHA))
     expect("piece-b: pr omitted from merge command -> BLOCK (deny on doubt)", rc, "block")
+    # A "merge <token.pr>" string inside a QUOTED arg (gh's --body) must NOT be scraped
+    # as the PR while gh merges a DIFFERENT positional pr (Codoki #268 High: the extract
+    # must anchor to the actual invocation, not any 'merge N' substring).
+    rc, _o, _e = run_guard('gh pr merge --body "merge 265" 999 --match-head-commit ' + VSHA,
+                           marker_active=True, channel="stdin", merge_token=_tok(pr=265, sha=VSHA))
+    expect("piece-b: quoted 'merge 265' in --body, real pr 999 -> BLOCK (no scrape)", rc, "block")
 
     print()
     if FAILS:

@@ -291,7 +291,14 @@ merge_authorized() {
   # base->develop PR), so require the merge command's target PR to equal token.pr.
   # Extract the bare integer arg after `merge` (tolerating flags between); deny if it
   # is absent/unparsable or mismatched (deny-on-doubt).
-  cpr=$(printf '%s' "$cmd" | grep -oE 'merge([[:space:]]+-[^[:space:]]+)*[[:space:]]+[0-9]+' | grep -oE '[0-9]+$' | head -1)
+  # ANCHOR the extraction at the actual `gh pr merge` invocation (clause start), NOT any
+  # `merge <int>` substring: an un-anchored scan would scrape a PR number out of a quoted
+  # arg (e.g. `--body "merge 265"`) while gh merges a different positional PR. The `^`
+  # anchor makes grep match only at position 0, so quoted content later cannot be reached;
+  # unusual layouts (env prefix, `gh -R o/r pr merge`, flag-before-pr) simply do not match
+  # and fall to deny-on-doubt. The honest sanctioned command authorize-merge prints
+  # (`gh pr merge <pr> --squash --match-head-commit <sha>`) matches.
+  cpr=$(printf '%s' "$cmd" | grep -oE '^[[:space:]]*gh[[:space:]]+pr[[:space:]]+merge([[:space:]]+-[^[:space:]]+)*[[:space:]]+[0-9]+' | grep -oE '[0-9]+$' | head -1)
   [ -n "$cpr" ] || return 1
   tpr=$(jq -r '.pr // empty' "$tok" 2>/dev/null) || return 1
   case "$tpr" in ''|*[!0-9]*) return 1 ;; esac
