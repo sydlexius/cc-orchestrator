@@ -517,6 +517,28 @@ def main():
     rc, _, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN, unreplied_findings=0,
                       threads_json=threads_doc(raw_nodes=[{"isResolved": True}, {"isResolved": True}]))
     check("all nodes isResolved=true -> exit 0 (provably resolved)", rc == 0)
+    # #265 review (CR Critical / Copilot): totalCount must be a PRESENT non-negative
+    # integer. A null/missing totalCount must NOT default to 0 and defeat the
+    # truncation guard (a partial GraphQL error can null it while nodes look valid).
+    rc, _, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN, unreplied_findings=0,
+                      threads_json='{"data":{"repository":{"pullRequest":{"reviewThreads":'
+                                   '{"totalCount":null,"nodes":[{"isResolved":true}]}}}}}')
+    check("null totalCount + resolved node -> exit 2 (truncation guard not defeated)", rc == 2)
+    rc, _, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN, unreplied_findings=0,
+                      threads_json='{"data":{"repository":{"pullRequest":{"reviewThreads":'
+                                   '{"nodes":[{"isResolved":true}]}}}}}')
+    check("missing totalCount -> exit 2 (fail closed)", rc == 2)
+    # totalCount < node count is impossible in a well-formed response -> MALFORMED.
+    rc, _, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN, unreplied_findings=0,
+                      threads_json=threads_doc(resolved=3, total=1))
+    check("totalCount(1) < nodes(3) impossible -> exit 2 (fail closed)", rc == 2)
+    # A GraphQL partial-error payload (non-empty top-level .errors) alongside data
+    # -> BLOCK, even if the data sub-object looks complete.
+    rc, _, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN, unreplied_findings=0,
+                      threads_json='{"errors":[{"message":"rate limited"}],"data":{"repository":'
+                                   '{"pullRequest":{"reviewThreads":{"totalCount":1,'
+                                   '"nodes":[{"isResolved":true}]}}}}}')
+    check("GraphQL .errors present (partial error) -> exit 2 (fail closed)", rc == 2)
     # --codoki-only must NOT run the thread gate (settlement is a pure check signal):
     # unresolved threads are irrelevant there.
     rc, _, _, _ = run(["1", "owner/repo", "--codoki-only"],
@@ -546,6 +568,15 @@ def main():
                       fixture_json=rollup(checkrun("ci", "COMPLETED", "SUCCESS"), head_ref_oid="__OMIT__"),
                       unreplied_findings=0)
     check("absent headRefOid + all green -> exit 2 (fail closed)", rc == 2)
+    # #265 review (CR Major): validate the ENTIRE SHA, not one line. grep is line-
+    # oriented, so "<40hex>\nforged" would pass a line-anchored match and inject
+    # extra output into the attestation. A multi-line head SHA must BLOCK.
+    rc, out, _, _ = run(["1", "owner/repo"],
+                        fixture_json=rollup(checkrun("ci", "COMPLETED", "SUCCESS"),
+                                            head_ref_oid=DEFAULT_SHA + "\nforged"),
+                        unreplied_findings=0)
+    check("multi-line head_sha (40hex + newline + junk) -> exit 2 (whole-value validation)",
+          rc == 2 and "forged" not in out)
     # --codoki-only does NOT require/emit headRefOid (settlement mode).
     rc, out, _, _ = run(["1", "owner/repo", "--codoki-only"],
                         fixture_json=rollup(checkrun("Codoki PR Review", "COMPLETED", "SUCCESS"),

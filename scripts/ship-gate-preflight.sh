@@ -353,26 +353,41 @@ threads_json="$(gh api graphql \
   echo "RESULT: BLOCK -- review threads unverifiable. [#$pr $repo]" >&2
   exit 2
 }
-if ! jq -e '.data.repository.pullRequest.reviewThreads' >/dev/null 2>&1 <<<"$threads_json"; then
-  echo "BLOCK: malformed / empty reviewThreads response for #$pr (cannot verify thread state)." >&2
+# FAIL CLOSED on a GraphQL partial-error payload (non-empty top-level .errors) or a
+# reviewThreads that is not an object - either means the thread state cannot be
+# trusted even if a data sub-object looks present.
+if ! jq -e '(((.errors // []) | length) == 0) and ((.data.repository.pullRequest.reviewThreads | type) == "object")' \
+     >/dev/null 2>&1 <<<"$threads_json"; then
+  echo "BLOCK: malformed / error-bearing reviewThreads response for #$pr (cannot verify thread state)." >&2
   echo "RESULT: BLOCK -- review threads unverifiable. [#$pr $repo]" >&2
   exit 2
 fi
-# Emit "TRUNC" (totalCount > fetched nodes), an unresolved count, or "OK". FAIL
-# CLOSED by counting PROVABLY-resolved nodes (isResolved == literal true) and
-# blocking the remainder, NOT by matching == false: reviewThreads.nodes elements
+# Emit "MALFORMED", "TRUNC" (totalCount > fetched nodes), an unresolved count, or
+# "OK". FAIL CLOSED by counting PROVABLY-resolved nodes (isResolved == literal true)
+# and blocking the remainder, NOT by matching == false: reviewThreads.nodes elements
 # are nullable, so a partial GraphQL error can null a thread while gh still returns
 # `data`. A `== false` match would read a null / missing / non-bool isResolved (and
 # a null node) as "resolved" and PASS an unready PR. Anything not provably true
-# blocks.
+# blocks. totalCount is VALIDATED as a present non-negative integer FIRST: a null/
+# missing/non-integer totalCount (a partial error can null it) must NOT default to 0
+# and silently disable the truncation guard; totalCount < nodes is impossible in a
+# well-formed response and is MALFORMED.
 thread_verdict="$(jq -r '
   .data.repository.pullRequest.reviewThreads as $rt
-  | ($rt.totalCount // 0) as $tc
-  | ($rt.nodes | length) as $n
-  | ([$rt.nodes[] | select(.isResolved == true)] | length) as $r
-  | if $tc > $n then "TRUNC:\($tc)>\($n)"
-    elif $r < $n then "UNRESOLVED:\($n - $r)"
-    else "OK" end
+  | if ($rt.totalCount | type) != "number"
+       or ($rt.nodes | type) != "array"
+       or $rt.totalCount < 0
+       or $rt.totalCount != ($rt.totalCount | floor)
+    then "MALFORMED"
+    else
+      ($rt.totalCount) as $tc
+      | ($rt.nodes | length) as $n
+      | ([$rt.nodes[] | select(.isResolved == true)] | length) as $r
+      | if $tc > $n then "TRUNC:\($tc)>\($n)"
+        elif $tc < $n then "MALFORMED"
+        elif $r < $n then "UNRESOLVED:\($n - $r)"
+        else "OK" end
+    end
 ' <<<"$threads_json")" || {
   echo "BLOCK: jq parse of reviewThreads failed (#$pr)." >&2
   echo "RESULT: BLOCK -- review threads unverifiable. [#$pr $repo]" >&2
@@ -380,6 +395,10 @@ thread_verdict="$(jq -r '
 }
 case "$thread_verdict" in
   OK) : ;;
+  MALFORMED)
+    echo "BLOCK: reviewThreads response malformed on #$pr (totalCount/nodes not a well-formed non-negative-int/array pair)." >&2
+    echo "RESULT: BLOCK -- review threads unverifiable (malformed). [#$pr $repo]" >&2
+    exit 2 ;;
   TRUNC:*)
     echo "BLOCK: reviewThreads list truncated on #$pr (${thread_verdict#TRUNC:} threads; only 100 fetched, remainder unverifiable)." >&2
     echo "RESULT: BLOCK -- review threads unverifiable (truncated). [#$pr $repo]" >&2
@@ -441,7 +460,10 @@ esac
 # absent) or not a hex object id: a PASS that cannot name the commit it cleared is
 # useless downstream and must not be issued. Parsed from the same snapshot as the
 # checks (head_sha above), so it is definitionally the commit those checks ran on.
-if ! printf '%s' "$head_sha" | grep -Eq '^[0-9a-f]{40,}$'; then
+# Validate the ENTIRE value (bash [[ =~ ]] anchors the whole string), NOT `printf |
+# grep` which is line-oriented and would pass a "<40hex>\nforged" head_sha - letting
+# junk into the emitted attestation a downstream step pins.
+if [[ ! "$head_sha" =~ ^[0-9a-f]{40,}$ ]]; then
   echo "BLOCK: headRefOid unreadable on #$pr (got '${head_sha:-<empty>}'); cannot attest the merge commit." >&2
   echo "RESULT: BLOCK -- head SHA unverifiable. [#$pr $repo]" >&2
   exit 2
