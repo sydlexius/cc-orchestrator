@@ -158,7 +158,14 @@ allow_stale=false
 audit_mode=false
 check_resolved=false
 itemized=false
-while [[ "${1:-}" == --* ]]; do
+# Parse flags and positionals in ONE pass so a flag is recognized wherever it sits,
+# NOT only before the <pr> positional (#259). The prior leading-only loop stopped at
+# the first non-flag, so `<pr> --itemized` left `--itemized` as $2=[repo] -> a cryptic
+# `gh api repos/--itemized/...` 404. Now: any `-`-leading token is a flag (unknown ->
+# loud usage error, never a silent repo), `--` ends flag parsing, everything else is a
+# positional. This makes `<pr> --flag` work AND guarantees a `[repo]` can never be a flag.
+positionals=()
+while [ "$#" -gt 0 ]; do
   case "$1" in
     --wait) wait_mode=true; shift ;;
     --count-only) count_only=true; shift ;;
@@ -170,9 +177,16 @@ while [[ "${1:-}" == --* ]]; do
     --audit|--all) audit_mode=true; shift ;;
     --check-resolved) check_resolved=true; shift ;;
     --itemized) itemized=true; shift ;;
-    *) echo "Unknown flag: $1"; exit 1 ;;
+    --) shift; while [ "$#" -gt 0 ]; do positionals+=("$1"); shift; done ;;
+    -*) echo "Unknown flag: $1 (a '-'-leading token is never accepted as <pr> or [repo])" >&2; exit 1 ;;
+    *) positionals+=("$1"); shift ;;
   esac
 done
+set -- "${positionals[@]+"${positionals[@]}"}"
+if [ "$#" -gt 2 ]; then
+  echo "Usage: too many positional arguments (expected <pr> [repo]); got: $*" >&2
+  exit 1
+fi
 
 # --itemized is a human-readable one-line-per-finding CHECKLIST display mode; it is
 # incompatible with the numeric/scripting early-exit modes (their outputs replace the
