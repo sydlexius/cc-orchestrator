@@ -2,15 +2,13 @@
 # resource registry. Conventions mirrored from sydlexius/stillwater (pinned action SHAs,
 # least-privilege permissions, persist-credentials: false, concurrency).
 #
-# Runs the ubuntu leg on EVERY event. The macos leg validates the guard's BSD `stat -f`
-# branch (vs Linux's GNU `stat -c`) - the first CI run caught exactly that divergence - but
-# it joins the matrix ONLY on the trusted, low-frequency events push-to-main / workflow_dispatch
-# (see the matrix `os:` comment). Rationale: this is a PRIVATE repo on a free org, so its macos
-# minutes bill against the 2,000-min allowance at a 10x multiplier; running macos on every PR
-# push was the entire monthly draw. The BSD branch is still validated at merge (push to main)
-# and on demand (workflow_dispatch); PRs validate the ubuntu/GNU branch every time.
-# shellcheck/ruff are platform-independent, so they run once (on ubuntu); the harnesses +
-# self-test run on whichever legs are active.
+# Runs BOTH the ubuntu (GNU `stat -c`) and macos (BSD `stat -f`) legs on EVERY event,
+# including every PR. The macos leg validates the guard's BSD `stat -f` branch - the first
+# CI run caught exactly that divergence. The repo is PUBLIC, so GitHub-hosted runner minutes
+# (macos included) are free and unmetered; the earlier private-repo cost guard (macos gated
+# to trusted events + an optional self-hosted linux runner via the SELF_HOSTED_LINUX repo
+# variable) is removed. shellcheck/ruff are platform-independent, so they run once (on
+# ubuntu); the harnesses + self-test run on both legs.
 name: CI
 
 on:
@@ -30,37 +28,14 @@ permissions:
 jobs:
   gates:
     name: gates (${{ matrix.os }})
-    # Route the ubuntu leg to a self-hosted runner ONLY when all three hold:
-    #   - it is the ubuntu-latest matrix leg (macOS has no self-hosted host),
-    #   - the event is an EXPLICIT allowlist of trusted triggers: push or
-    #     workflow_dispatch only (never pull_request / pull_request_target, so a
-    #     fork PR can never reach self-hosted infra - an allowlist, not a negation,
-    #     so a future trigger added to `on:` does not silently leak through),
-    #   - the repo variable SELF_HOSTED_LINUX == 'true' (the kill switch).
-    # Otherwise fall back to the GitHub-hosted matrix.os. Unset the variable to
-    # instantly revert everything to GitHub-hosted with no code change.
-    runs-on: >-
-      ${{ (matrix.os == 'ubuntu-latest'
-           && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-           && vars.SELF_HOSTED_LINUX == 'true')
-          && fromJSON('["self-hosted","linux","x64","unraid"]')
-          || matrix.os }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        # macOS joins the matrix ONLY on an EXPLICIT allowlist of trusted, low-frequency
-        # triggers - push (to main) or workflow_dispatch - never on pull_request. Same
-        # allowlist-not-negation shape as the runs-on routing below (a future trigger added
-        # to `on:` cannot silently pull the billed macOS leg into every PR). On a PR the
-        # matrix is ubuntu-only, so the BSD `stat -f` branch is validated at merge + on
-        # demand, not on every PR push (the 10x private-repo macOS-minutes draw). To
-        # validate the macOS branch BEFORE merging a guard change that touches the stat
-        # path, trigger this workflow via workflow_dispatch on the branch.
-        os: >-
-          ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-              && fromJSON('["ubuntu-latest","macos-latest"]')
-              || fromJSON('["ubuntu-latest"]') }}
+        # Both legs on every event (public repo -> free GitHub-hosted minutes). ubuntu
+        # covers the GNU `stat -c` branch; macos covers the BSD `stat -f` branch.
+        os: [ubuntu-latest, macos-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -72,16 +47,16 @@ jobs:
         with:
           python-version: '3.12'
 
+      # ruff runs Linux-only (the `ruff (F,E741)` step is `if: runner.os == 'Linux'`),
+      # so only install it there - no need to spend the macOS leg installing an unused tool.
       - name: Install ruff
+        if: runner.os == 'Linux'
         run: pip install ruff
 
       # Platform-independent lint: run once, on Linux. (jq is preinstalled on both runners.)
-      # shellcheck is pinned to v0.11.0. On GitHub-hosted runners we run it via the official
-      # koalaman image, digest-pinned (linux/amd64) for immutability per the repo SHA-pin
-      # convention. On self-hosted runners there is no Docker daemon by design, so we use the
-      # shellcheck v0.11.0 binary baked into the outatime-runner image - keep that image's
-      # SHELLCHECK_VERSION in lockstep with this digest. Either path predicts a clean local
-      # `shellcheck` v0.11.0 gate (the SC2015 drift that motivated #165).
+      # shellcheck is pinned to v0.11.0 via the official koalaman image, digest-pinned
+      # (linux/amd64) for immutability per the repo SHA-pin convention. Predicts a clean
+      # local `shellcheck` v0.11.0 gate (the SC2015 drift that motivated #165).
       - name: shellcheck v0.11.0 (security guard + runtime scripts)
         if: runner.os == 'Linux'
         run: |
@@ -95,22 +70,9 @@ jobs:
             scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh
             scripts/safe-push.sh scripts/pre-push-hook.sh
           )
-          if [ "${{ runner.environment }}" = "self-hosted" ]; then
-            # No Docker daemon here, so lint with the shellcheck baked into the
-            # outatime-runner image. Assert the pinned version so a stale image fails
-            # loudly rather than silently linting with a different version.
-            want=0.11.0
-            have=$(shellcheck --version 2>/dev/null | awk '/^version:/{print $2}')
-            if [ "$have" != "$want" ]; then
-              echo "::error::self-hosted shellcheck '$have' != pinned '$want'; rebuild the outatime-runner image (SHELLCHECK_VERSION)"
-              exit 1
-            fi
-            shellcheck "${scripts[@]}"
-          else
-            docker run --rm -v "$GITHUB_WORKSPACE:/mnt" -w /mnt \
-              koalaman/shellcheck@sha256:b9389b73c8f26f710a7171cb7d8848a34a9c1e07a7865e727c9ec4ce99f9a83f \
-              "${scripts[@]}"
-          fi
+          docker run --rm -v "$GITHUB_WORKSPACE:/mnt" -w /mnt \
+            koalaman/shellcheck@sha256:b9389b73c8f26f710a7171cb7d8848a34a9c1e07a7865e727c9ec4ce99f9a83f \
+            "${scripts[@]}"
 
       - name: ruff (F,E741)
         if: runner.os == 'Linux'
