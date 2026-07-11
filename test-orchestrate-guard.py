@@ -36,16 +36,26 @@ def _key(tmux):
 
 
 def run_guard(command, *, marker_active, channel, tmux=DEFAULT_TMUX,
-              foreign_keys=(), stale_self=False, ttl_hours=24):
+              foreign_keys=(), stale_self=False, ttl_hours=24,
+              merge_token=None, token_tmux=None):
     """Invoke the guard. Returns (exit_code, stdout, stderr). channel in {'stdin','env'}.
     command=None means 'send no command at all' (empty-read case).
       - marker_active: arm THIS session's key (fresh) under FLOOR_DIR.
       - tmux: the $TMUX value the guard sees (None => unset => never gated).
       - foreign_keys: extra $TMUX values to arm (fresh) - other sessions' markers.
-      - stale_self: arm THIS session's key with an OLD mtime (older than TTL)."""
+      - stale_self: arm THIS session's key with an OLD mtime (older than TTL).
+      - merge_token (#263 Piece B): if set, write a merge-auth token under
+        FLOOR_DIR/merge-auth/<key of token_tmux or tmux>. A dict is JSON-encoded; a
+        str is written verbatim (to exercise the malformed-JSON deny path)."""
     with tempfile.TemporaryDirectory() as td:
         floor_dir = os.path.join(td, "orchestrate-floor.d")
         os.makedirs(floor_dir, exist_ok=True)
+        if merge_token is not None:
+            auth = os.path.join(floor_dir, "merge-auth")
+            os.makedirs(auth, exist_ok=True)
+            tt = token_tmux if token_tmux is not None else tmux
+            with open(os.path.join(auth, _key(tt)), "w") as f:
+                f.write(merge_token if isinstance(merge_token, str) else json.dumps(merge_token))
         # Default 24 (not the guard's 72h default) so the stale_self case only needs a
         # ~25h-old file; passed to the guard via ORCHESTRATE_FLOOR_TTL_HOURS below.
         # Overridable per-case (e.g. ttl_hours=0/-5) to exercise the guard's TTL clamp.
@@ -480,6 +490,52 @@ def main():
             FAILS.append(f"regression: guard emitted a permissionDecision for '{cmd}' (ask was removed)")
     if not saw_decision:
         print("  [ok] regression: guard emits no permissionDecision on any path (ask removed)")
+
+    # --- #263 Piece B: merge-auth token relaxation (marker-active `gh pr merge`) ---
+    # A fresh session-scoped token whose head_sha matches the pinned --match-head-commit
+    # ALLOWs the merge; every doubt (absent/expired/mismatched/malformed/foreign/no-pin)
+    # BLOCKs (deny on doubt). merge-by-API is NOT relaxed. Solo (no marker) is unchanged.
+    VSHA = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+
+    def _tok(sha=VSHA, pr=265, exp_delta=600):
+        return {"pr": pr, "head_sha": sha, "expiry": int(time.time()) + exp_delta}
+
+    MERGE_OK = "gh pr merge 265 --squash --match-head-commit " + VSHA
+    rc, _o, _e = run_guard(MERGE_OK, marker_active=True, channel="stdin", merge_token=_tok())
+    expect("piece-b: fresh token + matching --match-head-commit -> ALLOW", rc, "allow")
+    rc, _o, _e = run_guard(MERGE_OK, marker_active=True, channel="stdin", merge_token=None)
+    expect("piece-b: NO token -> BLOCK (deny on doubt)", rc, "block")
+    rc, _o, _e = run_guard(MERGE_OK, marker_active=True, channel="stdin", merge_token=_tok(sha="b" * 40))
+    expect("piece-b: token head_sha != pinned sha -> BLOCK", rc, "block")
+    rc, _o, _e = run_guard(MERGE_OK, marker_active=True, channel="stdin", merge_token=_tok(exp_delta=-60))
+    expect("piece-b: EXPIRED token -> BLOCK", rc, "block")
+    rc, _o, _e = run_guard("gh pr merge 265 --squash", marker_active=True, channel="stdin", merge_token=_tok())
+    expect("piece-b: token but NO --match-head-commit pin -> BLOCK", rc, "block")
+    rc, _o, _e = run_guard(MERGE_OK, marker_active=True, channel="stdin", merge_token="not json{")
+    expect("piece-b: malformed token JSON -> BLOCK", rc, "block")
+    rc, _o, _e = run_guard(MERGE_OK, marker_active=True, channel="stdin",
+                           merge_token={"pr": 265, "expiry": int(time.time()) + 600})
+    expect("piece-b: token missing head_sha -> BLOCK", rc, "block")
+    rc, _o, _e = run_guard(MERGE_OK, marker_active=True, channel="stdin",
+                           merge_token={"pr": 265, "head_sha": VSHA, "expiry": "soon"})
+    expect("piece-b: non-numeric expiry -> BLOCK", rc, "block")
+    rc, _o, _e = run_guard(MERGE_OK.replace(VSHA, VSHA.upper()), marker_active=True,
+                           channel="stdin", merge_token=_tok(sha=VSHA))
+    expect("piece-b: UPPERCASE --match-head-commit matches lowercase token -> ALLOW", rc, "allow")
+    rc, _o, _e = run_guard(MERGE_OK, marker_active=False, channel="stdin", merge_token=None)
+    expect("piece-b: solo/no-marker gh pr merge -> ALLOW (unchanged)", rc, "allow")
+    rc, _o, _e = run_guard("gh api -X PUT repos/o/r/pulls/265/merge", marker_active=True,
+                           channel="stdin", merge_token=_tok())
+    expect("piece-b: merge-by-API NOT relaxed by a token -> BLOCK", rc, "block")
+    rc, _o, _e = run_guard(MERGE_OK, marker_active=True, channel="stdin",
+                           tmux=SESS_A, merge_token=_tok(), token_tmux=SESS_B)
+    expect("piece-b: another session's token does NOT authorize me -> BLOCK", rc, "block")
+    # Two --match-head-commit flags are AMBIGUOUS: gh's pflag honors the LAST, the guard
+    # would validate one - deny on doubt rather than risk validating a different SHA than
+    # gh enforces (hostile-review MINOR; aligns with deny-on-doubt).
+    rc, _o, _e = run_guard(MERGE_OK + " --match-head-commit " + ("c" * 40), marker_active=True,
+                           channel="stdin", merge_token=_tok(sha=VSHA))
+    expect("piece-b: two --match-head-commit flags (ambiguous) -> BLOCK", rc, "block")
 
     print()
     if FAILS:

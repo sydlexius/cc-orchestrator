@@ -232,14 +232,21 @@ is_pr_merge() {
 # succeeds-with-garbage on an unknown %m (so it can't be the fallback), whereas BSD cleanly
 # REJECTS `-c` (illegal option) so its fallback fires. Works on Linux/CI + macOS; without it
 # stat fails on the off-platform and Tier-2 silently fails OPEN.
-marker_active() {
+# THIS session's sanitized key. LC_ALL=C forces byte-oriented tr so the key is
+# locale-independent and matches BOTH the setup script's byte-mode python
+# sanitization (re.sub on UTF-8 bytes) AND orchestrate-authorize-merge.sh. Without
+# it a multibyte $TMUX would sanitize to a different length under a UTF-8 vs C locale,
+# silently diverging the sides' keys (a silent fail-open). Factored (#263 Piece B) so
+# the marker gate and the merge-auth token check can NEVER drift on key derivation.
+# Returns non-zero (no key) when $TMUX is unset - a non-tmux/solo session, never gated.
+_session_key() {
   [ -n "${TMUX:-}" ] || return 1
+  printf '%s' "$TMUX" | LC_ALL=C tr -c 'A-Za-z0-9' '_'
+}
+
+marker_active() {
   local key marker mtime now age_h
-  # LC_ALL=C forces byte-oriented tr so the key is locale-independent and matches the
-  # setup script's byte-mode python sanitization (re.sub on UTF-8 bytes). Without it, a
-  # multibyte $TMUX would sanitize to a different length under a UTF-8 vs C locale,
-  # silently diverging the two sides' keys (a silent fail-open of the gate).
-  key=$(printf '%s' "$TMUX" | LC_ALL=C tr -c 'A-Za-z0-9' '_')
+  key=$(_session_key) || return 1
   marker="$FLOOR_DIR/$key"
   [ -f "$marker" ] || return 1
   mtime=$(stat -c %Y "$marker" 2>/dev/null || stat -f %m "$marker" 2>/dev/null) || return 1
@@ -248,6 +255,38 @@ marker_active() {
   now=$(date +%s) || return 1
   age_h=$(( (now - mtime) / 3600 ))
   [ "$age_h" -lt "$TTL_HOURS" ]
+}
+
+# #263 Piece B: does a fresh, session-scoped merge-auth token AUTHORIZE the current
+# `gh pr merge` clause? The token (armed by orchestrate-authorize-merge.sh ONLY after
+# the readiness oracle PASSed) lives at $FLOOR_DIR/merge-auth/<session-key> and binds
+# {pr, head_sha, expiry}. DENY ON DOUBT: any missing / unreadable / non-JSON / expired
+# / SHA-mismatched token returns non-zero so the caller keeps the deny. NO network I/O
+# (a local file read only) - the network readiness check already happened, out of the
+# floor, in the authorize helper. The SHA pin is the strong bind: the merge MUST carry
+# `--match-head-commit <sha>` equal to token.head_sha, and gh itself refuses the merge
+# unless that SHA is the PR's current head - so a token cannot authorize a different PR
+# or a moved HEAD, and the floor need not re-parse the PR number. Reads $cmd.
+merge_authorized() {
+  local key tok msha tsha texp now
+  key=$(_session_key) || return 1
+  tok="$FLOOR_DIR/merge-auth/$key"
+  [ -f "$tok" ] || return 1
+  # Deny on an AMBIGUOUS pin: gh's pflag honors the LAST --match-head-commit, but we
+  # validate one occurrence; if the command carries MORE THAN ONE, refuse rather than
+  # risk validating a different SHA than gh will actually enforce (deny-on-doubt).
+  [ "$(printf '%s' "$cmd" | grep -oE -e '--match-head-commit([[:space:]=]|$)' | wc -l | tr -d '[:space:]')" -le 1 ] || return 1
+  # `-e`: the pattern begins with `--`, which grep would otherwise parse as an option.
+  msha=$(printf '%s' "$cmd" | grep -oE -e '--match-head-commit[[:space:]=]+[0-9a-fA-F]{40,}' | grep -oE '[0-9a-fA-F]{40,}' | head -1)
+  [ -n "$msha" ] || return 1
+  tsha=$(jq -r '.head_sha // empty' "$tok" 2>/dev/null) || return 1
+  texp=$(jq -r '.expiry // empty' "$tok" 2>/dev/null) || return 1
+  [ -n "$tsha" ] && [ -n "$texp" ] || return 1
+  case "$texp" in ''|*[!0-9]*) return 1 ;; esac   # non-numeric expiry -> deny
+  now=$(date +%s) || return 1
+  [ "$now" -lt "$texp" ] || return 1              # expired -> deny
+  [ "$(printf '%s' "$msha" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$tsha" | tr '[:upper:]' '[:lower:]')" ] || return 1
+  return 0
 }
 
 # --- (1)+(2) hard denies, evaluated PER-CLAUSE ----------------------------
@@ -313,8 +352,18 @@ if printf '%s' "$orig_cmd" | grep -Eq 'push|--no-verify|--admin|(^|[^[:alnum:]_-
     # blanket gh-pr rule - the recurring shadow can no longer defeat the gate. `gh pr merge --admin`
     # is already Tier-1 (is_gh_admin) above, denied even solo.
     if is_pr_merge && marker_active; then
-      echo "BLOCKED: 'gh pr merge' is not allowed from Claude during an orchestrate session (marker active). The maintainer merges from a SEPARATE plain terminal or the GitHub UI; in a solo session this command is allowed." >&2
-      exit 2
+      # #263 Piece B: a fresh human-armed merge-auth token whose head_sha matches the
+      # pinned --match-head-commit AUTHORIZES this merge (readiness was gated at arm
+      # time by the deterministic oracle, out of the floor). Absent/invalid token ->
+      # keep the deny. merge-by-API (is_merge_api, above) is NOT relaxed - one
+      # sanctioned path. This RELAXES a deny only; it never weakens Tier-1 or the
+      # merge-by-API deny, both of which are evaluated and exit before this point.
+      if merge_authorized; then
+        : # authorized; fall through (ALLOW)
+      else
+        echo "BLOCKED: 'gh pr merge' in an orchestrate session (marker active) needs a fresh merge-auth token. Run 'orchestrate-authorize-merge.sh <pr>' (it runs the readiness gate and, on PASS, arms a token), then merge with 'gh pr merge <pr> --squash --match-head-commit <sha>'. The maintainer may also merge from a SEPARATE plain terminal or the GitHub UI; in a solo session this command is allowed." >&2
+        exit 2
+      fi
     fi
     # Record a real push INVOCATION in THIS clause (command-position anchored) for the
     # advisory gate below. A "push" substring in a quoted arg / prose does NOT set this.

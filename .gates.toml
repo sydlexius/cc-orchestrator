@@ -12,7 +12,7 @@
 
   [[prep_pr.steps]]
   name = "shellcheck"
-  run = "shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh"
+  run = "shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/orchestrate-authorize-merge.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh"
   skip_if_absent = "shellcheck"
 
   [[prep_pr.steps]]
@@ -35,6 +35,10 @@
   [[prep_pr.steps]]
   name = "test-orchestrate-guard"
   run = "python3 test-orchestrate-guard.py"
+
+  [[prep_pr.steps]]
+  name = "test-orchestrate-authorize-merge"
+  run = "python3 test-orchestrate-authorize-merge.py"
 
   [[prep_pr.steps]]
   name = "test-orchestrate-steer"
