@@ -39,8 +39,20 @@ Runtime (`scripts/`; canonical source is this repo):
   `--force`/`-f` (not `--force-with-lease`), `git ... --no-verify` (any accepting subcommand),
   `gh ... --admin` (admin-bypass on `pr merge`). Tier-2 = orchestrate-MARKER-GATED merge: BOTH
   the `gh pr merge` CLI (`is_pr_merge`, #105) AND merge-by-API (`gh api ... pulls/N/merge`);
-  a SOLO/non-marker session is never Tier-2-gated. Fails OPEN on any internal error. Threat model
-  = honest bot on the obvious path, NOT adversarial evasion (it is a guardrail, not a sandbox).
+  a SOLO/non-marker session is never Tier-2-gated. #263 PIECE B: the `gh pr merge` CLI leg is
+  RELAXED to ALLOW in a marker session iff a fresh session-scoped merge-auth token
+  (`merge-auth/<sanitized-$TMUX>`, armed by `orchestrate-authorize-merge.sh` only after the
+  readiness oracle PASSed) has a `head_sha` matching the command's pinned `--match-head-commit`
+  (deny on any doubt; local read, NO network I/O in the floor; merge-by-API stays hard-denied).
+  `_session_key()` is factored so the marker gate and the token check never drift. Fails OPEN on any
+  internal error. Threat model = honest bot on the obvious path, NOT adversarial evasion (it is a
+  guardrail, not a sandbox).
+- `scripts/orchestrate-authorize-merge.sh` - the #263 Piece B lead helper (NOT the floor). On the
+  human's "merge" go it runs the hardened `ship-gate-preflight` (the network readiness check, out
+  of the floor) and ONLY on PASS captures the emitted `headRefOid` and writes a short-TTL, 0600,
+  session-scoped merge-auth token the guard checks; the merge then pins `--match-head-commit <sha>`.
+  Enables in-session merge (no separate terminal) without teaching the floor network I/O. Its only
+  write is the local token; no gh/git remote mutation, no allow-list/floor change.
 - `scripts/orchestrate-steer.sh` - the advisory WARN-level steering hook (#95), SEPARATE from the
   deny-floor guard. Exit 0 ALWAYS (never blocks); emits a `STEER:` nudge to stderr on four rules:
   (1) a marker-gated mid-run edit of a canonical file (SKILL.md/templates/guard/steer) -> log
@@ -178,13 +190,14 @@ clean-worktree check, so an unchanged committed tree skips re-running it
 `skills/orchestrate/templates/gates.toml.md`.
 
 ```sh
-shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
+shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/orchestrate-authorize-merge.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
 ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py
 ./scripts/orchestrate-guard.sh --self-test    # MUST use ./ - the self-test re-invokes "$0";
                                               # `bash scripts/orchestrate-guard.sh` makes $0 a bare name -> 127
 ./scripts/orchestrate-steer.sh --self-test    # advisory WARN-level steering hook (#95)
 ./scripts/orchestrate-context-meter.sh --self-test  # advisory PostToolUse context-budget meter (#228)
 python3 test-orchestrate-guard.py
+python3 test-orchestrate-authorize-merge.py
 python3 test-orchestrate-steer.py
 python3 test-orchestrate-context-meter.py
 python3 test-orchestrate-resources.py
