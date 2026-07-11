@@ -118,8 +118,10 @@ if [ -z "$repo" ]; then
   fi
 fi
 
-# FAIL CLOSED: any gh failure -> BLOCK.
-json="$(gh pr view "$pr" --repo "$repo" --json statusCheckRollup,reviewDecision 2>/dev/null)" || {
+# FAIL CLOSED: any gh failure -> BLOCK. headRefOid is fetched in the SAME snapshot
+# as the checks (#263 Piece A) so the SHA the oracle emits on PASS is exactly the
+# commit whose statusCheckRollup it validated - no second read to drift off.
+json="$(gh pr view "$pr" --repo "$repo" --json statusCheckRollup,reviewDecision,headRefOid 2>/dev/null)" || {
   echo "BLOCK: 'gh pr view' failed for #$pr in $repo" >&2
   exit 2
 }
@@ -166,6 +168,16 @@ if [ "$codoki_only" = true ]; then
 fi
 
 # --- FULL MODE -------------------------------------------------------------
+
+# (#263 Piece A) The validated head SHA, emitted on PASS so the downstream
+# authorize-merge step can pin --match-head-commit to exactly the commit whose
+# gates this run cleared. Parsed here (full mode only; --codoki-only never needs
+# it). ascii_downcase normalizes; empty/null/absent is caught at the PASS gate
+# below (a PASS with no pinnable SHA is useless), not here.
+head_sha="$(jq -r '(.headRefOid // "") | ascii_downcase' <<<"$json")" || {
+  echo "BLOCK: jq parse of headRefOid failed (#$pr)" >&2
+  exit 2
+}
 
 # Count of checks (empty rollup -> 0 -> BLOCK below).
 count="$(jq -r '(.statusCheckRollup // []) | length' <<<"$json")" || {
@@ -321,6 +333,67 @@ case "$review_decision" in
     exit 2 ;;
 esac
 
+# --- REVIEW-THREAD ENUMERATION GATE (#263 Piece A; FULL mode only) ----------
+# BLOCK on ANY unresolved review thread (GraphQL isResolved == false). This is a
+# FIRST-CLASS, explicitly-enumerated condition, distinct from the actionable-
+# findings count above ("0 unreplied findings" != "0 unresolved threads": a thread
+# can be replied-to yet unresolved, and vice versa) and NOT dependent on GitHub's
+# branch-protection / mergeStateStatus being configured (the oracle must not assume
+# repo settings). reviewThreads is not a `gh pr view --json` field, so it is a
+# SEPARATE GraphQL read (the {checks,decision,SHA} snapshot above stays atomic; this
+# is a fail-closed second read). FAIL CLOSED on every ambiguous state: a gh/query
+# error, malformed JSON, or a paginated-TRUNCATED list (totalCount > nodes fetched,
+# so the unfetched threads' state is unknown) all BLOCK.
+owner="${repo%%/*}"; name="${repo##*/}"
+# shellcheck disable=SC2016  # GraphQL $owner/$name/$number are query variables, NOT shell expansions.
+threads_json="$(gh api graphql \
+  -f query='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100){totalCount nodes{isResolved}}}}}' \
+  -F owner="$owner" -F name="$name" -F number="$pr" 2>/dev/null)" || {
+  echo "BLOCK: reviewThreads GraphQL query failed for #$pr in $repo (cannot verify thread state)." >&2
+  echo "RESULT: BLOCK -- review threads unverifiable. [#$pr $repo]" >&2
+  exit 2
+}
+if ! jq -e '.data.repository.pullRequest.reviewThreads' >/dev/null 2>&1 <<<"$threads_json"; then
+  echo "BLOCK: malformed / empty reviewThreads response for #$pr (cannot verify thread state)." >&2
+  echo "RESULT: BLOCK -- review threads unverifiable. [#$pr $repo]" >&2
+  exit 2
+fi
+# Emit "TRUNC" (totalCount > fetched nodes), an unresolved count, or "OK". FAIL
+# CLOSED by counting PROVABLY-resolved nodes (isResolved == literal true) and
+# blocking the remainder, NOT by matching == false: reviewThreads.nodes elements
+# are nullable, so a partial GraphQL error can null a thread while gh still returns
+# `data`. A `== false` match would read a null / missing / non-bool isResolved (and
+# a null node) as "resolved" and PASS an unready PR. Anything not provably true
+# blocks.
+thread_verdict="$(jq -r '
+  .data.repository.pullRequest.reviewThreads as $rt
+  | ($rt.totalCount // 0) as $tc
+  | ($rt.nodes | length) as $n
+  | ([$rt.nodes[] | select(.isResolved == true)] | length) as $r
+  | if $tc > $n then "TRUNC:\($tc)>\($n)"
+    elif $r < $n then "UNRESOLVED:\($n - $r)"
+    else "OK" end
+' <<<"$threads_json")" || {
+  echo "BLOCK: jq parse of reviewThreads failed (#$pr)." >&2
+  echo "RESULT: BLOCK -- review threads unverifiable. [#$pr $repo]" >&2
+  exit 2
+}
+case "$thread_verdict" in
+  OK) : ;;
+  TRUNC:*)
+    echo "BLOCK: reviewThreads list truncated on #$pr (${thread_verdict#TRUNC:} threads; only 100 fetched, remainder unverifiable)." >&2
+    echo "RESULT: BLOCK -- review threads unverifiable (truncated). [#$pr $repo]" >&2
+    exit 2 ;;
+  UNRESOLVED:*)
+    echo "BLOCK: ${thread_verdict#UNRESOLVED:} unresolved review thread(s) on #$pr (GraphQL isResolved==false). Resolve them before merge." >&2
+    echo "RESULT: BLOCK -- unresolved review thread(s). [#$pr $repo]" >&2
+    exit 2 ;;
+  *)
+    echo "BLOCK: unrecognized reviewThreads verdict '$thread_verdict' on #$pr (fail closed)." >&2
+    echo "RESULT: BLOCK -- review threads unverifiable. [#$pr $repo]" >&2
+    exit 2 ;;
+esac
+
 # --- CODOKI-ROOT-ACK GATE (#234; FULL mode only) ---------------------------
 # The merge-ready bar carries a review-response clause the thread-resolution +
 # unreplied-comments checks CANNOT see: the 👍/👎 ack on Codoki's ISSUE-LEVEL
@@ -362,5 +435,17 @@ case "$ack_verdict" in
     exit 2 ;;
 esac
 
-echo "RESULT: PASS -- all checks green, 0 actionable review-body findings, reviewDecision=${review_decision:-<none>} (not an active CHANGES_REQUESTED), Codoki root ack ${ack_verdict}. [#$pr $repo]"
+# --- HEAD-SHA ATTESTATION (#263 Piece A; FULL mode only) -------------------
+# Every other gate passed. Emit the validated head SHA so authorize-merge can pin
+# --match-head-commit to it. FAIL CLOSED if the SHA is unreadable (empty/null/
+# absent) or not a hex object id: a PASS that cannot name the commit it cleared is
+# useless downstream and must not be issued. Parsed from the same snapshot as the
+# checks (head_sha above), so it is definitionally the commit those checks ran on.
+if ! printf '%s' "$head_sha" | grep -Eq '^[0-9a-f]{40,}$'; then
+  echo "BLOCK: headRefOid unreadable on #$pr (got '${head_sha:-<empty>}'); cannot attest the merge commit." >&2
+  echo "RESULT: BLOCK -- head SHA unverifiable. [#$pr $repo]" >&2
+  exit 2
+fi
+
+echo "RESULT: PASS -- all checks green, 0 actionable review-body findings, reviewDecision=${review_decision:-<none>} (not an active CHANGES_REQUESTED), 0 unresolved review threads, Codoki root ack ${ack_verdict}, headRefOid=${head_sha}. [#$pr $repo]"
 exit 0
