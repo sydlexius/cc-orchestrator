@@ -161,8 +161,9 @@ Runtime (`scripts/`; canonical source is this repo):
   the proof harnesses (kept at repo root; dev tooling, not shipped in the skill).
 
 Skill definition (`skills/orchestrate/`): `SKILL.md` (lead playbook) + `templates/` (per-role
-charters + schemas) + `engage-ralph-loop.md` (the adversarial-critic-loop brief; named to
-disambiguate from the `/ralph-loop` skill) + `DESIGN-*`/`PLAN-*`/`ROADMAP-*` (under `skills/orchestrate/design/`).
+charters + schemas) + `DESIGN-*`/`PLAN-*`/`ROADMAP-*` (under `skills/orchestrate/design/`). The
+reusable `engage-ralph-loop.md` adversarial-critic-loop brief lives at the REPO ROOT (named to
+disambiguate from the `/ralph-loop` skill), not inside `skills/orchestrate/`.
 
 ## Gates (run locally; CI enforces them)
 
@@ -260,7 +261,11 @@ drives `/plugin marketplace` update-detection, so they must never diverge. The C
 
 ## Operating model (lead-driven; distilled from prior orchestration sessions)
 
-- AUTONOMY TIERS (maintainer directive 2026-06-14). Outward steps are gated BY TIER, not blanket-gated:
+- AUTONOMY TIERS (maintainer directive 2026-06-14). Outward steps are gated BY TIER, not blanket-gated.
+  This INTENTIONALLY OVERRIDES the user-global CLAUDE.md blanket ("never `git push` / open a PR / merge
+  without explicit permission") for the SOLO/non-CR tier below - there the standing grant IS that
+  permission; the human-gated tiers (CR-required, and the floor/operating-model carve-out) keep the
+  global gate:
   - NON-CR, well-shaped issue (no script-FUNCTION change - prose/doc/charter/SKILL.md/CLAUDE.md edits):
     the lead carries it the ENTIRE cycle AUTONOMOUSLY (implement -> PR -> CI -> merge -> cleanup) with NO
     per-step maintainer approval; the standing grant IS the "go".
@@ -279,13 +284,15 @@ drives `/plugin marketplace` update-detection, so they must never diverge. The C
     has the floor hard-deny `gh pr merge` CLI (is_pr_merge, #105) and deny merge-by-API, so there the lead
     SURFACES the merge to the human (who merges from a SEPARATE plain terminal). "Looks good"/"LGTM" is
     NEVER a merge authorization for the human-gated tiers; commit locally freely regardless of tier.
-- The LEAD owns all privileged/outward steps (push, `gh pr create`, CR replies, merge) and is the
-  SOLE human-facing channel. Teammates implement + test + commit in their OWN worktree and message
-  the lead rather than prompting the human (AskUserQuestion/permission prompts from teammates clobber
-  the human's input box).
-- The merge (the one irreversible step) stays human-executed: in a marker-active session the floor
-  hard-denies the `gh pr merge` CLI (is_pr_merge, #105) and the merge-by-API path, so the human
-  runs it from a SEPARATE plain terminal (no marker there) or the GitHub UI. The allow-list now
+- The LEAD owns all privileged/outward steps and is the SOLE human-facing channel (the shared
+  push/`gh pr create`/CR-replies/merge rule lives in the user-global CLAUDE.md; not restated here).
+  Repo-specific delta: teammates implement + test + commit in their OWN worktree and message the lead
+  rather than prompting the human (AskUserQuestion/permission prompts from teammates clobber the
+  human's input box).
+- The merge (the one irreversible step) is human-executed IN A MARKER-ACTIVE (TEAM) SESSION ONLY -
+  in a SOLO/non-marker session the NON-CR tier merges autonomously per AUTONOMY TIERS above. In a
+  marker-active session the floor hard-denies the `gh pr merge` CLI (is_pr_merge, #105) and the
+  merge-by-API path, so the human runs it from a SEPARATE plain terminal (no marker there) or the GitHub UI. The allow-list now
   carries an EXPLICIT merge-scoped entry (`Bash(gh pr merge *)`) - safe because the floor deny
   outranks it in a marker session, and it enables prompt-free solo merge for the maintainer.
 - Default to PARALLEL subagents for independent work, but only when DISJOINT (different files / git
@@ -342,6 +349,7 @@ this is a session restart, NOT an OS reboot).
 
 ## CI / security settings
 
-GitHub Actions pinned to commit SHAs (with a `# vX.Y.Z` comment), `permissions: contents: read`,
-`persist-credentials: false` on checkout, `concurrency` with cancel-in-progress. Branch protection on
-`main` requiring the CI check (mirrors sydlexius/stillwater) is applied at the finish-line.
+GitHub Actions follow the user-global CI/security rules (SHA-pinned with a `# vX.Y.Z` comment,
+`permissions: contents: read`, `persist-credentials: false` on checkout; not restated here). Repo
+specifics: `concurrency` with cancel-in-progress, and branch protection on `main` requiring the CI
+check (mirrors sydlexius/stillwater), applied at the finish-line.
