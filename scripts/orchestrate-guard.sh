@@ -268,7 +268,7 @@ marker_active() {
 # unless that SHA is the PR's current head - so a token cannot authorize a different PR
 # or a moved HEAD, and the floor need not re-parse the PR number. Reads $cmd.
 merge_authorized() {
-  local key tok msha tsha texp now
+  local key tok msha tsha texp now cpr tpr
   key=$(_session_key) || return 1
   tok="$FLOOR_DIR/merge-auth/$key"
   [ -f "$tok" ] || return 1
@@ -286,6 +286,16 @@ merge_authorized() {
   now=$(date +%s) || return 1
   [ "$now" -lt "$texp" ] || return 1              # expired -> deny
   [ "$(printf '%s' "$msha" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$tsha" | tr '[:upper:]' '[:lower:]')" ] || return 1
+  # Bind the PR too (defense-in-depth beyond the SHA + gh's own head check): two PRs
+  # CAN share a head SHA (e.g. one head branch is the head of a base->main and a
+  # base->develop PR), so require the merge command's target PR to equal token.pr.
+  # Extract the bare integer arg after `merge` (tolerating flags between); deny if it
+  # is absent/unparsable or mismatched (deny-on-doubt).
+  cpr=$(printf '%s' "$cmd" | grep -oE 'merge([[:space:]]+-[^[:space:]]+)*[[:space:]]+[0-9]+' | grep -oE '[0-9]+$' | head -1)
+  [ -n "$cpr" ] || return 1
+  tpr=$(jq -r '.pr // empty' "$tok" 2>/dev/null) || return 1
+  case "$tpr" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$cpr" = "$tpr" ] || return 1
   return 0
 }
 

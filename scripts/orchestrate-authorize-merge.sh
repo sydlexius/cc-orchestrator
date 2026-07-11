@@ -48,8 +48,11 @@ key=$(printf '%s' "$TMUX" | LC_ALL=C tr -c 'A-Za-z0-9' '_')
 
 FLOOR_DIR="${ORCHESTRATE_FLOOR_DIR:-$HOME/.claude/orchestrate-floor.d}"
 TTL_MIN="${ORCHESTRATE_MERGE_AUTH_TTL_MIN:-10}"
+# Empty / non-numeric / negative -> the 10m default (a bad value must not disarm the
+# gate). TTL_MIN=0 IS allowed and meaningful: it arms an already-expired token so the
+# guard always denies - the documented env kill-switch (set TTL 0 to stop honoring
+# tokens without a code change; see the reversal note above and the design doc).
 case "$TTL_MIN" in ''|*[!0-9]*) TTL_MIN=10 ;; esac
-[ "$TTL_MIN" -ge 1 ] 2>/dev/null || TTL_MIN=10
 
 # Locate the hardened readiness oracle (plugin root first, then the stable path).
 preflight="${CLAUDE_PLUGIN_ROOT:-}/scripts/ship-gate-preflight.sh"

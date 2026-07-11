@@ -33,7 +33,7 @@ def _key(tmux):
     return re.sub(rb'[^A-Za-z0-9]', b'_', tmux.encode("utf-8", "surrogateescape")).decode("ascii")
 
 
-def run(args, *, tmux="/tmp/tmux-x,1,0", preflight_mode="pass", ttl_min=None):
+def run(args, *, tmux="/tmp/tmux-x,1,0", preflight_mode="pass", ttl_min=None, via_plugin_root=False):
     """Run the helper with a stubbed ship-gate-preflight on PATH-independent lookup.
 
     preflight_mode: 'pass' (exit 0, prints a RESULT line with headRefOid=SHA),
@@ -44,7 +44,10 @@ def run(args, *, tmux="/tmp/tmux-x,1,0", preflight_mode="pass", ttl_min=None):
     td = tempfile.mkdtemp()
     floor_dir = os.path.join(td, "floor.d")
     home = os.path.join(td, "home")
-    scripts = os.path.join(home, ".claude", "scripts")
+    plugin_root = os.path.join(td, "plugin")
+    # Place the stub under CLAUDE_PLUGIN_ROOT/scripts (the FIRST lookup) when
+    # via_plugin_root, else under $HOME/.claude/scripts (the fallback).
+    scripts = os.path.join(plugin_root if via_plugin_root else home, ".claude" if not via_plugin_root else "", "scripts")
     os.makedirs(scripts)
     pf = os.path.join(scripts, "ship-gate-preflight.sh")
     if preflight_mode == "pass":
@@ -59,7 +62,10 @@ def run(args, *, tmux="/tmp/tmux-x,1,0", preflight_mode="pass", ttl_min=None):
 
     env = dict(os.environ)
     env["HOME"] = home
-    env.pop("CLAUDE_PLUGIN_ROOT", None)  # force the $HOME/.claude/scripts fallback
+    if via_plugin_root:
+        env["CLAUDE_PLUGIN_ROOT"] = plugin_root  # exercise the FIRST lookup path
+    else:
+        env.pop("CLAUDE_PLUGIN_ROOT", None)  # force the $HOME/.claude/scripts fallback
     env["ORCHESTRATE_FLOOR_DIR"] = floor_dir
     if ttl_min is not None:
         env["ORCHESTRATE_MERGE_AUTH_TTL_MIN"] = str(ttl_min)
@@ -90,6 +96,31 @@ def main():
         mode = stat.S_IMODE(os.stat(tok).st_mode)
         check("token mode is 0600", mode == 0o600)
     check("stdout prints the --match-head-commit merge command", "--match-head-commit" in out and SHA in out)
+
+    print("== TTL edge cases ==")
+    # TTL_MIN=0 is the documented kill-switch: arm an already-expired token so the guard
+    # always denies (env-based reversal without a code change).
+    rc, out, err, fd, _ = run(["265"], ttl_min=0)
+    tok = token_path(fd)
+    ok = rc == 0 and os.path.exists(tok)
+    if ok:
+        doc = json.load(open(tok)); now = int(time.time())
+        ok = now - 5 <= doc.get("expiry", 0) <= now + 5
+    check("TTL_MIN=0 -> token armed with expiry==now (immediate-expiry kill-switch)", ok)
+    # Empty / non-numeric / negative -> clamped to the 10m default (a bad value must not disarm).
+    for bad in ("", "abc", "-3"):
+        rc, _, _, fd, _ = run(["265"], ttl_min=bad)
+        tok = token_path(fd); ok = rc == 0 and os.path.exists(tok)
+        if ok:
+            doc = json.load(open(tok)); now = int(time.time())
+            ok = now + 500 <= doc.get("expiry", 0) <= now + 700
+        check(f"TTL_MIN={bad!r} -> clamped to 10m default", ok)
+
+    print("== preflight resolved via CLAUDE_PLUGIN_ROOT (first lookup) ==")
+    rc, out, err, fd, _ = run(["265"], via_plugin_root=True, ttl_min=10)
+    tok = token_path(fd)
+    check("preflight found under CLAUDE_PLUGIN_ROOT/scripts -> token armed, exit 0",
+          rc == 0 and os.path.exists(tok))
 
     print("== BLOCK path: NO token ==")
     rc, out, err, fd, _ = run(["265"], preflight_mode="block")

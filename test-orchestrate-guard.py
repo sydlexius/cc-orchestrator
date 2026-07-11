@@ -536,6 +536,23 @@ def main():
     rc, _o, _e = run_guard(MERGE_OK + " --match-head-commit " + ("c" * 40), marker_active=True,
                            channel="stdin", merge_token=_tok(sha=VSHA))
     expect("piece-b: two --match-head-commit flags (ambiguous) -> BLOCK", rc, "block")
+    # PR binding (Copilot #268): a token for #265 must NOT authorize merging a DIFFERENT
+    # PR even if the pinned SHA matches (two PRs can share a head SHA - same head branch).
+    rc, _o, _e = run_guard("gh pr merge 999 --squash --match-head-commit " + VSHA, marker_active=True,
+                           channel="stdin", merge_token=_tok(pr=265, sha=VSHA))
+    expect("piece-b: token.pr(265) != command pr(999), SHA matches -> BLOCK (pr binding)", rc, "block")
+    # pr right after `merge` (sanctioned) binds correctly -> ALLOW.
+    rc, _o, _e = run_guard("gh pr merge 265 --squash --match-head-commit " + VSHA, marker_active=True,
+                           channel="stdin", merge_token=_tok(pr=265, sha=VSHA))
+    expect("piece-b: token.pr == command pr (sanctioned order) -> ALLOW", rc, "allow")
+    # a flag BEFORE the positional pr still binds (gh accepts `merge --squash 265`).
+    rc, _o, _e = run_guard("gh pr merge --squash 265 --match-head-commit " + VSHA, marker_active=True,
+                           channel="stdin", merge_token=_tok(pr=265, sha=VSHA))
+    expect("piece-b: pr after a flag still binds -> ALLOW", rc, "allow")
+    # pr OMITTED / unparsable -> deny on doubt.
+    rc, _o, _e = run_guard("gh pr merge --squash --match-head-commit " + VSHA, marker_active=True,
+                           channel="stdin", merge_token=_tok(pr=265, sha=VSHA))
+    expect("piece-b: pr omitted from merge command -> BLOCK (deny on doubt)", rc, "block")
 
     print()
     if FAILS:
