@@ -317,6 +317,38 @@ languages) or silent behavior changes (in interpreted ones).
 
 ## Step 4a -- Local hostile review
 
+**Floor / merge-policy diff detection (#274; advisory, rigor-to-stakes).** First
+check whether this branch touches the deterministic-floor deny-authority scripts.
+If it does, the hostile review below must be the FULL `engage-ralph-loop` (K=2
+convergence), not a single pass -- a floor change is the highest-stakes diff this
+pipeline ships. This is ADVISORY: it escalates the depth of the review that always
+runs; it never blocks the push.
+
+```bash
+if git rev-parse --verify -q origin/main >/dev/null 2>&1; then base_ref=origin/main; else base_ref=main; fi
+base=$(git merge-base "$base_ref" HEAD)
+# The deny-authority scripts ARE the canonical floor set (guard + steer +
+# authorize-merge; ship-gate-preflight is the oracle, not deny-authority). Keyed on
+# these precise basenames, NOT on SKILL.md/CLAUDE.md, so an ordinary skill/doc edit
+# never trips it (conditional, not systematic -- non-floor diffs must not nag). Use
+# --name-status -M so BOTH sides of a RENAME are inspected: a floor script renamed
+# away from (or to) its canonical name still trips the nudge (a name-only diff shows
+# only the new path and would miss the old-name half).
+floor_hits=$(git diff -M --name-status "$base"..HEAD | \
+  grep -E '(^|[[:space:]/])(orchestrate-guard|orchestrate-steer|orchestrate-authorize-merge)\.sh([[:space:]]|$)' || true)
+if [ -n "$floor_hits" ]; then
+  echo ">> floor diff detected - engage-ralph-loop recommended (run the FULL K=2 convergence, not a single pass):"
+  echo "$floor_hits" | sed 's/^/   - /'
+fi
+```
+
+If the advisory fired, run Step 4a's review as the FULL `engage-ralph-loop` to K=2
+dry rounds (the security-floor rigor rule); if it did not, a single brief-shaped
+pass is sufficient. Either way the review below always runs -- the nudge only sets
+its depth. (When editing a SKILL.md/CLAUDE.md floor-invariant section rather than a
+script, apply the same K=2 judgment manually; that surface is deliberately not
+auto-detected here to avoid nagging every doc edit.)
+
 Run an adversarial pre-push review of the diff. Dispatch a hostile-reviewer
 subagent following the `engage-ralph-loop.md` brief (the adversarial-critic
 loop bundled with this plugin), pointed at the branch diff. The reviewer

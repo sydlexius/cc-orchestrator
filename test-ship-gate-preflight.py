@@ -109,11 +109,36 @@ def unknowntype(name, status="COMPLETED", conclusion="SUCCESS", typename="Unknow
     return d
 
 
+def diag_fixture(*, state="OPEN", mss="BLOCKED", mergeable="MERGEABLE",
+                 review_decision="__OMIT__", base="main", is_draft=False,
+                 contexts=None):
+    """PR-view JSON for --diagnose (#275). `contexts` = rollup entries
+    (checkrun()/statusctx() dicts)."""
+    doc = {"state": state, "mergeStateStatus": mss, "mergeable": mergeable,
+           "baseRefName": base, "headRefName": "feature", "isDraft": is_draft,
+           "statusCheckRollup": list(contexts or [])}
+    if review_decision != "__OMIT__":
+        doc["reviewDecision"] = review_decision
+    return json.dumps(doc)
+
+
+def prot_fixture(*, required_contexts=None, strict=False, conv_res=False,
+                 linear=False, signatures=False):
+    """branches/<base>/protection JSON for --diagnose (#275)."""
+    return json.dumps({
+        "required_status_checks": {"strict": strict,
+                                   "contexts": list(required_contexts or [])},
+        "required_conversation_resolution": {"enabled": conv_res},
+        "required_linear_history": {"enabled": linear},
+        "required_signatures": {"enabled": signatures},
+    })
+
+
 def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         unreplied_fail=False, unreplied_missing=False, unreplied_raw=None,
         unreplied_fail_until=0, codoki_ack_verdict="no-summary",
         codoki_ack_fail=False, codoki_ack_missing=False,
-        threads_json="__DEFAULT__", threads_fail=False):
+        threads_json="__DEFAULT__", threads_fail=False, protection=None):
     """Invoke the oracle with stubbed gh + pr-unreplied-comments.sh + gh-react.sh.
     Returns (exit_code, stdout, stderr, argv) where argv is the recorded helper
     argv content (one line per invocation, read back from the log) -- used to
@@ -147,6 +172,12 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
                 "    if [ -n \"${THREADS_FAIL:-}\" ]; then echo 'gh api graphql: simulated failure' >&2; exit 1; fi\n"
                 "    printf '%s' \"${FIXTURE_THREADS:-}\"; exit 0;;\n"
                 "  repo) echo 'owner/repo'; exit 0;;\n"
+                "  *protection)\n"
+                "    # `gh api repos/.../branches/<base>/protection` (#275 --diagnose). Empty\n"
+                "    # FIXTURE_PROTECTION simulates a 403 (no admin scope) so the degradation\n"
+                "    # path is exercised; the main oracle never calls this route.\n"
+                "    if [ -n \"${FIXTURE_PROTECTION:-}\" ]; then printf '%s' \"$FIXTURE_PROTECTION\"; exit 0; fi\n"
+                "    echo 'gh: HTTP 403 (branch protection needs admin)' >&2; exit 1;;\n"
                 "esac; done\n"
                 "# `gh pr view <pr> --repo <repo> --json statusCheckRollup,...,headRefOid`\n"
                 "printf '%s' \"${FIXTURE_JSON:-}\"\n"
@@ -212,6 +243,9 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         env["HOME"] = home
         env["FIXTURE_JSON"] = fixture_json
         env["FIXTURE_THREADS"] = DEFAULT_THREADS if threads_json == "__DEFAULT__" else threads_json
+        env.pop("FIXTURE_PROTECTION", None)
+        if protection is not None:
+            env["FIXTURE_PROTECTION"] = protection
         env.pop("THREADS_FAIL", None)
         if threads_fail:
             env["THREADS_FAIL"] = "1"
@@ -582,6 +616,126 @@ def main():
                         fixture_json=rollup(checkrun("Codoki PR Review", "COMPLETED", "SUCCESS"),
                                             head_ref_oid="__OMIT__"))
     check("--codoki-only PASSes without headRefOid (settlement mode) -> exit 0", rc == 0)
+
+    print("== DIAGNOSE (#275) ==")
+    # AC (c): REVIEW_REQUIRED -> names the review requirement.
+    rc, out, err, _ = run(["7", "owner/repo", "--diagnose"],
+                          fixture_json=diag_fixture(mss="BLOCKED", review_decision="REVIEW_REQUIRED",
+                                                    contexts=[checkrun("ci", "COMPLETED", "SUCCESS")]),
+                          protection=prot_fixture(required_contexts=["ci"]),
+                          threads_json=threads_doc(resolved=1))
+    o = out + err
+    check("#275(c): REVIEW_REQUIRED -> REASON names review requirement, exit 2",
+          rc == 2 and "REVIEW_REQUIRED" in o and "REASON:" in o)
+
+    # AC (a): unresolved conversation (require_conversation_resolution) -> names it + count.
+    rc, out, err, _ = run(["7", "owner/repo", "--diagnose"],
+                          fixture_json=diag_fixture(mss="BLOCKED",
+                                                    contexts=[checkrun("ci", "COMPLETED", "SUCCESS")]),
+                          protection=prot_fixture(required_contexts=["ci"], conv_res=True),
+                          threads_json=threads_doc(unresolved=2, resolved=1))
+    o = out + err
+    check("#275(a): unresolved conversation -> REASON with count 2, exit 2",
+          rc == 2 and "unresolved review conversation(s): 2" in o)
+
+    # AC (b): a required check that never reported -> MISSING.
+    rc, out, err, _ = run(["7", "owner/repo", "--diagnose"],
+                          fixture_json=diag_fixture(mss="BLOCKED",
+                                                    contexts=[checkrun("ci", "COMPLETED", "SUCCESS")]),
+                          protection=prot_fixture(required_contexts=["ci", "required-e2e"]),
+                          threads_json=threads_doc(resolved=1))
+    o = out + err
+    check("#275(b): missing required check -> REASON names it MISSING, exit 2",
+          rc == 2 and "required-e2e" in o and "MISSING" in o)
+
+    # A required check present but FAILING -> not-success reason.
+    rc, out, err, _ = run(["7", "owner/repo", "--diagnose"],
+                          fixture_json=diag_fixture(mss="BLOCKED",
+                                                    contexts=[checkrun("ci", "COMPLETED", "FAILURE")]),
+                          protection=prot_fixture(required_contexts=["ci"]),
+                          threads_json=threads_doc(resolved=1))
+    o = out + err
+    check("#275: failing required check -> REASON 'ci' not-success, exit 2",
+          rc == 2 and "'ci'" in o and "FAILURE" in o)
+
+    # Behind base (strict).
+    rc, out, err, _ = run(["7", "owner/repo", "--diagnose"],
+                          fixture_json=diag_fixture(mss="BEHIND",
+                                                    contexts=[checkrun("ci", "COMPLETED", "SUCCESS")]),
+                          protection=prot_fixture(required_contexts=["ci"], strict=True),
+                          threads_json=threads_doc(resolved=1))
+    check("#275: behind base -> REASON behind, exit 2", rc == 2 and "BEHIND base" in (out + err))
+
+    # Codoki root ack unmet.
+    rc, out, err, _ = run(["7", "owner/repo", "--diagnose"],
+                          fixture_json=diag_fixture(mss="BLOCKED",
+                                                    contexts=[checkrun("ci", "COMPLETED", "SUCCESS")]),
+                          protection=prot_fixture(required_contexts=["ci"]),
+                          threads_json=threads_doc(resolved=1),
+                          codoki_ack_verdict="unacked")
+    check("#275: Codoki ack unmet -> REASON ack UNMET, exit 2",
+          rc == 2 and "Codoki root-summary ack is UNMET" in (out + err))
+
+    # Codoki ack UNVERIFIABLE (reader failed) -> honest NOTE, not a silent skip.
+    rc, out, err, _ = run(["7", "owner/repo", "--diagnose"],
+                          fixture_json=diag_fixture(state="OPEN", mss="CLEAN", review_decision="APPROVED",
+                                                    contexts=[checkrun("ci", "COMPLETED", "SUCCESS")]),
+                          protection=prot_fixture(required_contexts=["ci"]),
+                          threads_json=threads_doc(resolved=1), codoki_ack_fail=True)
+    check("#275: Codoki ack unverifiable -> NOTE (not silent), exit 0",
+          rc == 0 and "could not be verified" in (out + err))
+
+    # Draft.
+    rc, out, err, _ = run(["7", "owner/repo", "--diagnose"],
+                          fixture_json=diag_fixture(mss="DRAFT", is_draft=True,
+                                                    contexts=[checkrun("ci", "COMPLETED", "SUCCESS")]),
+                          protection=prot_fixture(required_contexts=["ci"]),
+                          threads_json=threads_doc(resolved=1))
+    check("#275: draft PR -> REASON DRAFT, exit 2", rc == 2 and "DRAFT" in (out + err))
+
+    # Clean/mergeable -> exit 0 (no fabricated reason).
+    rc, out, err, _ = run(["7", "owner/repo", "--diagnose"],
+                          fixture_json=diag_fixture(state="OPEN", mss="CLEAN", review_decision="APPROVED",
+                                                    contexts=[checkrun("ci", "COMPLETED", "SUCCESS")]),
+                          protection=prot_fixture(required_contexts=["ci"]),
+                          threads_json=threads_doc(resolved=1))
+    check("#275: clean/mergeable -> exit 0, MERGEABLE", rc == 0 and "MERGEABLE" in (out + err))
+
+    # Merged short-circuit.
+    rc, out, err, _ = run(["7", "owner/repo", "--diagnose"], fixture_json=diag_fixture(state="MERGED"))
+    check("#275: merged PR -> exit 0 short-circuit", rc == 0 and "MERGED" in (out + err))
+
+    # UNKNOWN merge state with no other reason -> INDETERMINATE (not a fabricated block).
+    rc, out, err, _ = run(["7", "owner/repo", "--diagnose"],
+                          fixture_json=diag_fixture(mss="UNKNOWN", review_decision="APPROVED",
+                                                    contexts=[checkrun("ci", "COMPLETED", "SUCCESS")]),
+                          protection=prot_fixture(required_contexts=["ci"]),
+                          threads_json=threads_doc(resolved=1))
+    check("#275: UNKNOWN merge state -> INDETERMINATE, exit 2 (no fabricated reason)",
+          rc == 2 and "INDETERMINATE" in (out + err) and "REASON:" not in (out + err))
+
+    # Protection unreadable (403) but an unresolved thread exists -> still diagnosed.
+    rc, out, err, _ = run(["7", "owner/repo", "--diagnose"],
+                          fixture_json=diag_fixture(mss="BLOCKED",
+                                                    contexts=[checkrun("ci", "COMPLETED", "SUCCESS")]),
+                          protection=None,
+                          threads_json=threads_doc(unresolved=1))
+    o = out + err
+    check("#275: protection 403 -> NOTE + still flags unresolved thread, exit 2",
+          rc == 2 and "not readable" in o and "unresolved review conversation(s): 1" in o)
+
+    # >100 review threads -> truncation NOTE (the unresolved count is a lower bound).
+    rc, out, err, _ = run(["7", "owner/repo", "--diagnose"],
+                          fixture_json=diag_fixture(mss="BLOCKED",
+                                                    contexts=[checkrun("ci", "COMPLETED", "SUCCESS")]),
+                          protection=prot_fixture(required_contexts=["ci"], conv_res=True),
+                          threads_json=threads_doc(unresolved=1, total=150))
+    check("#275: >100 threads -> truncation NOTE (lower bound), exit 2",
+          rc == 2 and "lower bound" in (out + err))
+
+    # Core PR fetch failure -> fail-closed.
+    rc, _, _, _ = run(["7", "owner/repo", "--diagnose"], fixture_json=diag_fixture(), gh_fail=True)
+    check("#275: gh pr view failure -> exit 2 (fail closed)", rc == 2)
 
     print("== USAGE ==")
     rc, _, _, _ = run([], fixture_json=ALL_GREEN)

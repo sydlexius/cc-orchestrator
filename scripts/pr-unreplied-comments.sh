@@ -852,9 +852,23 @@ else
   ic_body_expr='(.body | split("\n")[0][:120])'
 fi
 
+# Exclude issue-level INFORMATIONAL bot summaries that are not actionable findings, so
+# the count (which --count-only echoes) agrees with --audit's authoritative accounting
+# instead of over-counting (#272; observed on docs-only PR #271: --count-only=2 vs
+# --audit=0). Two Codoki HTML-comment markers:
+#   - CODOKI_INFO           -> ALWAYS informational; never a finding.
+#   - CODOKI_REVIEW_COMMENT -> Codoki's issue-level review SUMMARY. Its "action" is the
+#     ROOT-SUMMARY ack (a 👍/👎 reaction; #234), NOT a reply. Once ACKED (any +1/-1 on
+#     the comment) it is handled, so drop it. An UNACKED summary INTENTIONALLY still
+#     counts: the ack is a real pending action, and ship-gate-preflight.sh BLOCKs on it -
+#     so keeping it counted keeps --count-only consistent with that gate.
+# (CodeRabbit's own auto-generated summary is already dropped by the "auto-generated" test.)
 actionable_issue=$(echo "$issue_comments" | jq --arg me "$me" '[.[] | select(
   '"$BOT_LOGIN_FILTER"' and
   (.body | test("auto-generated"; "i") | not) and
+  (.body | test("<!--\\s*CODOKI_INFO") | not) and
+  (((.body | test("<!--\\s*CODOKI_REVIEW_COMMENT")) and
+    (((.reactions."+1" // 0) + (.reactions."-1" // 0)) > 0)) | not) and
   (.body | test("^\\s*$") | not)
 ) | {id, type: "issue-comment", reply_type: "top-level", user: .user.login, created_at,
      body: '"$ic_body_expr"'}]')

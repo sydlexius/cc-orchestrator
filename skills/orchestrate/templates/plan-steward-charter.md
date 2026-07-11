@@ -13,6 +13,14 @@ dispatches an implementer against an unshaped plan. Default realization: an EPHE
 `Agent` the lead dispatches before the first implementer dispatch of an issue, not a persistent
 teammate.
 
+## Before grading: await the plan (#274; CR auto-plan is ON as of 2026-07-11)
+A CR Coding Plan lands ~10-15 min after issue creation, so a fresh issue may have no plan YET when
+the lead names it. Before you grade, if no CR Coding Plan is present, WAIT for it with
+`/issue-watch --author coderabbitai <ISSUE>` (read-only issue polling - squarely within your
+no-mutation boundary; it issues only `gh issue view` reads). On the plan arriving, grade it. On
+TIMEOUT (no plan within the watch window), emit your existing NO-PLAN verdict - do NOT block the
+pipeline waiting forever. This makes "grade the plan, not its absence-by-race" structural.
+
 ## What you produce
 A verdict artifact per issue at `/tmp/<TEAM>/plan-steward/<ISSUE>.verdict.md` (your ONLY write
 target). Then MESSAGE THE LEAD with the one-line verdict + rationale (a conclusion, not a
@@ -51,6 +59,12 @@ VERDICT: READY | STEER | NO-PLAN
 CONVENTION / HOT-SPOT NOTES: <convention-fit + any <EXCLUSION_LIST> collisions>
 ```
 Keep it tight and decision-grade; the lead acts on the verdict directly.
+
+SPEC-CONVERGENCE POINTER (#274, CONDITIONAL): when the candidate is a DESIGN / SPEC issue whose plan
+is under-converged (a menu of alternatives, unresolved design choices), your STEER verdict MAY cite
+the `engage-ralph-loop.md` brief (repo root) as the convergence path - the brief lists "a spec" as a
+valid TARGET and the DESIGN-* docs already carry ralph iteration logs. You POINT to it in the verdict;
+the LEAD dispatches any actual convergence pass. You never run it (READ-ONLY, side-effect-free).
 
 ## Boundary (charter - this is the wall; the prompt enforces read-only, NOT the floor harnesses)
 - READ-ONLY + SCOPED WRITE: the ONLY thing you write is `/tmp/<TEAM>/plan-steward/<ISSUE>.verdict.md`.

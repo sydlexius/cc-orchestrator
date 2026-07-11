@@ -657,6 +657,34 @@ def main():
     rc, out, err = run_argv(["123", "owner/repo", "extra"])
     check("#259: extra positional after <pr> [repo] -> usage error exit 1", rc == 1)
 
+    # --- #272: --count-only must not over-count informational bot summaries -------
+    # A docs-only PR whose only issue-level bot comments are (a) an ACKED Codoki
+    # review summary and (b) a CODOKI_INFO post must yield --count-only = 0 (matching
+    # --audit), not 2.
+    ACKED_SUMMARY = ('{"id":901,"user":{"login":"codoki-pr-intelligence[bot]"},'
+                     '"body":"<!-- CODOKI_REVIEW_COMMENT -->\\n### Codoki PR Review\\nSummary",'
+                     '"created_at":"2026-06-18T01:00:00Z","updated_at":"2026-06-18T01:00:00Z",'
+                     '"reactions":{"total_count":1,"+1":1,"-1":0}}')
+    CODOKI_INFO = ('{"id":902,"user":{"login":"codoki-pr-intelligence[bot]"},'
+                   '"body":"<!-- CODOKI_INFO -->\\nHeads-up, informational only",'
+                   '"created_at":"2026-06-18T01:00:00Z","updated_at":"2026-06-18T01:00:00Z",'
+                   '"reactions":{"total_count":0,"+1":0,"-1":0}}')
+    UNACKED_SUMMARY = ('{"id":903,"user":{"login":"codoki-pr-intelligence[bot]"},'
+                       '"body":"<!-- CODOKI_REVIEW_COMMENT -->\\n### Codoki PR Review\\nSummary",'
+                       '"created_at":"2026-06-18T01:00:00Z","updated_at":"2026-06-18T01:00:00Z",'
+                       '"reactions":{"total_count":0,"+1":0,"-1":0}}')
+    rc, out, err = run(["--count-only"], issue="[" + ACKED_SUMMARY + "," + CODOKI_INFO + "]")
+    check("#272: acked Codoki summary + CODOKI_INFO -> --count-only = 0",
+          rc == 0 and out.strip() == "0")
+    # CODOKI_INFO alone is never a finding.
+    rc, out, err = run(["--count-only"], issue="[" + CODOKI_INFO + "]")
+    check("#272: CODOKI_INFO alone -> --count-only = 0", rc == 0 and out.strip() == "0")
+    # An UNACKED Codoki summary INTENTIONALLY still counts (the ack is a real pending
+    # action; ship-gate-preflight.sh BLOCKs on it) - do not over-correct to 0.
+    rc, out, err = run(["--count-only"], issue="[" + UNACKED_SUMMARY + "]")
+    check("#272: UNACKED Codoki summary -> --count-only = 1 (still actionable)",
+          rc == 0 and out.strip() == "1")
+
     print()
     if FAILS:
         print(f"FAILED ({len(FAILS)}):"); [print("  - " + f) for f in FAILS]; sys.exit(1)
