@@ -40,17 +40,54 @@ def check(label, ok):
         FAILS.append(label)
 
 
-def rollup(*contexts, review_decision="__OMIT__"):
+# A valid-looking 40-hex head SHA the oracle emits on PASS (#263 Piece A). The
+# real oracle parses `headRefOid` from the SAME `gh pr view` snapshot as the
+# checks, so every PASS fixture carries one by default.
+DEFAULT_SHA = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+
+
+def rollup(*contexts, review_decision="__OMIT__", head_ref_oid=DEFAULT_SHA):
     """Build a statusCheckRollup JSON document from context dicts.
 
     review_decision: when supplied, add a top-level `reviewDecision` field (the
     #117 gate). Use None to emit an explicit JSON null; leave at the "__OMIT__"
     sentinel to omit the field entirely (mirrors a gh response that carries only
-    statusCheckRollup). Both null and absent must read as 'no active decision'."""
+    statusCheckRollup). Both null and absent must read as 'no active decision'.
+
+    head_ref_oid (#263 Piece A): the `headRefOid` field the oracle emits on PASS.
+    Defaults to DEFAULT_SHA so existing PASS fixtures keep passing. Pass None to
+    emit an explicit JSON null, or "" to emit an empty string -- both must read as
+    an unreadable SHA and BLOCK a PASS (a PASS with no pinnable SHA is useless to
+    the downstream authorize-merge step)."""
     doc = {"statusCheckRollup": list(contexts)}
     if review_decision != "__OMIT__":
         doc["reviewDecision"] = review_decision
+    if head_ref_oid != "__OMIT__":
+        doc["headRefOid"] = head_ref_oid
     return json.dumps(doc)
+
+
+def threads_doc(unresolved=0, resolved=0, total=None, raw_nodes=None):
+    """Build the reviewThreads GraphQL response the oracle enumerates (#263 Piece
+    A). `unresolved`/`resolved` set the node counts; `total` overrides totalCount
+    (default = node count). Setting total > node count simulates a paginated-
+    TRUNCATED list the oracle must treat as fail-closed.
+
+    raw_nodes (fail-closed cases): when supplied, use this exact list as `nodes`
+    verbatim -- so a caller can inject a node whose isResolved is null / missing /
+    a string, or a null node element. Every such node is NOT provably resolved and
+    MUST be counted as unresolved (block), never silently read as resolved."""
+    if raw_nodes is not None:
+        nodes = raw_nodes
+    else:
+        nodes = ([{"isResolved": False}] * unresolved) + ([{"isResolved": True}] * resolved)
+    tc = len(nodes) if total is None else total
+    return json.dumps({"data": {"repository": {"pullRequest": {
+        "reviewThreads": {"totalCount": tc, "nodes": nodes}}}}})
+
+
+# Default threads fixture for the existing PASS cases: zero threads, none unresolved.
+DEFAULT_THREADS = threads_doc(unresolved=0, resolved=0)
 
 
 def checkrun(name, status, conclusion):
@@ -75,7 +112,8 @@ def unknowntype(name, status="COMPLETED", conclusion="SUCCESS", typename="Unknow
 def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         unreplied_fail=False, unreplied_missing=False, unreplied_raw=None,
         unreplied_fail_until=0, codoki_ack_verdict="no-summary",
-        codoki_ack_fail=False, codoki_ack_missing=False):
+        codoki_ack_fail=False, codoki_ack_missing=False,
+        threads_json="__DEFAULT__", threads_fail=False):
     """Invoke the oracle with stubbed gh + pr-unreplied-comments.sh + gh-react.sh.
     Returns (exit_code, stdout, stderr, argv) where argv is the recorded helper
     argv content (one line per invocation, read back from the log) -- used to
@@ -102,9 +140,15 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
                 "#!/usr/bin/env bash\n"
                 "set -eu\n"
                 "if [ -n \"${GH_FAIL:-}\" ]; then echo 'gh: simulated failure' >&2; exit 1; fi\n"
-                "# `gh repo view --json nameWithOwner --jq .nameWithOwner`\n"
-                "for a in \"$@\"; do case \"$a\" in repo) echo 'owner/repo'; exit 0;; esac; done\n"
-                "# `gh pr view <pr> --repo <repo> --json statusCheckRollup`\n"
+                "# Route by subcommand token: `gh api graphql` (#263 thread gate),\n"
+                "# `gh repo view`, else `gh pr view`.\n"
+                "for a in \"$@\"; do case \"$a\" in\n"
+                "  graphql)\n"
+                "    if [ -n \"${THREADS_FAIL:-}\" ]; then echo 'gh api graphql: simulated failure' >&2; exit 1; fi\n"
+                "    printf '%s' \"${FIXTURE_THREADS:-}\"; exit 0;;\n"
+                "  repo) echo 'owner/repo'; exit 0;;\n"
+                "esac; done\n"
+                "# `gh pr view <pr> --repo <repo> --json statusCheckRollup,...,headRefOid`\n"
                 "printf '%s' \"${FIXTURE_JSON:-}\"\n"
             )
         os.chmod(gh, 0o755)
@@ -167,6 +211,10 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
         env["HOME"] = home
         env["FIXTURE_JSON"] = fixture_json
+        env["FIXTURE_THREADS"] = DEFAULT_THREADS if threads_json == "__DEFAULT__" else threads_json
+        env.pop("THREADS_FAIL", None)
+        if threads_fail:
+            env["THREADS_FAIL"] = "1"
         if gh_fail:
             env["GH_FAIL"] = "1"
         env["UNREPLIED_FINDINGS"] = str(unreplied_findings)
@@ -419,6 +467,121 @@ def main():
                       fixture_json=rollup(checkrun("Codoki PR Review", "COMPLETED", "SUCCESS")),
                       codoki_ack_missing=True)
     check("--codoki-only skips the ack gate (gh-react missing still PASS)", rc == 0)
+
+    print("== #263 Piece A: review-thread enumeration gate (isResolved) ==")
+    # Baseline: all green, 0 unresolved threads -> PASS.
+    rc, out, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN,
+                        unreplied_findings=0, threads_json=threads_doc(unresolved=0, resolved=2))
+    check("all green + 0 unresolved threads (2 resolved) -> exit 0", rc == 0)
+    # ONE unresolved thread -> BLOCK, even with everything else green.
+    rc, _, err, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN,
+                        unreplied_findings=0, threads_json=threads_doc(unresolved=1, resolved=2))
+    check("1 unresolved review thread -> exit 2 (block)", rc == 2)
+    check("BLOCK message names the unresolved thread(s)",
+          "unresolved" in err.lower() and "thread" in err.lower())
+    # Many unresolved -> BLOCK.
+    rc, _, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN,
+                      unreplied_findings=0, threads_json=threads_doc(unresolved=5))
+    check("5 unresolved threads -> exit 2 (block)", rc == 2)
+    # FAIL CLOSED: the threads GraphQL query errors -> BLOCK.
+    rc, _, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN,
+                      unreplied_findings=0, threads_fail=True)
+    check("threads GraphQL query fails -> exit 2 (fail closed)", rc == 2)
+    # FAIL CLOSED: malformed threads JSON -> BLOCK.
+    rc, _, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN,
+                      unreplied_findings=0, threads_json="not json{")
+    check("malformed threads JSON -> exit 2 (fail closed)", rc == 2)
+    # FAIL CLOSED: paginated-TRUNCATED list (totalCount > nodes fetched) -> BLOCK,
+    # even when every fetched node is resolved (the unfetched ones are unknown).
+    rc, _, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN, unreplied_findings=0,
+                      threads_json=threads_doc(unresolved=0, resolved=3, total=150))
+    check("truncated thread list (totalCount 150 > 3 nodes) -> exit 2 (fail closed)", rc == 2)
+    # FAIL CLOSED on a node that is NOT PROVABLY resolved. isResolved is Boolean! on
+    # the happy path, but reviewThreads.nodes ELEMENTS are nullable, so a partial
+    # GraphQL error can null a thread while gh still returns `data`. Anything other
+    # than a literal isResolved==true MUST block, never read as resolved (hostile
+    # review FINDING 1: the inverse `== false` match failed OPEN here).
+    rc, _, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN, unreplied_findings=0,
+                      threads_json=threads_doc(raw_nodes=[{"isResolved": None}]))
+    check("thread isResolved=null -> exit 2 (not provably resolved, fail closed)", rc == 2)
+    rc, _, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN, unreplied_findings=0,
+                      threads_json=threads_doc(raw_nodes=[{}]))
+    check("thread with isResolved MISSING -> exit 2 (fail closed)", rc == 2)
+    rc, _, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN, unreplied_findings=0,
+                      threads_json=threads_doc(raw_nodes=[None]))
+    check("NULL node element -> exit 2 (fail closed)", rc == 2)
+    rc, _, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN, unreplied_findings=0,
+                      threads_json=threads_doc(raw_nodes=[{"isResolved": "false"}]))
+    check("thread isResolved as STRING 'false' -> exit 2 (fail closed)", rc == 2)
+    # Positive control: provably-resolved (literal true) nodes still PASS.
+    rc, _, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN, unreplied_findings=0,
+                      threads_json=threads_doc(raw_nodes=[{"isResolved": True}, {"isResolved": True}]))
+    check("all nodes isResolved=true -> exit 0 (provably resolved)", rc == 0)
+    # #265 review (CR Critical / Copilot): totalCount must be a PRESENT non-negative
+    # integer. A null/missing totalCount must NOT default to 0 and defeat the
+    # truncation guard (a partial GraphQL error can null it while nodes look valid).
+    rc, _, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN, unreplied_findings=0,
+                      threads_json='{"data":{"repository":{"pullRequest":{"reviewThreads":'
+                                   '{"totalCount":null,"nodes":[{"isResolved":true}]}}}}}')
+    check("null totalCount + resolved node -> exit 2 (truncation guard not defeated)", rc == 2)
+    rc, _, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN, unreplied_findings=0,
+                      threads_json='{"data":{"repository":{"pullRequest":{"reviewThreads":'
+                                   '{"nodes":[{"isResolved":true}]}}}}}')
+    check("missing totalCount -> exit 2 (fail closed)", rc == 2)
+    # totalCount < node count is impossible in a well-formed response -> MALFORMED.
+    rc, _, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN, unreplied_findings=0,
+                      threads_json=threads_doc(resolved=3, total=1))
+    check("totalCount(1) < nodes(3) impossible -> exit 2 (fail closed)", rc == 2)
+    # A GraphQL partial-error payload (non-empty top-level .errors) alongside data
+    # -> BLOCK, even if the data sub-object looks complete.
+    rc, _, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN, unreplied_findings=0,
+                      threads_json='{"errors":[{"message":"rate limited"}],"data":{"repository":'
+                                   '{"pullRequest":{"reviewThreads":{"totalCount":1,'
+                                   '"nodes":[{"isResolved":true}]}}}}}')
+    check("GraphQL .errors present (partial error) -> exit 2 (fail closed)", rc == 2)
+    # --codoki-only must NOT run the thread gate (settlement is a pure check signal):
+    # unresolved threads are irrelevant there.
+    rc, _, _, _ = run(["1", "owner/repo", "--codoki-only"],
+                      fixture_json=rollup(checkrun("Codoki PR Review", "COMPLETED", "SUCCESS")),
+                      threads_json=threads_doc(unresolved=9))
+    check("--codoki-only ignores the thread gate (9 unresolved) -> exit 0", rc == 0)
+
+    print("== #263 Piece A: emit validated headRefOid on PASS ==")
+    # PASS prints a parseable headRefOid=<sha> line, and it is the validated SHA.
+    rc, out, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN, unreplied_findings=0)
+    check("PASS emits a parseable headRefOid=<sha> on stdout", rc == 0 and f"headRefOid={DEFAULT_SHA}" in out)
+    # A BLOCK (unresolved thread) must NOT emit a headRefOid (no attestation on a non-PASS).
+    rc, out, err, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN,
+                          unreplied_findings=0, threads_json=threads_doc(unresolved=1))
+    check("BLOCK does NOT emit headRefOid=", rc == 2 and "headRefOid=" not in (out + err))
+    # FAIL CLOSED: an otherwise-green PASS with an UNREADABLE head SHA must BLOCK
+    # (a PASS with no pinnable SHA is useless downstream).
+    rc, _, _, _ = run(["1", "owner/repo"],
+                      fixture_json=rollup(checkrun("ci", "COMPLETED", "SUCCESS"), head_ref_oid=""),
+                      unreplied_findings=0)
+    check("empty headRefOid + all green -> exit 2 (cannot attest SHA, fail closed)", rc == 2)
+    rc, _, _, _ = run(["1", "owner/repo"],
+                      fixture_json=rollup(checkrun("ci", "COMPLETED", "SUCCESS"), head_ref_oid=None),
+                      unreplied_findings=0)
+    check("null headRefOid + all green -> exit 2 (fail closed)", rc == 2)
+    rc, _, _, _ = run(["1", "owner/repo"],
+                      fixture_json=rollup(checkrun("ci", "COMPLETED", "SUCCESS"), head_ref_oid="__OMIT__"),
+                      unreplied_findings=0)
+    check("absent headRefOid + all green -> exit 2 (fail closed)", rc == 2)
+    # #265 review (CR Major): validate the ENTIRE SHA, not one line. grep is line-
+    # oriented, so "<40hex>\nforged" would pass a line-anchored match and inject
+    # extra output into the attestation. A multi-line head SHA must BLOCK.
+    rc, out, _, _ = run(["1", "owner/repo"],
+                        fixture_json=rollup(checkrun("ci", "COMPLETED", "SUCCESS"),
+                                            head_ref_oid=DEFAULT_SHA + "\nforged"),
+                        unreplied_findings=0)
+    check("multi-line head_sha (40hex + newline + junk) -> exit 2 (whole-value validation)",
+          rc == 2 and "forged" not in out)
+    # --codoki-only does NOT require/emit headRefOid (settlement mode).
+    rc, out, _, _ = run(["1", "owner/repo", "--codoki-only"],
+                        fixture_json=rollup(checkrun("Codoki PR Review", "COMPLETED", "SUCCESS"),
+                                            head_ref_oid="__OMIT__"))
+    check("--codoki-only PASSes without headRefOid (settlement mode) -> exit 0", rc == 0)
 
     print("== USAGE ==")
     rc, _, _, _ = run([], fixture_json=ALL_GREEN)
