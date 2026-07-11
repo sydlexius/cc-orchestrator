@@ -138,7 +138,8 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         unreplied_fail=False, unreplied_missing=False, unreplied_raw=None,
         unreplied_fail_until=0, codoki_ack_verdict="no-summary",
         codoki_ack_fail=False, codoki_ack_missing=False,
-        threads_json="__DEFAULT__", threads_fail=False, protection=None, comments=None):
+        threads_json="__DEFAULT__", threads_fail=False, protection=None, comments=None,
+        comments_fail=False):
     """Invoke the oracle with stubbed gh + pr-unreplied-comments.sh + gh-react.sh.
     Returns (exit_code, stdout, stderr, argv) where argv is the recorded helper
     argv content (one line per invocation, read back from the log) -- used to
@@ -174,6 +175,9 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
                 "  repo) echo 'owner/repo'; exit 0;;\n"
                 "  *comments)\n"
                 "    # `gh api repos/.../issues/<pr>/comments` (#237 @codoki-trigger detector).\n"
+                "    # COMMENTS_FAIL fails ONLY this route (gh pr view still succeeds) to test the\n"
+                "    # trigger detector's fail-toward-not-triggered posture in isolation (#277 CR).\n"
+                "    if [ -n \"${COMMENTS_FAIL:-}\" ]; then echo 'gh: simulated comments-API failure' >&2; exit 1; fi\n"
                 "    printf '%s' \"${FIXTURE_COMMENTS:-[]}\"; exit 0;;\n"
                 "  *protection)\n"
                 "    # `gh api repos/.../branches/<base>/protection` (#275 --diagnose). Empty\n"
@@ -252,6 +256,9 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         env.pop("FIXTURE_COMMENTS", None)
         if comments is not None:
             env["FIXTURE_COMMENTS"] = comments
+        env.pop("COMMENTS_FAIL", None)
+        if comments_fail:
+            env["COMMENTS_FAIL"] = "1"
         env.pop("THREADS_FAIL", None)
         if threads_fail:
             env["THREADS_FAIL"] = "1"
@@ -457,6 +464,15 @@ def main():
     # REGRESSION: --codoki-only stays STRICT (missing -> exit 2), unchanged by #237.
     rc, _, _, _ = run(["1", "owner/repo", "--codoki-only"], fixture_json=no_codoki, comments=C_TRIGGER)
     check("regression: --codoki-only missing check -> exit 2 (strict, ignores trigger)", rc == 2)
+    # #277 CR: an ISOLATED comments-API failure (gh pr view still OK) must classify as
+    # NOT-EXPECTED (the trigger detector fails toward not-triggered - liveness), exit 0.
+    rc, out, _, _ = run(["1", "owner/repo", "--codoki-gate"], fixture_json=no_codoki, comments_fail=True)
+    check("#277: --codoki-gate comments-API failure -> exit 0 (fail-toward-satisfied, no hang)",
+          rc == 0 and "not expected" in out.lower())
+    # ...and the STRICT --codoki-only is unaffected by a comments failure (it never fetches
+    # comments): a missing check still BLOCKs, so the merge-gate posture stays fail-closed.
+    rc, _, _, _ = run(["1", "owner/repo", "--codoki-only"], fixture_json=no_codoki, comments_fail=True)
+    check("#277: --codoki-only missing check + comments-fail -> exit 2 (unaffected, fail-closed)", rc == 2)
 
     print("== FULL MODE: reviewDecision gate (#117, coupled with findings) ==")
     green_ctx = (checkrun("ci", "COMPLETED", "SUCCESS"), statusctx("buildkite", "SUCCESS"))
