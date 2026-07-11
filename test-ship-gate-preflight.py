@@ -724,6 +724,15 @@ def main():
     check("#275: protection 403 -> NOTE + still flags unresolved thread, exit 2",
           rc == 2 and "not readable" in o and "unresolved review conversation(s): 1" in o)
 
+    # >100 review threads -> truncation NOTE (the unresolved count is a lower bound).
+    rc, out, err, _ = run(["7", "owner/repo", "--diagnose"],
+                          fixture_json=diag_fixture(mss="BLOCKED",
+                                                    contexts=[checkrun("ci", "COMPLETED", "SUCCESS")]),
+                          protection=prot_fixture(required_contexts=["ci"], conv_res=True),
+                          threads_json=threads_doc(unresolved=1, total=150))
+    check("#275: >100 threads -> truncation NOTE (lower bound), exit 2",
+          rc == 2 and "lower bound" in (out + err))
+
     # Core PR fetch failure -> fail-closed.
     rc, _, _, _ = run(["7", "owner/repo", "--diagnose"], fixture_json=diag_fixture(), gh_fail=True)
     check("#275: gh pr view failure -> exit 2 (fail closed)", rc == 2)

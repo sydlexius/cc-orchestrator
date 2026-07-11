@@ -116,7 +116,7 @@ done
 pr="${args[0]:-}"
 repo="${args[1]:-}"
 if [ -z "$pr" ]; then
-  echo "usage: ship-gate-preflight.sh <pr> [owner/repo] [--codoki-only] [--codoki-pattern <name>] [--diagnose]" >&2
+  echo "usage: ship-gate-preflight.sh <pr> [owner/repo] [--codoki-only] [--codoki-pattern <name>] [--diagnose|--why]" >&2
   exit 1
 fi
 
@@ -186,6 +186,14 @@ if [ "$diagnose" = true ]; then
   # shellcheck disable=SC2016  # GraphQL $owner/$name/$number are query variables, not shell expansions.
   if tj="$(gh api graphql -f query='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100){totalCount nodes{isResolved}}}}}' -F owner="$owner" -F name="$name" -F number="$pr" 2>/dev/null)"; then
     unresolved="$(jq -r 'try ([.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved != true)] | length) catch "?"' <<<"$tj")"
+    # Truncation guard (mirrors the FULL-mode thread gate): only 100 threads are
+    # fetched, so on totalCount>fetched the unresolved count is a LOWER BOUND - say so
+    # rather than let a >100-thread PR read as fewer/zero unresolved conversations.
+    rt_total="$(jq -r 'try (.data.repository.pullRequest.reviewThreads.totalCount) catch "null"' <<<"$tj")"
+    rt_nodes="$(jq -r 'try (.data.repository.pullRequest.reviewThreads.nodes | length) catch "null"' <<<"$tj")"
+    if [ "$rt_total" != "null" ] && [ "$rt_nodes" != "null" ] && [ "$rt_total" -gt "$rt_nodes" ] 2>/dev/null; then
+      echo "NOTE: only ${rt_nodes} of ${rt_total} review threads fetched (first:100); the unresolved-conversation count is a lower bound."
+    fi
   fi
   crr="$(jq -r '(.required_conversation_resolution.enabled // false)' <<<"$prot")"
   if [ "$unresolved" != "?" ] && [ "$unresolved" -gt 0 ] 2>/dev/null && { [ "$crr" = true ] || [ "$prot_readable" = false ]; }; then

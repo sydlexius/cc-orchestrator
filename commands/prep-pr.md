@@ -327,11 +327,15 @@ runs; it never blocks the push.
 ```bash
 if git rev-parse --verify -q origin/main >/dev/null 2>&1; then base_ref=origin/main; else base_ref=main; fi
 base=$(git merge-base "$base_ref" HEAD)
-# The deny-authority scripts (the floor itself). Keyed on these precise paths, NOT
-# on SKILL.md/CLAUDE.md, so an ordinary skill/doc edit never trips it (conditional,
-# not systematic -- non-floor diffs must not nag).
-floor_hits=$(git diff --name-only "$base"..HEAD | \
-  grep -E '(^|/)(orchestrate-guard|orchestrate-steer|orchestrate-authorize-merge)\.sh$' || true)
+# The deny-authority scripts ARE the canonical floor set (guard + steer +
+# authorize-merge; ship-gate-preflight is the oracle, not deny-authority). Keyed on
+# these precise basenames, NOT on SKILL.md/CLAUDE.md, so an ordinary skill/doc edit
+# never trips it (conditional, not systematic -- non-floor diffs must not nag). Use
+# --name-status -M so BOTH sides of a RENAME are inspected: a floor script renamed
+# away from (or to) its canonical name still trips the nudge (a name-only diff shows
+# only the new path and would miss the old-name half).
+floor_hits=$(git diff -M --name-status "$base"..HEAD | \
+  grep -E '(^|[[:space:]/])(orchestrate-guard|orchestrate-steer|orchestrate-authorize-merge)\.sh([[:space:]]|$)' || true)
 if [ -n "$floor_hits" ]; then
   echo ">> floor diff detected - engage-ralph-loop recommended (run the FULL K=2 convergence, not a single pass):"
   echo "$floor_hits" | sed 's/^/   - /'
