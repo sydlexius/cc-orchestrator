@@ -22,6 +22,17 @@
 #                              pr-unreplied-comments.sh.
 #     --codoki-pattern <name>  Override the Codoki check name to match in
 #                              --codoki-only mode (default: "Codoki PR Review").
+#     --diagnose | --why       READ-ONLY diagnosis mode (#275): on a non-mergeable
+#                              PR, reconcile branches/<base>/protection against the
+#                              PR's live check/review/thread/ack state and emit one
+#                              `REASON:` line per unmet rule (unresolved
+#                              conversation, missing/failing required check,
+#                              REVIEW_REQUIRED/CHANGES_REQUESTED, behind-base,
+#                              Codoki ack, draft, conflicts). A DIAGNOSTIC, not the
+#                              merge gate: emits NO head SHA, relaxes nothing. Exit 0
+#                              = no blocking rule; exit 2 = blocked (reasons printed)
+#                              or fail-closed (PR state unreadable). Protection read
+#                              is best-effort (needs admin scope; degrades to a NOTE).
 #   Exit codes:
 #     0  PASS  - all gates green (full mode: every check terminal+acceptable AND
 #               0 actionable review-body findings AND reviewDecision not an active
@@ -83,11 +94,13 @@ set -euo pipefail
 ACCEPTABLE_CONCLUSIONS='["SUCCESS","NEUTRAL","SKIPPED"]'
 
 codoki_only=false
+diagnose=false
 codoki_pattern="Codoki PR Review"
 args=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --codoki-only) codoki_only=true; shift ;;
+    --diagnose|--why) diagnose=true; shift ;;
     --codoki-pattern)
       if [ "$#" -lt 2 ]; then
         echo "usage: ship-gate-preflight.sh: --codoki-pattern requires a value" >&2
@@ -103,7 +116,7 @@ done
 pr="${args[0]:-}"
 repo="${args[1]:-}"
 if [ -z "$pr" ]; then
-  echo "usage: ship-gate-preflight.sh <pr> [owner/repo] [--codoki-only] [--codoki-pattern <name>]" >&2
+  echo "usage: ship-gate-preflight.sh <pr> [owner/repo] [--codoki-only] [--codoki-pattern <name>] [--diagnose]" >&2
   exit 1
 fi
 
@@ -116,6 +129,139 @@ if [ -z "$repo" ]; then
     echo "BLOCK: could not resolve repo (pass owner/repo explicitly)" >&2
     exit 2
   fi
+fi
+
+# --- DIAGNOSE MODE (#275) --------------------------------------------------
+# READ-ONLY diagnosis of WHY a PR is not mergeable. GitHub's mergeStateStatus is a
+# single opaque token (BLOCKED / BEHIND / DIRTY / ...) that never names WHICH branch-
+# protection rule is unmet, so the lead has to hand-reconcile branches/<base>/
+# protection against the PR's live state (canticle #460 was misreported as "needs
+# admin-merge" when it was blocked SOLELY by an unresolved conversation). This mode
+# reconciles them and emits one `REASON:` line per unmet rule. It is a DIAGNOSTIC,
+# NOT the merge gate: it emits no --match-head-commit SHA and nothing here relaxes
+# the floor or touches the allow-list. Exit 0 = no blocking rule detected; exit 2 =
+# blocked (reasons printed) OR fail-closed (core PR state unreadable). The branch-
+# protection read is BEST-EFFORT (it needs admin scope): a 403/absent read degrades
+# to a NOTE + PR-state-only reasons, so a low-privilege token still gets a diagnosis.
+if [ "$diagnose" = true ]; then
+  dj="$(gh pr view "$pr" --repo "$repo" --json state,mergeStateStatus,mergeable,reviewDecision,baseRefName,headRefName,isDraft,statusCheckRollup 2>/dev/null)" || {
+    echo "BLOCK: 'gh pr view' failed for #$pr in $repo (cannot diagnose)." >&2
+    echo "RESULT: BLOCKED -- PR state unreadable. [#$pr $repo]" >&2
+    exit 2
+  }
+  if ! jq -e . >/dev/null 2>&1 <<<"$dj"; then
+    echo "BLOCK: malformed JSON from 'gh pr view' for #$pr (cannot diagnose)." >&2
+    echo "RESULT: BLOCKED -- PR state unreadable. [#$pr $repo]" >&2
+    exit 2
+  fi
+  pr_state="$(jq -r '(.state // "") | ascii_upcase' <<<"$dj")"
+  # A merged/closed PR is not "blocked" - short-circuit before diagnosing rules.
+  case "$pr_state" in
+    MERGED) echo "MERGED: #$pr is already merged (nothing to diagnose). [$repo]"; exit 0 ;;
+    CLOSED) echo "CLOSED: #$pr is closed and not merged (nothing to diagnose). [$repo]"; exit 0 ;;
+  esac
+  mss="$(jq -r '(.mergeStateStatus // "") | ascii_upcase' <<<"$dj")"
+  mergeable="$(jq -r '(.mergeable // "") | ascii_upcase' <<<"$dj")"
+  rdec="$(jq -r '(.reviewDecision // "") | ascii_upcase' <<<"$dj")"
+  base="$(jq -r '.baseRefName // ""' <<<"$dj")"
+  is_draft="$(jq -r '(.isDraft // false)' <<<"$dj")"
+  echo "DIAGNOSE #$pr $repo: mergeStateStatus=${mss:-<none>} mergeable=${mergeable:-<none>} reviewDecision=${rdec:-<none>} base=${base:-<none>}"
+  reasons=0
+
+  # Branch protection (best-effort; the endpoint needs admin scope).
+  prot='{}'; prot_readable=false
+  if [ -n "$base" ] && p="$(gh api "repos/$repo/branches/$base/protection" 2>/dev/null)" && jq -e . >/dev/null 2>&1 <<<"$p"; then
+    prot="$p"; prot_readable=true
+  else
+    echo "NOTE: branch protection for '${base:-?}' not readable (needs admin scope, or the branch is unprotected); diagnosing from PR state only."
+  fi
+
+  # (1) Draft.
+  if [ "$is_draft" = true ]; then
+    echo "REASON: PR is a DRAFT (mark ready-for-review to merge)."; reasons=$((reasons+1))
+  fi
+
+  # (2) Unresolved review conversations (GraphQL isResolved; the REST API cannot see it).
+  owner="${repo%%/*}"; name="${repo##*/}"; unresolved="?"
+  # shellcheck disable=SC2016  # GraphQL $owner/$name/$number are query variables, not shell expansions.
+  if tj="$(gh api graphql -f query='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100){totalCount nodes{isResolved}}}}}' -F owner="$owner" -F name="$name" -F number="$pr" 2>/dev/null)"; then
+    unresolved="$(jq -r 'try ([.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved != true)] | length) catch "?"' <<<"$tj")"
+  fi
+  crr="$(jq -r '(.required_conversation_resolution.enabled // false)' <<<"$prot")"
+  if [ "$unresolved" != "?" ] && [ "$unresolved" -gt 0 ] 2>/dev/null && { [ "$crr" = true ] || [ "$prot_readable" = false ]; }; then
+    extra=""; [ "$crr" = true ] && extra=" (require_conversation_resolution)"
+    echo "REASON: unresolved review conversation(s): ${unresolved}${extra}."; reasons=$((reasons+1))
+  fi
+
+  # (3) Required status checks unsatisfied (missing / not-success). Only when
+  # protection is readable - the required set is unknowable otherwise.
+  if [ "$prot_readable" = true ]; then
+    req_ctx="$(jq -r '[ (.required_status_checks.contexts // [])[], (.required_status_checks.checks[]?.context) ] | map(select(. != null)) | unique | .[]' <<<"$prot" 2>/dev/null || true)"
+    while IFS= read -r ctx; do
+      [ -z "$ctx" ] && continue
+      v="$(jq -r --arg c "$ctx" --argjson ok '["SUCCESS","NEUTRAL","SKIPPED"]' '
+        [ (.statusCheckRollup // [])[] | select((.name // .context // "") == $c)
+          | (.conclusion // .state // .status // "") | ascii_upcase ] as $states
+        | if ($states | length) == 0 then "MISSING"
+          elif ($states | map(select(. as $s | $ok | index($s))) | length) == ($states | length) then "OK"
+          else "BAD:" + ($states | join(",")) end' <<<"$dj")"
+      case "$v" in
+        OK) : ;;
+        MISSING) echo "REASON: required check '$ctx' is MISSING (never reported)."; reasons=$((reasons+1)) ;;
+        BAD:*) echo "REASON: required check '$ctx' is ${v#BAD:} (not success)."; reasons=$((reasons+1)) ;;
+      esac
+    done <<<"$req_ctx"
+  fi
+
+  # (4) Review requirement.
+  case "$rdec" in
+    REVIEW_REQUIRED) echo "REASON: review required -- reviewDecision=REVIEW_REQUIRED (approving review(s) missing)."; reasons=$((reasons+1)) ;;
+    CHANGES_REQUESTED) echo "REASON: changes requested -- reviewDecision=CHANGES_REQUESTED (a reviewer is blocking)."; reasons=$((reasons+1)) ;;
+  esac
+
+  # (5) Behind base / merge conflicts.
+  if [ "$mss" = "BEHIND" ]; then
+    strict=""; [ "$(jq -r '(.required_status_checks.strict // false)' <<<"$prot")" = true ] && strict=" (strict status checks require up-to-date)"
+    echo "REASON: branch is BEHIND base '$base'${strict} -- update-branch / rebase."; reasons=$((reasons+1))
+  fi
+  if [ "$mergeable" = "CONFLICTING" ] || [ "$mss" = "DIRTY" ]; then
+    echo "REASON: merge conflicts with base (mergeable=${mergeable}) -- rebase/resolve."; reasons=$((reasons+1))
+  fi
+
+  # (6) Codoki root-summary ack (reuse the canonical reader).
+  reactor="${HOME}/.claude/scripts/gh-react.sh"
+  if [ -x "$reactor" ]; then
+    ack_out="$("$reactor" codoki-ack "$pr" "$repo" 2>/dev/null || true)"
+    av="$(printf '%s\n' "$ack_out" | sed -n 's/.*CODOKI-ACK:[[:space:]]*\([A-Za-z-]*\).*/\1/p' | tail -n1)"
+    if [ "$av" = "unacked" ]; then
+      echo "REASON: Codoki root-summary ack is UNMET (react via gh-react.sh codoki-ack $pr --react +1|-1; a 👎 also needs an @codoki reply)."; reasons=$((reasons+1))
+    fi
+  fi
+
+  # Catch-all: a blocked-ish state we could not attribute to a specific rule above.
+  if [ "$reasons" -eq 0 ]; then
+    case "$mss" in
+      CLEAN|HAS_HOOKS|UNSTABLE|"")
+        echo "MERGEABLE: no blocking branch-protection rule detected (mergeStateStatus=${mss:-<none>})."
+        exit 0 ;;
+      UNKNOWN)
+        # GitHub has not finished computing the merge state (transient). Do NOT
+        # fabricate a rule; report indeterminate and fail-closed so a caller re-runs.
+        echo "INDETERMINATE: mergeStateStatus=UNKNOWN (GitHub still computing the merge state); re-run in a few seconds." >&2
+        echo "RESULT: INDETERMINATE -- merge state not yet computed. [#$pr $repo]" >&2
+        exit 2 ;;
+      *)
+        enabled="$(jq -r '[ (if (.required_conversation_resolution.enabled // false) then "conversation-resolution" else empty end),
+                            (if (.required_linear_history.enabled // false) then "linear-history" else empty end),
+                            (if (.required_signatures.enabled // false) then "signed-commits" else empty end),
+                            (if (.required_status_checks.strict // false) then "strict-checks" else empty end) ] | join(", ")' <<<"$prot" 2>/dev/null || echo "")"
+        echo "REASON: blocked by an unmet rule not individually diagnosed (mergeStateStatus=${mss}); enabled protections: ${enabled:-unknown}."
+        reasons=$((reasons+1)) ;;
+    esac
+  fi
+
+  echo "RESULT: BLOCKED -- ${reasons} unmet rule(s). [#$pr $repo]"
+  exit 2
 fi
 
 # FAIL CLOSED: any gh failure -> BLOCK. headRefOid is fetched in the SAME snapshot
