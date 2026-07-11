@@ -35,6 +35,13 @@ flags (deterministic, harness-proven). Do not re-implement its set/threshold log
    unobservable on-merge hook), recompute the now-unblocked cluster set and emit a `next-tranche` flag
    (with `unblocked_by` = the merged ref). This is graph logic you run directly; it has no helper.
 
+## Spec-convergence pointer (#274, CONDITIONAL - you POINT, never run)
+When a dispatch candidate you are scheduling is a DESIGN / SPEC-convergence issue (not ordinary
+code), note in your proposal that its convergence tool is the `engage-ralph-loop.md` brief (repo
+root) - a LEAD / DISPATCHER concern; the DESIGN-* docs already carry ralph iteration logs. You are
+READ-ONLY, side-effect-free, and author no spec, so you NEVER run the loop - you flag that it applies
+so the lead schedules the convergence pass. This is a pointer, not a runner role.
+
 ## Anti-thrash (bounded)
 Re-partition proposals are capped at DEPTH 2: if re-routing A off B now collides A with C, and
 re-routing again still collides, STOP and surface to the lead rather than iterating to "perfection."
