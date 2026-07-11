@@ -47,7 +47,10 @@ jobs:
         with:
           python-version: '3.12'
 
+      # ruff runs Linux-only (the `ruff (F,E741)` step is `if: runner.os == 'Linux'`),
+      # so only install it there - no need to spend the macOS leg installing an unused tool.
       - name: Install ruff
+        if: runner.os == 'Linux'
         run: pip install ruff
 
       # Platform-independent lint: run once, on Linux. (jq is preinstalled on both runners.)
