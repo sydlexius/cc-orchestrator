@@ -33,7 +33,8 @@
 #         Codoki SETTLED: Codoki posts its verdict as a `Codoki PR Review` entry in
 #         statusCheckRollup, NOT in the reviews API, so it is invisible to a
 #         reviews-API poll. This script defers Codoki detection to the deterministic
-#         oracle `ship-gate-preflight.sh --codoki-only`, which reads statusCheckRollup
+#         oracle `ship-gate-preflight.sh --codoki-gate` (#237: Codoki-auto-review-OFF
+#         aware, so an untriggered PR with no Codoki check never hangs), which reads statusCheckRollup
 #         (#110). Exit 0 from the oracle = Codoki settled; exit 2 = not yet settled
 #         (stays pending); exit 1 = oracle usage error (fail-open, not blocked). When
 #         the oracle is not installed, Codoki gating is skipped (falls back to the
@@ -393,14 +394,18 @@ while true; do
       ;;
   esac
 
-  # Codoki settlement (#110). Codoki posts its verdict as a `Codoki PR Review`
+  # Codoki settlement (#110, #237). Codoki posts its verdict as a `Codoki PR Review`
   # entry in statusCheckRollup (NOT the reviews API), so this script defers to the
-  # deterministic oracle which reads that rollup. Exit 0 = settled (do not block);
-  # exit 2 = check missing/incomplete/failed (block on "codoki-check"); exit 1 =
-  # oracle usage error, a script bug rather than a PR state -> fail open, do not
-  # block. The oracle is skipped entirely when it is not installed.
+  # deterministic oracle which reads that rollup. Uses --codoki-gate (NOT --codoki-only):
+  # with org Codoki auto-review OFF, a MISSING check is the NORMAL state, and the strict
+  # --codoki-only would BLOCK on it forever (the hang #237 fixes). --codoki-gate is
+  # Codoki-OFF aware -- Codoki-waiting is OPT-IN, exactly like CR-waiting (#173): exit 0
+  # = satisfied (settled OR not-expected -> do not block); exit 2 = expected-but-unsettled
+  # (a manual @codoki trigger present, or check present-but-failing -> block on
+  # "codoki-check"); exit 1 = oracle usage error -> fail open, do not block. The oracle
+  # is skipped entirely when it is not installed.
   if [ -x "$CODOKI_ORACLE" ]; then
-    if "$CODOKI_ORACLE" --codoki-only "$pr" "$repo" >/dev/null 2>&1; then
+    if "$CODOKI_ORACLE" --codoki-gate "$pr" "$repo" >/dev/null 2>&1; then
       :
     else
       codoki_rc=$?
