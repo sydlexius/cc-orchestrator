@@ -545,10 +545,24 @@ def main():
     rc, _o, _e = run_guard("gh pr merge 265 --squash --match-head-commit " + VSHA, marker_active=True,
                            channel="stdin", merge_token=_tok(pr=265, sha=VSHA))
     expect("piece-b: token.pr == command pr (sanctioned order) -> ALLOW", rc, "allow")
-    # a flag BEFORE the positional pr still binds (gh accepts `merge --squash 265`).
+    # ANY flag before the positional pr -> deny-on-doubt (the sanctioned form is pr-FIRST;
+    # allowing flags between merge and the pr re-opens the value-flag divergence below).
     rc, _o, _e = run_guard("gh pr merge --squash 265 --match-head-commit " + VSHA, marker_active=True,
                            channel="stdin", merge_token=_tok(pr=265, sha=VSHA))
-    expect("piece-b: pr after a flag still binds -> ALLOW", rc, "allow")
+    expect("piece-b: a flag before the pr -> BLOCK (pr must be first after merge)", rc, "block")
+    # CRITICAL class (hostile-review): gh's value-taking flags (-b/--body/-t/--subject/
+    # -A/--author-email/-F/--body-file) can carry a bare integer VALUE; a valueless-flag
+    # regex would read that value as the pr while gh merges a DIFFERENT positional pr.
+    # Requiring the pr immediately after `merge` denies the whole class.
+    for vflag in ("-b", "--body", "-t", "--subject", "-A", "--author-email"):
+        cmd = f"gh pr merge {vflag} 265 999 --match-head-commit {VSHA}"
+        rc, _o, _e = run_guard(cmd, marker_active=True, channel="stdin", merge_token=_tok(pr=265, sha=VSHA))
+        expect(f"piece-b: value-flag {vflag} 265 before real pr 999 -> BLOCK (no value scrape)", rc, "block")
+    # A malformed non-token pr (gh would treat `265abc` as a branch, not PR 265) must NOT
+    # extract 265 -> deny-on-doubt (the pr must be a complete numeric token).
+    rc, _o, _e = run_guard("gh pr merge 265abc --squash --match-head-commit " + VSHA, marker_active=True,
+                           channel="stdin", merge_token=_tok(pr=265, sha=VSHA))
+    expect("piece-b: pr token '265abc' (not a clean number) -> BLOCK", rc, "block")
     # pr OMITTED / unparsable -> deny on doubt.
     rc, _o, _e = run_guard("gh pr merge --squash --match-head-commit " + VSHA, marker_active=True,
                            channel="stdin", merge_token=_tok(pr=265, sha=VSHA))

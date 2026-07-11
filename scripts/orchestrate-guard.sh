@@ -291,14 +291,19 @@ merge_authorized() {
   # base->develop PR), so require the merge command's target PR to equal token.pr.
   # Extract the bare integer arg after `merge` (tolerating flags between); deny if it
   # is absent/unparsable or mismatched (deny-on-doubt).
-  # ANCHOR the extraction at the actual `gh pr merge` invocation (clause start), NOT any
-  # `merge <int>` substring: an un-anchored scan would scrape a PR number out of a quoted
-  # arg (e.g. `--body "merge 265"`) while gh merges a different positional PR. The `^`
-  # anchor makes grep match only at position 0, so quoted content later cannot be reached;
-  # unusual layouts (env prefix, `gh -R o/r pr merge`, flag-before-pr) simply do not match
-  # and fall to deny-on-doubt. The honest sanctioned command authorize-merge prints
-  # (`gh pr merge <pr> --squash --match-head-commit <sha>`) matches.
-  cpr=$(printf '%s' "$cmd" | grep -oE '^[[:space:]]*gh[[:space:]]+pr[[:space:]]+merge([[:space:]]+-[^[:space:]]+)*[[:space:]]+[0-9]+' | grep -oE '[0-9]+$' | head -1)
+  # Extract the target PR as the token IMMEDIATELY after `merge` (anchored at the clause
+  # start), with NO flags permitted between. This is deliberately strict: allowing flags
+  # before the pr re-opens a value-flag divergence - gh's value-taking flags (-b/--body/
+  # -t/--subject/-A/--author-email/-F/--body-file) can carry a bare-integer VALUE that a
+  # valueless-flag regex would read as the pr while gh merges a DIFFERENT positional pr
+  # (and a quoted "-body \"merge N\"" could smuggle a number too). Requiring pr-first denies
+  # that ENTIRE class (you cannot out-enumerate gh's flags; demand the one shape we emit).
+  # The `^` anchor prevents scanning later/quoted content; any non-pr-first layout falls to
+  # deny-on-doubt. The sanctioned command authorize-merge prints is exactly pr-first:
+  # `gh pr merge <pr> --squash --match-head-commit <sha>`.
+  # The trailing (space|end) requires the pr to be a COMPLETE token so a malformed
+  # `gh pr merge 265abc` (which gh treats as a branch, not PR 265) does not extract 265.
+  cpr=$(printf '%s' "$cmd" | grep -oE '^[[:space:]]*gh[[:space:]]+pr[[:space:]]+merge[[:space:]]+[0-9]+([[:space:]]|$)' | grep -oE '[0-9]+' | head -1)
   [ -n "$cpr" ] || return 1
   tpr=$(jq -r '.pr // empty' "$tok" 2>/dev/null) || return 1
   case "$tpr" in ''|*[!0-9]*) return 1 ;; esac
