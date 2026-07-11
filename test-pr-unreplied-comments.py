@@ -129,6 +129,26 @@ def run(args, *, inline="[]", reviews="[]", issue="[]", graphql=None,
         return p.returncode, p.stdout, p.stderr
 
 
+def run_argv(argv, *, inline="[]", reviews="[]", issue="[]", me="testuser"):
+    """Run the script with EXACTLY `argv` (no appended positional), for arg-parse tests
+    (e.g. a flag placed AFTER the <pr> positional). Same gh stub as run()."""
+    with tempfile.TemporaryDirectory() as td:
+        bindir = os.path.join(td, "bin"); os.makedirs(bindir)
+        gh = os.path.join(bindir, "gh")
+        with open(gh, "w") as f:
+            f.write(GH_STUB)
+        os.chmod(gh, 0o755)
+        env = dict(os.environ)
+        env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+        env["ME"] = me
+        env["INLINE_JSON"] = inline
+        env["REVIEWS_JSON"] = reviews
+        env["ISSUE_JSON"] = issue
+        env["COMMITTER_DATE"] = "2026-06-18T00:00:00Z"
+        p = subprocess.run(["bash", SCRIPT] + argv, env=env, capture_output=True, text=True, timeout=20)
+        return p.returncode, p.stdout, p.stderr
+
+
 def findings_count(out):
     """Extract N from the 'Review-body comments with actionable findings: N' line."""
     for ln in out.splitlines():
@@ -612,6 +632,30 @@ def main():
     check("itemized: GraphQL failure -> inline resolved:? (best-effort degrade)",
           any(ln.startswith("inline |") and "resolved:?" in ln for ln in out.splitlines()))
     check("itemized: GraphQL failure does not change exit (still 0)", rc == 0)
+
+    print("== #259: flags are position-independent; a flag after <pr> is NOT swallowed as [repo] ==")
+    # The bug: `<pr> --count-only` left --count-only as $2=repo -> gh api repos/--count-only/...
+    # -> cryptic 404. After the fix the flag is parsed wherever it sits and the default repo
+    # (or a real one) is used. --count-only is the simplest mode to assert on (prints a number).
+    rc, out, err = run_argv(["123", "--count-only", "owner/repo"])
+    check("#259: `<pr> --count-only <repo>` runs count mode (not repos/--count-only 404)",
+          rc == 0 and "--count-only" not in err and out.strip().isdigit())
+    # A flag after <pr> with the default repo omitted must also work (the natural form).
+    rc, out, err = run_argv(["123", "--count-only"])
+    check("#259: `<pr> --count-only` (default repo) runs count mode", rc == 0 and out.strip().isdigit())
+    # Regression: the documented flags-BEFORE order still works.
+    rc, out, err = run_argv(["--count-only", "123", "owner/repo"])
+    check("#259: `--count-only <pr> <repo>` (flags first) still works", rc == 0 and out.strip().isdigit())
+    # A genuinely unknown flag ANYWHERE fails LOUDLY (usage error), never a cryptic 404.
+    rc, out, err = run_argv(["123", "--bogus", "owner/repo"])
+    check("#259: `<pr> --bogus` -> usage error exit 1 (loud, not 404)",
+          rc == 1 and "bogus" in (out + err).lower())
+    # A bare `-x`-style token after <pr> is also a flag, not a repo -> loud usage error.
+    rc, out, err = run_argv(["123", "-x"])
+    check("#259: `<pr> -x` -> usage error exit 1 (a dash-token is never a repo)", rc == 1)
+    # Too many positionals (a second bare token after the repo) -> usage error.
+    rc, out, err = run_argv(["123", "owner/repo", "extra"])
+    check("#259: extra positional after <pr> [repo] -> usage error exit 1", rc == 1)
 
     print()
     if FAILS:
