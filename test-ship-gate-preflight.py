@@ -802,6 +802,11 @@ def main():
     check("--codoki-pattern with no value -> exit 1 (usage)", rc == 1)
     rc, _, _, _ = run(["1", "owner/repo", "--bogus"], fixture_json=ALL_GREEN)
     check("unknown flag -> exit 1 (usage)", rc == 1)
+    # #277 Copilot: the three modes are mutually exclusive.
+    rc, _, _, _ = run(["1", "owner/repo", "--codoki-only", "--codoki-gate"], fixture_json=ALL_GREEN)
+    check("#277: --codoki-only + --codoki-gate -> exit 1 (mutually exclusive)", rc == 1)
+    rc, _, _, _ = run(["1", "owner/repo", "--codoki-gate", "--diagnose"], fixture_json=ALL_GREEN)
+    check("#277: --codoki-gate + --diagnose -> exit 1 (mutually exclusive)", rc == 1)
 
     print()
     if FAILS:

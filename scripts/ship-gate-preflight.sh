@@ -126,6 +126,19 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+# The three modes are MUTUALLY EXCLUSIVE (strict settle check vs the liveness gate vs
+# the read-only diagnosis are distinct contracts). Specifying more than one is ambiguous
+# - e.g. --codoki-only + --codoki-gate would silently switch a strict check into liveness
+# behavior - so reject it with a usage error (Copilot review on #277).
+mode_count=0
+[ "$codoki_only" = true ] && mode_count=$((mode_count + 1))
+[ "$codoki_gate" = true ] && mode_count=$((mode_count + 1))
+[ "$diagnose" = true ] && mode_count=$((mode_count + 1))
+if [ "$mode_count" -gt 1 ]; then
+  echo "usage: ship-gate-preflight.sh: --codoki-only, --codoki-gate, and --diagnose are mutually exclusive" >&2
+  exit 1
+fi
+
 pr="${args[0]:-}"
 repo="${args[1]:-}"
 if [ -z "$pr" ]; then
