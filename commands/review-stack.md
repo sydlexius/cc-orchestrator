@@ -131,8 +131,9 @@ Each agent receives this task:
 > must never post `@coderabbitai review` (or invoke any CR-trigger). CR
 > auto-review is OFF org-wide, so CR is opt-in/maintainer-allocated -- a stacked
 > PR with no CR review is a normal state, not something to fix. **Codoki**
-> (`codoki-pr-intelligence[bot]`) is the primary auto-reviewer and reviews every
-> push on its own. Poll for and triage whatever reviews already exist; if a CR
+> (`codoki-pr-intelligence[bot]`) is NOT IN SERVICE (subscription lapsed
+> 2026-07-12): it auto-reviews nothing, and this command must never post
+> `@codoki`. Poll for and triage whatever reviews already exist; if a CR
 > pass would help, note it and let the maintainer allocate one.
 >
 > **Step B -- Poll for review readiness (geometric cooldown):**
@@ -176,8 +177,9 @@ Each agent receives this task:
 
 **Bot identity notes (important -- include in each agent prompt):**
 - CodeRabbit reviews: `coderabbitai[bot]`
-- Codoki reviews: `codoki-pr-intelligence[bot]` -- COMMENTED reviews with an
-  EMPTY review body; all findings are inline comments + a `### Codoki PR Review`
+- Codoki reviews: `codoki-pr-intelligence[bot]` -- NOT IN SERVICE; only a LEGACY
+  review on an older PR can exist. If one does: COMMENTED reviews with an EMPTY
+  review body; all findings are inline comments + a `### Codoki PR Review`
   issue-comment summary, so never infer "no findings" from its review state.
 - Codecov (`codecov[bot]`) is NOT a reviewer -- skip it in the unreplied flow.
   Instead, capture the coverage advisory separately:
@@ -539,7 +541,7 @@ After restacking (or skipping it), continue to the next PR that needs work.
 Parallelism: Steps 2-3 ran N agents concurrently (data gathering + pre-triage).
 Step 4 ran serially in dependency order (cascade constraint).
 
-Codoki auto-reviews the pushed PRs. CodeRabbit re-reviews only if the maintainer allocates a pass - this command never triggers one (CR auto-review is OFF org-wide).
+Codoki is not in service, so it does not review the pushed PRs; Greptile (where installed) still may. CodeRabbit re-reviews only if the maintainer allocates a pass - this command never triggers one (CR auto-review is OFF org-wide).
 
 This is the Way.
 ```
@@ -557,5 +559,5 @@ This is the Way.
 - **Auto-dismiss obvious cross-stack repeats** without asking (e.g. "dead code" that's wired in a later PR).
 - **If a restack fails with conflicts,** stop and report. Don't auto-resolve.
 - **If a restack invalidates pre-triage,** note it during the fix phase and adjust.
-- **Codoki re-reviews automatically; CodeRabbit does not (auto-review OFF org-wide -- a CR pass is maintainer-allocated).**
+- **Codoki does not re-review (not in service) and CodeRabbit does not (auto-review OFF org-wide -- a CR pass is maintainer-allocated); Greptile, where installed, still may.**
 - **Save the original branch** so you can return to it at the end.
