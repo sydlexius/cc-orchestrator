@@ -5,7 +5,7 @@ description: Use when scaffolding and running a lead-orchestrated multi-agent se
 
 # Orchestrate: lead-run multi-agent PR pipeline
 
-**Version 0.81.1** (semver; releases tagged `vX.Y.Z`). Bump on any material change to this skill, its templates, or the runtime - PATCH for a fix, MINOR for a new rule/feature, MAJOR for a breaking charter or deterministic-floor change - so `/reload-skills` surfaces the new number and drift between the symlinked repo and the loaded skill is visible. History: `git log` + the GitHub Release notes cut at each `vX.Y.Z` tag.
+**Version 0.82.0** (semver; releases tagged `vX.Y.Z`). Bump on any material change to this skill, its templates, or the runtime - PATCH for a fix, MINOR for a new rule/feature, MAJOR for a breaking charter or deterministic-floor change - so `/reload-skills` surfaces the new number and drift between the symlinked repo and the loaded skill is visible. History: `git log` + the GitHub Release notes cut at each `vX.Y.Z` tag.
 
 You are the LEAD (orchestrator). You delegate building and the mechanical PR
 lifecycle to single-purpose teammates, and you keep for yourself the decisions
@@ -58,6 +58,7 @@ wall. Spawn each from its template charter.
 
 ## Hard invariants (never violate)
 - NO bot ever merges. Merge + post-merge-cleanup are the maintainer's/lead's only. AUTONOMY-TIER nuance (maintainer directive 2026-06-14, full text in CLAUDE.md operating-model): a TEAM bot (pr-shipper/pr-triage/etc.) NEVER merges - unchanged. The LEAD may EXECUTE a merge without a per-PR maintainer go ONLY for a well-shaped NON-CR issue in a SOLO / non-marker session (the standing autonomy grant is the go); a CR-required PR's merge stays human, and a MARKER-ACTIVE session's floor hard-denies `gh pr merge` CLI (is_pr_merge, #105) + denies merge-by-API, so the lead SURFACES the merge to the human there (the human merges from a SEPARATE plain terminal where no marker is present). A change editing the floor / merge-policy / operating-model itself routes for maintainer merge even when "doc" (the self-imposed carve-out).
+- CAPTURE, DON'T IMPLEMENT (#283). A deferred process/tooling/infra idea that is NOT the issue you are currently working gets FILED (`/orchestrate:feedback add`, or `orchestrate-feedback.sh add <slug> < <bodyfile>`), NEVER edited inline - and that covers ANY out-of-scope infra change, HELPER SCRIPTS INCLUDED (`safe-push.sh`, the `pr-*`/`gh-*` wrappers, `commands/*.md`, the gate runner), not just the SKILL.md/templates/guard trio. Detail: "Session feedback log".
 - LEAD-NO-IMPLEMENT. The lead never writes/edits/fixes target-repo code; ALL build work delegates to a PR-blind implementer. (Hard-invariant restatement of the Lead operating contract near the top, which carries the full rule + the at-the-keyboard self-check.)
 - Per-PR human go at STACK time: a branch is appended to the shipper stack only after the maintainer deems it shippable (UAT punch-list or AskUserQuestion + live URL).
 - Lead vets EVERY PR body/title `#N` ref against `gh issue view N` before stacking (small TaskList IDs collide with old issues).
@@ -243,6 +244,22 @@ collided with an in-flight PR and had to be reverted cross-session). Record it i
 LEAD folds it into the real file via the repo's normal PR process in a deliberate triage pass
 (do the edit in an ISOLATED git worktree so the live symlinked file is never touched until merge).
 The advisory steering hook (`orchestrate-steer.sh`, #95) WARNs on a marker-active mid-run edit of these canonical files as a deterministic backstop to this rule.
+CAPTURE, DON'T IMPLEMENT (#283; the GENERAL rule the enumeration above only half-states). A deferred
+process / tooling / infra idea that is NOT the issue you are currently working gets FILED via
+`orchestrate-feedback.sh add`, NEVER implemented inline - and this covers ANY out-of-scope infra
+change, not just the `SKILL.md` / `templates/` / `orchestrate-guard.sh` trio named above. The
+HELPER SCRIPTS are explicitly in scope (`safe-push.sh`, the `pr-*`/`gh-*` wrappers, `commands/*.md`,
+the gate runner): they are canonical-source files by the same argument as the guard, and a lead who
+reads only the three-file enumeration wrongly concludes a helper-script change is uncovered - that is
+the exact 2026-07-11 miss this rule closes (the lead started EDITING `safe-push.sh` mid-run instead of
+FILING the idea; the maintainer had to correct "that needs filed, not fixed"). Recording it IS the
+deliverable: the lead folds it into the real fix later through the normal PR/triage process, so the
+capture costs one call and loses nothing. `/orchestrate:feedback` is the command path.
+NO DETERMINISTIC BACKSTOP ON THE HELPER SCRIPTS (yet). The steer hook named above WARNs on only the
+THREE canonical files (`SKILL.md`, `templates/`, `orchestrate-guard.sh`); a mid-run edit of
+`safe-push.sh` or any other helper is SILENT today (verified, #284). So on the helper-script scope
+this rule is INSTRUCTION-LAYER ONLY - nothing will stop you, which is exactly why it is a hard
+invariant. #284 extends the matcher.
 HOW TO WRITE THE LOG (and any commit message that quotes push/merge prose): write the entry body to a temp file with the FILE-EDIT tool, then pipe it in via a STDIN REDIRECT - `orchestrate-feedback.sh add <slug> < <bodyfile>` - NEVER put the body on the command line (positional arg) and NEVER a `cat >> ... <<EOF` heredoc. The Bash guard hook inspects COMMAND LINES, so prose mentioning `git push`/merge in a heredoc body OR a positional body arg trips it (it literally blocked the entry documenting that block, dogfood 2026-06-06); a `< file` redirect keeps the prose OFF the command line. The helper reads its body from stdin precisely for this. Related: the guard loads at SESSION START, so a guard fix only takes effect once the affected session RESTARTS - a running session keeps its old guard snapshot.
 Teammates that hit a blocked gate or have a suggestion surface it to the lead, who records it
 (teammates do not write the log directly). This is the triage queue: entries get folded into
