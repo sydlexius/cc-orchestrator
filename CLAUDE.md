@@ -123,9 +123,18 @@ Runtime (`scripts/`; canonical source is this repo):
   the UAT auto-rebuild watcher, and the least-privilege gh wrappers. `gh-react.sh codoki-ack`
   (#234) is the canonical reader/actuator of the Codoki ROOT-SUMMARY ack (the 👍/👎 reaction on
   Codoki's issue-level review-summary comment - a surface with no `isResolved` that never appears
-  in `reviewThreads`); `ship-gate-preflight.sh` FULL mode now BLOCKs when a Codoki summary exists
-  with no NON-BOT ack (a 👎 rebut also needs an `@codoki` reply), PASSES on no-summary, and
+  in `reviewThreads`); `ship-gate-preflight.sh` FULL mode BLOCKs when a Codoki summary exists
+  with no NON-BOT ack, PASSES on no-summary, and
   `pr-unreplied-comments.sh --audit` surfaces the summary's ACKED/UNACKED state (informational).
+  CODOKI IS NOT IN SERVICE (subscription lapsed 2026-07-12; no free tier). No trigger is ever posted
+  and no check ever appears, so every Codoki gate ON A LIVE PR PATH is INERT BY DESIGN and PASSes on
+  absence: `--codoki-gate` (what `pr-watch.sh` calls) and the FULL-mode root-ack gate. The STRICT
+  `--codoki-only` mode is the EXCEPTION - it BLOCKs (exit 2) on a missing check by contract, so it and
+  its only caller `codoki-quota-watch.sh` are now DEAD TOOLING: do not run them (a post-lapse PR gets a
+  permanently wrong "keep waiting"). All of it stays in the tree deliberately; do NOT revive a trigger
+  to make it "meaningful".
+  The retired agent-judgment rules are archived in
+  `skills/orchestrate/design/ARCHIVE-codoki-mechanisms.md`.
 - `scripts/prose-lint.sh` - the outward-draft prose-lint adapter (#219). A THIN wrapper over
   `~/Developer/prose-tooling`'s `bin/prose_check.py` (reuses, does NOT reimplement, the Markdown-aware
   LanguageTool client + house-style config), so the prose cc-orchestrator EMITS (issue/PR bodies,

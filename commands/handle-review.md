@@ -12,9 +12,13 @@ after all fixes are complete**. Never push per-comment.
 This command targets bot reviewer comments (logins ending with `[bot]`). For human
 reviewer comments, apply the same triage and fix discipline manually.
 
-**Which reviewers to expect.** **Codoki** (`codoki-pr-intelligence[bot]`) is the
-**primary auto-reviewer** -- it reviews every push on its own, so it is the
-reviewer to settle on by default. **CodeRabbit** is **opt-in / maintainer-allocated**:
+**Which reviewers to expect.** **Codoki**
+(`codoki-pr-intelligence[bot]`) is **NOT IN SERVICE** (subscription lapsed
+2026-07-12) -- it reviews nothing and is never triggered; never post `@codoki`.
+With Codoki gone and CR auto-review OFF, the only bot that may still post
+UNPROMPTED is **Greptile** (where installed) -- keep waiting for it (see below).
+A Codoki thread on an older PR is a LEGACY finding: triage, reply and resolve it
+like any other bot's. **CodeRabbit** is **opt-in / maintainer-allocated**:
 org-wide CR auto-review is OFF, so a CR review exists only when the maintainer has
 already triggered one. This command NEVER triggers a CR pass (see Step 1.25); a
 missing CR review is a normal state, not a problem to fix.
@@ -34,7 +38,8 @@ for Greptile via the same `pr-unreplied-comments.sh` script (its BOT_LOGIN_FILTE
 includes greptile-apps[bot]); the `pr-watch.sh` quiet-period gate also covers
 Greptile so /pr-watch never settles before Greptile's review lands.
 
-**Codoki** (`codoki-pr-intelligence[bot]`) IS treated as a reviewer bot here. It
+**Codoki** (`codoki-pr-intelligence[bot]`) is NOT IN SERVICE, so it posts nothing
+new; the handling below applies ONLY to a LEGACY Codoki review on an older PR. It
 posts COMMENTED reviews whose review *body is empty* -- every finding lives in
 inline comments plus a single `### Codoki PR Review` issue-comment summary
 (severity-tagged Medium/High table). Because the review body is blank, an
@@ -85,9 +90,7 @@ command MUST NOT post `@coderabbitai review` / `@coderabbitai full review` (or
 any other bot-review trigger) under any circumstance -- not when a review is
 missing, not "to be safe", never. CR auto-review is OFF org-wide, so CR is
 **opt-in**: it reviews only when the maintainer has already allocated a pass.
-**Codoki** (`codoki-pr-intelligence[bot]`) is the primary auto-reviewer and
-reviews every PR on its own, so a missing CR review is a normal state, not a
-problem to fix.
+A missing CR review is a normal state, not a problem to fix.
 
 Detect whether a CR review is *expected* -- so Step 1.5 knows whether to wait
 for one -- **without triggering anything**:
@@ -111,8 +114,8 @@ cr_triggered=$(gh api "repos/$repo/issues/$pr_number/comments" \
 
 If none of those signals is present (`cr_reviews == 0` AND `cr_requested` empty
 AND `cr_triggered == 0`), CR is **not expected**: do NOT wait for it
-in Step 1.5 and do NOT trigger it. Triage whatever reviews already exist (Codoki
-as primary; CR only if it already reviewed). If a CR pass would help, you may
+in Step 1.5 and do NOT trigger it. Triage whatever reviews already exist (CR only
+if it already reviewed). If a CR pass would help, you may
 note "a CR pass is available -- the maintainer can allocate one" and stop; never
 post the trigger yourself.
 
@@ -133,7 +136,7 @@ consecutive polls:
 1. No pending review requests for bot users **that are expected** -- i.e. only
    wait on CodeRabbit when Step 1.25 found it *expected* (already reviewed /
    requested / maintainer-triggered). When CR is not expected, do not count it as
-   pending; Codoki and any other already-present bot are the reviewers to settle.
+   pending; any already-present bot review is what you settle on.
 2. Unreplied bot comment count is stable (same count on two consecutive checks)
 
 **Geometric cooldown:** Reviews are never triggered by this command (Step 1.25);
@@ -755,5 +758,6 @@ Assemble and print:
 - Resolved: CR resolve $cr_status; GraphQL threads (Copilot + Greptile + Codoki) $graphql_resolve_status
 ```
 
-Codoki auto-reviews the push. CodeRabbit reviews only if the maintainer has
-allocated a pass -- this command never triggers one.
+Codoki is not in service, so it does not review the push; Greptile (where
+installed) still may. CodeRabbit reviews only if the maintainer has allocated a
+pass -- this command never triggers one.

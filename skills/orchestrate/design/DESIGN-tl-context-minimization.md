@@ -66,7 +66,8 @@ Adversarial review found most of the "new" mechanisms already ship. This design 
   model is shipped; the gate receipt (below) is a *formalization* of it, not a new format.
 - **`ship-gate-preflight.sh`** (#110): already the deterministic merge oracle (exit 0=PASS /
   2=BLOCK, fail-closed, verdict chosen inside the tool), already consumed by exit code in
-  `/merge-pr` and `pr-watch.sh --codoki-only`. It IS the "verify by exit code" contract.
+  `/merge-pr` and `pr-watch.sh` (which calls the oracle's `--codoki-gate`). It IS the "verify by
+  exit code" contract.
 - **`pr-watch.sh` / `issue-watch.sh`**: already the never-poll watchers (block, one stdout
   line). The "never-poll rule" is shipped policy, not a new lever.
 - **DELEGATE-OR-SUMMARIZE** (`SKILL.md`): already mandates pushing big reads/greps/log work to
