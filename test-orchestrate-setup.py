@@ -921,13 +921,14 @@ def main():
         check("#95: dry-run previews advisory steering hooks + steer DEPLOY, writes nothing",
               rc == 0 and "advisory WARN-level steering" in out and not os.path.exists(sdest)
               and steer_matchers(s1) == set())
-        # --apply wires all 4 steer hooks (Edit/Write/Bash/Read) + deploys the steer script (executable).
+        # --apply wires all 5 steer hooks (Edit/Write/Bash/Read/Agent) + deploys the steer script.
+        # Agent (#231) is REQUIRED: without that matcher the foreground-containment WARN is dead code.
         rc, out = run(["configure", "--apply", "--yes"], env_overrides=sov(s1))
         steer_deployed = (os.path.isfile(sdest)
                           and open(sdest, "rb").read() == open(sbundle, "rb").read()
                           and bool(os.stat(sdest).st_mode & 0o111))
-        check("#95: configure --apply wires the 4 steering hooks + deploys orchestrate-steer.sh",
-              rc == 0 and steer_matchers(s1) == {"Edit", "Write", "Bash", "Read"} and steer_deployed)
+        check("#95/#231: configure --apply wires the 5 steering hooks + deploys orchestrate-steer.sh",
+              rc == 0 and steer_matchers(s1) == {"Edit", "Write", "Bash", "Read", "Agent"} and steer_deployed)
         # Idempotent: second --apply makes no steer change.
         rc, out = run(["configure", "--apply", "--yes"], env_overrides=sov(s1))
         check("#95: configure is idempotent once steering is wired (no new steer hook line)",
@@ -965,11 +966,11 @@ def main():
                     if h.get("type") == "command" and h.get("command") == STEER_CMD}
 
         def wired_steer_settings(fn):
-            """Settings with the guard hook + all 4 steer hooks wired with the EXACT fail-open
+            """Settings with the guard hook + all 5 steer hooks wired with the EXACT fail-open
             command (the in-sync, fully-wired state)."""
             p = os.path.join(td, fn)
             blocks = [GUARD_HOOK] + [{"matcher": m, "hooks": [{"type": "command", "command": STEER_CMD}]}
-                                     for m in ("Edit", "Write", "Bash", "Read")]
+                                     for m in ("Edit", "Write", "Bash", "Read", "Agent")]
             json.dump({"hooks": {"PreToolUse": blocks}, "permissions": {"allow": ["Bash(x *)"]}}, open(p, "w"))
             return p
 
@@ -978,11 +979,11 @@ def main():
         s_cmd = fresh_settings("s_cmd.json")
         run(["configure", "--apply", "--yes"], env_overrides=sov(s_cmd))
         check("#95 F1: configure writes the fail-open STEER_HOOK_COMMAND (`[ -r ... ] && ... || true`)",
-              steer_exact_matchers(s_cmd) == {"Edit", "Write", "Bash", "Read"})
+              steer_exact_matchers(s_cmd) == {"Edit", "Write", "Bash", "Read", "Agent"})
 
         # Finding 2: present() is an EXACT (type+command) match - a stale/disabled steer line does NOT
         # count as wired, so configure still adds the real hook. Seed an Edit block with a DISABLED
-        # command (`true # orchestrate-steer.sh`); configure must re-wire all 3 with the exact command.
+        # command (`true # orchestrate-steer.sh`); configure must re-wire all 5 with the exact command.
         s_stale = os.path.join(td, "s_stale.json")
         json.dump({"hooks": {"PreToolUse": [GUARD_HOOK,
                    {"matcher": "Edit", "hooks": [{"type": "command",
@@ -992,8 +993,8 @@ def main():
         check("#95 F2: a disabled `true # orchestrate-steer.sh` line is NOT counted as exact-wired",
               "Edit" in steer_matchers(s_stale) and steer_exact_matchers(s_stale) == set())
         run(["configure", "--apply", "--yes"], env_overrides=sov(s_stale))
-        check("#95 F2: configure re-wires all 4 steer hooks with the exact command despite the stale line",
-              steer_exact_matchers(s_stale) == {"Edit", "Write", "Bash", "Read"})
+        check("#95 F2: configure re-wires all 5 steer hooks with the exact command despite the stale line",
+              steer_exact_matchers(s_stale) == {"Edit", "Write", "Bash", "Read", "Agent"})
 
         # Finding 3: check_steer WARNs on the "deploy" action - hooks fully wired but the deployed
         # steer SCRIPT is absent (so the hook cannot run). Previously fell through to PASS.
@@ -1010,7 +1011,7 @@ def main():
         rc, out = run(["configure", "--apply", "--yes"], env_overrides=sov(s_rn))
         check("#95 F5: restart notice fires for a steer-only hook add (no guard add)",
               "RESTART" in out and "hooks load at session start" in out
-              and steer_exact_matchers(s_rn) == {"Edit", "Write", "Bash", "Read"})
+              and steer_exact_matchers(s_rn) == {"Edit", "Write", "Bash", "Read", "Agent"})
 
     # #228: configure wires the PostToolUse context-budget meter + deploys the meter script (Option
     # A); --no-ctxmeter opts out; doctor WARNs (never FAILs) when the meter is missing. Mirrors #95.

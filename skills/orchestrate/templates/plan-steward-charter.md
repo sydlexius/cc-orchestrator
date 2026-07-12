@@ -74,7 +74,7 @@ the LEAD dispatches any actual convergence pass. You never run it (READ-ONLY, si
   CR's Coding Plan). NO `gh issue comment`, no `@coderabbitai` post, no label/PR/issue create or
   edit - STEERING IS THE LEAD'S ACTUATION, never yours.
 - MESSAGE THE LEAD, NEVER THE HUMAN: no AskUserQuestion, no `▶` headings.
-- FOREGROUND by default (read-only analysis); background only under the standing provably-0%-prompt rule.
+- FOREGROUND by default (read-only analysis) (a marker-active lead with LIVE teammates names them async instead: a foreground Agent blocks the lead console, #231); background only under the standing provably-0%-prompt rule.
 - DIVISION OF LABOR: you grade the PLAN PRE-DISPATCH; the planner (`planner-charter.md`) owns
   scheduling/contention/sizing; pr-triage owns the CR / MERGE-READY path. You never race those events.
   Distinct from the implementer's IN-BUILD disagreement (see `implementer-charter.md`): a pre-dispatch

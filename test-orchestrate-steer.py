@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Proof harness for orchestrate-steer.sh (the WARN-level steering hook, #95).
 
-Asserts the two advisory rules, through BOTH input channels (stdin JSON, $TOOL_INPUT env):
+Asserts the five advisory rules, through BOTH input channels (stdin JSON, $TOOL_INPUT env):
   (1) MID-RUN CANONICAL EDIT (marker-gated): an Edit/Write of a canonical file (SKILL.md,
       templates/*, orchestrate-guard.sh, orchestrate-steer.sh) WARNs only while THIS session's
       marker is fresh; never blocks (exit 0). A non-canonical path, or a canonical path with no
@@ -11,6 +11,7 @@ Asserts the two advisory rules, through BOTH input channels (stdin JSON, $TOOL_I
 Every case asserts exit 0 (steering NEVER blocks) and the presence/absence of the `STEER:` line.
 Run: python3 test-orchestrate-steer.py
 """
+import importlib.util
 import json
 import os
 import re
@@ -318,6 +319,131 @@ def main():
     # Empty payload -> silent, exit 0 (fail-open).
     rc, err = run_steer({}, channel="stdin")
     check("empty tool_input -> silent, exit 0 (fail-open)", rc == 0 and not warned(err))
+
+    # --- #284: the canonical-edit rule must cover the DEPLOYED HELPERS + commands/ --------------
+    # Reproduced live: a marker-active mid-run edit of safe-push.sh was SILENT, so the ONE mechanism
+    # whose job is to say "log feedback, do not edit mid-run" missed the exact file that motivated
+    # the rule. These are canonical-source files by the same argument as the guard.
+    print("\n== #284: canonical matcher covers the deployed helpers + commands/ ==")
+    repo = os.path.dirname(os.path.abspath(__file__))
+    for helper in ("scripts/safe-push.sh", "scripts/pr-unreplied-comments.sh",
+                   "scripts/gh-comment.sh", "scripts/gate-runner.py", "commands/prep-pr.md"):
+        p = os.path.join(repo, helper)
+        rc, err = run_steer({"file_path": p}, channel="stdin", tool_name="Edit", marker_active=True)
+        check(f"#284: marker-active Edit of {helper} -> WARN", rc == 0 and warned(err))
+        # Marker-gating must survive: no marker -> silent (a solo session is never nagged).
+        rc, err = run_steer({"file_path": p}, channel="stdin", tool_name="Edit", marker_active=False)
+        check(f"#284: NO marker, Edit of {helper} -> silent", rc == 0 and not warned(err))
+
+    # LOCKSTEP (the guard against the exact bug round 1 caught): EVERY Option-A-deployed helper in
+    # orchestrate-setup.py's HELPER_NAMES must be canonical to the steer matcher. The first cut of this
+    # matcher drifted 4 helpers behind that set, so a mid-run `issue-watch.sh` edit stayed SILENT --
+    # bug #283 verbatim, for a different file. Without this test the list re-drifts the next time a
+    # helper is added.
+    # IMPORT the real tuple; do NOT regex it. A regex here is how this test became THEATER once
+    # already: `HELPER_NAMES\s*=\s*[\(\[](.*?)[\)\]]` is non-greedy and terminated at the first `)`,
+    # which lands inside an inline comment `(#216).` -- so it captured 12 of 15 names and silently
+    # dropped ship-gate-preflight.sh, issue-watch.sh and gh-react.sh, TWO of which were the very
+    # helpers whose omission was the bug this test exists to catch. Mutation-proved: deleting
+    # issue-watch.sh from the matcher left the harness GREEN. Import the module and pin the EXACT
+    # count, so a truncated parse or a newly-added helper cannot pass unnoticed.
+    spec = importlib.util.spec_from_file_location(
+        "_osetup", os.path.join(repo, "scripts/orchestrate-setup.py"))
+    _osetup = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(_osetup)
+    helper_names = list(_osetup.HELPER_NAMES)
+    check("#284 lockstep: HELPER_NAMES imported (exact count -- a truncated parse must not pass)",
+          len(helper_names) == 15)
+    for h in helper_names:
+        p = os.path.join(repo, "scripts", h)
+        rc, err = run_steer({"file_path": p}, channel="stdin", tool_name="Edit", marker_active=True)
+        check(f"#284 lockstep: deployed helper {h} is canonical -> WARN", rc == 0 and warned(err))
+
+    # A symlinked helper (the legacy claude-kit layout) must STILL warn: readlink -f resolves it away
+    # from any scripts/ parent, so a resolved-only match would go silent on the exact layout the
+    # resolution exists to handle.
+    with tempfile.TemporaryDirectory() as td:
+        os.makedirs(os.path.join(td, "scripts"))
+        real = os.path.join(td, "kit-safe-push.sh")
+        open(real, "w").close()
+        link = os.path.join(td, "scripts", "safe-push.sh")
+        os.symlink(real, link)
+        rc, err = run_steer({"file_path": link}, channel="stdin", tool_name="Edit", marker_active=True)
+        check("#284: SYMLINKED helper (resolves outside scripts/) still WARNs", rc == 0 and warned(err))
+
+    # A Read of a canonical helper still must NOT nag (the Read carve-out is preserved).
+    rc, err = run_steer({"file_path": os.path.join(repo, "scripts/safe-push.sh")},
+                        channel="stdin", tool_name="Read", marker_active=True, session_id="sess-284")
+    check("#284: marker-active READ of a helper -> no canonical-edit nag", rc == 0 and not warned(err))
+
+    # A non-canonical script must stay silent (the matcher must not swallow the whole repo).
+    rc, err = run_steer({"file_path": os.path.join(repo, "test-orchestrate-steer.py")},
+                        channel="stdin", tool_name="Edit", marker_active=True)
+    check("#284: marker-active Edit of a NON-canonical file (a test harness) -> silent",
+          rc == 0 and not warned(err))
+
+    # --- #231: foreground-Agent containment (marker-gated WARN) ---------------------------------
+    # The #221 spike proved PreToolUse fires on Agent and the payload carries run_in_background.
+    # CRITICAL (from the 45 captured live payloads): the field is ABSENT, not false, when the caller
+    # omits it -- and agents DEFAULT TO BACKGROUND. So a naive falsy check would warn on 13/45 legal
+    # background spawns. Demand the EXACT shape: warn only on an explicit `false`.
+    print("\n== #231: foreground-Agent containment ==")
+    rc, err = run_steer({"description": "x", "prompt": "y", "run_in_background": False},
+                        channel="stdin", tool_name="Agent", marker_active=True)
+    check("#231: marker-active Agent with run_in_background=false -> WARN", rc == 0 and warned(err))
+
+    rc, err = run_steer({"description": "x", "prompt": "y"},
+                        channel="stdin", tool_name="Agent", marker_active=True)
+    check("#231: marker-active Agent with run_in_background ABSENT (defaults background) -> silent",
+          rc == 0 and not warned(err))
+
+    rc, err = run_steer({"description": "x", "prompt": "y", "run_in_background": True},
+                        channel="stdin", tool_name="Agent", marker_active=True)
+    check("#231: marker-active Agent with run_in_background=true -> silent", rc == 0 and not warned(err))
+
+    rc, err = run_steer({"description": "x", "prompt": "y", "run_in_background": False},
+                        channel="stdin", tool_name="Agent", marker_active=False)
+    check("#231: NO marker, foreground Agent -> silent (solo session is never gated)",
+          rc == 0 and not warned(err))
+
+    # The WARN must name the remedy (a NAMED async teammate), not merely scold.
+    _, err = run_steer({"description": "x", "prompt": "y", "run_in_background": False},
+                       channel="stdin", tool_name="Agent", marker_active=True)
+    check("#231: the WARN names the remedy (named async teammate)",
+          "name" in err.lower() and ("async" in err.lower() or "background" in err.lower()))
+
+    # A non-Agent tool carrying run_in_background (e.g. a Bash background call) must NOT trigger it.
+    rc, err = run_steer({"command": "ls", "run_in_background": False},
+                        channel="stdin", tool_name="Bash", marker_active=True)
+    check("#231: Bash with run_in_background=false -> silent (Agent-only rule)",
+          rc == 0 and not warned(err))
+
+    # TYPE-EXACTNESS: only a JSON boolean false warns. The STRING "false" and 0 are NOT false -- the
+    # matcher must not collapse types (the "demand the exact shape" rule the floor-matcher work paid
+    # for). An earlier tostring-based form warned on the string, which is the shape a hand-built or
+    # proxied payload could carry.
+    rc, err = run_steer({"description": "x", "run_in_background": "false"},
+                        channel="stdin", tool_name="Agent", marker_active=True)
+    check('#231: run_in_background as the STRING "false" -> silent (type-exact)',
+          rc == 0 and not warned(err))
+    rc, err = run_steer({"description": "x", "run_in_background": 0},
+                        channel="stdin", tool_name="Agent", marker_active=True)
+    check("#231: run_in_background=0 -> silent (type-exact, not falsy)", rc == 0 and not warned(err))
+    rc, err = run_steer({"description": "x", "run_in_background": None},
+                        channel="stdin", tool_name="Agent", marker_active=True)
+    check("#231: run_in_background=null -> silent", rc == 0 and not warned(err))
+
+    # FAIL-SILENT-OPEN on the Agent path with jq unavailable: the hook must never block a spawn.
+    # Build a PATH holding ONLY bash (jq lives in /usr/bin, so we cannot simply drop a dir).
+    with tempfile.TemporaryDirectory() as jqless:
+        os.symlink("/bin/bash", os.path.join(jqless, "bash"))
+        env = dict(os.environ, PATH=jqless)
+        payload = json.dumps({"tool_name": "Agent", "session_id": "s",
+                              "tool_input": {"run_in_background": False}})
+        p = subprocess.run(["/bin/bash", STEER], input=payload, capture_output=True, text=True,
+                           timeout=10, env=env)
+        check("#231: jq absent -> exit 0, silent (fail-open, never blocks the spawn)",
+              p.returncode == 0 and not warned(p.stderr))
 
     print()
     if FAILS:

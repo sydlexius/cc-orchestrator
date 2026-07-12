@@ -42,7 +42,7 @@ fi
 ```
 
 **Parallelism strategy:** Data gathering (poll, fetch, pre-triage) is parallelized
-across PRs using foreground agents. Fixing is serial because base PR fixes cascade into
+across PRs using foreground agents. (In a marker-active ORCHESTRATE session with LIVE teammates, name these agents and let them run async instead - a foreground Agent blocks the lead console, and the steer hook WARNs on it (#231). Solo, foreground is correct.) Fixing is serial because base PR fixes cascade into
 dependent PRs via rebase.
 
 ---
@@ -117,7 +117,7 @@ Save the original branch name so you can return to it at the end.
 ## Step 2 -- Parallel: poll readiness, fetch comments
 
 After identifying the stack, launch **one foreground Agent per PR** in a single message
-(all agents in parallel). Each agent performs the full data-gathering pipeline for its PR.
+(all agents in parallel). Each agent performs the full data-gathering pipeline for its PR. (In a marker-active ORCHESTRATE session with LIVE teammates, name these agents and let them run async instead - a foreground Agent blocks the lead console, and the steer hook WARNs on it (#231). Solo, foreground is correct.)
 
 ### Agent prompt template (one per PR)
 
@@ -229,7 +229,7 @@ If no PRs need work, say: "All PRs in the stack are clean. Nothing to do." and s
 ## Step 3 -- Parallel: pre-triage analysis
 
 For each PR with status `NEEDS WORK`, launch **one foreground Agent per PR** in a single
-message to pre-compute the triage. These agents run in parallel.
+message to pre-compute the triage. These agents run in parallel. (In a marker-active ORCHESTRATE session with LIVE teammates, name these agents and let them run async instead - a foreground Agent blocks the lead console, and the steer hook WARNs on it (#231). Solo, foreground is correct.)
 
 ### Agent prompt template (one per PR)
 

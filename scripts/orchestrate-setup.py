@@ -49,7 +49,7 @@ GUARD = os.environ.get("ORCHESTRATE_GUARD", os.path.join(HOME, ".claude", "scrip
 BUNDLED_GUARD = os.environ.get("ORCHESTRATE_BUNDLED_GUARD",
     os.path.join(os.path.dirname(os.path.realpath(__file__)), "orchestrate-guard.sh"))
 # The WARN-level steering hook (#95) - a SEPARATE script from the deny-floor guard. Deployed to the
-# stable STEER path the same Option-A way, and wired as advisory Edit/Write/Bash/Read PreToolUse hooks.
+# stable STEER path the same Option-A way, and wired as advisory Edit/Write/Bash/Read/Agent PreToolUse hooks.
 # Advisory + opt-out-able (`configure --no-steer`), so doctor only ever WARNs about it, never FAILs.
 STEER = os.environ.get("ORCHESTRATE_STEER", os.path.join(HOME, ".claude", "scripts", "orchestrate-steer.sh"))
 BUNDLED_STEER = os.environ.get("ORCHESTRATE_BUNDLED_STEER",
@@ -158,9 +158,14 @@ GUARD_HOOK_JSON = ("  Add this to ~/.claude/settings.json under hooks.PreToolUse
                    "  verifies + prints; `orchestrate-setup.py configure --apply` writes it for you):\n"
                    "    " + json.dumps(GUARD_HOOK_BLOCK))
 
-# The advisory steering hooks (#95, #226). Four PreToolUse blocks (Edit, Write, Bash, Read) all
-# pointing at the stable steer path. Read (#226) is wired so the read-dedup WARN fires on a redundant
-# re-Read; the steer script gates its canonical-edit rule OFF for a Read so this never nags a reader.
+# The advisory steering hooks (#95, #226, #231). FIVE PreToolUse blocks (Edit, Write, Bash, Read,
+# Agent) all pointing at the stable steer path. Read (#226) is wired so the read-dedup WARN fires on a
+# redundant re-Read; the steer script gates its canonical-edit rule OFF for a Read so this never nags
+# a reader. Agent (#231) is wired so the foreground-Agent containment WARN can see the spawn at all -
+# WITHOUT this matcher that rule is DEAD CODE (the hook is never invoked for an Agent call, and a
+# hook that never runs fails open silently, which is the false-sense-of-enforcement the #221 spike
+# was run to rule out). #221 verified empirically that PreToolUse DOES fire on `Agent` and that the
+# payload carries `run_in_background`.
 # SEPARATE from the guard's Bash hook (settings.json runs every matching block, so
 # the guard deny and the steer WARN coexist on a Bash call). Advisory + opt-out-able.
 # The command is fail-OPEN: `[ -r <steer> ] && bash <steer> || true` so a missing/unreadable deployed
@@ -172,7 +177,7 @@ STEER_HOOK_COMMAND = ('[ -r "$HOME/.claude/scripts/orchestrate-steer.sh" ] && '
 STEER_HOOK_BLOCKS = [
     {"matcher": m,
      "hooks": [{"type": "command", "command": STEER_HOOK_COMMAND}]}
-    for m in ("Edit", "Write", "Bash", "Read")
+    for m in ("Edit", "Write", "Bash", "Read", "Agent")
 ]
 
 # The PostToolUse context-budget meter hook (#228). ONE PostToolUse block matching all tools ("*")
@@ -351,7 +356,7 @@ def _deploy_steer():
 def check_steer(settings):
     """Doctor check for the advisory steering hooks (#95). WARN (never FAIL) when the hooks are not
     wired or the deployed steer script is stale/uncomparable - steering is opt-out-able and advisory,
-    so its absence is never a hard fail. PASS when all 3 hooks are wired + the deployed steer matches
+    so its absence is never a hard fail. PASS when all 5 hooks are wired + the deployed steer matches
     the bundled copy. Stays read-only."""
     missing = _missing_steer_hook_blocks(settings)
     action = _steer_deploy_action()

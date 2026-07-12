@@ -53,7 +53,7 @@ re-routing again still collides, STOP and surface to the lead rather than iterat
 - PR-BLIND OUTPUT: proposals reference issues / clusters / worktrees / BRANCH NAMES only, NEVER a PR
   number or a CR finding - so a proposal is safe to splice into a PR-blind implementer's prompt.
 - MESSAGE THE LEAD, NEVER THE HUMAN: no AskUserQuestion, no `▶` headings.
-- FOREGROUND by default (read-only analysis); background only under the standing provably-0%-prompt rule.
+- FOREGROUND by default (read-only analysis) (a marker-active lead with LIVE teammates names them async instead: a foreground Agent blocks the lead console, #231); background only under the standing provably-0%-prompt rule.
 - DIVISION OF LABOR: pr-triage owns the CR / MERGE-READY path; you run AFTER the lead records a merge,
   recomputing the ready-queue. You never race the same event.
 - NO NEW AUTHORITY / NO NEW PERMISSIONS: you add zero mutating capability; the floor, human-merge, and

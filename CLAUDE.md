@@ -54,17 +54,28 @@ Runtime (`scripts/`; canonical source is this repo):
   Enables in-session merge (no separate terminal) without teaching the floor network I/O. Its only
   write is the local token; no gh/git remote mutation, no allow-list/floor change.
 - `scripts/orchestrate-steer.sh` - the advisory WARN-level steering hook (#95), SEPARATE from the
-  deny-floor guard. Exit 0 ALWAYS (never blocks); emits a `STEER:` nudge to stderr on four rules:
-  (1) a marker-gated mid-run edit of a canonical file (SKILL.md/templates/guard/steer) -> log
-  feedback instead (gated OFF for a `Read` so wiring the hook for Read never nags a reader);
+  deny-floor guard. Exit 0 ALWAYS (never blocks); emits a `STEER:` nudge to stderr on five rules:
+  (1) a marker-gated mid-run edit of a canonical file -> log feedback instead (gated OFF for a `Read`
+  so wiring the hook for Read never nags a reader). CANONICAL = SKILL.md/templates/guard/steer PLUS
+  (#284) the Option-A-DEPLOYED helpers (`safe-push.sh`, `pr-*.sh`, `gh-*.sh`, `gate-runner.py`,
+  `reply-comment.sh`, ...) and `commands/*.md` - they are canonical-source by the same argument as the
+  guard, and their omission made a mid-run `safe-push.sh` edit SILENT (the #283 miss). Matched under a
+  `scripts/`/`commands/` PARENT so a same-named file elsewhere is not swallowed;
   (2) a raw `gh api` mutation not via a `gh-*` wrapper -> use the wrapper;
   (3) a raw `gh pr comment`/`gh pr create` -> canonical path (reply-comment.sh/gh-comment.sh; /prep-pr)
   (#159; canonical-steering only - `merge` and the allow-listed lifecycle subcommands are NOT flagged);
   (4) a redundant re-`Read` of a path already read this session with unchanged mtime+size -> skip the
   Read (#226; stateful per-session state keyed on the stdin `session_id`, marker-independent, advisory
-  so the post-compaction re-read exception stays valid).
-  Wired
-  for Edit/Write/Bash/Read PreToolUse by `configure` (deployed Option-A like the guard); never duplicates
+  so the post-compaction re-read exception stays valid);
+  (5) a marker-gated FOREGROUND `Agent` spawn (#231) -> give it a `name` AND omit the flag (BOTH halves:
+  a name alone does not make it async; dropping the flag alone leaves it unnamed+backgrounded, which cannot
+  answer a permission prompt), because a foreground agent BLOCKS the lead console for its whole run. Keyed on the EXACT shape: only an
+  explicit `run_in_background: false` warns. The field is ABSENT (not false) when omitted and an Agent
+  DEFAULTS TO BACKGROUND, so a naive falsy check would have fired on 28 of the 45 live spawns the #221
+  spike captured and been WRONG on 13 - absent/true/malformed/non-Agent are all SILENT.
+  Wired for Edit/Write/Bash/Read/Agent PreToolUse by `configure` (deployed Option-A like the guard).
+  The `Agent` matcher is LOAD-BEARING, not cosmetic: without it the hook is never invoked on a spawn
+  and rule (5) is DEAD CODE that fails open silently. Never duplicates
   or weakens a guard deny; opt out with `configure --no-steer`. Fails SILENT-OPEN.
 - `orchestrate-resources.py` - cross-session port + data-dir lease allocator (flock-atomic JSON
   state). `stillwater` profile emits SW_* env (lease JSON on STDOUT, eval-able exports on STDERR);
@@ -74,10 +85,10 @@ Runtime (`scripts/`; canonical source is this repo):
   [--apply]` is the consent-based path that wires the floor hook + missing allow-list entries into
   settings.json, DEPLOYS the bundled guard to the stable `~/.claude/scripts/` path (so a fresh
   plugin install has a working floor; idempotent, refreshes a stale copy, warns on a missing source),
-  DEPLOYS the 13 bundled PR-lifecycle helpers the same Option-A way (#133; #234 added
+  DEPLOYS the 15 bundled PR-lifecycle helpers (HELPER_NAMES) the same Option-A way (#133; #234 added
   `gh-react.sh`; retiring any claude-kit
   symlink, backed up to `<dest>.bak`), and (unless `--no-steer`) DEPLOYS + wires the advisory
-  steering hook `orchestrate-steer.sh` for Edit/Write/Bash/Read (#95/#226; doctor only ever WARNs about it),
+  steering hook `orchestrate-steer.sh` for Edit/Write/Bash/Read/Agent (#95/#226/#231; doctor only ever WARNs about it),
   DEPLOYS this script to the stable path + wires a read-only SessionStart `init` advisory hook (#162;
   the `init` subcommand reuses the single `_scan_merge_gate_shadows` matcher to surface a `gh pr *`
   merge-gate shadow at session start - READ-ONLY, SILENT on a clean cascade, exit 0 on every path
