@@ -434,16 +434,30 @@ def main():
     check("#231: run_in_background=null -> silent", rc == 0 and not warned(err))
 
     # FAIL-SILENT-OPEN on the Agent path with jq unavailable: the hook must never block a spawn.
-    # Build a PATH holding ONLY bash (jq lives in /usr/bin, so we cannot simply drop a dir).
+    #
+    # The PATH must contain `cat` but NOT `jq`. An earlier version of this case symlinked ONLY bash --
+    # which meant `cat` was missing too, so the script's `stdin_json=$(cat)` returned nothing and it
+    # early-exited on the empty-payload fail-open BEFORE ever reaching jq. It passed while proving
+    # NOTHING about jq-absence (caught by Copilot on PR #286). Provide cat + the other coreutils the
+    # hook may touch, and withhold ONLY jq, so the jq-missing branch is the one actually exercised.
     with tempfile.TemporaryDirectory() as jqless:
-        os.symlink("/bin/bash", os.path.join(jqless, "bash"))
+        for tool in ("bash", "cat", "basename", "readlink", "mkdir", "chmod", "cksum", "cut", "printf"):
+            for src in (f"/bin/{tool}", f"/usr/bin/{tool}"):
+                if os.path.exists(src):
+                    os.symlink(src, os.path.join(jqless, tool))
+                    break
+        check("#231: jq-absent probe has cat but NOT jq (else the case proves nothing)",
+              os.path.exists(os.path.join(jqless, "cat"))
+              and not os.path.exists(os.path.join(jqless, "jq")))
         env = dict(os.environ, PATH=jqless)
         payload = json.dumps({"tool_name": "Agent", "session_id": "s",
                               "tool_input": {"run_in_background": False}})
         p = subprocess.run(["/bin/bash", STEER], input=payload, capture_output=True, text=True,
                            timeout=10, env=env)
+        # exit 0 AND genuinely silent: no STEER line and no stderr noise at all (the fail-silent-open
+        # contract is silence, not merely a zero exit).
         check("#231: jq absent -> exit 0, silent (fail-open, never blocks the spawn)",
-              p.returncode == 0 and not warned(p.stderr))
+              p.returncode == 0 and not warned(p.stderr) and p.stderr.strip() == "")
 
     print()
     if FAILS:
