@@ -530,8 +530,9 @@ Build a `--label` flag string from the matched names, e.g.
 
 **Do NOT suggest the `norabbit` label.** It is a denylist filter nested under
 CR's `reviews.auto_review` config, so it exempts a PR from the AUTOMATIC review
-only -- and this repo's `.coderabbit.yaml` already sets `auto_review.enabled:
-false`, with manual `@coderabbitai review` triggers still running on demand. The
+only -- and this repo's `.coderabbit.yaml` already sets
+`reviews.auto_review.enabled: false`, with manual `@coderabbitai review`
+triggers still running on demand. The
 label therefore gates a feature that is already off: it suppresses nothing, and a
 maintainer-triggered pass ignores it. Suggesting it is a no-op that costs a turn. (The label
 is still honored as a deterministic CR-satisfied signal by `pr-watch.sh` (#34),
