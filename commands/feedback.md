@@ -1,7 +1,7 @@
 ---
 description: "Capture a deferred process/tooling idea to the feedback maildir - do NOT implement it now (add | list)"
 argument-hint: "add <slug>  |  list"
-allowed-tools: ["Bash"]
+allowed-tools: ["Bash", "Write"]
 ---
 
 # Capture a deferred idea (feedback maildir)
@@ -19,8 +19,10 @@ This wraps `orchestrate-feedback.sh`. It exposes exactly two subcommands: `add` 
 
 ## Step 1 -- `add <slug>` (the primary path)
 
-FIRST write the entry body to a temp file with the FILE-EDIT tool (what the friction was, what you
+FIRST write the entry body to a temp file with the `Write` tool (what the friction was, what you
 would change, and where - per SKILL.md's HOW TO WRITE THE LOG). THEN pipe it in via a STDIN REDIRECT.
+`Write` is in `allowed-tools` for exactly this reason: the body MUST reach the helper via a file, so
+a command that could only run Bash could not perform its own primary step.
 Substitute your own slug and body path:
 
 ```bash
