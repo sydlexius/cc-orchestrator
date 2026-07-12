@@ -528,9 +528,16 @@ using whatever names the repo actually defines).
 Build a `--label` flag string from the matched names, e.g.
 `--label "enhancement"`.
 
-**Mechanical / docs-only / config-only PRs:** consider suggesting the
-`norabbit` label to the maintainer (it is in the org CodeRabbit denylist, so it
-skips an unnecessary review). Suggest only -- never apply it without consent.
+**Do NOT suggest the `norabbit` label.** It is a denylist filter nested under
+CR's `reviews.auto_review` config, so it exempts a PR from the AUTOMATIC review
+only -- and this repo's `.coderabbit.yaml` already sets
+`reviews.auto_review.enabled: false`, with manual `@coderabbitai review`
+triggers still running on demand. The
+label therefore gates a feature that is already off: it suppresses nothing, and a
+maintainer-triggered pass ignores it. Suggesting it is a no-op that costs a turn. (The label
+is still honored as a deterministic CR-satisfied signal by `pr-watch.sh` (#34),
+and would matter again if auto-review were ever re-enabled -- so it stays
+supported, just never recommended.)
 
 ### Step 8b -- Create the PR
 

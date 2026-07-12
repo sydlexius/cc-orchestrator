@@ -33,5 +33,5 @@ Closes #
   - Commit/PR prose with trigger words goes through a file (`git commit -F <file>`, `--body-file`), never a Bash heredoc - the live guard greps command lines.
   - Push via `~/.claude/scripts/safe-push.sh`.
   - Do NOT edit the symlinked canonical skill/guard files as part of unrelated work (no-mid-run-canonical-edits).
-  - Consider suggesting the `norabbit` label to the maintainer for mechanical/docs-only/config-only PRs.
+  - Do NOT suggest the `norabbit` label: CR auto-review is OFF org-wide, so it suppresses nothing (a maintainer-triggered review ignores it).
 -->
