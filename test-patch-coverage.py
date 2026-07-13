@@ -15,6 +15,7 @@ no dedup shipped.
 Run: python3 test-patch-coverage.py
 """
 import os
+import atexit
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,18 @@ import tempfile
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "patch-coverage.sh")
 FAILS = []
 _TMPDIRS = []
+
+
+@atexit.register
+def _cleanup_tmpdirs():
+    """Sweep the throwaway git repos on EVERY exit path (CodeRabbit, PR #290).
+
+    A sweep at the end of main() leaks them whenever a case raises before reaching it --
+    `_git()` runs with check=True, so a git failure aborts mid-case -- and it would also
+    be skipped by the sys.exit(1) failure path. atexit covers all three.
+    """
+    for d in _TMPDIRS:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def check(label, cond):
@@ -120,9 +133,6 @@ def main():
     rc_z, out_z = run_case([f"{BLOCK} 2 0"], go_src=GO_BASE, added_src=GO_ADDED)
     check("#288: genuinely uncovered block -> still 0%, gate FAILS (no false PASS)",
           rc_z != 0 and "Total patch coverage: 0.00%" in out_z)
-
-    for d in _TMPDIRS:
-        shutil.rmtree(d, ignore_errors=True)
 
     print()
     if FAILS:
