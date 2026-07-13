@@ -853,6 +853,20 @@ def main():
           "(sibling matcher anchored too)",
           rc == 0 and out.strip() == "1")
 
+    # PR #290 (Copilot): anchoring ALONE is not enough -- the marker must also be TERMINATED.
+    # A body merely STARTING with `<!-- CODOKI_REVIEW_COMMENT` (no `-->`) was still treated as a
+    # Codoki summary: a self-suppression channel, and inconsistent with INFO_MARKERS_RE, which
+    # requires a COMPLETE leading HTML comment.
+    UNTERMINATED = ('[{"id":9105,"user":{"login":"coderabbitai[bot]"},'
+                    '"created_at":"2026-06-18T03:00:00Z",'
+                    '"body":"<!-- CODOKI_REVIEW_COMMENT this is not a closed comment\\n'
+                    'High: a real finding hiding behind an unterminated marker.",'
+                    '"reactions":{"+1":1}}]')
+    rc, out, err = run(["--count-only"], issue=UNTERMINATED)
+    check("#290: an UNTERMINATED CODOKI_REVIEW_COMMENT marker does NOT suppress the comment "
+          "(marker must be a COMPLETE leading HTML comment)",
+          rc == 0 and out.strip() == "1")
+
     # (5) The report must show the BREAKDOWN, not just a summed integer (a bare "2 findings" for
     # ONE finding is what fed the "the oracle cries wolf" read that ends in an override).
     rc, out, err = run(["--allow-stale"], reviews=CR_BODY_1_PLUS_6)

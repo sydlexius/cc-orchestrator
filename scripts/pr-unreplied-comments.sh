@@ -942,7 +942,13 @@ fi
 #      NO WARNING. Every issue-level finding suppressed, silently, on a fail-closed gate.
 #      -> Accept only a `|`-separated list of marker NAMES, validate each, and BUILD the
 #         alternation ourselves. A bad value fails LOUD (never silent-open).
-#   - CODOKI_REVIEW_COMMENT -> Codoki's issue-level review SUMMARY. Its "action" is the
+#   - CODOKI_REVIEW_COMMENT -> Codoki's issue-level review SUMMARY. Matched as a COMPLETE leading
+#     HTML comment (anchored AND terminated), exactly like INFO_MARKERS_RE. Anchoring alone is not
+#     enough: without the `-->` terminator, any body merely STARTING with `<!-- CODOKI_REVIEW_COMMENT`
+#     is treated as a summary, which is a self-suppression channel (Copilot, PR #290). If Codoki ever
+#     adds an attribute to the marker, this simply stops matching and the summary is COUNTED as
+#     actionable - an over-count, never an under-count. That is the correct direction to fail on a
+#     fail-closed gate. Its "action" is the
 #     ROOT-SUMMARY ack (a 👍/👎 reaction; #234), NOT a reply. Once ACKED (any +1/-1 on
 #     the comment) it is handled, so drop it. An UNACKED summary INTENTIONALLY still
 #     counts: the ack is a real pending action, and ship-gate-preflight.sh BLOCKs on it -
@@ -952,7 +958,7 @@ actionable_issue=$(echo "$issue_comments" | jq --arg me "$me" --arg infomarkers 
   '"$BOT_LOGIN_FILTER"' and
   (.body | test("auto-generated"; "i") | not) and
   (.body | test($infomarkers) | not) and
-  (((.body | test("^[[:space:]]*<!--[[:space:]]*CODOKI_REVIEW_COMMENT")) and
+  (((.body | test("^[[:space:]]*<!--[[:space:]]*CODOKI_REVIEW_COMMENT[[:space:]]*-->")) and
     (((.reactions."+1" // 0) + (.reactions."-1" // 0)) > 0)) | not) and
   (.body | test("^\\s*$") | not)
 ) | {id, type: "issue-comment", reply_type: "top-level", user: .user.login, created_at,
