@@ -226,11 +226,47 @@ for file in "${changed[@]}"; do
 
   # Coverage blocks for this file. Profile paths are module-relative.
   cov_path="${module}/${file}"
+  # UNION duplicate blocks before classification (#288). A single
+  # `go test -coverpkg=./... ./...` emits each block ONCE PER TEST BINARY - every binary
+  # instruments every package - so a binary that never executed a block contributes a `0`
+  # count for it. The classifier below applies an ALL-HIT rule (one miss poisons the line),
+  # so WITHOUT this union a single 0 from an unrelated test binary marks a genuinely-covered
+  # line as MISSED: a 100%-covered patch reported 0.00% and FAILED the gate (stillwater
+  # #2424). That is worse than refusing to measure - 0% is a plausible number an agent acts
+  # on, so it goes and writes tests for lines that are already covered.
+  #
+  # Collapse identical block KEYS (sLine.sCol,eLine.eCol) to one entry, taking the MAX count.
+  # This is the same union `go tool cover` applies on read and that Codecov applies across
+  # shards - this script was the outlier, not the union.
+  #
+  # IDEMPOTENT: an already-unioned profile has no duplicate keys, so a repo whose gate
+  # pre-unions (stillwater's pre-push-gate.sh) sees byte-identical output and zero change.
+  # It collapses only IDENTICAL keys, never DISTINCT overlapping blocks - so the all-hit
+  # semantics for a genuinely-partial line (a hit block and a missed block covering it) are
+  # preserved, matching Codecov's partial accounting. Both properties are pinned by
+  # test-patch-coverage.py.
+  #
+  # No new dependency: NOT `gocovmerge` (that is NOT a Go toolchain tool - `go tool
+  # gocovmerge` fails unless the repo declares github.com/wadey/gocovmerge in go.mod, so a
+  # generic target repo would fall through), and NOT a hard error on duplicates (duplicates
+  # are the NORMAL output of the standard -coverpkg incantation, so failing loud on them
+  # would break every ordinary repo).
   cov_blocks=$(awk -v pfx="${cov_path}:" '
     BEGIN { plen = length(pfx) }
     substr($1, 1, plen) == pfx {
-      # Emit: "range nstmts count" (range = sLine.sCol,eLine.eCol)
-      print substr($1, plen + 1), $2, $3
+      key = substr($1, plen + 1)
+      cnt = $3 + 0
+      if (!(key in seen) || cnt > maxcnt[key]) { maxcnt[key] = cnt }
+      seen[key] = 1
+      nstmts[key] = $2
+      if (!(key in ordered)) { ordered[key] = ++n; order[n] = key }
+    }
+    END {
+      # Emit in first-seen order (deterministic output; order-independent result).
+      for (i = 1; i <= n; i++) {
+        k = order[i]
+        print k, nstmts[k], maxcnt[k]
+      }
     }' "$COVER_OUT")
 
   # Validate block range format before classification. Catching a bad

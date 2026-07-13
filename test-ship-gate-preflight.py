@@ -352,6 +352,20 @@ def main():
     rc, _, _, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN, unreplied_raw="4 (2 major)")
     check("review-body findings line with numeric-prefixed count (4 ...) -> exit 2", rc == 2)
 
+    # #289: the BLOCK must NAME THE CLEARING ACTION. This is the half of #289 that actually
+    # prevents the stillwater #2424 override: a review-body finding has no inline thread to
+    # resolve and clears only by acking the review BY ID, and that channel was invisible from the
+    # block message -- so the maintainer replied "fixed in <sha>" (no id), the gate never cleared,
+    # and they merged OVER the oracle. A fail-closed gate that cannot tell you how to satisfy it
+    # trains the lead to override it. (This message had ZERO harness coverage until now: it could
+    # be reverted and every test stayed green.)
+    rc, out, err, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN, unreplied_findings=2)
+    both = out + err
+    check("#289: a review-body BLOCK names the clearing action (reply-comment.sh --review)",
+          rc == 2 and "reply-comment.sh --review" in both)
+    check("#289: the BLOCK says the review id is the ack token (a bare reply does NOT clear)",
+          rc == 2 and "review id" in both.lower() and "does NOT clear" in both)
+
     print("== #178: --allow-stale invocation + retry + surfaced failure ==")
     # The oracle MUST invoke the helper with --allow-stale so a behind-base PR (the
     # helper's deterministic exit-2 STOP) is not masked as a generic "helper failed".

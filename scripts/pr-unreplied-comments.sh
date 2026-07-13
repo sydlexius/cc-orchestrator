@@ -222,6 +222,48 @@ if [ "$audit_mode" = true ]; then
   fi
 fi
 
+# Validate + build the informational-marker matcher HERE, BEFORE the first `gh` call (#289).
+# It used to live ~700 lines down, AFTER ~11 gh api round-trips - and AFTER the early-exit
+# returns for --audit / --coverage-only / --pending-only, so a typo'd PR_INFO_MARKERS was
+# never validated in those modes at all. A bad config must fail FAST and in EVERY mode.
+# DEFAULT = CODOKI_INFO ONLY. `docs-drift-bot` was in this list for one round and it was a
+# CRITICAL mistake, caught in review: that is an IDENTITY marker (the workflow stamps it on
+# EVERY body so it can upsert its own comment), and it rides on the "## Docs drift: MERGE
+# BLOCKED" body just as much as on the "hard gate cleared" one. Excluding on it silently
+# suppressed a genuinely BLOCKING finding - the exact recall loss this gate exists to prevent.
+#
+# A marker qualifies here ONLY if it denotes an INFORMATIONAL-ONLY comment CLASS (every comment
+# bearing it is status output). An identity/upsert marker does NOT qualify. If a bot needs its
+# all-clear excluded, it must emit a DISTINCT marker for that state (e.g. `<!-- foo:cleared -->`)
+# and the repo declares that one - never the identity marker.
+_info_markers="${PR_INFO_MARKERS:-CODOKI_INFO}"
+_validated=""
+_old_ifs="$IFS"
+# `set -f` is REQUIRED: the split below is an unquoted expansion, so without it the value also
+# undergoes PATHNAME EXPANSION and the matcher gets built from FILENAMES in the cwd (proved in
+# review: PR_INFO_MARKERS='.*' produced "invalid entry '.claude'"). A validator whose behavior
+# depends on the caller's cwd is not a validator.
+set -f
+IFS='|'
+for _m in $_info_markers; do
+  # Names only: letters, digits, underscore, hyphen. Anything else is rejected LOUDLY rather
+  # than interpolated into the matcher (an injected alternation would disable the gate).
+  case "$_m" in
+    *[!A-Za-z0-9_-]* | '')
+      IFS="$_old_ifs"; set +f
+      echo "pr-unreplied-comments: invalid PR_INFO_MARKERS entry '$_m' - marker names may contain only [A-Za-z0-9_-]. Refusing to build the matcher (a malformed marker regex would silently suppress findings on a fail-closed gate)." >&2
+      exit 2 ;;
+  esac
+  if [ -z "$_validated" ]; then _validated="$_m"; else _validated="$_validated|$_m"; fi
+done
+IFS="$_old_ifs"; set +f
+if [ -z "$_validated" ]; then
+  echo "pr-unreplied-comments: PR_INFO_MARKERS produced no valid markers. Refusing to build an empty matcher." >&2
+  exit 2
+fi
+# Anchored + terminated: the marker must be the leading, complete HTML comment of the body.
+INFO_MARKERS_RE="^[[:space:]]*<!--[[:space:]]*(${_validated})[[:space:]]*-->"
+
 pr_number="${1:?Usage: pr-unreplied-comments.sh [--wait] [--count-only] [--pending-only] [--latest-per-reviewer] [--itemized] <pr_number> [repo]}"
 repo="${2:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"
 me=$(gh api user --jq .login)
@@ -835,9 +877,23 @@ review_body_findings=$(( review_body_count + outside_diff_sum ))
 
 if [ "$review_body_findings" -gt 0 ]; then
   if [ "$count_only" = false ] && [ "$itemized" = false ]; then
-    echo "=== Review-body comments with actionable findings: $review_body_findings ==="
+    # Report BODIES and OUTSIDE-DIFF items separately (#289). Summing them into one integer
+    # reported "2 findings" for ONE finding on stillwater #2424, which fed the "the oracle
+    # cries wolf" read that ends in a merge override.
+    echo "=== Review-body comments with actionable findings: $review_body_findings ($review_body_count body/bodies + $outside_diff_sum outside-diff) ==="
     echo ""
     echo "$review_bodies"
+    echo ""
+    # NAME THE CLEARING ACTION (#289). This is THE fix for the stillwater #2424 false BLOCK:
+    # a pure outside-diff review has no inline thread to resolve and clears ONLY when a
+    # comment of yours REFERENCES THE REVIEW ID. That channel existed but was undiscoverable
+    # from the block message, so the maintainer replied "fixed in <sha>" (no id), the gate
+    # never cleared, and they overrode it.
+    echo "TO CLEAR each finding above: address it, then ack the review BY ID -"
+    if ! echo "$review_bodies" | jq -r --arg pr "$pr_number" '.[] | "  reply-comment.sh --review \(.id) \($pr) \"<why it is addressed / the fix SHA>\""'; then
+      echo "  (could not render the per-review ack commands - run '$0 --itemized $pr_number $repo' and ack each review id shown there)" >&2
+    fi
+    echo "(A reply WITHOUT the review id does NOT clear it - the id is the ack token.)"
     echo ""
   fi
   found=$((found + review_body_findings))
@@ -857,17 +913,46 @@ fi
 # instead of over-counting (#272; observed on docs-only PR #271: --count-only=2 vs
 # --audit=0). Two Codoki HTML-comment markers:
 #   - CODOKI_INFO           -> ALWAYS informational; never a finding.
+#
+# INFORMATIONAL MARKERS (#289). A bot comment carrying a DECLARED HTML-comment marker is
+# status output, not a review finding. stillwater #2424 had a github-actions comment reading
+# "## Docs drift: hard gate cleared -- merge is not blocked by this check" counted as an
+# actionable finding: the oracle classified an ALL-CLEAR as a finding.
+#
+# Marker-based, deliberately NOT login-based: `github-actions[bot]` is the GENERIC actor for
+# workflow-posted findings (security/lint), so excluding that login wholesale would MISS real
+# ones. And deliberately NOT keyword-based ("cleared" appears inside real findings, and a bot
+# could clear itself). A repo declares its informational markers; the default covers Codoki's.
+# Extend per-repo via PR_INFO_MARKERS (an ERE alternation of marker names).
+# HARDENED (hostile-review, lens 1). Two defects in the first cut of this, both of which
+# would have SILENTLY WEAKENED a fail-closed merge gate:
+#
+#  (1) UNANCHORED. `jq test()` is a substring match, so a marker matched ANYWHERE in a body -
+#      and with no `-->` terminator. A REAL finding that merely QUOTES the marker (CodeRabbit
+#      quotes diff snippets in its issue-level walkthrough, and this repo family literally
+#      ships that marker) was classified informational and VANISHED from the actionable count.
+#      It was also a trivial self-suppression channel: a bot emitting `<!-- CODOKI_INFO`
+#      anywhere in its body became invisible to the gate.
+#      -> Require the marker to be a COMPLETE HTML comment at the START of the body, which is
+#         how the real Codoki / docs-drift markers are actually emitted.
+#
+#  (2) REGEX INJECTION. PR_INFO_MARKERS was interpolated as a raw regex fragment INSIDE the
+#      capture group, so an unbalanced `)` escaped it: `x)|(.*` (or the plausible TYPO
+#      `CODOKI_INFO)|(`) produced an alternation matching every comment -> exit 0, count 0,
+#      NO WARNING. Every issue-level finding suppressed, silently, on a fail-closed gate.
+#      -> Accept only a `|`-separated list of marker NAMES, validate each, and BUILD the
+#         alternation ourselves. A bad value fails LOUD (never silent-open).
 #   - CODOKI_REVIEW_COMMENT -> Codoki's issue-level review SUMMARY. Its "action" is the
 #     ROOT-SUMMARY ack (a 👍/👎 reaction; #234), NOT a reply. Once ACKED (any +1/-1 on
 #     the comment) it is handled, so drop it. An UNACKED summary INTENTIONALLY still
 #     counts: the ack is a real pending action, and ship-gate-preflight.sh BLOCKs on it -
 #     so keeping it counted keeps --count-only consistent with that gate.
 # (CodeRabbit's own auto-generated summary is already dropped by the "auto-generated" test.)
-actionable_issue=$(echo "$issue_comments" | jq --arg me "$me" '[.[] | select(
+actionable_issue=$(echo "$issue_comments" | jq --arg me "$me" --arg infomarkers "$INFO_MARKERS_RE" '[.[] | select(
   '"$BOT_LOGIN_FILTER"' and
   (.body | test("auto-generated"; "i") | not) and
-  (.body | test("<!--\\s*CODOKI_INFO") | not) and
-  (((.body | test("<!--\\s*CODOKI_REVIEW_COMMENT")) and
+  (.body | test($infomarkers) | not) and
+  (((.body | test("^[[:space:]]*<!--[[:space:]]*CODOKI_REVIEW_COMMENT")) and
     (((.reactions."+1" // 0) + (.reactions."-1" // 0)) > 0)) | not) and
   (.body | test("^\\s*$") | not)
 ) | {id, type: "issue-comment", reply_type: "top-level", user: .user.login, created_at,
@@ -951,10 +1036,13 @@ if [ "$itemized" = true ]; then
       | (.user | sub("\\[bot\\]$"; "")) as $u
       | "issue-level | \($u) | (issue) | \(excerpt(.body)) | replied:n/a resolved:n/a" )'
 
-  # Review-body findings have no inline thread; each clears only when addressed AND
-  # the reviewer re-reviews a fresh SHA (a maintainer re-trigger for CodeRabbit).
+  # Review-body findings have no inline thread; each clears when a comment of YOURS
+  # REFERENCES THE REVIEW ID (ack-by-reference). An earlier version of this NOTE claimed they
+  # clear only on "a fresh SHA / a maintainer re-trigger for CodeRabbit" - THE CODE NEVER
+  # IMPLEMENTED THAT, and the false claim is what made the maintainer override the gate on
+  # stillwater #2424 instead of simply acking. The ack is agent-serviceable (#289).
   if [ "$review_body_count" -gt 0 ]; then
-    echo "NOTE: review-body findings have no inline thread to resolve; each clears only when addressed AND the reviewer re-reviews a fresh SHA (a maintainer re-trigger for CodeRabbit)."
+    echo "NOTE: review-body findings have no inline thread to resolve. Each clears when a comment of yours REFERENCES THE REVIEW ID: reply-comment.sh --review <review-id> $pr_number \"<reply>\". A reply without the id does NOT clear it."
   fi
   exit 0
 fi

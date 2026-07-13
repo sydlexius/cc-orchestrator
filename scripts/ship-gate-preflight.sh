@@ -532,7 +532,16 @@ else
 fi
 
 if [ "$findings" -gt 0 ]; then
+  # NAME THE CLEARING ACTION (#289). A review-body finding has NO inline thread to resolve; it
+  # clears when a comment of yours REFERENCES THE REVIEW ID. That channel already existed but
+  # was invisible from this message, so on stillwater #2424 the maintainer replied "fixed in
+  # <sha>" (no id), the gate never cleared, and they merged OVER the oracle. A fail-closed gate
+  # that cannot tell you how to satisfy it trains the lead to override it - the worst possible
+  # failure mode for the one deterministic gate in the pipeline.
   echo "BLOCK: $findings actionable review-body finding(s) unaddressed on #$pr -- run '$helper --itemized --allow-stale $pr $repo' for the itemized breakdown." >&2
+  echo "  TO CLEAR: address each finding, then ack its review BY ID:" >&2
+  echo "    reply-comment.sh --review <review-id> $pr \"<why it is addressed / the fix SHA>\"" >&2
+  echo "  The review id is the ack token - a reply WITHOUT it does NOT clear the finding." >&2
   echo "RESULT: BLOCK -- $findings actionable review-body finding(s). [#$pr $repo]" >&2
   exit 2
 fi
