@@ -5,13 +5,23 @@
 # distinct script preserves the floor's integrity (the guard stays pure hard-deny) and lets the
 # steering be disabled (`configure --no-steer`) without touching deny logic.
 #
-# Rules (#95, #159, #226):
+# Rules (#95, #159, #226, #231, #284):
 #   (1) MID-RUN CANONICAL EDIT (marker-gated): an Edit/Write whose target resolves to a canonical
-#       file (SKILL.md, templates/*, orchestrate-guard.sh, orchestrate-steer.sh) while THIS session's
-#       orchestrate marker is fresh -> WARN: log feedback to the mailbox, do not edit mid-run.
-#       Enforces [[orchestrate-no-mid-run-canonical-edits]]. Marker-gated so a teammate editing those
-#       files in its OWN worktree during a sanctioned PR build (a different $TMUX key, so no marker)
-#       is NOT warned - only the lead editing them mid-run in the marker-active session is. Gated OFF
+#       file while THIS session's orchestrate marker is fresh -> WARN: log feedback to the mailbox,
+#       do not edit mid-run. CANONICAL = SKILL.md, templates/*, orchestrate-guard.sh,
+#       orchestrate-steer.sh, PLUS (#284) the Option-A-DEPLOYED helpers (HELPER_NAMES), the rest of
+#       the floor fileset (orchestrate-authorize-merge.sh) and commands/*.md - their omission left a
+#       mid-run safe-push.sh edit SILENT, which is the exact miss (#283) that motivated this rule. Enforces [[orchestrate-no-mid-run-canonical-edits]].
+#       ACCEPTED FP (do not "fix" by weakening the rule): a TEAMMATE legitimately implementing an
+#       assigned change to one of these files in its OWN worktree may ALSO see this WARN, because
+#       tmux panes of one session share $TMUX and therefore see the same marker. Advisory-only, so the
+#       cost is a nudge on legitimate work, never a block; #284 widened the file set, which widens this
+#       FP too. (An earlier version of this header asserted a teammate has "a different $TMUX key, so
+#       no marker" - that is NOT established and is probably false; the honest statement is here.)
+#       ACCEPTED FP (2): the `*/commands/*.md` glob matches ANY repo's commands/ dir, so a
+#       marker-active lead editing a TARGET repo's own commands/*.md draws a spurious nudge. Advisory;
+#       tightening it to known basenames would miss a newly-added command - accepted.
+#       Gated OFF
 #       for a `Read` tool call (a Read carries a file_path too) so wiring the hook for Read never
 #       turns reading a canonical file into a spurious "do not edit" nag.
 #   (2) RAW GH-API MUTATION -> WRAPPER: a Bash command invoking `gh api` with a MUTATION flag
@@ -23,6 +33,10 @@
 #       unchanged mtime+size -> WARN: the content is already in context, skip the Read. Stateful
 #       (per-session, keyed on the stdin session_id), marker-independent, advisory only. The valid
 #       exception (post-compaction re-read) is why this is a WARN and never a deny.
+#   (5) FOREGROUND-AGENT CONTAINMENT (marker-gated, #231): an `Agent` spawned with an EXPLICIT
+#       run_in_background:false -> WARN: name it AND omit the flag (both halves), because a foreground Agent
+#       BLOCKS the lead console for its entire run. Type-EXACT (absent != false; see
+#       is_foreground_agent) and marker-gated. THREE accepted limitations are documented at the rule.
 #
 # These COMPLEMENT the guard's denies; they NEVER duplicate or weaken them (all WARN, exit 0). The
 # guard already DENIES push-to-main, bare force, --no-verify, gh --admin, and marker-gated merge;
@@ -136,7 +150,91 @@ is_canonical_path() {
     */skills/orchestrate/SKILL.md) return 0 ;;
     */skills/orchestrate/templates/*) return 0 ;;
   esac
+  # (#284) The Option-A-DEPLOYED helpers and the slash commands are canonical-source files by the
+  # SAME argument as the guard: the repo is the source, they are deployed to a stable path, and a
+  # mid-run edit of the working copy silently mutates canonical source while racing the in-flight PR.
+  # Reproduced before this fix: a marker-active edit of safe-push.sh was SILENT, so the ONE mechanism
+  # whose purpose is to say "log feedback, do not edit mid-run" missed the exact file that motivated
+  # the rule (a lead edited safe-push.sh mid-run instead of filing the idea; #283).
+  # Matched under a `scripts/` or `commands/` PARENT, so a same-named file elsewhere is not swallowed.
+  #
+  # Checked against BOTH the raw path AND the readlink-resolved path: a LEGACY claude-kit SYMLINK
+  # (repo `scripts/safe-push.sh` -> `~/kit/safe-push.sh`) resolves AWAY from any `scripts/` parent, so
+  # a resolved-only test goes silent on exactly the symlink layout readlink -f exists to handle. The
+  # guard/steer entries above dodge this by matching on BASENAME; these are parent-anchored, so they
+  # need both candidates.
+  #
+  # The helper list is LOCKSTEPPED to orchestrate-setup.py's HELPER_NAMES (the Option-A deployed set)
+  # by a test-orchestrate-steer.py regression case. Do NOT hand-extend one without the other: this
+  # list initially drifted 4 helpers behind that set, leaving a mid-run `issue-watch.sh` edit silent -
+  # the very bug (#283/#284) this rule closes, for a different file.
+  # The set is a SUPERSET of orchestrate-setup.py's HELPER_NAMES (the 15 Option-A-deployed helpers),
+  # and deliberately so - be precise about which, because an earlier comment here over-claimed
+  # "exactly HELPER_NAMES" and was wrong:
+  #   - every HELPER_NAMES entry (a lockstep test pins this; adding a helper without adding it here
+  #     is a test failure, which is how the first cut of this list drifted 4 helpers behind),
+  #   - the deployed hook/CLI scripts (guard + steer match by BASENAME above; context-meter + setup),
+  #   - orchestrate-authorize-merge.sh - on the FLOOR-FILESET ground, NOT the deployed ground. It is
+  #     NOT in HELPER_NAMES and has no stable-path copy (a round-6 review caught an earlier version of
+  #     this comment falsely calling it "deployed"). It is in because it ARMS the merge-auth token the
+  #     deterministic FLOOR trusts to allow a merge - the repo's own floor fileset (the adversarial-prep
+  #     charter) is guard + steer + authorize-merge - which makes it the most security-relevant non-guard
+  #     script here. Backstopping pr-read-comments.sh while leaving THIS out was backwards.
+  #   - the WHOLE `gh-*.sh` / `pr-*.sh` wrapper families, not just the deployed ones. Intentional: they
+  #     are canonical plugin source by the same argument, and a future `pr-foo.sh` is covered on day 1,
+  #   - `commands/*.md`.
+  # THE MEMBERSHIP RULE, stated honestly. A file is canonical if a mid-run edit of it would mutate
+  # CANONICAL PLUGIN SOURCE the live session depends on. That is THREE categories, not one - be exact,
+  # because two earlier versions of this comment were WRONG (one claimed "exactly HELPER_NAMES", the
+  # next claimed "the DEPLOYED set", and neither described the actual set):
+  #   (i)   the Option-A-DEPLOYED set: HELPER_NAMES (15) + the deployed hook/CLI scripts;
+  #   (ii)  the FLOOR fileset: guard + steer + authorize-merge (authorize-merge is NOT deployed - it is
+  #         in on floor grounds alone, because it arms the merge-auth token the floor trusts);
+  #   (iii) the remaining canonical PLUGIN SOURCE surfaces the session loads: the WHOLE `gh-*.sh` /
+  #         `pr-*.sh` wrapper families (not just the deployed ones) and `commands/*.md`.
+  # NOT canonical: an ordinary repo script that is in NONE of the three (an existing harness case pins
+  # orchestrate-resources.py that way, and it is right).
+  # First arm = the named HELPER_NAMES entries not already covered by the pr-*/gh-* globs, plus the
+  # deployed hook/CLI scripts (guard + steer match by basename above). Second arm = the pr-*/gh-*
+  # families (pr-watch, pr-unreplied-comments, pr-read-comments, pr-codeql-autofixes, gh-react, ...).
+  # NOTE: no inline comments inside the pattern list - a `#` inside a continued case pattern is a
+  # bash SYNTAX ERROR (shellcheck SC1009), which shellcheck caught here.
+  local cand
+  for cand in "$p" "$resolved"; do
+    case "$cand" in
+      */scripts/reply-comment.sh|*/scripts/resolve-threads.sh|*/scripts/cleanup-worktree.sh|\
+      */scripts/patch-coverage.sh|*/scripts/safe-push.sh|*/scripts/gate-runner.py|\
+      */scripts/pre-push-hook.sh|*/scripts/prefs-coverage.py|*/scripts/issue-watch.sh|\
+      */scripts/ship-gate-preflight.sh|*/scripts/orchestrate-context-meter.sh|\
+      */scripts/orchestrate-setup.py|*/scripts/orchestrate-authorize-merge.sh)
+        return 0 ;;
+      */scripts/pr-*.sh|*/scripts/gh-*.sh) return 0 ;;
+      */commands/*.md) return 0 ;;
+    esac
+  done
   return 1
+}
+
+# (#231) An EXPLICIT foreground Agent spawn. Keyed on the exact shape, never on falsiness.
+#
+# THE TRAP (from the #221 spike's 45 captured live payloads): `run_in_background` is ABSENT, not
+# `false`, when the caller omits it - and an Agent DEFAULTS TO BACKGROUND. Of those 45 spawns, 13
+# omitted the field entirely while running backgrounded and legal. So a naive `if not
+# run_in_background` check would warn on 28 of 45 spawns and be WRONG on 13 of them. Demand the
+# EXACT shape (a literal `false`); anything else - absent, true, malformed, non-Agent - is SILENT.
+# This is the floor-matcher lesson applied to an advisory rule: deny-on-doubt becomes silent-on-doubt.
+is_foreground_agent() {
+  # TYPE-EXACT by construction: `== false` matches ONLY a JSON boolean false. An absent key is null
+  # (not false), the string "false" is not false, 0 is not false, and a non-object input makes jq -e
+  # exit nonzero. So absent / true / "false" / 0 / malformed / missing-jq all fall to SILENT, and only
+  # the one sanctioned shape warns.
+  #
+  # NOTE the trap this avoids: `// empty` is UNUSABLE here (jq's alternative operator treats a literal
+  # `false` as empty and would erase the very value we test for), and a shell falsy check would be
+  # WORSE - `run_in_background` is ABSENT, not false, when omitted, and an Agent DEFAULTS TO BACKGROUND,
+  # so 13 of the 45 live spawns the #221 spike captured were legal background agents with no field at
+  # all. A falsy check would have warned on all of them.
+  printf '%s' "$1" | jq -e '.run_in_background == false' >/dev/null 2>&1
 }
 
 # A raw `gh api` MUTATION on the command line, NOT routed through a gh-* wrapper. Requires the `gh`
@@ -254,6 +352,40 @@ fi
 # the $TOOL_INPUT env channel - is NOT "Read", so the existing env-channel behavior is preserved).
 if [ "$tool_name" != "Read" ] && [ -n "$file_path" ] && is_canonical_path "$file_path" && marker_active; then
   emit_warn "Canonical symlinked file - log skill/charter/guard feedback via orchestrate-feedback.sh add (~/.claude/orchestrate-feedback/) and triage via PR; do not edit mid-run."
+fi
+
+# (5) foreground-Agent containment WARN (#231): marker-gated, Agent-only. In an ORCHESTRATE session a
+# foreground Agent BLOCKS the lead console end-to-end for its whole duration, freezing the lead's
+# ability to drive the team. Only an EXPLICIT run_in_background=false trips it (is_foreground_agent is
+# type-exact; absent means background). Advisory - it never blocks the spawn.
+#
+# It fires on a NAMED foreground agent too, deliberately: the override's rationale is ANTI-BLOCKING
+# ("the anti-blocking requirement beats the naming-overhead concern"), and a named foreground agent
+# blocks the console exactly as hard as an unnamed one (12 of the 45 spiked spawns were named AND
+# foreground). The remedy must therefore be stated as BOTH halves - NAME IT **AND** OMIT THE FLAG:
+#   - "name it" ALONE is causally FALSE: a name does NOT make an agent async, and `name` +
+#     run_in_background:false still blocks the console (this is the named-foreground case above);
+#   - "drop the flag" ALONE is UNSAFE on privileged work: it yields an UNNAMED BACKGROUNDED agent,
+#     which the standing background-agent ban forbids and which STALLS SILENTLY on the first
+#     permission prompt (it cannot answer one). Bare background is for a provably-0%-prompt
+#     read-only pass and nothing else.
+# Earlier drafts of this rule shipped each half alone; both were wrong, in opposite directions.
+#
+# THREE ACCEPTED LIMITATIONS, stated so nobody mistakes this for full enforcement:
+#  (a) ~15% BLIND. marker_active() is $TMUX-keyed, and $TMUX was ABSENT on 7 of the 45 live spawns the
+#      #221 spike captured (the in-process spawn case), where this rule silently no-ops. It is a
+#      NUDGE on the common path, NOT a guarantee.
+#  (b) OVER-APPROXIMATES "team is live". The CLAUDE.md override forbids a foreground agent when the
+#      lead has LIVE NAMED TEAMMATES, and re-sanctions the foreground one-shot when SOLO. A marker is
+#      the closest proxy the hook can see, but it has a 72h TTL - so a lead who tore the team down and
+#      is working solo in the same tmux pane can still be nagged for the SANCTIONED pattern. The
+#      message therefore says so outright, so a correct spawn is not made to feel like a violation.
+#  (c) NESTED SPAWNS. PreToolUse fires for a TEAMMATE's tool calls too, so a teammate spawning its own
+#      foreground Agent also sees this WARN, where "blocks the LEAD console" is imprecise (it blocks
+#      that teammate). Deliberately NOT special-cased: a nesting check would add a fragile inference
+#      for an advisory nudge whose advice ("do not block yourself on a foreground agent") still holds.
+if [ "$tool_name" = "Agent" ] && is_foreground_agent "$tool_input_json" && marker_active; then
+  emit_warn "Foreground Agent in a marker-active session: run_in_background=false BLOCKS the lead console for the agent's ENTIRE run, freezing your ability to drive the team. REMEDY = give it a 'name' AND omit run_in_background:false (BOTH halves: a name alone does not make it async - named + foreground still blocks; dropping the flag alone leaves it UNNAMED and backgrounded, which cannot answer a permission prompt and will stall silently on privileged work). Collect it via its completion notification / SendMessage. Bare background (no name) is allowed ONLY for a provably-0%-prompt read-only pass. If NO teammates are live (solo work in a stale-marker pane), a foreground one-shot is sanctioned - ignore this."
 fi
 
 # (2) raw gh-api mutation WARN: marker-independent.
