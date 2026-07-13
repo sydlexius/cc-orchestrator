@@ -337,12 +337,20 @@ def main():
     # NB: match the block-closing `fi` at COLUMN 0 -- `ln.strip() == "fi"` also matches the NESTED
     # `fi`s inside the self-test, which would end the strip early and leave its inert `exit 1` in the
     # "live" source (a false failure; it bit this test).
-    live, in_selftest = [], False
+    # Close the block on a `fi` at the SAME INDENT as its opening `if` -- not at column 0. Matching
+    # column 0 assumes the self-test is never nested; if it is ever moved inside a function, its `fi`
+    # is indented, `in_selftest` stays true for the REST OF THE FILE, and every live-path exit after
+    # it drops out of the scan -- a FALSE GREEN on the very invariant this test exists to guard
+    # (CodeRabbit, PR #291). Matching a bare `ln.strip() == "fi"` is the opposite failure: it stops
+    # early on a NESTED fi and leaves the self-test's inert `exit 1` in the live source (a false RED,
+    # which bit this test during implementation). Indent-matching avoids both.
+    live, in_selftest, selftest_indent = [], False, None
     for ln in src.split("\n"):
         if "--self-test" in ln and ln.lstrip().startswith("if "):
             in_selftest = True
+            selftest_indent = len(ln) - len(ln.lstrip())
         if in_selftest:
-            if ln == "fi":
+            if ln.strip() == "fi" and (len(ln) - len(ln.lstrip())) == selftest_indent:
                 in_selftest = False
             continue
         live.append(ln)

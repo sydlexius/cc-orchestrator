@@ -426,6 +426,14 @@ for f in paths:
 sys.exit(0)
 PROBE
   [ "$advisory" = true ] && tier="advisory"
+
+  # NEVER downgrade a brand-new hook (CodeRabbit, PR #291). A diff that ADDS a hook which is ALSO on
+  # the known-hooks list -- e.g. the first-ever add of orchestrate-context-meter.sh (#228) -- sets
+  # BOTH new_hook and hook_hits, and the line above would overwrite the deny-authority tier the
+  # new-hook rule just assigned. The probe only establishes what the file does TODAY; it says nothing
+  # about code whose blast radius nobody has reviewed yet. Reproduced against the real #228 commit:
+  # tier went deny-authority -> advisory. Deny-on-doubt has to WIN the last write.
+  [ -n "$new_hook" ] && tier="deny-authority"
 fi
 
 echo ">> RIGOR TIER: $tier"
