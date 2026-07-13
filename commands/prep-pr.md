@@ -327,35 +327,111 @@ languages) or silent behavior changes (in interpreted ones).
 ## Step 4a -- Local hostile review
 
 **Floor / merge-policy diff detection (#274; advisory, rigor-to-stakes).** First
-check whether this branch touches the deterministic-floor deny-authority scripts.
-If it does, the hostile review below must be the FULL `engage-ralph-loop` (K=2
-convergence), not a single pass -- a floor change is the highest-stakes diff this
-pipeline ships. This is ADVISORY: it escalates the depth of the review that always
-runs; it never blocks the push.
+determine the RIGOR TIER for this diff. Rigor scales with BLAST RADIUS -- what a defect
+here could actually DO -- not with which directory the file lives in. This is ADVISORY:
+it sets the DEPTH of the review that always runs; it never blocks the push.
+
+**Why this is tiered (#287).** The old detector keyed on a flat basename set
+(`orchestrate-guard|orchestrate-steer|orchestrate-authorize-merge`) and demanded the FULL
+K=2 loop for all three. But `orchestrate-guard.sh` is the DENY AUTHORITY (a defect there
+permits a bad push or merge), while `orchestrate-steer.sh` is ADVISORY -- it exits 0 on
+every path and cannot block a single tool call, so a defect there is a wrong or missing
+NUDGE. Giving them identical ceremony cost a ~50-minute, 10-round loop on an advisory
+hook. Tier by what the code can DO.
 
 ```bash
 if git rev-parse --verify -q origin/main >/dev/null 2>&1; then base_ref=origin/main; else base_ref=main; fi
 base=$(git merge-base "$base_ref" HEAD)
-# The deny-authority scripts ARE the canonical floor set (guard + steer +
-# authorize-merge; ship-gate-preflight is the oracle, not deny-authority). Keyed on
-# these precise basenames, NOT on SKILL.md/CLAUDE.md, so an ordinary skill/doc edit
-# never trips it (conditional, not systematic -- non-floor diffs must not nag). Use
-# --name-status -M so BOTH sides of a RENAME are inspected: a floor script renamed
-# away from (or to) its canonical name still trips the nudge (a name-only diff shows
-# only the new path and would miss the old-name half).
-floor_hits=$(git diff -M --name-status "$base"..HEAD | \
-  grep -E '(^|[[:space:]/])(orchestrate-guard|orchestrate-steer|orchestrate-authorize-merge)\.sh([[:space:]]|$)' || true)
-if [ -n "$floor_hits" ]; then
-  echo ">> floor diff detected - engage-ralph-loop recommended (run the FULL K=2 convergence, not a single pass):"
-  echo "$floor_hits" | sed 's/^/   - /'
+# --name-status -M so BOTH sides of a RENAME are inspected: a floor script renamed away from
+# (or to) its canonical name still trips the nudge (a name-only diff shows only the new path).
+hook_hits=$(git diff -M --name-status "$base"..HEAD | \
+  grep -E '(^|[[:space:]/])(orchestrate-guard|orchestrate-steer|orchestrate-authorize-merge|orchestrate-context-meter)\.(sh|py)([[:space:]]|$)' || true)
+
+# An UNKNOWN or NEW hook must never fall to the CHEAPEST tier. The enumeration above lists the KNOWN
+# hooks; a diff that ADDS a new one is adding enforcement-layer code whose blast radius nothing has
+# established. Unknown -> deny-authority, never "standard".
+#
+# Deliberately NOT keyed on "touches orchestrate-setup.py": that was tried and it is TOO BROAD --
+# setup.py carries the hook WIRING but is edited by plenty of benign changes (PR #286 touched it only
+# to add a matcher), so keying on it re-tiers an advisory diff back to K=2 and re-creates the exact
+# 50-minute loop this tiering exists to prevent. Over-strictness that defeats the feature is still a bug.
+new_hook=$(git diff -M --name-status "$base"..HEAD | \
+  grep -E '^A.*scripts/orchestrate-.*\.(sh|py)$' || true)
+
+tier="standard"
+if [ -n "$new_hook" ]; then
+  tier="deny-authority"
+  echo ">> NEW hook script added -- no cheap tier is earned by code whose blast radius is unestablished."
 fi
+if [ -n "$hook_hits" ]; then
+  # DENY-AUTHORITY by default. Assume the worst tier and let a file EARN the cheaper one.
+  tier="deny-authority"
+
+  # EVERY path in the name-status record, OLD AND NEW. `awk '{print $NF}'` prints only the LAST
+  # field, which on a RENAME record (`R099<TAB>old<TAB>new`) is the NEW path -- so a diff that
+  # RENAMED-and-edited the guard escaped the deny-authority classification entirely and was tiered
+  # ADVISORY. That was found in review, and it is the worst possible direction to be wrong in.
+  hook_paths=$(printf '%s\n' "$hook_hits" | cut -f2- | tr '\t' '\n' | sed '/^$/d')
+
+  # A hook is ADVISORY only if it can neither DENY nor SPEAK: exit 0 and empty stdout on EVERY
+  # probe. Claude Code blocks a tool call only on a nonzero exit or a stdout permissionDecision.
+  #
+  # PROBE, do NOT static-grep (a `printf ... | grep` writes to a PIPE, not stdout: a "no echo
+  # without a redirect" heuristic flags every internal pipe and the advisory tier is never granted
+  # -- the feature ships DEAD). And do NOT decide deny-authority BY NAME: that is the very sin this
+  # tiering exists to end, and it fails on a rename. Instead include a probe the DENY AUTHORITY
+  # ACTUALLY BLOCKS. A hook that blocks anything IS a deny authority, whatever it is called.
+  #
+  # ISOLATION: the deny probe is assembled from FRAGMENTS so the trigger substring never appears
+  # contiguously on this command line -- the live guard hook greps Bash command lines, so spelling
+  # it out here would get /prep-pr itself denied. (Same reason the guard's own harness builds its
+  # payloads inside a Python driver.)
+  deny_cmd="git pu""sh origin ma""in"
+  advisory=true
+  for f in $hook_paths; do
+    [ -f "$f" ] || { advisory=false; break; }        # deleted/renamed-away -> deny-on-doubt
+    for probe in \
+      "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"ls\"}}" \
+      "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"/tmp/x\"}}" \
+      "{\"tool_name\":\"Agent\",\"tool_input\":{\"run_in_background\":false}}" \
+      "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"$deny_cmd\"}}" \
+      "not json at all" \
+      ""; do
+      # timeout: the detector EXECUTES a work-in-progress hook. A stray `read`, `sleep` or infinite
+      # loop in an unfinished edit would otherwise hang /prep-pr forever. A timeout is DOUBT ->
+      # deny-authority.
+      out=$(printf '%s' "$probe" | timeout 5 bash "$f" 2>/dev/null); rc=$?
+      if [ "$rc" -ne 0 ] || [ -n "$out" ]; then advisory=false; break 2; fi
+    done
+  done
+  [ "$advisory" = true ] && tier="advisory"
+fi
+
+echo ">> RIGOR TIER: $tier"
+[ -n "$hook_hits" ] && printf '%s\n' "$hook_hits" | sed 's/^/   - /'
+case "$tier" in
+  deny-authority) echo "   -> FULL engage-ralph-loop, K=2 convergence (a defect here can permit a bad push/merge)." ;;
+  advisory)       echo "   -> ONE multi-lens pass + ONE fix-scoped verify round (hook proven exit-0/no-stdout: it cannot block anything)." ;;
+  standard)       echo "   -> ONE multi-lens pass." ;;
+esac
+echo "   -> ESCALATE to the full loop on ANY Critical/Important finding, whatever the tier."
 ```
 
-If the advisory fired, run Step 4a's review as the FULL `engage-ralph-loop` to K=2
-dry rounds (the security-floor rigor rule); if it did not, a single brief-shaped
-pass is sufficient. Either way the review below always runs -- the nudge only sets
+Run Step 4a's review at the tier printed above, per `engage-ralph-loop.md`:
+
+- **deny-authority** -> the FULL loop to K=2 dry rounds.
+- **advisory** / **standard** -> ONE pass with the lenses run IN PARALLEL (correctness-safety /
+  test-vacuity / doc-truth / adversarial-input), plus -- for advisory -- one HOSTILE, FIX-SCOPED
+  verify round over the fix diff (the fixes are new unreviewed code; that is where the
+  longest-surviving defects come from).
+- **ANY tier**: a Critical or Important finding ESCALATES the diff to the full loop. The fast path
+  is therefore taken only on diffs that come back clean, which is exactly where it is free.
+
+Cap every tier at MAX_ROUNDS (default 6): the cap is a BUDGET ALARM, never "ship anyway" -- on
+hitting it, STOP and surface the rounds run, the findings fixed, the lens classes NOT yet probed,
+and the option to SPLIT the diff. Either way the review below always runs -- the tier only sets
 its depth. (When editing a SKILL.md/CLAUDE.md floor-invariant section rather than a
-script, apply the same K=2 judgment manually; that surface is deliberately not
+script, apply the same TIER judgment manually; that surface is deliberately not
 auto-detected here to avoid nagging every doc edit.)
 
 Run an adversarial pre-push review of the diff. Dispatch a hostile-reviewer
