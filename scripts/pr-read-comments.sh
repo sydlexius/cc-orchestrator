@@ -11,7 +11,11 @@
 #
 # Modes (combinable):
 #   (default)  Inline review comments (diff comments)
-#   --reviews  Review-body comments (summary comments on reviews)
+#   --reviews  Review-body comments ONLY (summary comments on reviews)
+#
+# DEFAULT (no mode flag): ALL THREE surfaces - inline + review-body + issue-level - i.e. exactly
+# what pr-unreplied-comments.sh COUNTS for the gate. A reader that shows less than the gate counts
+# lets an agent conclude "no findings" and then be blocked by one it never saw (#289).
 #   --issue    Issue-level PR comments (general conversation)
 #
 # With no IDs: prints all unreplied bot comments of the selected type(s).
@@ -90,10 +94,21 @@ if [ "${#}" -gt 0 ]; then
   exit 0
 fi
 
-# No IDs: print unreplied bot comments of selected type(s)
-# Default to inline if no mode flags given
+# No IDs: print unreplied bot comments of selected type(s).
+#
+# THE READER MUST SHOW AT LEAST WHAT THE GATE COUNTS (#289; maintainer-flagged on PR #290).
+# The DEFAULT used to be inline-ONLY, while pr-unreplied-comments.sh COUNTS inline + review-body
+# + issue-level findings. So the two helpers disagreed in the dangerous direction: an agent ran
+# the reader, saw nothing, concluded "no findings" - and was then BLOCKED by a review-body
+# finding it was never shown. That is the #251 CR-nitpick miss, structurally guaranteed. (SKILL.md
+# even DOCUMENTED the default as reading "comment + review BODIES", which it did not.)
+#
+# The default now covers every surface the gate gates on. An explicit flag still NARROWS to one
+# surface, so `--issue` / `--reviews` keep their exact meaning for a caller that wants only that.
 if [ "$mode_reviews" = false ] && [ "$mode_issue" = false ]; then
   mode_inline=true
+  mode_reviews=true
+  mode_issue=true
 else
   mode_inline=false
 fi

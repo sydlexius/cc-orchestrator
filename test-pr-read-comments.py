@@ -153,6 +153,33 @@ def main():
     check("--issue + slug: exit 0", rc == 0)
     check("--issue targets the provided repo", "repos/owner/repo/issues/123/comments" in calls)
 
+    # ---- #289/#290: THE READER MUST SHOW AT LEAST WHAT THE GATE COUNTS ----
+    # The default used to be inline-ONLY while pr-unreplied-comments.sh COUNTS inline +
+    # review-body + issue-level. So an agent ran the reader, saw nothing, concluded "no
+    # findings", and was then BLOCKED by a review-body finding it was never shown -- the #251
+    # CR-nitpick miss, made structural. (SKILL.md even documented the default as reading
+    # "comment + review BODIES", which it did not.) The default must now hit all three surfaces.
+    print("\n== #289/#290: the DEFAULT reader covers every surface the gate gates on ==")
+    CR_NITPICK = ('[{"id":4681275083,"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED",'
+                  '"body":"Nitpick comments (1)\\n\\nTemp dirs leak if a case raises."}]')
+    rc, out, err, calls = run(["123", "owner/repo"], reviews=CR_NITPICK, issue=ISSUE_BODY)
+    check("#290: DEFAULT (no flags) fetches review BODIES (the CR-nitpick surface)",
+          "repos/owner/repo/pulls/123/reviews" in calls)
+    check("#290: DEFAULT (no flags) fetches ISSUE-level comments",
+          "repos/owner/repo/issues/123/comments" in calls)
+    check("#290: DEFAULT (no flags) still fetches INLINE comments",
+          "repos/owner/repo/pulls/123/comments" in calls)
+    check("#290: a CR review-body nitpick is VISIBLE in the default output "
+          "(it BLOCKS the gate, so the reader may not hide it)",
+          "Nitpick" in out and rc == 0)
+
+    # An EXPLICIT flag still NARROWS to that one surface (no behavior change for a caller that
+    # deliberately asked for a single surface).
+    rc, out, err, calls = run(["--issue", "123", "owner/repo"], reviews=CR_NITPICK,
+                              issue=ISSUE_BODY)
+    check("#290: an EXPLICIT --issue still narrows (does NOT pull review bodies)",
+          "repos/owner/repo/pulls/123/reviews" not in calls)
+
     print()
     if FAILS:
         print(f"FAILED ({len(FAILS)}):"); [print("  - " + f) for f in FAILS]; sys.exit(1)
