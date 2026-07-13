@@ -386,24 +386,45 @@ if [ -n "$hook_hits" ]; then
   # contiguously on this command line -- the live guard hook greps Bash command lines, so spelling
   # it out here would get /prep-pr itself denied. (Same reason the guard's own harness builds its
   # payloads inside a Python driver.)
-  deny_cmd="git pu""sh origin ma""in"
-  advisory=true
-  for f in $hook_paths; do
-    [ -f "$f" ] || { advisory=false; break; }        # deleted/renamed-away -> deny-on-doubt
-    for probe in \
-      "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"ls\"}}" \
-      "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"/tmp/x\"}}" \
-      "{\"tool_name\":\"Agent\",\"tool_input\":{\"run_in_background\":false}}" \
-      "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"$deny_cmd\"}}" \
-      "not json at all" \
-      ""; do
-      # timeout: the detector EXECUTES a work-in-progress hook. A stray `read`, `sleep` or infinite
-      # loop in an unfinished edit would otherwise hang /prep-pr forever. A timeout is DOUBT ->
-      # deny-authority.
-      out=$(printf '%s' "$probe" | timeout 5 bash "$f" 2>/dev/null); rc=$?
-      if [ "$rc" -ne 0 ] || [ -n "$out" ]; then advisory=false; break 2; fi
-    done
-  done
+  # ISOLATION: the deny probe is assembled from FRAGMENTS so the trigger substring never appears
+  # contiguously on this command line -- the live guard hook greps Bash command lines, so spelling it
+  # out here would get /prep-pr itself denied. It is passed to the prober via the ENVIRONMENT, never
+  # as an argument, for the same reason. (Same discipline as the guard's own harness.)
+  export ORCH_DENY_PROBE="git pu""sh origin ma""in"
+  export ORCH_HOOK_PATHS="$hook_paths"
+
+  # The prober runs in PYTHON, not with `timeout`. `timeout(1)` is NOT present on a stock macOS (nor
+  # some minimal Linux images), and without it every probe returns non-zero -> the advisory tier can
+  # NEVER be earned -> the whole tiering silently becomes a NO-OP. That is the third "ships dead"
+  # trap in this feature, and it is why the property is PROBED rather than assumed. python3 is
+  # already a hard dependency of the gate suite, so it is the portable floor.
+  if python3 - <<'PROBE'; then advisory=true; else advisory=false; fi
+import json, os, subprocess, sys
+
+paths = [p for p in os.environ.get("ORCH_HOOK_PATHS", "").split("\n") if p.strip()]
+probes = [
+    json.dumps({"tool_name": "Bash",  "tool_input": {"command": "ls"}}),
+    json.dumps({"tool_name": "Edit",  "tool_input": {"file_path": "/tmp/x"}}),
+    json.dumps({"tool_name": "Agent", "tool_input": {"run_in_background": False}}),
+    json.dumps({"tool_name": "Bash",  "tool_input": {"command": os.environ["ORCH_DENY_PROBE"]}}),
+    "not json at all",
+    "",
+]
+for f in paths:
+    if not os.path.isfile(f):
+        sys.exit(1)                      # deleted / renamed away -> deny-on-doubt
+    for payload in probes:
+        try:
+            r = subprocess.run(["bash", f], input=payload, capture_output=True,
+                               text=True, timeout=5)
+        except subprocess.TimeoutExpired:
+            sys.exit(1)                  # a WIP hook that hangs -> doubt -> deny-authority
+        # ADVISORY iff it can neither DENY (nonzero exit) nor SPEAK (stdout): Claude Code blocks a
+        # tool call only on a nonzero exit or a stdout permissionDecision.
+        if r.returncode != 0 or r.stdout != "":
+            sys.exit(1)
+sys.exit(0)
+PROBE
   [ "$advisory" = true ] && tier="advisory"
 fi
 
