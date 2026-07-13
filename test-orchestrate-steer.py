@@ -320,6 +320,74 @@ def main():
     rc, err = run_steer({}, channel="stdin")
     check("empty tool_input -> silent, exit 0 (fail-open)", rc == 0 and not warned(err))
 
+    # --- #287: THE ADVISORY INVARIANT (mechanically pinned, never assumed) ---------------------
+    # /prep-pr Step 4a grants this script the CHEAP review tier (one multi-lens pass instead of the
+    # full K=2 loop) on the strength of ONE property: it is ADVISORY -- it cannot block a tool call.
+    # Claude Code blocks only on a nonzero exit (2) or a stdout `permissionDecision: deny`, so the
+    # property is: no nonzero exit on a live path, and NO STDOUT AT ALL.
+    #
+    # This test IS the tier's premise. Without it, "steer is advisory" is a claim in a comment, and
+    # the day a diff adds an `exit 2` is precisely the day that diff gets reviewed at the cheap tier.
+    # Deny-on-doubt applied to rigor: if this ever goes red, the tier must revert to deny-authority.
+    print("\n== #287: the ADVISORY INVARIANT that earns this script the cheap review tier ==")
+    with open(STEER) as fh:
+        src = fh.read()
+    # Strip the --self-test block: its nonzero exits are inert (the hook is wired with NO args, so
+    # the self-test branch is unreachable in production).
+    # NB: match the block-closing `fi` at COLUMN 0 -- `ln.strip() == "fi"` also matches the NESTED
+    # `fi`s inside the self-test, which would end the strip early and leave its inert `exit 1` in the
+    # "live" source (a false failure; it bit this test).
+    # Close the block on a `fi` at the SAME INDENT as its opening `if` -- not at column 0. Matching
+    # column 0 assumes the self-test is never nested; if it is ever moved inside a function, its `fi`
+    # is indented, `in_selftest` stays true for the REST OF THE FILE, and every live-path exit after
+    # it drops out of the scan -- a FALSE GREEN on the very invariant this test exists to guard
+    # (CodeRabbit, PR #291). Matching a bare `ln.strip() == "fi"` is the opposite failure: it stops
+    # early on a NESTED fi and leaves the self-test's inert `exit 1` in the live source (a false RED,
+    # which bit this test during implementation). Indent-matching avoids both.
+    live, in_selftest, selftest_indent = [], False, None
+    for ln in src.split("\n"):
+        if "--self-test" in ln and ln.lstrip().startswith("if "):
+            in_selftest = True
+            selftest_indent = len(ln) - len(ln.lstrip())
+        if in_selftest:
+            if ln.strip() == "fi" and (len(ln) - len(ln.lstrip())) == selftest_indent:
+                in_selftest = False
+            continue
+        live.append(ln)
+    live_src = "\n".join(live)
+    bad_exits = re.findall(r'(?:^|[^A-Za-z_])exit\s+([1-9]\d*)', live_src)
+    check("#287 ADVISORY INVARIANT: no nonzero exit on any live path (it cannot DENY a tool call)",
+          not bad_exits)
+
+    # No stdout on ANY path: every emission must be >&2. A stdout write is how a PreToolUse hook
+    # returns a permissionDecision, so stdout is the other way this script could become blocking.
+    _repo = os.path.dirname(os.path.abspath(__file__))
+    payloads = [
+        {"tool_name": "Bash", "tool_input": {"command": "gh api -X PATCH repos/o/r/issues/1"}},
+        {"tool_name": "Edit", "tool_input": {"file_path": os.path.join(_repo, "scripts/safe-push.sh")}},
+        {"tool_name": "Agent", "tool_input": {"run_in_background": False}},
+        {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+        {"tool_name": "Agent", "tool_input": {}},
+    ]
+    stdout_clean, rc_clean = True, True
+    for pl in payloads:
+        with tempfile.TemporaryDirectory() as td:
+            fd = os.path.join(td, "orchestrate-floor.d"); os.makedirs(fd)
+            open(os.path.join(fd, _key(DEFAULT_TMUX)), "w").close()   # marker ACTIVE (worst case)
+            env = dict(os.environ, ORCHESTRATE_FLOOR_DIR=fd, TMUX=DEFAULT_TMUX,
+                       ORCHESTRATE_READ_STATE_DIR=os.path.join(td, "rs"))
+            env.pop("TOOL_INPUT", None)
+            pr = subprocess.run([STEER], input=json.dumps(pl), env=env,
+                                capture_output=True, text=True, timeout=10)
+            if pr.stdout != "":
+                stdout_clean = False
+            if pr.returncode != 0:
+                rc_clean = False
+    check("#287 ADVISORY INVARIANT: writes NOTHING to stdout on any path "
+          "(a stdout permissionDecision is the other way a hook can block)", stdout_clean)
+    check("#287 ADVISORY INVARIANT: exits 0 on every path, marker ACTIVE, all rule surfaces",
+          rc_clean)
+
     # --- #284: the canonical-edit rule must cover the DEPLOYED HELPERS + commands/ --------------
     # Reproduced live: a marker-active mid-run edit of safe-push.sh was SILENT, so the ONE mechanism
     # whose job is to say "log feedback, do not edit mid-run" missed the exact file that motivated
