@@ -170,10 +170,20 @@ bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh --itemized "$pr_numb
 ```
 
 Each line is `<class> | <user> | <loc> | <excerpt> | replied:<..> resolved:<..>`.
-A **review-body** finding has NO inline thread to resolve: it clears only when the
-finding is addressed AND the reviewer re-reviews a fresh SHA (a maintainer
-re-trigger for CodeRabbit) -- so it stays on the checklist until that re-review
-lands, even after you fix and push. Work every line to closure before claiming the
+A **review-body** finding has NO inline thread to resolve: it clears when you ACK
+THE REVIEW BY ID -- a comment of yours whose body REFERENCES the review id:
+
+```sh
+reply-comment.sh --review <review-id> <pr> "<why it is addressed / the fix SHA>"
+```
+
+The review id is the ack token. A reply WITHOUT it does NOT clear the finding --
+not a `--file/--line` inline reply, not an `@coderabbitai resolve`, not a bare
+"fixed in <sha>". (An earlier version of this doc claimed such a finding "clears
+only when the reviewer re-reviews a fresh SHA / a maintainer re-trigger". THAT WAS
+FALSE -- the code never implemented it. Following that advice is what left a ready
+PR blocked and forced a merge override on stillwater #2424: the lead fixed the
+finding, replied without the id, and the gate correctly never cleared.) Work every line to closure before claiming the
 review is triaged.
 
 Then pull the full bodies per class for the actual fixes:

@@ -104,7 +104,7 @@ emit(PULL)
 
 def run(args, *, inline="[]", reviews="[]", issue="[]", graphql=None,
         graphql_next=None, committer_date="2026-06-18T00:00:00Z", me="testuser",
-        check_runs=None):
+        check_runs=None, extra_env=None):
     with tempfile.TemporaryDirectory() as td:
         bindir = os.path.join(td, "bin"); os.makedirs(bindir)
         gh = os.path.join(bindir, "gh")
@@ -124,6 +124,8 @@ def run(args, *, inline="[]", reviews="[]", issue="[]", graphql=None,
             env["GRAPHQL_NEXT"] = graphql_next
         if check_runs is not None:
             env["CHECK_RUNS_JSON"] = check_runs
+        if extra_env:
+            env.update(extra_env)
         p = subprocess.run(["bash", SCRIPT] + args + ["123", "owner/repo"],
                            env=env, capture_output=True, text=True, timeout=20)
         return p.returncode, p.stdout, p.stderr
@@ -483,8 +485,15 @@ def main():
     check("itemized: review-body line marks (body) and resolved:n/a",
           any(ln.startswith("review-body |") and "(body)" in ln and "resolved:n/a" in ln
               for ln in out.splitlines()))
-    check("itemized: review-body carries the NOTE about no inline thread / re-review",
-          "NOTE:" in out and "re-review" in out)
+    # #289: this case used to assert the NOTE said the finding clears when "the reviewer
+    # re-reviews a fresh SHA (a maintainer re-trigger)" -- i.e. the TEST PINNED THE FALSE
+    # CLAIM. The code never implemented that; the real clearing condition is ack-by-review-id,
+    # and the false NOTE is what made the maintainer override the gate on stillwater #2424.
+    # Now it asserts the note states the condition the code ACTUALLY implements.
+    check("itemized: review-body NOTE states the REAL clearing condition (ack by review id)",
+          "NOTE:" in out and "REFERENCES THE REVIEW ID" in out
+          and "reply-comment.sh --review" in out
+          and "re-review" not in out and "maintainer re-trigger" not in out)
     check("itemized: review-body exit 0", rc == 0)
 
     # (b) inline unreplied comment -> "inline | ... | path:line |" with resolved from GraphQL.
@@ -684,6 +693,185 @@ def main():
     rc, out, err = run(["--count-only"], issue="[" + UNACKED_SUMMARY + "]")
     check("#272: UNACKED Codoki summary -> --count-only = 1 (still actionable)",
           rc == 0 and out.strip() == "1")
+
+    # ---- #289: the ship-gate FALSE BLOCK (stillwater #2424) ----
+    # A pure outside-diff CR review clears ONLY via ack-by-REVIEW-ID (a $me comment created
+    # after submitted_at whose body CONTAINS the review id). The maintainer replied "fixed in
+    # <sha>" with no review id -> never acked -> BLOCK forever, while the helper's own NOTE
+    # told them it could only be cleared by a maintainer re-trigger. They overrode the gate.
+    print("\n== #289: review-body findings -- the ack channel must be DISCOVERABLE ==")
+    OUTSIDE_ONLY = (
+        '[{"id":4680966542,"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T02:00:00Z",'
+        '"body":"> [!CAUTION]\\n<summary>Outside diff range comments (1)</summary>"}]'
+    )
+
+    # The BLOCK/report path must NAME the exact clearing action, with the review id. Without
+    # this the finding is undiscoverable-in-practice and the lead overrides the gate.
+    rc, out, err = run([], reviews=OUTSIDE_ONLY)
+    both = out + err
+    check("#289: report names the clearing command (reply-comment.sh --review)",
+          "reply-comment.sh --review" in both)
+    check("#289: report names the REVIEW ID to ack", "4680966542" in both)
+
+    # The wrong NOTE must be gone: the code does NOT implement 'the reviewer re-reviews a
+    # fresh SHA / a maintainer re-trigger'. That false line is what caused the override.
+    # NB: assert against --itemized, where the NOTE actually PRINTS. An earlier version of this
+    # case ran default mode, which never emits the NOTE at all -- so it passed VACUOUSLY and
+    # stayed GREEN even with the false NOTE restored verbatim (proved by mutation in review).
+    rc_i, out_i, err_i = run(["--itemized", "--allow-stale"], reviews=OUTSIDE_ONLY)
+    both_i = out_i + err_i
+    check("#289: the false 'maintainer re-trigger' NOTE is gone (asserted in --itemized, "
+          "where the NOTE actually prints)",
+          "NOTE:" in both_i and "maintainer re-trigger" not in both_i
+          and "re-reviews a fresh SHA" not in both_i)
+
+    # An id-stamped ack CLEARS it (proving the channel works and the agent can self-serve).
+    ACK = ('[{"id":9001,"user":{"login":"testuser"},"created_at":"2026-06-18T03:00:00Z",'
+           '"body":"Fixed in abc1234. Acking CR review 4680966542."}]')
+    rc, out, err = run(["--count-only"], reviews=OUTSIDE_ONLY, issue=ACK)
+    check("#289: an ID-STAMPED ack clears the review-body finding (count 0)",
+          rc == 0 and out.strip() == "0")
+
+    # A bare 'fixed in <sha>' reply WITHOUT the review id must NOT clear it -- that is the
+    # real #2424 behavior and it is CORRECT (the finding was real). It must merely be
+    # DISCOVERABLE, not auto-cleared.
+    NO_ID = ('[{"id":9002,"user":{"login":"testuser"},"created_at":"2026-06-18T03:00:00Z",'
+             '"body":"@coderabbitai Valid finding, fixed in 16f8e332."}]')
+    rc, out, err = run(["--count-only"], reviews=OUTSIDE_ONLY, issue=NO_ID)
+    check("#289: a reply WITHOUT the review id does NOT clear it (finding stays real)",
+          rc == 0 and out.strip() != "0")
+
+    # REGRESSION GUARD (the DANGEROUS fix that was proposed and rejected): an APPROVED review
+    # on HEAD must NEVER clear an earlier COMMENTED review's outside-diff finding. CR's
+    # incremental review only examines the diff SINCE its last review, so a finding on code the
+    # fix push never touched is never re-examined: APPROVED means "nothing new in the
+    # increment", NOT "the old finding is fixed". Reverting this would let an ignored
+    # outside-diff Major merge behind an increment-only approve (#31, #132, stillwater#1931).
+    APPROVED_AFTER = (
+        '[{"id":4680966542,"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T02:00:00Z",'
+        '"body":"<summary>Outside diff range comments (1)</summary>"},'
+        '{"id":4681018833,"user":{"login":"coderabbitai[bot]"},"state":"APPROVED",'
+        '"submitted_at":"2026-06-18T05:00:00Z","body":""}]'
+    )
+    rc, out, err = run(["--count-only"], reviews=APPROVED_AFTER)
+    check("#289 REGRESSION GUARD: a later APPROVED review does NOT clear an earlier "
+          "COMMENTED outside-diff finding (#31/#132/stillwater#1931)",
+          rc == 0 and out.strip() != "0")
+
+    # An issue-level bot comment carrying a DECLARED INFORMATIONAL marker is not actionable.
+    # (github-actions[bot] STAYS in the bot set -- it is the generic actor for real
+    # workflow-posted security/lint findings, so no login-based blanket exclusion.)
+    INFO_MARKED = ('[{"id":9100,"user":{"login":"github-actions[bot]"},'
+                   '"created_at":"2026-06-18T03:00:00Z",'
+                   '"body":"<!-- MY_BOT_INFO -->\\n## Nightly status\\nAll green."}]')
+    rc, out, err = run(["--count-only"], issue=INFO_MARKED,
+                       extra_env={"PR_INFO_MARKERS": "MY_BOT_INFO"})
+    check("#289: a bot comment with a DECLARED informational marker -> not actionable (0)",
+          rc == 0 and out.strip() == "0")
+
+    # CRITICAL REGRESSION (caught in review): an IDENTITY marker must NEVER be used to exclude.
+    # `docs-drift-bot` was briefly a DEFAULT marker -- but the workflow stamps that same marker on
+    # EVERY body so it can upsert its own comment, including "## Docs drift: MERGE BLOCKED". So the
+    # exclusion silently suppressed a genuinely BLOCKING finding: the exact recall loss this gate
+    # exists to prevent. Only an INFORMATIONAL-ONLY marker class qualifies. Both bodies below carry
+    # the identity marker; NEITHER may be excluded by default.
+    DRIFT_BLOCKED = ('[{"id":9103,"user":{"login":"github-actions[bot]"},'
+                     '"created_at":"2026-06-18T03:00:00Z",'
+                     '"body":"<!-- docs-drift-bot -->\\n## Docs drift: MERGE BLOCKED\\n'
+                     'Merge is blocked until you update docs/."}]')
+    rc, out, err = run(["--count-only"], issue=DRIFT_BLOCKED)
+    check("#289 CRITICAL: a docs-drift MERGE-BLOCKED comment is STILL actionable "
+          "(an identity/upsert marker must never be an informational exclusion)",
+          rc == 0 and out.strip() == "1")
+
+    # ...but a github-actions comment WITHOUT the marker is STILL actionable (a real
+    # workflow-posted finding must not be lost).
+    REAL_FINDING = ('[{"id":9101,"user":{"login":"github-actions[bot]"},'
+                    '"created_at":"2026-06-18T03:00:00Z",'
+                    '"body":"Security scan: 2 high-severity findings in pkg/auth."}]')
+    rc, out, err = run(["--count-only"], issue=REAL_FINDING)
+    check("#289: an UNMARKED github-actions finding is STILL actionable (no login blanket)",
+          rc == 0 and out.strip() == "1")
+
+    # HARDENING (hostile review, lens 1) -- two ways the first cut of the marker exclusion
+    # SILENTLY WEAKENED a fail-closed merge gate. Both are pinned here so they cannot return.
+    #
+    # (1) QUOTING ATTACK / accident: a REAL finding that merely MENTIONS the marker string
+    # must NOT be suppressed. The matcher must require the marker to be the body's LEADING,
+    # COMPLETE HTML comment -- not a substring anywhere in the text. (CodeRabbit quotes diff
+    # snippets in its walkthrough, and this repo family ships that very marker, so a real
+    # finding ABOUT the marker is not hypothetical.)
+    # NB: this MUST quote a marker that is actually IN the default set (CODOKI_INFO). An earlier
+    # version quoted `docs-drift-bot`, which a later fix REMOVED from the defaults -- so the case
+    # passed because the marker was not in the matcher, NOT because the matcher was anchored, and
+    # it stayed GREEN when the anchoring was reverted. A fix had silently broken the guard.
+    QUOTES_MARKER = ('[{"id":9102,"user":{"login":"coderabbitai[bot]"},'
+                     '"created_at":"2026-06-18T03:00:00Z",'
+                     '"body":"Potential issue: the workflow writes `<!-- CODOKI_INFO -->` '
+                     'but the gate never reads it. Fix before merge."}]')
+    rc, out, err = run(["--count-only"], issue=QUOTES_MARKER)
+    check("#289 HARDENING: a real finding that QUOTES the marker is NOT suppressed "
+          "(matcher is anchored to a leading, complete HTML comment)",
+          rc == 0 and out.strip() == "1")
+
+    # (2) REGEX INJECTION: PR_INFO_MARKERS used to be interpolated as a raw regex fragment
+    # INSIDE the capture group, so an unbalanced ')' escaped it. `x)|(.*` -- or the plausible
+    # TYPO `CODOKI_INFO)|(` -- produced an alternation matching EVERY comment: exit 0, count 0,
+    # NO WARNING. Every issue-level finding silently suppressed on a fail-closed gate. The
+    # matcher now takes marker NAMES only and REFUSES a malformed value LOUDLY.
+    for bad in ("x)|(.*", "CODOKI_INFO)|(", ".*"):
+        rc, out, err = run(["--count-only"], issue=REAL_FINDING,
+                           extra_env={"PR_INFO_MARKERS": bad})
+        check(f"#289 HARDENING: injected PR_INFO_MARKERS {bad!r} -> REFUSED loudly, "
+              f"never a silent count of 0",
+              rc != 0 and "invalid PR_INFO_MARKERS" in err and out.strip() != "0")
+
+    # A well-formed custom marker list still works.
+    rc, out, err = run(["--count-only"], issue=REAL_FINDING,
+                       extra_env={"PR_INFO_MARKERS": "MY_BOT_INFO"})
+    check("#289 HARDENING: a VALID custom marker list is accepted (real finding still counted)",
+          rc == 0 and out.strip() == "1")
+
+    # (3) GLOB: the marker split is an unquoted expansion, so without `set -f` the value also
+    # undergoes PATHNAME EXPANSION and the matcher is built from FILENAMES in the cwd -- silently,
+    # with the gate's behavior depending on where it was invoked from. A glob must be REFUSED.
+    rc, out, err = run(["--count-only"], issue=REAL_FINDING, extra_env={"PR_INFO_MARKERS": "*"})
+    check("#289 HARDENING: a GLOB in PR_INFO_MARKERS is refused (set -f; matcher never built "
+          "from cwd filenames)",
+          rc != 0 and "invalid PR_INFO_MARKERS" in err)
+
+    # (4) The SIBLING marker (CODOKI_REVIEW_COMMENT) must be anchored too -- same defect class,
+    # one line away, and it was left unanchored for a round.
+    QUOTES_SIBLING = ('[{"id":9104,"user":{"login":"coderabbitai[bot]"},'
+                      '"created_at":"2026-06-18T03:00:00Z",'
+                      '"body":"Bug: we emit `<!-- CODOKI_REVIEW_COMMENT -->` but never parse it.",'
+                      '"reactions":{"+1":1}}]')
+    rc, out, err = run(["--count-only"], issue=QUOTES_SIBLING)
+    check("#289 HARDENING: a finding QUOTING the CODOKI_REVIEW_COMMENT marker is not suppressed "
+          "(sibling matcher anchored too)",
+          rc == 0 and out.strip() == "1")
+
+    # PR #290 (Copilot): anchoring ALONE is not enough -- the marker must also be TERMINATED.
+    # A body merely STARTING with `<!-- CODOKI_REVIEW_COMMENT` (no `-->`) was still treated as a
+    # Codoki summary: a self-suppression channel, and inconsistent with INFO_MARKERS_RE, which
+    # requires a COMPLETE leading HTML comment.
+    UNTERMINATED = ('[{"id":9105,"user":{"login":"coderabbitai[bot]"},'
+                    '"created_at":"2026-06-18T03:00:00Z",'
+                    '"body":"<!-- CODOKI_REVIEW_COMMENT this is not a closed comment\\n'
+                    'High: a real finding hiding behind an unterminated marker.",'
+                    '"reactions":{"+1":1}}]')
+    rc, out, err = run(["--count-only"], issue=UNTERMINATED)
+    check("#290: an UNTERMINATED CODOKI_REVIEW_COMMENT marker does NOT suppress the comment "
+          "(marker must be a COMPLETE leading HTML comment)",
+          rc == 0 and out.strip() == "1")
+
+    # (5) The report must show the BREAKDOWN, not just a summed integer (a bare "2 findings" for
+    # ONE finding is what fed the "the oracle cries wolf" read that ends in an override).
+    rc, out, err = run(["--allow-stale"], reviews=CR_BODY_1_PLUS_6)
+    check("#289: the report shows the total AND its breakdown (bodies + outside-diff)",
+          "body/bodies" in out and "outside-diff" in out)
 
     print()
     if FAILS:

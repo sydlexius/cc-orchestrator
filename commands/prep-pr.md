@@ -237,6 +237,15 @@ it from anywhere else -- an out-of-band copy risks drifting from the running
 release). Do NOT fall back to the old 0%-function check -- that gate is what let
 this regress in the first place.
 
+**Union contract (#288).** `patch-coverage.sh` UNIONS duplicate coverage blocks
+internally before measuring, so an integrating repo's gate does **not** need to
+pre-union its profile. This matters: a single `go test -coverpkg=./... ./...`
+emits each block once PER TEST BINARY, so a binary that never executed a block
+contributes a `0` count for it. Without the union, one such `0` marked a
+genuinely-covered line as missed and the script reported a confidently wrong
+**0.00%** and failed the gate. Pre-unioning (e.g. via `gocovmerge`) remains
+harmless -- the union is idempotent -- but it is no longer required.
+
 **Excluding files from patch coverage:** the script already reads the repo's
 `codecov.yml` `ignore:` list, so generated files and pure-CLI entry points that
 Codecov ignores are excluded locally too -- no action needed when they are
