@@ -172,6 +172,34 @@ Runtime (`scripts/`; canonical source is this repo):
   only a malformed invocation (unknown flag / bare trailing `--yes`/`--root`) exits 2; no gh/git/
   network mutation, no floor/allow-list change. Design + 2 hostile-review passes:
   `scratchpad`/design notes (concurrency-wipe hazard, wrong-signal, go-misdiagnosis all caught).
+- `scripts/base-freshness.sh` - the git-only base-freshness check (#282). Answers ONE question: is
+  <head> current with origin/<base>? The base is ALWAYS caller-supplied - it NEVER infers or
+  hard-codes `main`, which is what makes a backport / release-base branch correct by construction.
+  Non-interactive by construction (GIT_TERMINAL_PROMPT=0 + SSH BatchMode, a caller's own
+  GIT_SSH_COMMAND preserved), so an unreachable/auth-required origin fails FAST instead of hanging a
+  push path. Best-effort `git fetch origin <base>` then `git rev-list --count`; exactly one labeled
+  `freshness:` line every time: fresh / behind N (with the count + a refresh pointer) / unknown
+  (unresolvable ref, fetch failure, shallow clone). EXIT CONTRACT: 0 for fresh AND unknown
+  (best-effort degradation NEVER blocks a caller), 1 ONLY for a definitively-resolved BEHIND, 2 for a
+  malformed invocation. Read-only: no `gh`, no remote mutation, no working-tree/index change. Used by
+  the pr-shipper fix-round advisory and by open-pr-staleness-sweep.sh (which does NOT reimplement the
+  fetch + rev-list idiom).
+- `scripts/open-pr-staleness-sweep.sh` - the merge-side open-PR staleness sweep (#282), called from
+  `/post-merge-cleanup` with the just-merged PR (which it EXCLUDES). A merge advances the base and
+  silently leaves every OTHER open PR behind it; this notices them. THE SAFETY HINGE is the reviewed
+  predicate: reviewed = (reviews[] non-empty) OR (review-thread/comment count > 0) - deliberately NOT
+  `reviewDecision`, which is NULL on a PR that has review COMMENTS but no submitted decision, i.e.
+  exactly a PR carrying bot findings and cited fix SHAs. Routing: behind + NOT reviewed -> refresh
+  with a PLAIN `gh pr update-branch <n>` (DEFAULT merge-commit mode, ADDITIVE); behind + REVIEWED ->
+  SURFACE only, never mutated (a HEAD-moving commit dismisses a bot's prior approval and disturbs the
+  incremental-review delta); predicate INDETERMINATE (unreadable/absent/malformed field, read failed)
+  -> treated as REVIEWED -> SURFACE (fail toward surface, NEVER toward acting); update-branch
+  unpermitted/failing -> degrade to REPORT-ONLY and continue. `--rebase` is NEVER passed on ANY path
+  (it rewrites every commit SHA and orphans cited fix SHAs). FAIL-OPEN by contract, a DELIBERATE
+  divergence from `stale-branch-sweep.sh` (which fails CLOSED because it DELETES): exit 0 on EVERY
+  operational path including a read failure, so it can never block cleanup; exit 2 ONLY on a malformed
+  invocation. Needs the maintainer-granted `Bash(gh pr update-branch *)` allow-list entry; without it
+  the report-only degradation is the normal path. No floor/guard change.
 - `scripts/prefs-coverage.py` - opt-in UI-preference-coverage HARD-GATE (a repo enables it by adding a
   `.prefs.toml` + a `.gates.toml` step; schema `skills/orchestrate/templates/prefs.toml.md`). For each
   `[[pref]]` it greps the directly-changed governed surfaces for the pref's `verify` regex; a governed,
@@ -211,8 +239,8 @@ clean-worktree check, so an unchanged committed tree skips re-running it
 `skills/orchestrate/templates/gates.toml.md`.
 
 ```sh
-shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/orchestrate-authorize-merge.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
-ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py
+shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/orchestrate-authorize-merge.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh scripts/base-freshness.sh scripts/open-pr-staleness-sweep.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
+ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-open-pr-staleness-sweep.py
 ./scripts/orchestrate-guard.sh --self-test    # MUST use ./ - the self-test re-invokes "$0";
                                               # `bash scripts/orchestrate-guard.sh` makes $0 a bare name -> 127
 ./scripts/orchestrate-steer.sh --self-test    # advisory WARN-level steering hook (#95)
@@ -245,6 +273,8 @@ python3 test-prefs-coverage.py
 python3 test-prose-lint.py
 python3 test-resolve-threads.py
 python3 test-cache-reclaim.py
+python3 test-base-freshness.py
+python3 test-open-pr-staleness-sweep.py
 ```
 
 ## Versioning

@@ -1669,6 +1669,7 @@ def main():
         "Bash(gh pr view *)", "Bash(gh pr diff *)", "Bash(gh pr checks *)",
         "Bash(gh pr create *)", "Bash(gh pr list *)", "Bash(gh pr status *)",
         "Bash(gh pr edit *)", "Bash(gh pr ready *)", "Bash(gh pr comment *)",
+        "Bash(gh pr update-branch *)",
         "Bash(gh pr merge *)", "Bash(gh issue *)", "Bash(git *)",
         "Write(/tmp/**)", "Edit(/tmp/**)", "Read(/tmp/**)",
         "Bash(make *)", "Bash(golangci-lint run *)", "Bash(govulncheck *)",
@@ -1682,8 +1683,12 @@ def main():
               real_got == EXPECTED_107)
         check("#107 real required-permissions.md: no Bash(gh api *) phantom (the #24 least-privilege regression)",
               not any("gh api" in e for e in real_got))
-        check("#107 real required-permissions.md: all 9 non-merge gh-pr subcommands present",
-              sum(1 for e in real_got if e.startswith("Bash(gh pr ") and "merge" not in e) == 9)
+        # 10 = the 9 original non-merge subcommands + `update-branch` (#282). A blanket
+        # `Bash(gh pr *)` would ALSO match this prefix, so the count doubles as a phantom guard.
+        check("#107 real required-permissions.md: all 10 non-merge gh-pr subcommands present",
+              sum(1 for e in real_got if e.startswith("Bash(gh pr ") and "merge" not in e) == 10)
+        check("#107 real required-permissions.md: no blanket Bash(gh pr *) phantom (the merge-gate shadow)",
+              "Bash(gh pr *)" not in real_got)
     else:
         check("#107 real required-permissions.md: file accessible for regression check", False)
 
