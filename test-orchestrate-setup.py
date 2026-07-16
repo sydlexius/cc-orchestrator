@@ -5,6 +5,7 @@ Run: python3 test-orchestrate-setup.py"""
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -212,6 +213,74 @@ def main():
             # that conjunct is true no matter what check_agent_teams did.
             check(f"#294 teammateMode={mode} -> reported as a supported backend, not 'not ready'",
                   "Agent Teams not ready" not in out and f"teammateMode={mode}" in out)
+
+        # #294: `auto` is a documented backend too (the harness resolves it to whatever the
+        # terminal supports), so it must PASS like the other three.
+        auto_settings = os.path.join(td, "teams-auto.json")
+        json.dump({"teammateMode": "auto", "env": {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"},
+                   "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                       {"type": "command", "command": 'bash "$HOME/.claude/scripts/orchestrate-guard.sh"'}]}]}},
+                  open(auto_settings, "w"))
+        rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": auto_settings, "ORCHESTRATE_GUARD": guard}, tmux=True)
+        check("#294 teammateMode=auto -> PASS, no hard fail",
+              rc == 0 and "teammateMode=auto" in out and "Agent Teams not ready" not in out)
+
+        # #294: teams ENABLED but teammateMode UNSET -> WARN (the harness picks a backend), never
+        # FAIL. Distinct branch from the unknown-mode WARN below.
+        unset_settings = os.path.join(td, "teams-unset.json")
+        json.dump({"env": {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"},
+                   "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                       {"type": "command", "command": 'bash "$HOME/.claude/scripts/orchestrate-guard.sh"'}]}]}},
+                  open(unset_settings, "w"))
+        rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": unset_settings, "ORCHESTRATE_GUARD": guard}, tmux=True)
+        check("#294 teammateMode UNSET -> WARN (not FAIL), names it as unset",
+              rc == 0 and "UNSET" in out and "Agent Teams not ready" not in out)
+
+        # #294: teams ENABLED but an UNRECOGNIZED teammateMode -> WARN, never FAIL. doctor cannot
+        # know a mode it does not recognize is broken, and a false hard-fail is the #294 defect.
+        unknown_settings = os.path.join(td, "teams-unknown.json")
+        json.dump({"teammateMode": "no-such-backend", "env": {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"},
+                   "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                       {"type": "command", "command": 'bash "$HOME/.claude/scripts/orchestrate-guard.sh"'}]}]}},
+                  open(unknown_settings, "w"))
+        rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": unknown_settings, "ORCHESTRATE_GUARD": guard}, tmux=True)
+        check("#294 unrecognized teammateMode -> WARN (not FAIL), names the documented backends",
+              rc == 0 and "not a documented backend" in out and "Agent Teams not ready" not in out)
+
+        # #294 DETERMINISTIC tmux BRANCHES. Both check_tmux branches must WARN, and pinning them
+        # to whatever the HOST happens to have installed leaves one branch untested EVERYWHERE
+        # (a dev box has tmux and only ever runs the "not inside" branch; a bare CI runner has no
+        # tmux and only ever runs "not installed"). Force each branch with a controlled PATH.
+        # SANIBIN carries the tools doctor genuinely shells out to, and deliberately omits tmux so
+        # `shutil.which("tmux")` misses regardless of the host. Getting this list WRONG fails the
+        # doctor for a reason that has nothing to do with tmux and looks exactly like a tmux bug:
+        # `python3` is required because write_stub_guard emits a PYTHON stub (`#!/usr/bin/env
+        # python3`), so omitting it made the guard self-test exit 127 and hard-fail the run while
+        # the tmux WARN under test was perfectly correct. `env` is required for that same shebang
+        # to resolve. Keep this list in sync with what doctor actually executes.
+        sanibin = os.path.join(td, "sanibin"); os.makedirs(sanibin, exist_ok=True)
+        for _tool in ("bash", "sh", "git", "env", "stat", "date", "python3",
+                      os.path.basename(sys.executable)):
+            _real = shutil.which(_tool)
+            if _real and not os.path.exists(os.path.join(sanibin, _tool)):
+                os.symlink(_real, os.path.join(sanibin, _tool))
+        fakebin = os.path.join(td, "fakebin"); os.makedirs(fakebin, exist_ok=True)
+        fake_tmux = os.path.join(fakebin, "tmux")
+        open(fake_tmux, "w").write("#!/bin/sh\nexit 0\n"); os.chmod(fake_tmux, 0o755)
+
+        # tmux present on PATH (our fake), $TMUX empty -> the "not inside tmux" branch.
+        rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": wired, "ORCHESTRATE_GUARD": guard,
+                                                 "PATH": fakebin + os.pathsep + sanibin}, tmux=False)
+        check("#294 tmux INSTALLED + $TMUX empty -> WARN 'not inside tmux' (deterministic branch)",
+              rc == 0 and "not inside tmux" in out and "[WARN]" in out and "iTerm2" in out)
+        check("#294 tmux-installed-not-inside WARN surfaces marker-arming", "marker" in out.lower())
+        # No tmux anywhere on PATH -> the "not installed" branch, on ANY host.
+        rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": wired, "ORCHESTRATE_GUARD": guard,
+                                                 "PATH": sanibin}, tmux=False)
+        check("#294 tmux NOT INSTALLED -> WARN 'tmux not installed' (deterministic branch)",
+              rc == 0 and "tmux not installed" in out and "[WARN]" in out and "iTerm2" in out)
+        # Both branches must keep surfacing the ONE genuine tmux dependency.
+        check("#294 tmux-not-installed WARN still surfaces marker-arming", "marker" in out.lower())
 
         # PRESERVED genuine dependency: Agent Teams actually DISABLED is still a hard fail.
         # #294 only stops the FAIL on a WORKING non-tmux backend.
@@ -1729,6 +1798,64 @@ def main():
         )
         check("#112 --slug: malformed slug (no slash) rejected with error",
               p_bad.returncode != 0 and "owner/name" in (p_bad.stdout + p_bad.stderr))
+
+    # #294 ARM-TIME BACKSTOP. cmd_up's fail-fast pre-check returns before arm_marker whenever
+    # $TMUX is empty, so the `except RuntimeError` around arm_marker is unreachable by env alone.
+    # It is NOT dead code - it covers the race where the session key becomes underivable BETWEEN
+    # the pre-check and the arm - so drive that race directly: let the pre-check pass, then make
+    # _session_key() fail at arm time. The backstop must abort cleanly (rc1), tell the SAME story
+    # as the pre-check (one shared constant), and arm nothing.
+    import importlib.util as _ilu294
+    with tempfile.TemporaryDirectory() as _td294:
+        _spec294 = _ilu294.spec_from_file_location("orchestrate_setup_backstop", SCRIPT)
+        _mod294 = _ilu294.module_from_spec(_spec294)
+        _spec294.loader.exec_module(_mod294)
+
+        _repo294 = os.path.join(_td294, "repo"); os.makedirs(_repo294)
+        subprocess.run(["git", "-C", _repo294, "init", "-q"], check=True)
+        subprocess.run(["git", "-C", _repo294, "-c", "user.email=t@t", "-c", "user.name=t",
+                        "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+        # cmd_up reaches scaffold_artifacts BEFORE arm_marker, and scaffold_artifacts hard-aborts
+        # without an origin remote (it needs an owner/name slug for the brief). No remote here
+        # means the run dies there and never reaches the backstop this case exists to exercise.
+        subprocess.run(["git", "-C", _repo294, "remote", "add", "origin",
+                        "https://github.com/testowner/testrepo.git"], check=True)
+        _floor294 = os.path.join(_td294, "floor"); os.makedirs(_floor294)
+        _art294 = os.path.join(_td294, "art"); os.makedirs(_art294)
+        _mod294.FLOOR_DIR = _floor294
+        _mod294.ARTIFACTS = _art294
+
+        class _Args294:
+            team, repo, spacing, slug = "demo", _repo294, None, None
+
+        # Pre-check PASSES (a key exists), doctor is stubbed green, then the key vanishes exactly
+        # once - at arm time - which is the race the backstop exists for.
+        _calls = {"n": 0}
+
+        def _key_then_vanish():
+            _calls["n"] += 1
+            return None if _calls["n"] > 1 else "fixture_key"
+
+        _orig_doctor, _orig_key, _orig_stale = _mod294.cmd_doctor, _mod294._session_key, _mod294._check_stale_guard_at_up
+        _mod294.cmd_doctor = lambda a: 0
+        _mod294._check_stale_guard_at_up = lambda: None
+        _mod294._session_key = _key_then_vanish
+        try:
+            import io as _io294, contextlib as _cl294
+            _err294 = _io294.StringIO()
+            with _cl294.redirect_stderr(_err294), _cl294.redirect_stdout(_io294.StringIO()):
+                _rc294 = _mod294.cmd_up(_Args294())
+            _out294 = _err294.getvalue()
+        finally:
+            _mod294.cmd_doctor, _mod294._session_key, _mod294._check_stale_guard_at_up = _orig_doctor, _orig_key, _orig_stale
+
+        check("#294 arm-time backstop: key lost after the pre-check -> clean rc1, not a traceback",
+              _rc294 == 1 and "Traceback" not in _out294)
+        check("#294 arm-time backstop tells the SAME story as the pre-check (shared constant)",
+              "cannot arm the floor marker" in _out294 and "marker" in _out294.lower())
+        check("#294 arm-time backstop names it was raised at arm time (distinguishable in logs)",
+              "raised at arm time" in _out294)
+        check("#294 arm-time backstop arms NO marker", os.listdir(_floor294) == [])
 
     # #107: _missing_allow_entries harvester over-harvest guard (Option A: a deliberately
     # SIMPLE parser - every backticked Bash/Write/Edit/Read(...) token on a non-NOTE line in
