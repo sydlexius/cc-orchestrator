@@ -1329,7 +1329,10 @@ def _check_stale_guard_at_up():
     print(border, file=sys.stderr)
     print("WARNING: STALE FLOOR GUARD", file=sys.stderr)
     print(f"  {detail}.", file=sys.stderr)
-    print("  The session will still arm, but the deployed guard may be out of date.", file=sys.stderr)
+    print("  #312: if this session has NO $TMUX, `up` will ABORT at the armed self-test - a", file=sys.stderr)
+    print("  PRE-#312 deployed guard keys the marker off $TMUX only, so it cannot see the", file=sys.stderr)
+    print("  ccsid-keyed marker this script arms. That is a STALE GUARD, not a broken floor.", file=sys.stderr)
+    print("  With $TMUX set the session still arms, but the deployed guard may be out of date.", file=sys.stderr)
     print("  REMEDY (in order):", file=sys.stderr)
     print("    1. Run:    orchestrate-setup.py configure --apply", file=sys.stderr)
     print("    2. RESTART each open Claude Code session (the PreToolUse hook loads the", file=sys.stderr)
@@ -1406,10 +1409,28 @@ def cmd_up(args):
         # The scaffolded /tmp artifacts are intentionally LEFT here: they are inert without
         # a marker file, so they cannot trigger any floor action - and they are useful for
         # post-mortem debugging of why the self-test failed.
+        _stale_hint = ""
+        if not os.environ.get("TMUX"):
+            # #312 UPGRADE PATH - the single most likely cause here, and the old message
+            # misdiagnosed it as a defective floor. This script arms a ccsid-keyed marker when
+            # $TMUX is absent; a PRE-#312 DEPLOYED guard keys off $TMUX only, so it cannot see
+            # that marker and correctly declines to gate -> the self-test reads as fail-open.
+            # The floor is not broken; the DEPLOYED COPY is stale. The hook runs the deployed
+            # guard, not the repo's, and it loads at SESSION START - so this needs a redeploy
+            # AND a session restart, not a guard fix.
+            _stale_hint = (
+                "\n  LIKELY CAUSE (#312): this session has no $TMUX, so the marker is keyed off "
+                "$CLAUDE_CODE_SESSION_ID.\n  A PRE-#312 deployed guard keys off $TMUX ONLY and "
+                "cannot see that marker - the floor is STALE, not failing open.\n  REMEDY: "
+                "orchestrate-setup.py configure --apply   (redeploys the guard), then RESTART "
+                "this Claude Code session\n  (the PreToolUse hook loads the deployed guard at "
+                "session start). Or relaunch inside tmux."
+            )
         print("\nup: ABORT - armed self-test FAILED: with the marker armed the guard did not "
               "hard-deny ALL of: push-main, merge-by-API, and the gh pr merge CLI (all must exit 2). "
-              "The floor is failing open. Marker REMOVED. Fix the guard before standing up a "
-              "session.", file=sys.stderr)
+              "Marker REMOVED (fail-closed: no session is stood up)." + _stale_hint +
+              "\n  If $TMUX IS set and this still fails, the floor is genuinely failing open - "
+              "fix the guard before standing up a session.", file=sys.stderr)
         return 1
     print(f"\nup: SESSION ARMED."
           f"\n  marker:   {marker_path}"

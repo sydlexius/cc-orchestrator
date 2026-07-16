@@ -209,7 +209,7 @@ matches the guard), under `$FLOOR_DIR`, fresh within `$TTL_HOURS`.
 `$CLAUDE_CODE_SESSION_ID` - **tmux is NOT required for a gated session**, so a non-tmux
 session is NOT automatically solo. Only a session with NEITHER identifier is unkeyed and
 therefore never gated. Match ANY candidate key, like the guard does. (This is one of the
-FIVE live copies of the derivation listed in `orchestrate-guard.sh`'s DERIVATION REGISTRY;
+SIX live copies of the derivation listed in `orchestrate-guard.sh`'s DERIVATION REGISTRY;
 they must move together.)
 
 ```bash

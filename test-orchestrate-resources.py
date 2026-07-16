@@ -559,6 +559,55 @@ def main():
               rc == 0 and sessions == ["S1", "S2"])
         check("#312 resources: both live non-tmux leases hold DISTINCT ports (no double-allocation)",
               len(ports) == 2 and all(p is not None for p in ports) and len(set(ports)) == 2)
+        # THE ASYMMETRIC CASE (round-5 finding; the symmetric case above did NOT cover it).
+        # `up` runs as a Bash TOOL CALL so its env is command-controllable (`env -u TMUX ... up`)
+        # -> the marker can be armed under the CCSID key while a later allocate sees a real
+        # $TMUX. Recording only the first-precedence key made the lease look UNOWNED, so the GC
+        # reclaimed a LIVE session's lease and the next allocate handed out its port. The lease
+        # must record EVERY candidate and be alive if ANY marker is present, mirroring the guard.
+        # (Re-deriving at GC time would be WRONG: the GC runs inside ANOTHER session's allocate,
+        # so the ambient env is not the lease owner's.)
+        floor_asym = os.path.join(td312, "floor-asym"); os.makedirs(floor_asym)
+        st_asym = os.path.join(td312, "asym.json")
+        ov_asym = dict(ov312); ov_asym.update({"ORCHESTRATE_FLOOR_DIR": floor_asym,
+                                               "ORCHESTRATE_RESOURCES_FILE": st_asym,
+                                               "ORCHESTRATE_PORT_RANGE": "2300-2400"})
+        # Marker armed under the CCSID key only (the env-sanitized `up`)...
+        open(os.path.join(floor_asym, CCKEY), "w").close()
+        # ...while allocate runs WITH a real $TMUX (so first-precedence would be the tmux key).
+        rc, out, err = run(["allocate", "--session", "S1", "--teammate", "t1"],
+                           env_overrides=ov_asym, tmux="/tmp/tmux-501/default,99,0", ccsid=CCSID)
+        check("#312 resources: asymmetric-env allocate succeeds", rc == 0)
+        _l1 = json.load(open(st_asym))["leases"][0]
+        check("#312 resources: the lease records BOTH candidate keys (not just first-precedence)",
+              CCKEY in (_l1.get("marker_keys") or []))
+        _aged2 = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=30)
+        _st = json.load(open(st_asym))
+        _st["leases"][0]["created"] = _aged2.strftime("%Y-%m-%dT%H:%M:%SZ")
+        json.dump(_st, open(st_asym, "w"))
+        rc, out, err = run(["allocate", "--session", "S2", "--teammate", "t2"],
+                           env_overrides=ov_asym, tmux="/tmp/tmux-501/default,99,0", ccsid=CCSID)
+        _ls = json.load(open(st_asym)).get("leases", [])
+        _sessions = sorted(ln.get("session") for ln in _ls)
+        _ports = [ln.get("resources", {}).get("port", {}).get("value") for ln in _ls]
+        check("#312 resources: ARM/CHECK ASYMMETRY - a live lease is NOT GC'd (marker found via "
+              "the ccsid candidate)", rc == 0 and _sessions == ["S1", "S2"])
+        check("#312 resources: asymmetric case keeps DISTINCT ports (no double-allocation)",
+              len(_ports) == 2 and all(p is not None for p in _ports) and len(set(_ports)) == 2)
+        # BACKWARD COMPAT: a pre-#312 lease carries only the legacy single `marker_key`. It must
+        # still be read correctly (a pre-#312 lease can only carry a tmux key, and that
+        # derivation is unchanged, so the legacy fallback stays exact).
+        _st = json.load(open(st_asym))
+        _st["leases"][0].pop("marker_keys", None)
+        _st["leases"][0]["marker_key"] = CCKEY
+        _st["leases"][0]["created"] = _aged2.strftime("%Y-%m-%dT%H:%M:%SZ")
+        json.dump(_st, open(st_asym, "w"))
+        rc, out, err = run(["allocate", "--session", "S3", "--teammate", "t3"],
+                           env_overrides=ov_asym, tmux="/tmp/tmux-501/default,99,0", ccsid=CCSID)
+        _sessions = sorted(ln.get("session") for ln in json.load(open(st_asym)).get("leases", []))
+        check("#312 resources: a LEGACY lease (marker_key only, no marker_keys) is still honored",
+              rc == 0 and "S1" in _sessions)
+
         # And the fail-closed end still holds: NEITHER identifier -> no key -> "" -> reclaimable,
         # which is the ORIGINAL, still-correct meaning of an empty marker_key.
         rc, out, err = run(["allocate", "--session", "S3", "--teammate", "t3"],

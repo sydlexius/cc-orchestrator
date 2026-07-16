@@ -274,7 +274,7 @@ is_raw_gh_pr_mutation() {
 }
 
 # #312: EVERY key this session could have armed under, first-precedence first. Mirrors the guard's
-# _session_keys() exactly. See the DERIVATION REGISTRY in orchestrate-guard.sh: FIVE live copies of
+# _session_keys() exactly. See the DERIVATION REGISTRY in orchestrate-guard.sh: SIX live copies of
 # this derivation exist and must move together.
 _sanitize_key() {
   printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9' '_'
