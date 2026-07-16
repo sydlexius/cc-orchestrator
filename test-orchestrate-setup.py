@@ -5,6 +5,7 @@ Run: python3 test-orchestrate-setup.py"""
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -52,10 +53,33 @@ def write_stub_guard(path, selftest_rc=0):
     os.chmod(path, 0o755)
 
 
+# #305 CASCADE ISOLATION: path to a CLEAN settings-cascade fixture, created once per run in
+# main()'s tempdir and used as run()'s DEFAULT ORCHESTRATE_SETTINGS_FILES. See run().
+_CLEAN_CASCADE = None
+
+
 def run(args, *, env_overrides=None, tmux=True):
     """Invoke the CLI. Returns (returncode, stdout+stderr)."""
     env = dict(os.environ)
     env.pop("TOOL_INPUT", None)
+    # #305 CASCADE ISOLATION: default the settings CASCADE to a single clean fixture, the same
+    # way the steer/ctxmeter/setup sources are defaulted to /nonexistent below. WHY: doctor's
+    # _scan_merge_gate_shadows() reads _cascade_files(), which resolves ORCHESTRATE_SETTINGS_FILES
+    # / ORCHESTRATE_PROJECT_DIR / the git toplevel of CWD - NOT ORCHESTRATE_SETTINGS. So a test
+    # that passes only an ORCHESTRATE_SETTINGS fixture STILL read the developer's real ~/.claude
+    # + real repo .claude/ settings, and hard-failed on any real merge-gate shadow living there
+    # (e.g. a blanket gh-pr wildcard re-added by an "always allow" click). Because cmd_up gates on
+    # cmd_doctor and returns BEFORE scaffold_artifacts, that cascaded into a FileNotFoundError on
+    # the up-scaffold assertions. The gate was thus machine-dependent: red on a dev box, green on
+    # a clean checkout, for reasons having nothing to do with the branch under test.
+    # The override REPLACES the whole cascade (_cascade_files early-returns on it), so this one
+    # line excludes BOTH the real HOME and the real project settings.
+    # NOT a production-logic change: a real doctor/up run never sets the override, so it reads the
+    # real cascade and still hard-fails on a genuine shadow. Tests that deliberately exercise the
+    # scan pass their own ORCHESTRATE_SETTINGS_FILES via env_overrides, which is applied LAST by
+    # env.update() below and therefore still wins.
+    if _CLEAN_CASCADE:
+        env["ORCHESTRATE_SETTINGS_FILES"] = _CLEAN_CASCADE
     # #95 STEER ISOLATION: point the bundled steer source at a non-existent path by DEFAULT so an
     # unrelated configure test never wires the advisory steering hooks nor deploys the steer script
     # to the real ~/.claude/scripts (steer reads as 'missing-source' -> skipped). Tests that exercise
@@ -98,7 +122,16 @@ def check(label, cond):
 
 
 def main():
+    global _CLEAN_CASCADE
     with tempfile.TemporaryDirectory() as td:
+        # #305: the clean cascade fixture backing run()'s ORCHESTRATE_SETTINGS_FILES default.
+        # A REAL file with a benign allow-list (not a /nonexistent path), so the scan still
+        # exercises its read+parse path and a regression there cannot hide behind a missing
+        # file. Nothing here shadows the merge gate: no blanket gh-pr wildcard, and the
+        # enumerated non-merge subcommand is explicitly NOT a shadow.
+        _CLEAN_CASCADE = os.path.join(td, "clean-cascade.json")
+        json.dump({"permissions": {"allow": ["Bash(gh pr view *)"]}}, open(_CLEAN_CASCADE, "w"))
+
         good = os.path.join(td, "settings.json")
         json.dump({"teammateMode": "tmux", "env": {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}}, open(good, "w"))
 
@@ -117,10 +150,140 @@ def main():
         check("doctor skeleton (healthy fixture) exits 0", rc == 0)
         check("doctor prints no-hard-fail", "no hard fail" in out)
 
+        # #305 THE COUNTER-TEST, and the whole point of the isolation default: it must make the
+        # gate machine-INDEPENDENT without blinding the shadow scan. An explicit shadowing
+        # ORCHESTRATE_SETTINGS_FILES (applied last by env.update) must STILL hard-fail. If this
+        # ever passes rc0, the default has suppressed real merge-gate detection - which would be
+        # far worse than the leaky test it replaced.
+        shadow_cascade = os.path.join(td, "shadow-cascade.json")
+        json.dump({"permissions": {"allow": ["Bash(gh pr *)"]}}, open(shadow_cascade, "w"))
+        rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": wired, "ORCHESTRATE_GUARD": guard,
+                                                 "ORCHESTRATE_SETTINGS_FILES": shadow_cascade}, tmux=True)
+        # Pin the DISCRIMINATING FAIL string (_emit(FAIL, "...N allow-rule(s) SHADOW the ... gate"),
+        # setup.py:~1142) - NOT a bare "shadow" substring, which also appears in the PASS line
+        # ("no settings-cascade rule shadows the ... gate") and in the SessionStart
+        # shadow-advisory hook check. A bare-substring conjunct cannot discriminate, so it would
+        # ride entirely on rc==1 and pass vacuously if the scan were blinded while some unrelated
+        # check hard-failed in the same run.
+        check("#305 explicit shadowing cascade STILL hard-fails (isolation did not blind the scan)",
+              rc == 1 and "SHADOW the" in out)
+        # And the clean default must not be a false negative in the other direction: the same
+        # doctor run with the DEFAULT (clean) cascade sees no shadow.
+        rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": wired, "ORCHESTRATE_GUARD": guard}, tmux=True)
+        check("#305 default clean cascade -> scan runs and reports NO shadow",
+              rc == 0 and "no settings-cascade rule shadows" in out)
+
         rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": wired, "ORCHESTRATE_GUARD": guard}, tmux=True)
         check("teams+tmux PASS -> no hard fail (rc0)", rc == 0 and "Agent Teams enabled" in out)
+        # #294: an empty $TMUX is ADVISORY, never a hard fail. Teammates still spawn via the
+        # documented iTerm2 / in-process backend (both CLAUDE.md files describe the fallback);
+        # only the pane layout differs. The old FAIL aborted `up` for a condition the
+        # maintainer PREFERS, and trained the operator to skim a doctor that also carries
+        # genuinely dangerous WARNs.
         rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": wired, "ORCHESTRATE_GUARD": guard}, tmux=False)
-        check("not in tmux -> hard fail (rc1)", rc == 1 and "NOT inside tmux" in out)
+        # Accept EITHER tmux-condition wording: a dev box has tmux installed (so the branch
+        # under test is "installed but $TMUX empty"), a bare CI runner does not (so it takes
+        # the "not installed" branch). Both must WARN, never FAIL - pinning only one phrasing
+        # would make this test pass on the author's machine and fail in CI.
+        check("#294 not in tmux -> WARN, NOT a hard fail (rc0)",
+              rc == 0 and "[WARN]" in out and
+              ("not inside tmux" in out.lower() or "tmux not installed" in out.lower()))
+        check("#294 not-in-tmux message names the documented fallback backends",
+              "iTerm2" in out and "in-process" in out)
+        # The message must NOT resurrect the false claim it replaces.
+        check("#294 not-in-tmux message drops the false 'teammates will not spawn' claim",
+              "will not spawn" not in out)
+        # $TMUX IS a genuine dependency for marker-arming (_session_key returns None without
+        # it). The WARN must say so - that is the one capability that really needs tmux.
+        check("#294 not-in-tmux WARN still surfaces the marker-arming $TMUX dependency",
+              "marker" in out.lower())
+
+        # #294: a resolved NON-tmux backend is a working configuration, not a failure.
+        for mode in ("iterm2", "in-process"):
+            m_settings = os.path.join(td, f"teams-{mode}.json")
+            json.dump({"teammateMode": mode, "env": {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"},
+                       "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                           {"type": "command", "command": 'bash "$HOME/.claude/scripts/orchestrate-guard.sh"'}]}]}},
+                      open(m_settings, "w"))
+            rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": m_settings, "ORCHESTRATE_GUARD": guard}, tmux=True)
+            check(f"#294 teammateMode={mode} -> no hard fail (rc0)", rc == 0)
+            # Pin check_agent_teams' OWN PASS phrasing. A bare `mode in out` is vacuous for
+            # "in-process": check_tmux's WARN text already contains the literal "in-process"
+            # ("teammates spawn via the iTerm2 / in-process backend"), so on a tmux-less host
+            # that conjunct is true no matter what check_agent_teams did.
+            check(f"#294 teammateMode={mode} -> reported as a supported backend, not 'not ready'",
+                  "Agent Teams not ready" not in out and f"teammateMode={mode}" in out)
+
+        # #294: `auto` is a documented backend too (the harness resolves it to whatever the
+        # terminal supports), so it must PASS like the other three.
+        auto_settings = os.path.join(td, "teams-auto.json")
+        json.dump({"teammateMode": "auto", "env": {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"},
+                   "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                       {"type": "command", "command": 'bash "$HOME/.claude/scripts/orchestrate-guard.sh"'}]}]}},
+                  open(auto_settings, "w"))
+        rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": auto_settings, "ORCHESTRATE_GUARD": guard}, tmux=True)
+        check("#294 teammateMode=auto -> PASS, no hard fail",
+              rc == 0 and "teammateMode=auto" in out and "Agent Teams not ready" not in out)
+
+        # #294: teams ENABLED but teammateMode UNSET -> WARN (the harness picks a backend), never
+        # FAIL. Distinct branch from the unknown-mode WARN below.
+        unset_settings = os.path.join(td, "teams-unset.json")
+        json.dump({"env": {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"},
+                   "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                       {"type": "command", "command": 'bash "$HOME/.claude/scripts/orchestrate-guard.sh"'}]}]}},
+                  open(unset_settings, "w"))
+        rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": unset_settings, "ORCHESTRATE_GUARD": guard}, tmux=True)
+        check("#294 teammateMode UNSET -> WARN (not FAIL), names it as unset",
+              rc == 0 and "UNSET" in out and "Agent Teams not ready" not in out)
+
+        # #294: teams ENABLED but an UNRECOGNIZED teammateMode -> WARN, never FAIL. doctor cannot
+        # know a mode it does not recognize is broken, and a false hard-fail is the #294 defect.
+        unknown_settings = os.path.join(td, "teams-unknown.json")
+        json.dump({"teammateMode": "no-such-backend", "env": {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"},
+                   "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                       {"type": "command", "command": 'bash "$HOME/.claude/scripts/orchestrate-guard.sh"'}]}]}},
+                  open(unknown_settings, "w"))
+        rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": unknown_settings, "ORCHESTRATE_GUARD": guard}, tmux=True)
+        check("#294 unrecognized teammateMode -> WARN (not FAIL), names the documented backends",
+              rc == 0 and "not a documented backend" in out and "Agent Teams not ready" not in out)
+
+        # #294 DETERMINISTIC tmux BRANCHES. Both check_tmux branches must WARN, and pinning them
+        # to whatever the HOST happens to have installed leaves one branch untested EVERYWHERE
+        # (a dev box has tmux and only ever runs the "not inside" branch; a bare CI runner has no
+        # tmux and only ever runs "not installed"). Force each branch with a controlled PATH.
+        # SANIBIN carries the tools doctor genuinely shells out to, and deliberately omits tmux so
+        # `shutil.which("tmux")` misses regardless of the host. Getting this list WRONG fails the
+        # doctor for a reason that has nothing to do with tmux and looks exactly like a tmux bug:
+        # `python3` is required because write_stub_guard emits a PYTHON stub (`#!/usr/bin/env
+        # python3`), so omitting it made the guard self-test exit 127 and hard-fail the run while
+        # the tmux WARN under test was perfectly correct. `env` is required for that same shebang
+        # to resolve. Keep this list in sync with what doctor actually executes.
+        sanibin = os.path.join(td, "sanibin"); os.makedirs(sanibin, exist_ok=True)
+        for _tool in ("bash", "sh", "git", "env", "stat", "date", "python3",
+                      os.path.basename(sys.executable)):
+            _real = shutil.which(_tool)
+            if _real and not os.path.exists(os.path.join(sanibin, _tool)):
+                os.symlink(_real, os.path.join(sanibin, _tool))
+        fakebin = os.path.join(td, "fakebin"); os.makedirs(fakebin, exist_ok=True)
+        fake_tmux = os.path.join(fakebin, "tmux")
+        open(fake_tmux, "w").write("#!/bin/sh\nexit 0\n"); os.chmod(fake_tmux, 0o755)
+
+        # tmux present on PATH (our fake), $TMUX empty -> the "not inside tmux" branch.
+        rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": wired, "ORCHESTRATE_GUARD": guard,
+                                                 "PATH": fakebin + os.pathsep + sanibin}, tmux=False)
+        check("#294 tmux INSTALLED + $TMUX empty -> WARN 'not inside tmux' (deterministic branch)",
+              rc == 0 and "not inside tmux" in out and "[WARN]" in out and "iTerm2" in out)
+        check("#294 tmux-installed-not-inside WARN surfaces marker-arming", "marker" in out.lower())
+        # No tmux anywhere on PATH -> the "not installed" branch, on ANY host.
+        rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": wired, "ORCHESTRATE_GUARD": guard,
+                                                 "PATH": sanibin}, tmux=False)
+        check("#294 tmux NOT INSTALLED -> WARN 'tmux not installed' (deterministic branch)",
+              rc == 0 and "tmux not installed" in out and "[WARN]" in out and "iTerm2" in out)
+        # Both branches must keep surfacing the ONE genuine tmux dependency.
+        check("#294 tmux-not-installed WARN still surfaces marker-arming", "marker" in out.lower())
+
+        # PRESERVED genuine dependency: Agent Teams actually DISABLED is still a hard fail.
+        # #294 only stops the FAIL on a WORKING non-tmux backend.
         bad = os.path.join(td, "bad.json")
         json.dump({"teammateMode": "acceptEdits"}, open(bad, "w"))
         rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": bad, "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "", "ORCHESTRATE_GUARD": guard}, tmux=True)
@@ -187,6 +350,42 @@ def main():
         planner_seed = os.path.join(team_dir, "planner", "proposed.json")
         check("#11 up scaffolds <team>/planner/proposed.json={\"flags\": []}",
               os.path.exists(planner_seed) and json.load(open(planner_seed)) == {"flags": []})
+
+        # #294 SCOPE BOUNDARY - read this before "fixing" the expectation below to rc0.
+        # `up` outside tmux still REFUSES, and that is correct TODAY: the marker key is derived
+        # from $TMUX, and orchestrate-guard.sh derives ITS key identically - no $TMUX, no key, no
+        # marker. A TEAM session with no marker runs with the Tier-2 merge gate OFF, so standing
+        # one up would silently disarm the merge deny for every teammate. Refusing is the safe
+        # direction. What #294 fixes HERE is the FAILURE MODE, not the refusal: an uncaught
+        # RuntimeError traceback becomes an honest abort naming marker-arming (the ONE genuine
+        # tmux dependency) instead of the old, false "teammates will not spawn" claim.
+        # Generalizing the key so a non-tmux session CAN arm is a deny-authority floor change
+        # tracked separately; when it lands, this expectation flips to rc0 + scaffold assertions.
+        art_notmux = os.path.join(td, "artifacts-notmux"); os.makedirs(art_notmux)
+        upov_notmux = dict(ov)
+        upov_notmux.update({"ORCHESTRATE_ARTIFACT_DIR": art_notmux, "ORCHESTRATE_FLOOR_DIR": floor_dir})
+        # Snapshot the floor dir: the earlier tmux=True `up` legitimately armed a marker in here,
+        # so "no marker exists" would be a false assertion. What must hold is that the non-tmux
+        # run adds NOTHING - it must never arm under a half-derived or defaulted key.
+        floor_before = sorted(os.listdir(floor_dir)) if os.path.isdir(floor_dir) else []
+        rc_nt, out_nt = run(["up", "--team", "demo", "--repo", repo],
+                            env_overrides=upov_notmux, tmux=False)
+        floor_after = sorted(os.listdir(floor_dir)) if os.path.isdir(floor_dir) else []
+        check("#294 up outside tmux aborts CLEANLY (rc1), never a raw traceback",
+              rc_nt == 1 and "Traceback" not in out_nt and "RuntimeError" not in out_nt)
+        check("#294 up outside tmux abort names marker-arming + $TMUX as the REAL reason",
+              "marker" in out_nt.lower() and "$TMUX" in out_nt)
+        check("#294 up outside tmux abort drops the false 'teammates will not spawn' claim",
+              "will not spawn" not in out_nt)
+        # The refusal must be TOTAL: never arm under a half-derived or defaulted key.
+        check("#294 up outside tmux arms NO new marker (floor dir unchanged)",
+              floor_after == floor_before)
+        # ...and it must not LITTER. Doctor's tmux checks are advisory now, so up sails past the
+        # doctor gate where it used to stop; without the fail-fast pre-check it would scaffold
+        # stack.json / profile.env / the brief before refusing at arm time. A pure refusal path
+        # must create nothing.
+        check("#294 up outside tmux scaffolds NOTHING on the refusal path",
+              not os.path.exists(os.path.join(art_notmux, "demo")))
         brief = open(os.path.join(team_dir, "pr-shipper-brief.md")).read()
         # Verify: brief body contains the owner/name SLUG (derived from the remote), not the
         # raw path. The header comment records the path for diagnostics, so we check the
@@ -1600,6 +1799,64 @@ def main():
         check("#112 --slug: malformed slug (no slash) rejected with error",
               p_bad.returncode != 0 and "owner/name" in (p_bad.stdout + p_bad.stderr))
 
+    # #294 ARM-TIME BACKSTOP. cmd_up's fail-fast pre-check returns before arm_marker whenever
+    # $TMUX is empty, so the `except RuntimeError` around arm_marker is unreachable by env alone.
+    # It is NOT dead code - it covers the race where the session key becomes underivable BETWEEN
+    # the pre-check and the arm - so drive that race directly: let the pre-check pass, then make
+    # _session_key() fail at arm time. The backstop must abort cleanly (rc1), tell the SAME story
+    # as the pre-check (one shared constant), and arm nothing.
+    import importlib.util as _ilu294
+    with tempfile.TemporaryDirectory() as _td294:
+        _spec294 = _ilu294.spec_from_file_location("orchestrate_setup_backstop", SCRIPT)
+        _mod294 = _ilu294.module_from_spec(_spec294)
+        _spec294.loader.exec_module(_mod294)
+
+        _repo294 = os.path.join(_td294, "repo"); os.makedirs(_repo294)
+        subprocess.run(["git", "-C", _repo294, "init", "-q"], check=True)
+        subprocess.run(["git", "-C", _repo294, "-c", "user.email=t@t", "-c", "user.name=t",
+                        "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+        # cmd_up reaches scaffold_artifacts BEFORE arm_marker, and scaffold_artifacts hard-aborts
+        # without an origin remote (it needs an owner/name slug for the brief). No remote here
+        # means the run dies there and never reaches the backstop this case exists to exercise.
+        subprocess.run(["git", "-C", _repo294, "remote", "add", "origin",
+                        "https://github.com/testowner/testrepo.git"], check=True)
+        _floor294 = os.path.join(_td294, "floor"); os.makedirs(_floor294)
+        _art294 = os.path.join(_td294, "art"); os.makedirs(_art294)
+        _mod294.FLOOR_DIR = _floor294
+        _mod294.ARTIFACTS = _art294
+
+        class _Args294:
+            team, repo, spacing, slug = "demo", _repo294, None, None
+
+        # Pre-check PASSES (a key exists), doctor is stubbed green, then the key vanishes exactly
+        # once - at arm time - which is the race the backstop exists for.
+        _calls = {"n": 0}
+
+        def _key_then_vanish():
+            _calls["n"] += 1
+            return None if _calls["n"] > 1 else "fixture_key"
+
+        _orig_doctor, _orig_key, _orig_stale = _mod294.cmd_doctor, _mod294._session_key, _mod294._check_stale_guard_at_up
+        _mod294.cmd_doctor = lambda a: 0
+        _mod294._check_stale_guard_at_up = lambda: None
+        _mod294._session_key = _key_then_vanish
+        try:
+            import io as _io294, contextlib as _cl294
+            _err294 = _io294.StringIO()
+            with _cl294.redirect_stderr(_err294), _cl294.redirect_stdout(_io294.StringIO()):
+                _rc294 = _mod294.cmd_up(_Args294())
+            _out294 = _err294.getvalue()
+        finally:
+            _mod294.cmd_doctor, _mod294._session_key, _mod294._check_stale_guard_at_up = _orig_doctor, _orig_key, _orig_stale
+
+        check("#294 arm-time backstop: key lost after the pre-check -> clean rc1, not a traceback",
+              _rc294 == 1 and "Traceback" not in _out294)
+        check("#294 arm-time backstop tells the SAME story as the pre-check (shared constant)",
+              "cannot arm the floor marker" in _out294 and "marker" in _out294.lower())
+        check("#294 arm-time backstop names it was raised at arm time (distinguishable in logs)",
+              "raised at arm time" in _out294)
+        check("#294 arm-time backstop arms NO marker", os.listdir(_floor294) == [])
+
     # #107: _missing_allow_entries harvester over-harvest guard (Option A: a deliberately
     # SIMPLE parser - every backticked Bash/Write/Edit/Read(...) token on a non-NOTE line in
     # the section is a prescribed entry - plus a DISCIPLINED doc, pinned by an exact-set test).
@@ -1671,7 +1928,11 @@ def main():
         "Bash(gh pr edit *)", "Bash(gh pr ready *)", "Bash(gh pr comment *)",
         "Bash(gh pr update-branch *)",
         "Bash(gh pr merge *)", "Bash(gh issue *)", "Bash(git *)",
-        "Write(/tmp/**)", "Edit(/tmp/**)", "Read(/tmp/**)",
+        # #310: NO Write(/tmp/**) here. Claude Code resolves EVERY file-editing tool
+        # (Write/Edit/NotebookEdit/MultiEdit) against Edit(path) rules, so Edit(/tmp/**)
+        # below already grants tmp writes and a Write(...) rule matches NOTHING - the
+        # harness prints a startup warning for each one. See the no-Write pin below.
+        "Edit(/tmp/**)", "Read(/tmp/**)",
         "Bash(make *)", "Bash(golangci-lint run *)", "Bash(govulncheck *)",
         "Bash(~/.claude/scripts/*.sh *)",
     }
@@ -1689,6 +1950,17 @@ def main():
               sum(1 for e in real_got if e.startswith("Bash(gh pr ") and "merge" not in e) == 10)
         check("#107 real required-permissions.md: no blanket Bash(gh pr *) phantom (the merge-gate shadow)",
               "Bash(gh pr *)" not in real_got)
+        # #310 REGRESSION PIN: the doc must never prescribe a Write(...) rule. Claude Code
+        # matches all file-editing tools against Edit(path) ONLY, so a Write(path) rule is
+        # INERT - it grants nothing and the harness emits a startup warning naming it. The
+        # harvester regex still ACCEPTS Write(...) on purpose (dropping the alternative would
+        # make a re-added token silently unharvested - a loud wrong rule traded for a silent
+        # one); this pin is what keeps the doc honest. If this fails, a Write(...) token came
+        # back: delete it and rely on the Edit(...) twin, which already covers the Write tool.
+        _writes = sorted(e for e in real_got if e.startswith("Write("))
+        check("#310 real required-permissions.md prescribes NO inert Write(...) rule "
+              f"(Edit(...) covers all file-editing tools; found {_writes})",
+              _writes == [])
     else:
         check("#107 real required-permissions.md: file accessible for regression check", False)
 
