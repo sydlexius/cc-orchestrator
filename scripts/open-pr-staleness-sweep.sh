@@ -120,6 +120,19 @@ if [ -z "$repo" ]; then
   exit 0
 fi
 
+# --- Cross-repo guard: the CURRENT checkout must be the SAME repo as $repo ---
+# The behind check below fetches origin/<head> from the CURRENT worktree's origin, but every `gh`
+# call is scoped to $repo (which may be an explicit [repo] arg or GITHUB_REPOSITORY). If the local
+# checkout's origin points at a DIFFERENT repo than $repo, the fetch + rev-list would measure
+# UNRELATED history and could route the WRONG PR into (or away from) update-branch. Resolve the
+# current checkout's slug and require it to equal $repo; on any mismatch or unreadable slug, SKIP
+# (fail open, like the other advisory skips here) - never measure against the wrong origin.
+checkout_repo="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)"
+if [ -z "$checkout_repo" ] || [ "$checkout_repo" != "$repo" ]; then
+  echo "open-pr-staleness-sweep: the current checkout ('${checkout_repo:-unknown}') is not the target repo ($repo); the behind check fetches this checkout's origin, so skipping the staleness sweep (advisory)."
+  exit 0
+fi
+
 # --- Read phase (READ-ONLY) ---
 # NO SILENT CAP: `gh pr list` pages up to --limit. If the result COUNT equals the limit the set may
 # be TRUNCATED, so the report must say so and must never claim a clean "nothing to do" (the sweep

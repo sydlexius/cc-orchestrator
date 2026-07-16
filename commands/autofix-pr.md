@@ -111,25 +111,43 @@ For each `round` from 1:
 ### 2a-pre. Bring PR forward if behind base
 
 Check whether the PR is behind its OWN base; if so, refresh it server-side
-(default merge-commit mode, never `--rebase`) before watching:
+(default merge-commit mode, never `--rebase`) -- but ONLY when there is no
+pending review/triage work. If findings are still open, SKIP the pre-round
+refresh and let the fix round advance the branch itself (its push moves HEAD
+anyway):
 
 ```bash
 state_pre=$(gh pr view "$pr_number" --json mergeStateStatus --jq .mergeStateStatus)
 base_ref=$(gh pr view "$pr_number" --json baseRefName --jq .baseRefName)
 if [ "$state_pre" = "BEHIND" ]; then
-  echo "round <round>: PR #$pr_number is BEHIND $base_ref; running update-branch (default merge-commit mode)"
-  gh pr update-branch "$pr_number"
-  # ADDITIVE: a merge commit advances the HEAD; every existing commit SHA
-  # (and every fix SHA cited in a review reply) survives untouched.
-  # Loop into 2a so /pr-watch handles the wait.
+  # GATE (#282): only refresh when review is COMPLETE (no unreplied bot findings).
+  # A HEAD-moving update-branch dismisses a bot's prior approval and disturbs the
+  # incremental-review delta, so it must NOT run while triage is still pending --
+  # this contradicts the BEHIND-BASE ROUTING rule in SKILL.md otherwise.
+  unreplied=$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh" --count-only "$pr_number" 2>/dev/null || echo 1)
+  if [ "$unreplied" = "0" ]; then
+    echo "round <round>: PR #$pr_number is BEHIND $base_ref and review is complete; running update-branch (default merge-commit mode)"
+    gh pr update-branch "$pr_number"
+    # ADDITIVE: a merge commit advances the HEAD; every existing commit SHA
+    # (and every fix SHA cited in a review reply) survives untouched.
+    # Loop into 2a so /pr-watch handles the wait.
+  else
+    echo "round <round>: PR #$pr_number is BEHIND $base_ref but $unreplied finding(s) still pending; SKIPPING the pre-round refresh -- the fix round's push will advance the branch."
+    # Do NOT update-branch now: the FIX branch (2b) pushes fixes this round,
+    # and that push moves HEAD past base on its own without dismissing a review
+    # that has not yet been fully triaged.
+  fi
 fi
 ```
 
 **Caveat:** the refresh moves HEAD, so a bot's prior approval is dismissed and
-CI re-runs -- an already-CR-approved PR re-spends a review-slot. This stub does
-it anyway because a stale base eventually blocks merge. What it must NEVER do is
-pass `--rebase` (#282): that rewrites every commit SHA, orphans the fix SHAs
-cited in review replies, and empties the bot's incremental-review delta.
+CI re-runs -- an already-CR-approved PR re-spends a review-slot. That is why it
+is GATED on review being complete (`pr-unreplied-comments.sh --count-only`
+returning `0`): with findings still open the sweep would dismiss a review that
+has not been fully triaged and orphan the fix SHAs already cited in replies, so
+it defers to the fix round, whose own push advances the branch. What it must
+NEVER do is pass `--rebase` (#282): that rewrites every commit SHA, orphans the
+fix SHAs cited in review replies, and empties the bot's incremental-review delta.
 
 **Never** call `gh pr update-branch` on a Dependabot PR (per
 `feedback_no_update_branch_on_dependabot` -- the foreign-author merge

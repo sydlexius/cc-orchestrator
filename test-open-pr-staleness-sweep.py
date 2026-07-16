@@ -49,7 +49,10 @@ GH_STUB = (
     "#!/usr/bin/env bash\n"
     "set -u\n"
     'printf "%s\\n" "$*" >>"$GHLOG"\n'
-    'if [ "$1" = "repo" ]; then echo "owner/name"; exit 0; fi\n'
+    '# `gh repo view --json nameWithOwner` resolves the CURRENT checkout slug (the cross-repo\n'
+    '# guard). Defaults to the target repo so existing cases exercise the sweep body; set\n'
+    '# CHECKOUT_REPO to a DIFFERENT slug to drive the mismatch skip.\n'
+    'if [ "$1" = "repo" ]; then echo "${CHECKOUT_REPO:-owner/name}"; exit 0; fi\n'
     'if [ "$1" = "pr" ] && [ "$2" = "list" ]; then\n'
     '  [ "${LIST_RC:-0}" = "0" ] || exit "$LIST_RC"\n'
     '  for n in ${OPEN_PRS:-}; do echo "$n"; done\n'
@@ -112,7 +115,8 @@ def view_recheck(reviews="0", comments="0"):
 
 
 def run(args, *, open_prs="", views=None, views_recheck=None, view_rcs=None, behind="0",
-        list_rc=0, update_rc=0, fetch_fail_ref="", ssh_command=None, freshness_stub=None):
+        list_rc=0, update_rc=0, fetch_fail_ref="", ssh_command=None, freshness_stub=None,
+        checkout_repo=None):
     """Invoke open-pr-staleness-sweep.sh with stubbed gh + git.
     Returns (rc, stdout, stderr, gh_invocations, fetchlog)."""
     with tempfile.TemporaryDirectory() as td:
@@ -150,6 +154,8 @@ def run(args, *, open_prs="", views=None, views_recheck=None, view_rcs=None, beh
         env["LIST_RC"] = str(list_rc)
         env["UPDATE_RC"] = str(update_rc)
         env["FETCH_FAIL_REF"] = fetch_fail_ref
+        if checkout_repo is not None:
+            env["CHECKOUT_REPO"] = checkout_repo
         env.pop("GIT_TERMINAL_PROMPT", None)
         if ssh_command is not None:
             env["GIT_SSH_COMMAND"] = ssh_command
@@ -393,6 +399,18 @@ def main():
     check("exit 0", rc == 0)
     check("an unparseable count NEVER reaches update-branch (no '?' fallback)", updates_for(calls) == [])
     check("routed to surface (undetermined)", "124" in out)
+
+    print("== CROSS-REPO GUARD: current checkout != target repo -> SKIP, NO update-branch ==")
+    # The behind check fetches origin/<head> from the CURRENT checkout, but gh is scoped to the
+    # target repo. A checkout whose origin is a DIFFERENT repo would measure unrelated history, so
+    # the sweep must skip (exit 0) and touch nothing.
+    rc, out, err, calls, flog = run(
+        ["101", "owner/name"], open_prs="101 130", behind="4",
+        views={130: view(reviews="0", comments="0")}, checkout_repo="someone/else")
+    check("exit 0 (advisory skip)", rc == 0)
+    check("NO update-branch when checkout != target repo", updates_for(calls) == [])
+    check("never even lists the target repo's PRs", not any("pr list" in c for c in calls))
+    check("says the checkout is not the target repo", "not the target repo" in out)
 
     print("== malformed invocation -> exit 2 (the ONLY non-zero exit) ==")
     rc, out, err, calls, flog = run([])

@@ -173,9 +173,11 @@ coverage_advisory = true
   name = "base-freshness"
   # OPT-IN (#282), ADVISORY: is this branch still current with its base? The base is
   # ALWAYS explicit -- base-freshness.sh never infers or hard-codes `main`, so each
-  # repo (and each backport lane) names its OWN base here. Copy this step only if you
-  # want the pre-push warning; it is deliberately NOT a default step.
-  run = "bash scripts/base-freshness.sh main"
+  # repo (and each backport lane) names its OWN base here. The `<BASE>` below is a
+  # PLACEHOLDER: you MUST substitute it with this repo/lane's own base branch before
+  # use -- copying it verbatim checks a ref named "<BASE>" and reports unknown. Copy
+  # this step only if you want the pre-push warning; it is deliberately NOT a default step.
+  run = "bash scripts/base-freshness.sh <BASE>"
   # `required = false` is LOAD-BEARING: base-freshness exits 1 on a definitively-BEHIND
   # branch, and being behind base must WARN, never hard-fail the gate (the routing is the
   # lead's -- see SKILL.md BEHIND-BASE ROUTING). fresh AND unknown both exit 0.
