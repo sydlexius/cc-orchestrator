@@ -13,13 +13,14 @@
 #
 # NON-INTERACTIVE BY CONSTRUCTION: GIT_TERMINAL_PROMPT=0 (no HTTP credential prompt) plus SSH
 # BatchMode (no SSH password / host-key prompt; a caller's own GIT_SSH_COMMAND is PRESERVED and
-# BatchMode appended, an explicit BatchMode is left alone). An unreachable or auth-required origin
-# therefore FAILS FAST instead of hanging a push path. (Same pattern as finding_channel.py.)
+# `-o BatchMode=yes` appended LAST, so it OVERRIDES any caller BatchMode=no - the effective setting
+# is always yes). An unreachable or auth-required origin therefore FAILS FAST instead of hanging a
+# push path. (Same pattern as finding_channel.py.)
 #
 # Exactly ONE labeled `freshness:` line is printed on every path:
 #   freshness: fresh   - <head> contains every commit on origin/<base> (0 behind).
-#   freshness: behind  - <head> is N>0 commits behind origin/<base>; the line carries N and a
-#                        rebase / refresh pointer.
+#   freshness: behind  - <head> is N>0 commits behind origin/<base>; the line carries N and an
+#                        ADDITIVE refresh pointer (merge / gh pr update-branch, never rebase).
 #   freshness: unknown - could not be determined (unresolvable ref, fetch failure, shallow clone,
 #                        not a git repo). The check DEGRADES; it never guesses.
 #
@@ -55,6 +56,14 @@ if [ -z "$base" ]; then
   echo "usage: base-freshness.sh <base> [head]" >&2
   exit 2
 fi
+# Validate the caller-supplied base as a real branch name BEFORE any fetch. This keeps the helper
+# READ-ONLY: a refspec-shaped value (e.g. 'main:refs/heads/other') would otherwise reach `git fetch`
+# and UPDATE local refs. One check covers both the fetch and the later rev-list use of $base.
+if ! git check-ref-format "refs/heads/$base" >/dev/null 2>&1; then
+  echo "base-freshness: invalid base branch name '$base' (must be a plain branch name, not a refspec)" >&2
+  echo "usage: base-freshness.sh <base> [head]" >&2
+  exit 2
+fi
 head_ref="${2:-HEAD}"
 if [ "$#" -gt 2 ]; then
   echo "base-freshness: unexpected extra argument '$3'" >&2
@@ -65,15 +74,13 @@ fi
 # --- Non-interactive git (fail fast, never hang) ---
 export GIT_TERMINAL_PROMPT=0
 # GIT_TERMINAL_PROMPT=0 stops HTTP credential prompts but NOT an SSH password / host-key prompt -
-# that needs BatchMode. Preserve a caller's custom GIT_SSH_COMMAND (identity/port/wrapper) and just
-# append BatchMode; an explicit BatchMode (yes or no) is the caller's call and is left untouched.
+# that needs BatchMode. Preserve a caller's custom GIT_SSH_COMMAND (identity/port/wrapper) but ALWAYS
+# append `-o BatchMode=yes` LAST: ssh honors the LAST `-o` for a given option, so this overrides any
+# earlier BatchMode=no the caller set and guarantees the EFFECTIVE setting is non-interactive.
 if [ -n "${GIT_SSH_COMMAND:-}" ]; then
-  case "$GIT_SSH_COMMAND" in
-    *BatchMode*) : ;;
-    *) GIT_SSH_COMMAND="$GIT_SSH_COMMAND -oBatchMode=yes" ;;
-  esac
+  GIT_SSH_COMMAND="$GIT_SSH_COMMAND -o BatchMode=yes"
 else
-  GIT_SSH_COMMAND="ssh -oBatchMode=yes"
+  GIT_SSH_COMMAND="ssh -o BatchMode=yes"
 fi
 export GIT_SSH_COMMAND
 
@@ -116,5 +123,5 @@ if [ "$behind" -eq 0 ]; then
   exit 0
 fi
 
-echo "freshness: behind - '$head_ref' is $behind commit(s) behind origin/$base; refresh it before merge: rebase in the branch's own worktree ('git rebase origin/$base'), or for an OPEN PR use the server-side 'gh pr update-branch <n>' (DEFAULT merge-commit mode - never --rebase on a reviewed PR: it rewrites every commit SHA and orphans cited fix SHAs)"
+echo "freshness: behind - '$head_ref' is $behind commit(s) behind origin/$base; refresh it before merge with an ADDITIVE update that PRESERVES the reviewed commit SHAs: merge the base into the branch in its own worktree ('git merge origin/$base'), or for an OPEN PR use the server-side 'gh pr update-branch <n>' (DEFAULT merge-commit mode; a history-rewrite would orphan the fix SHAs cited in review replies)"
 exit 1

@@ -27,6 +27,8 @@ recorded for assertion.
 Run: python3 test-open-pr-staleness-sweep.py
 """
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -57,9 +59,16 @@ GH_STUB = (
     '  n="$3"\n'
     '  eval "rc=\\${VIEW_RC_$n:-0}"\n'
     '  [ "$rc" = "0" ] || exit "$rc"\n'
-    '  eval "line=\\${VIEW_$n:-}"\n'
-    '  printf "%s\\n" "$line"\n'
-    "  exit 0\n"
+    '  # Distinguish the SNAPSHOT read (asks for baseRefName) from the TOCTOU RE-CHECK read\n'
+    '  # (reviews,comments only). The recheck returns VIEW_RECHECK_$n if set, else mirrors the\n'
+    '  # snapshot reviews (field 3) + comments (field 4) so existing cases are unchanged.\n'
+    '  case "$*" in\n'
+    '    *baseRefName*) eval "line=\\${VIEW_$n:-}"; printf "%s\\n" "$line"; exit 0 ;;\n'
+    '    *) eval "rline=\\${VIEW_RECHECK_$n:-}"\n'
+    '       if [ -n "$rline" ]; then printf "%s\\n" "$rline"\n'
+    '       else eval "line=\\${VIEW_$n:-}"; printf "%s\\n" "$line" | cut -f3,4; fi\n'
+    '       exit 0 ;;\n'
+    '  esac\n'
     "fi\n"
     'if [ "$1" = "pr" ] && [ "$2" = "update-branch" ]; then\n'
     '  exit "${UPDATE_RC:-0}"\n'
@@ -75,6 +84,11 @@ GIT_STUB = (
     'if [ "$1" = "rev-parse" ] && [ "$2" = "--git-dir" ]; then echo "$GITDIR"; exit 0; fi\n'
     'if [ "$1" = "rev-parse" ] && [ "$2" = "--is-shallow-repository" ]; then echo false; exit 0; fi\n'
     'if [ "$1" = "fetch" ]; then\n'
+    '  # Record the non-interactive env of EACH fetch (the head fetch here, the base fetch inside\n'
+    '  # base-freshness) so the sweep\'s OWN head-fetch env can be asserted.\n'
+    '  { echo "ARGS=$*"\n'
+    '    echo "GIT_TERMINAL_PROMPT=${GIT_TERMINAL_PROMPT:-<unset>}"\n'
+    '    echo "GIT_SSH_COMMAND=${GIT_SSH_COMMAND:-<unset>}"; } >>"${FETCHLOG:-/dev/null}"\n'
     '  [ -n "${FETCH_FAIL_REF:-}" ] && [ "$3" = "$FETCH_FAIL_REF" ] && exit 1\n'
     '  exit "${FETCH_RC:-0}"\n'
     "fi\n"
@@ -92,14 +106,20 @@ def view(base="main", head="feat/x", reviews="0", comments="0", cross="false"):
     return TAB.join([base, head, reviews, comments, cross])
 
 
-def run(args, *, open_prs="", views=None, view_rcs=None, behind="0",
-        list_rc=0, update_rc=0, fetch_fail_ref=""):
+def view_recheck(reviews="0", comments="0"):
+    """A stubbed TOCTOU RE-CHECK line: just reviews-count + thread/comment-count (2 fields)."""
+    return TAB.join([reviews, comments])
+
+
+def run(args, *, open_prs="", views=None, views_recheck=None, view_rcs=None, behind="0",
+        list_rc=0, update_rc=0, fetch_fail_ref="", ssh_command=None, freshness_stub=None):
     """Invoke open-pr-staleness-sweep.sh with stubbed gh + git.
-    Returns (rc, stdout, stderr, gh_invocations)."""
+    Returns (rc, stdout, stderr, gh_invocations, fetchlog)."""
     with tempfile.TemporaryDirectory() as td:
         bindir = os.path.join(td, "bin"); os.makedirs(bindir)
         gitdir = os.path.join(td, "gitdir"); os.makedirs(gitdir)
         ghlog = os.path.join(td, "ghlog")
+        fetchlog = os.path.join(td, "fetchlog")
 
         for name, body in (("gh", GH_STUB), ("git", GIT_STUB)):
             p = os.path.join(bindir, name)
@@ -107,27 +127,52 @@ def run(args, *, open_prs="", views=None, view_rcs=None, behind="0",
                 f.write(body)
             os.chmod(p, 0o755)
 
+        # When a freshness_stub is given, run a COPY of the sweep next to a STUB base-freshness.sh so
+        # the sweep's OWN result-gating is exercised independently of the real helper (e.g. a helper
+        # that exits non-1 or emits a non-numeric count must NOT reach update-branch).
+        script_to_run = SCRIPT
+        if freshness_stub is not None:
+            scriptsdir = os.path.join(td, "scripts"); os.makedirs(scriptsdir)
+            script_to_run = os.path.join(scriptsdir, "open-pr-staleness-sweep.sh")
+            shutil.copy(SCRIPT, script_to_run)
+            fp = os.path.join(scriptsdir, "base-freshness.sh")
+            with open(fp, "w") as f:
+                f.write(freshness_stub)
+            os.chmod(fp, 0o755)
+
         env = dict(os.environ)
         env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
         env["GITDIR"] = gitdir
         env["GHLOG"] = ghlog
+        env["FETCHLOG"] = fetchlog
         env["OPEN_PRS"] = open_prs
         env["BEHIND"] = behind
         env["LIST_RC"] = str(list_rc)
         env["UPDATE_RC"] = str(update_rc)
         env["FETCH_FAIL_REF"] = fetch_fail_ref
+        env.pop("GIT_TERMINAL_PROMPT", None)
+        if ssh_command is not None:
+            env["GIT_SSH_COMMAND"] = ssh_command
+        else:
+            env.pop("GIT_SSH_COMMAND", None)
         for n, line in (views or {}).items():
             env[f"VIEW_{n}"] = line
+        for n, line in (views_recheck or {}).items():
+            env[f"VIEW_RECHECK_{n}"] = line
         for n, rc in (view_rcs or {}).items():
             env[f"VIEW_RC_{n}"] = str(rc)
 
-        p = subprocess.run(["bash", SCRIPT] + args, env=env,
+        p = subprocess.run(["bash", script_to_run] + args, env=env,
                            capture_output=True, text=True, timeout=30)
         calls = []
         if os.path.exists(ghlog):
             with open(ghlog) as fh:
                 calls = [ln.rstrip("\n") for ln in fh if ln.strip()]
-        return p.returncode, p.stdout, p.stderr, calls
+        flog = ""
+        if os.path.exists(fetchlog):
+            with open(fetchlog) as fh:
+                flog = fh.read()
+        return p.returncode, p.stdout, p.stderr, calls, flog
 
 
 def no_rebase(calls):
@@ -138,9 +183,27 @@ def updates_for(calls):
     return [c for c in calls if "update-branch" in c]
 
 
+def fetch_block(fetchlog, ref):
+    """Return the (ARGS, TERMINAL, SSH) 3-line block of the fetch whose ARGS names <ref>, or None."""
+    lines = fetchlog.splitlines()
+    for i in range(0, len(lines) - 2, 3):
+        if lines[i].startswith("ARGS=") and f" {ref} " in (lines[i] + " "):
+            return "\n".join(lines[i:i + 3])
+    return None
+
+
+def effective_batchmode(block):
+    """The LAST BatchMode value ssh honors in a fetch block's GIT_SSH_COMMAND (later -o wins)."""
+    lines = [ln for ln in block.splitlines() if ln.startswith("GIT_SSH_COMMAND=")]
+    if not lines:
+        return None
+    vals = re.findall(r"BatchMode=(\w+)", lines[-1])
+    return vals[-1] if vals else None
+
+
 def main():
     print("== excludes the just-merged PR ==")
-    rc, out, err, calls = run(
+    rc, out, err, calls, flog = run(
         ["101", "owner/name"], open_prs="101 102", behind="3",
         views={101: view(head="feat/merged"), 102: view(head="feat/other")})
     check("exit 0", rc == 0)
@@ -150,7 +213,7 @@ def main():
     check("no --rebase anywhere", no_rebase(calls))
 
     print("== behind + NOT reviewed -> update-branch in DEFAULT (merge-commit) mode ==")
-    rc, out, err, calls = run(
+    rc, out, err, calls, flog = run(
         ["101", "owner/name"], open_prs="101 102", behind="4",
         views={102: view(reviews="0", comments="0")})
     check("exit 0", rc == 0)
@@ -159,7 +222,7 @@ def main():
     check("reports the refresh", "102" in out and "refresh" in out.lower())
 
     print("== behind + REVIEWED (reviews[] non-empty) -> SURFACE only, NO mutation ==")
-    rc, out, err, calls = run(
+    rc, out, err, calls, flog = run(
         ["101", "owner/name"], open_prs="101 102", behind="4",
         views={102: view(reviews="2", comments="0")})
     check("exit 0", rc == 0)
@@ -168,7 +231,7 @@ def main():
     check("no --rebase anywhere", no_rebase(calls))
 
     print("== behind + REVIEWED (review threads/comments > 0, no submitted decision) -> SURFACE ==")
-    rc, out, err, calls = run(
+    rc, out, err, calls, flog = run(
         ["101", "owner/name"], open_prs="101 103", behind="4",
         views={103: view(reviews="0", comments="5")})
     check("exit 0", rc == 0)
@@ -177,7 +240,7 @@ def main():
     check("surfaced for the lead", "103" in out)
 
     print("== predicate INDETERMINATE (malformed field) -> treated as REVIEWED -> NO mutation ==")
-    rc, out, err, calls = run(
+    rc, out, err, calls, flog = run(
         ["101", "owner/name"], open_prs="101 104", behind="4",
         views={104: view(reviews="?", comments="?")})
     check("exit 0", rc == 0)
@@ -185,14 +248,14 @@ def main():
     check("surfaced as indeterminate", "104" in out)
 
     print("== predicate HALF-indeterminate -> still REVIEWED -> NO mutation ==")
-    rc, out, err, calls = run(
+    rc, out, err, calls, flog = run(
         ["101", "owner/name"], open_prs="101 105", behind="4",
         views={105: view(reviews="0", comments="?")})
     check("exit 0", rc == 0)
     check("NO update-branch call", updates_for(calls) == [])
 
     print("== per-PR read FAILS -> treated as reviewed -> NO mutation, exit 0 ==")
-    rc, out, err, calls = run(
+    rc, out, err, calls, flog = run(
         ["101", "owner/name"], open_prs="101 106", behind="4",
         views={106: view()}, view_rcs={106: 1})
     check("exit 0 (fail-open)", rc == 0)
@@ -200,7 +263,7 @@ def main():
     check("surfaced", "106" in out)
 
     print("== update-branch DENIED / errors -> degrade to REPORT-ONLY, exit 0 ==")
-    rc, out, err, calls = run(
+    rc, out, err, calls, flog = run(
         ["101", "owner/name"], open_prs="101 107", behind="4",
         views={107: view(reviews="0", comments="0")}, update_rc=1)
     check("exit 0 despite the failed update-branch", rc == 0)
@@ -209,12 +272,12 @@ def main():
     check("no --rebase retry", no_rebase(calls))
 
     print("== open-PR LIST read failure -> exit 0 (fail-open, never blocks cleanup) ==")
-    rc, out, err, calls = run(["101", "owner/name"], list_rc=1)
+    rc, out, err, calls, flog = run(["101", "owner/name"], list_rc=1)
     check("exit 0 (fail-open)", rc == 0)
     check("no update-branch attempted", updates_for(calls) == [])
 
     print("== none behind -> clean no-op ==")
-    rc, out, err, calls = run(
+    rc, out, err, calls, flog = run(
         ["101", "owner/name"], open_prs="101 108", behind="0",
         views={108: view(reviews="0", comments="0")})
     check("exit 0", rc == 0)
@@ -222,7 +285,7 @@ def main():
     check("reports nothing to do", "no open PR" in out or "nothing" in out.lower())
 
     print("== no OTHER open PRs -> clean no-op ==")
-    rc, out, err, calls = run(["101", "owner/name"], open_prs="101")
+    rc, out, err, calls, flog = run(["101", "owner/name"], open_prs="101")
     check("exit 0", rc == 0)
     check("no update-branch", updates_for(calls) == [])
 
@@ -230,7 +293,7 @@ def main():
     # A fork PR's headRefName names a branch in the FORK. If origin happens to carry a
     # same-named branch (dev / patch-1 / fix), measuring against origin/<head> compares an
     # UNRELATED ref - and a >0 count on an unreviewed PR would then MUTATE it.
-    rc, out, err, calls = run(
+    rc, out, err, calls, flog = run(
         ["101", "owner/name"], open_prs="101 109", behind="7",
         views={109: view(head="patch-1", reviews="0", comments="0", cross="true")})
     check("exit 0", rc == 0)
@@ -239,7 +302,7 @@ def main():
     check("says cross-repository", "cross-repo" in out.lower())
 
     print("== isCrossRepository UNREADABLE -> treated as cross-repo -> skipped + surfaced ==")
-    rc, out, err, calls = run(
+    rc, out, err, calls, flog = run(
         ["101", "owner/name"], open_prs="101 110", behind="7",
         views={110: view(reviews="0", comments="0", cross="?")})
     check("exit 0", rc == 0)
@@ -247,7 +310,7 @@ def main():
     check("surfaced", "110" in out)
 
     print("== HEAD fetch FAILS -> UNKNOWN (never measured against a stale local ref) ==")
-    rc, out, err, calls = run(
+    rc, out, err, calls, flog = run(
         ["101", "owner/name"], open_prs="101 111", behind="9",
         views={111: view(head="feat/x", reviews="0", comments="0")},
         fetch_fail_ref="feat/x")
@@ -256,7 +319,7 @@ def main():
     check("surfaced as undetermined", "111" in out)
 
     print("== merged-PR exclusion is NUMERIC (a zero-padded argument still matches) ==")
-    rc, out, err, calls = run(
+    rc, out, err, calls, flog = run(
         ["007", "owner/name"], open_prs="7 102", behind="4",
         views={7: view(head="feat/merged"), 102: view(head="feat/other")})
     check("exit 0", rc == 0)
@@ -266,25 +329,83 @@ def main():
 
     print("== gh pr list CAP hit -> the truncation is stated, never a clean 'nothing to do' ==")
     many = " ".join(str(i) for i in range(1, 101))   # exactly the --limit 100 cap
-    rc, out, err, calls = run(
+    rc, out, err, calls, flog = run(
         ["101", "owner/name"], open_prs=many, behind="0",
         views={i: view(reviews="0", comments="0") for i in range(1, 101)})
     check("exit 0", rc == 0)
     check("the cap is surfaced", "100" in out and ("truncat" in out.lower() or "cap" in out.lower()))
     check("no unqualified 'nothing to do' claim", "nothing to do" not in out)
 
+    print("== NON-INTERACTIVE: the sweep's OWN head fetch is GIT_TERMINAL_PROMPT=0 + BatchMode=yes ==")
+    # A caller BatchMode=no must NOT survive as the effective setting on the head fetch.
+    rc, out, err, calls, flog = run(
+        ["101", "owner/name"], open_prs="101 120", behind="4",
+        views={120: view(head="feat/hf", reviews="0", comments="0")},
+        ssh_command="ssh -o BatchMode=no")
+    head_blk = fetch_block(flog, "feat/hf")
+    check("the head fetch was recorded", head_blk is not None)
+    check("GIT_TERMINAL_PROMPT=0 on the head fetch", "GIT_TERMINAL_PROMPT=0" in (head_blk or ""))
+    check("caller BatchMode=no preserved on the head fetch", "BatchMode=no" in (head_blk or ""))
+    check("but the EFFECTIVE head-fetch BatchMode is yes (our -o appended LAST wins)",
+          effective_batchmode(head_blk or "") == "yes")
+
+    print("== TOCTOU: not-reviewed at snapshot but REVIEWED at re-check -> NOT refreshed ==")
+    # The snapshot shows 0 reviews / 0 comments (would refresh), but a review lands before the
+    # mutation: the pre-update re-read shows reviews>0, so the sweep must SURFACE, not update-branch.
+    rc, out, err, calls, flog = run(
+        ["101", "owner/name"], open_prs="101 121", behind="5",
+        views={121: view(reviews="0", comments="0")},
+        views_recheck={121: view_recheck(reviews="3", comments="0")})
+    check("exit 0", rc == 0)
+    check("NO update-branch (became reviewed between snapshot and mutation)", updates_for(calls) == [])
+    check("surfaced for the lead", "121" in out)
+    check("no --rebase anywhere", no_rebase(calls))
+
+    print("== TOCTOU: re-check UNREADABLE -> treated as reviewed -> NOT refreshed ==")
+    rc, out, err, calls, flog = run(
+        ["101", "owner/name"], open_prs="101 122", behind="5",
+        views={122: view(reviews="0", comments="0")},
+        views_recheck={122: view_recheck(reviews="?", comments="?")})
+    check("exit 0", rc == 0)
+    check("NO update-branch on an indeterminate re-check", updates_for(calls) == [])
+    check("surfaced", "122" in out)
+
+    print("== HARDENED GATE: helper exits NON-1 with a behind label -> NOT refreshed ==")
+    stub_badrc = (
+        "#!/usr/bin/env bash\n"
+        'echo "freshness: behind - origin/head is 5 commit(s) behind origin/main"\n'
+        "exit 3\n")
+    rc, out, err, calls, flog = run(
+        ["101", "owner/name"], open_prs="101 123", behind="5",
+        views={123: view(reviews="0", comments="0")}, freshness_stub=stub_badrc)
+    check("exit 0", rc == 0)
+    check("a non-1 helper exit NEVER reaches update-branch", updates_for(calls) == [])
+    check("routed to surface (undetermined)", "123" in out)
+
+    print("== HARDENED GATE: helper exits 1 but count is NON-NUMERIC -> NOT refreshed ==")
+    stub_nonnum = (
+        "#!/usr/bin/env bash\n"
+        'echo "freshness: behind - origin/head is many commits behind origin/main"\n'
+        "exit 1\n")
+    rc, out, err, calls, flog = run(
+        ["101", "owner/name"], open_prs="101 124", behind="5",
+        views={124: view(reviews="0", comments="0")}, freshness_stub=stub_nonnum)
+    check("exit 0", rc == 0)
+    check("an unparseable count NEVER reaches update-branch (no '?' fallback)", updates_for(calls) == [])
+    check("routed to surface (undetermined)", "124" in out)
+
     print("== malformed invocation -> exit 2 (the ONLY non-zero exit) ==")
-    rc, out, err, calls = run([])
+    rc, out, err, calls, flog = run([])
     check("no PR number -> exit 2", rc == 2)
-    rc, out, err, calls = run(["abc"])
+    rc, out, err, calls, flog = run(["abc"])
     check("non-numeric PR -> exit 2", rc == 2)
-    rc, out, err, calls = run(["--bogus", "101"])
+    rc, out, err, calls, flog = run(["--bogus", "101"])
     check("unknown flag -> exit 2", rc == 2)
-    rc, out, err, calls = run(["101", "owner/name", "extra"])
+    rc, out, err, calls, flog = run(["101", "owner/name", "extra"])
     check("extra positional -> exit 2", rc == 2)
 
     print("== --help -> exit 0, prints the header ==")
-    rc, out, err, calls = run(["--help"])
+    rc, out, err, calls, flog = run(["--help"])
     check("--help -> exit 0", rc == 0)
     check("--help prints usage", "open-pr-staleness-sweep.sh" in out)
 

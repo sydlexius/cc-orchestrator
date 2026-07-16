@@ -20,6 +20,7 @@ for fetch / ref-resolution / rev-list so each degradation branch is driven direc
 Run: python3 test-base-freshness.py
 """
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,16 @@ def check(label, ok):
     status = "ok  " if ok else "FAIL"; print(f"  [{status}] {label}")
     if not ok:
         FAILS.append(label)
+
+
+def effective_batchmode(log):
+    """The LAST BatchMode value ssh would honor across the recorded GIT_SSH_COMMAND (later -o wins).
+    Returns 'yes' / 'no' / None. Matches both `-oBatchMode=X` and `-o BatchMode=X` spellings."""
+    lines = [ln for ln in log.splitlines() if ln.startswith("GIT_SSH_COMMAND=")]
+    if not lines:
+        return None
+    vals = re.findall(r"BatchMode=(\w+)", lines[-1])
+    return vals[-1] if vals else None
 
 
 GIT_STUB = (
@@ -112,12 +123,15 @@ def main():
     check("fresh is labeled fresh", "freshness: fresh" in out)
     check("fresh names the caller-supplied base", "origin/main" in out)
 
-    print("== behind N -> distinct non-zero, count + rebase pointer ==")
+    print("== behind N -> distinct non-zero, count + ADDITIVE refresh guidance (never rebase) ==")
     rc, out, err, log = run(["main"], behind="7")
     check("behind -> distinct non-zero (1)", rc == 1)
     check("behind is labeled behind", "freshness: behind" in out)
     check("behind carries the count", "7" in out)
-    check("behind carries a rebase pointer", "rebase" in out)
+    check("behind guidance is ADDITIVE (git merge + update-branch)",
+          "git merge" in out and "update-branch" in out)
+    check("behind guidance NEVER prescribes a rebase (rewrites reviewed SHAs)",
+          "rebase" not in out.lower())
 
     print("== a NON-main base is honored verbatim (never infers main) ==")
     rc, out, err, log = run(["release/1.2"], behind="3")
@@ -167,10 +181,11 @@ def main():
     check("caller ssh command preserved", "-i /k/id -p 2222" in log)
     check("BatchMode still enforced", "BatchMode=yes" in log)
 
-    print("== NON-INTERACTIVE: an explicit BatchMode is not doubled ==")
+    print("== NON-INTERACTIVE: a caller BatchMode=no cannot survive (effective BatchMode=yes) ==")
     rc, out, err, log = run(["main"], ssh_command="ssh -oBatchMode=no")
-    check("explicit caller BatchMode left alone (not appended twice)",
-          log.count("BatchMode") == 1)
+    check("caller ssh BatchMode=no is preserved in the command", "BatchMode=no" in log)
+    check("but the EFFECTIVE BatchMode is yes (our -o BatchMode=yes appended LAST wins)",
+          effective_batchmode(log) == "yes")
 
     print("== malformed invocation -> exit 2 ==")
     rc, out, err, log = run([])

@@ -91,6 +91,17 @@ case "$merged_pr" in
     exit 2 ;;
 esac
 
+# --- Non-interactive git (fail fast, never hang) for this script's OWN head fetch ---
+# base-freshness.sh sets its own; the sweep's head fetch below needs the SAME guarantee. Append
+# `-o BatchMode=yes` LAST so it overrides any caller BatchMode=no (ssh honors the last -o).
+export GIT_TERMINAL_PROMPT=0
+if [ -n "${GIT_SSH_COMMAND:-}" ]; then
+  GIT_SSH_COMMAND="$GIT_SSH_COMMAND -o BatchMode=yes"
+else
+  GIT_SSH_COMMAND="ssh -o BatchMode=yes"
+fi
+export GIT_SSH_COMMAND
+
 # --- Locate the behind-check helper (sibling; repo layout AND deployed ~/.claude/scripts layout) ---
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 freshness="$script_dir/base-freshness.sh"
@@ -195,21 +206,24 @@ for n in $open_prs; do
   fi
   fresh_out="$(bash "$freshness" "$base_ref" "origin/$head_ref" 2>/dev/null)"; fresh_rc=$?
 
-  if [ "$fresh_rc" -eq 2 ]; then
-    unknowns+=("#$n - freshness check could not run")
-    continue
-  fi
-  if [ "$fresh_rc" -eq 0 ]; then
+  # HARDENED BEHIND GATING: a refresh is authorized ONLY when ALL THREE hold - the helper exited
+  # EXACTLY 1, its output carries the explicit `freshness: behind` label, AND a numeric commit count
+  # parsed out of it. ANY other status (0 fresh/unknown, 2 malformed, or a killed/incompatible
+  # helper's odd exit code) or a non-numeric count routes to SURFACE (unknowns), NEVER to
+  # update-branch. There is deliberately NO `?` fallback for behind_n - an unparseable count can
+  # never reach the mutation.
+  behind_n=""
+  case "$fresh_out" in
+    *"freshness: behind"*)
+      behind_n="$(printf '%s' "$fresh_out" | sed -nE 's/.* is ([0-9]+) commit.*/\1/p' | head -1)" ;;
+  esac
+  if [ "$fresh_rc" -ne 1 ] || [ -z "$behind_n" ]; then
     case "$fresh_out" in
-      *"freshness: unknown"*) unknowns+=("#$n - freshness undetermined (${base_ref})") ;;
-      *) : ;;   # fresh: nothing to do
+      *"freshness: fresh"*) : ;;   # up to date: nothing to do
+      *) unknowns+=("#$n - freshness undetermined (${base_ref})") ;;
     esac
     continue
   fi
-
-  # fresh_rc == 1: definitively BEHIND. Pull the count out of the helper's labeled line.
-  behind_n="$(printf '%s' "$fresh_out" | sed -nE 's/.* is ([0-9]+) commit.*/\1/p' | head -1)"
-  behind_n="${behind_n:-?}"
 
   if [ "$reviewed" = true ]; then
     if [ "$indeterminate" = true ]; then
@@ -217,6 +231,32 @@ for n in $open_prs; do
     else
       needs_lead+=("#$n ($head_ref) is $behind_n behind origin/$base_ref - REVIEWED (reviews=$reviews_n, threads/comments=$threads_n); NOT refreshed automatically")
     fi
+    continue
+  fi
+
+  # TOCTOU GUARD (#282): a review / comment can land BETWEEN the snapshot above and this mutation.
+  # RE-READ the review state immediately before update-branch and proceed ONLY if it STILL shows
+  # not-reviewed. An unreadable / indeterminate re-check is treated as REVIEWED -> SURFACE (fail
+  # toward not-acting), the same direction as the snapshot-time predicate.
+  if ! recheck="$(gh pr view "$n" --repo "$repo" --json reviews,comments \
+        --jq '[ (if (.reviews|type)=="array" then (.reviews|length|tostring) else "?" end),
+                (if (.comments|type)=="array" then (.comments|length|tostring) else "?" end) ]
+              | @tsv' 2>/dev/null)"; then
+    recheck=""
+  fi
+  re_reviewed=true
+  if [ -n "$recheck" ]; then
+    IFS=$'\t' read -r re_reviews_n re_comments_n <<<"$recheck"
+    re_reviews_n="${re_reviews_n:-?}"; re_comments_n="${re_comments_n:-?}"
+    re_indeterminate=false
+    case "$re_reviews_n" in ''|*[!0-9]*) re_indeterminate=true ;; esac
+    case "$re_comments_n" in ''|*[!0-9]*) re_indeterminate=true ;; esac
+    if [ "$re_indeterminate" = false ] && [ "$re_reviews_n" -eq 0 ] && [ "$re_comments_n" -eq 0 ]; then
+      re_reviewed=false
+    fi
+  fi
+  if [ "$re_reviewed" = true ]; then
+    needs_lead+=("#$n ($head_ref) is $behind_n behind origin/$base_ref - became REVIEWED (or its re-check was unreadable) between snapshot and refresh; NOT refreshed (no action taken)")
     continue
   fi
 
