@@ -959,8 +959,39 @@ def _session_key():
 
 
 def _marker_path():
+    """The path this session ARMS under (first-precedence key). See _marker_paths() for
+    teardown, which must clear EVERY candidate."""
     key = _session_key()
     return os.path.join(FLOOR_DIR, key) if key else None
+
+
+def _session_keys():
+    """EVERY key this session could have armed under, first-precedence first. MIRRORS the
+    DERIVATION REGISTRY in `scripts/orchestrate-guard.sh` - the guard's `marker_active()`
+    treats ANY of these as gating, so teardown must clear ALL of them."""
+    def _sanitize(value):
+        return re.sub(rb'[^A-Za-z0-9]', b'_', value.encode("utf-8", "surrogateescape")).decode("ascii")
+
+    keys = []
+    tmux = os.environ.get("TMUX", "")
+    if tmux:
+        keys.append(_sanitize(tmux))
+    ccsid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if ccsid:
+        keys.append("ccsid_" + _sanitize(ccsid))
+    return keys
+
+
+def _marker_paths():
+    """EVERY marker path this session could own.
+
+    #312 TEARDOWN INVARIANT: `down` must clear ALL of them, not just _marker_path(). The
+    guard gates on ANY candidate marker, so removing only the first-precedence one can leave
+    the session GATED after `down`: arm with $TMUX absent (ccsid key), later run `down` with
+    $TMUX set, and the ccsid marker survives - the merge gate stays armed until its 72h TTL
+    expires, with `down` reporting success. Fail toward DISARMED: remove everything this
+    session could have armed."""
+    return [os.path.join(FLOOR_DIR, k) for k in _session_keys()]
 
 
 def arm_marker(team, repo, head):
@@ -1546,17 +1577,22 @@ def _warn_dirty_worktrees(repo):
 
 
 def cmd_down(args):
-    path = _marker_path()
-    existed = bool(path) and os.path.exists(path)
+    # #312: clear EVERY candidate marker, not just the first-precedence one. The guard gates
+    # on ANY candidate, so a session armed under the ccsid key and torn down with $TMUX set
+    # would otherwise stay GATED while `down` reported success.
+    paths = [p for p in _marker_paths() if os.path.exists(p)]
+    existed = bool(paths)
     # Read the repo BEFORE removing the marker; scan its worktrees so a dirty tree is
-    # surfaced before the lead cleans worktrees (#25, warn-and-proceed).
-    repo = _marker_repo(path) if existed else None
-    if path:
+    # surfaced before the lead cleans worktrees (#25, warn-and-proceed). Use the first
+    # EXISTING marker - they are this one session's, so any of them names the same repo.
+    repo = _marker_repo(paths[0]) if existed else None
+    for _p in _marker_paths():
         try:
-            os.remove(path)
+            os.remove(_p)
         except OSError:
-            # FileNotFoundError (already disarmed) or NotADirectoryError (FLOOR_DIR is a
-            # file) etc.: down is best-effort teardown, never crash on a bad marker path.
+            # FileNotFoundError (already disarmed / never armed under this candidate) or
+            # NotADirectoryError (FLOOR_DIR is a file) etc.: down is best-effort teardown,
+            # never crash on a bad marker path.
             pass
     _gc_stale_tombstones()
     _release_session_resources(getattr(args, "team", None))

@@ -383,31 +383,16 @@ EOF
 # `--match-head-commit <sha>` equal to token.head_sha, and gh itself refuses the merge
 # unless that SHA is the PR's current head - so a token cannot authorize a different PR
 # or a moved HEAD, and the floor need not re-parse the PR number. Reads $cmd.
-merge_authorized() {
-  local key tok msha tsha texp now cpr tpr
-  # #312: follow the SAME candidate set as marker_active, so an arm-side/check-side scheme
-  # disagreement cannot strand a legitimately-armed token under an unread name (which would
-  # deny every authorized merge - the safe direction, but a broken feature). Each candidate
-  # token is still this session's OWN, oracle-verified and SHA-pinned below, so accepting any
-  # of them widens nothing: the bind, not the filename, is what authorizes the merge.
-  tok=""
-  while IFS= read -r key; do
-    [ -n "$key" ] || continue
-    if [ -f "$FLOOR_DIR/merge-auth/$key" ]; then
-      tok="$FLOOR_DIR/merge-auth/$key"
-      break
-    fi
-  done <<EOF
-$(_session_keys)
-EOF
-  [ -n "$tok" ] || return 1
-  # Deny on an AMBIGUOUS pin: gh's pflag honors the LAST --match-head-commit, but we
-  # validate one occurrence; if the command carries MORE THAN ONE, refuse rather than
-  # risk validating a different SHA than gh will actually enforce (deny-on-doubt).
-  [ "$(printf '%s' "$cmd" | grep -oE -e '--match-head-commit([[:space:]=]|$)' | wc -l | tr -d '[:space:]')" -le 1 ] || return 1
-  # `-e`: the pattern begins with `--`, which grep would otherwise parse as an option.
-  msha=$(printf '%s' "$cmd" | grep -oE -e '--match-head-commit[[:space:]=]+[0-9a-fA-F]{40,}' | grep -oE '[0-9a-fA-F]{40,}' | head -1)
-  [ -n "$msha" ] || return 1
+# Does ONE token file authorize the current $cmd? 0 = yes, non-zero = no (deny on ANY doubt).
+# Split out of merge_authorized (#312) so EVERY candidate is VALIDATED rather than only the
+# first one that happens to EXIST: with both identifiers set, an expired or malformed token
+# under the first-precedence key would otherwise SHADOW a valid token under the second and
+# deny an authorized merge. Safe direction, but it defeats the arm/check-mismatch recovery
+# this candidate set exists to provide. Command-level checks (the ambiguous-pin refusal, the
+# pr extraction) stay in the caller - they are properties of $cmd, not of a token.
+_token_authorizes() {
+  local tok="$1" msha="$2" cpr="$3" tsha texp now tpr
+  [ -f "$tok" ] || return 1
   tsha=$(jq -r '.head_sha // empty' "$tok" 2>/dev/null) || return 1
   texp=$(jq -r '.expiry // empty' "$tok" 2>/dev/null) || return 1
   [ -n "$tsha" ] && [ -n "$texp" ] || return 1
@@ -418,8 +403,23 @@ EOF
   # Bind the PR too (defense-in-depth beyond the SHA + gh's own head check): two PRs
   # CAN share a head SHA (e.g. one head branch is the head of a base->main and a
   # base->develop PR), so require the merge command's target PR to equal token.pr.
-  # Extract the bare integer arg after `merge` (tolerating flags between); deny if it
-  # is absent/unparsable or mismatched (deny-on-doubt).
+  tpr=$(jq -r '.pr // empty' "$tok" 2>/dev/null) || return 1
+  case "$tpr" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$cpr" = "$tpr" ] || return 1
+  return 0
+}
+
+merge_authorized() {
+  local key msha cpr
+  # COMMAND-level checks first (properties of $cmd, identical for every candidate token).
+  # Deny on an AMBIGUOUS pin: gh's pflag honors the LAST --match-head-commit, but we
+  # validate one occurrence; if the command carries MORE THAN ONE, refuse rather than
+  # risk validating a different SHA than gh will actually enforce (deny-on-doubt).
+  [ "$(printf '%s' "$cmd" | grep -oE -e '--match-head-commit([[:space:]=]|$)' | wc -l | tr -d '[:space:]')" -le 1 ] || return 1
+  # `-e`: the pattern begins with `--`, which grep would otherwise parse as an option.
+  msha=$(printf '%s' "$cmd" | grep -oE -e '--match-head-commit[[:space:]=]+[0-9a-fA-F]{40,}' | grep -oE '[0-9a-fA-F]{40,}' | head -1)
+  [ -n "$msha" ] || return 1
+  # Extract the bare integer arg after `merge`; deny if absent/unparsable (deny-on-doubt).
   # Extract the target PR as the token IMMEDIATELY after `merge` (anchored at the clause
   # start), with NO flags permitted between. This is deliberately strict: allowing flags
   # before the pr re-opens a value-flag divergence - gh's value-taking flags (-b/--body/
@@ -434,10 +434,20 @@ EOF
   # `gh pr merge 265abc` (which gh treats as a branch, not PR 265) does not extract 265.
   cpr=$(printf '%s' "$cmd" | grep -oE '^[[:space:]]*gh[[:space:]]+pr[[:space:]]+merge[[:space:]]+[0-9]+([[:space:]]|$)' | grep -oE '[0-9]+' | head -1)
   [ -n "$cpr" ] || return 1
-  tpr=$(jq -r '.pr // empty' "$tok" 2>/dev/null) || return 1
-  case "$tpr" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$cpr" = "$tpr" ] || return 1
-  return 0
+  # Now try EVERY candidate token and take the first that FULLY validates. Do not stop at the
+  # first that merely EXISTS: an expired/malformed token under the first-precedence key would
+  # shadow a valid one under the second and deny an authorized merge. Each candidate is this
+  # session's OWN token, oracle-verified and SHA+PR-pinned by _token_authorizes, so trying all
+  # of them widens NOTHING - the bind, not the filename, is what authorizes the merge.
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    if _token_authorizes "$FLOOR_DIR/merge-auth/$key" "$msha" "$cpr"; then
+      return 0
+    fi
+  done <<EOF
+$(_session_keys)
+EOF
+  return 1
 }
 
 # --- (1)+(2) hard denies, evaluated PER-CLAUSE ----------------------------

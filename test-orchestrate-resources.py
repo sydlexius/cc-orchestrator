@@ -4,6 +4,7 @@ Run: python3 test-orchestrate-resources.py"""
 import datetime as _dt
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -12,6 +13,12 @@ import tempfile
 
 def _nowish():
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _key(value):
+    """Mirror the sanitization in the DERIVATION REGISTRY (orchestrate-guard.sh) EXACTLY:
+    byte-mode, so the key matches regardless of locale (#312)."""
+    return re.sub(rb'[^A-Za-z0-9]', b'_', value.encode("utf-8", "surrogateescape")).decode("ascii")
 
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "orchestrate-resources.py")
 FAILS = []
@@ -579,8 +586,14 @@ def main():
                            env_overrides=ov_asym, tmux="/tmp/tmux-501/default,99,0", ccsid=CCSID)
         check("#312 resources: asymmetric-env allocate succeeds", rc == 0)
         _l1 = json.load(open(st_asym))["leases"][0]
-        check("#312 resources: the lease records BOTH candidate keys (not just first-precedence)",
-              CCKEY in (_l1.get("marker_keys") or []))
+        # Pin the EXACT candidate list, in precedence order. A membership check
+        # (`CCKEY in marker_keys`) is too weak: it passes on `[CCKEY]` alone - a lease that
+        # silently DROPPED the tmux candidate, which is the very defect this case exists to catch.
+        _tmux_key_asym = _key("/tmp/tmux-501/default,99,0")
+        check("#312 resources: lease records the EXACT candidate list [tmux_key, ccsid_key]",
+              (_l1.get("marker_keys") or []) == [_tmux_key_asym, CCKEY])
+        check("#312 resources: legacy marker_key stays the FIRST-PRECEDENCE (tmux) key",
+              _l1.get("marker_key") == _tmux_key_asym)
         _aged2 = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=30)
         _st = json.load(open(st_asym))
         _st["leases"][0]["created"] = _aged2.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -594,19 +607,22 @@ def main():
               "the ccsid candidate)", rc == 0 and _sessions == ["S1", "S2"])
         check("#312 resources: asymmetric case keeps DISTINCT ports (no double-allocation)",
               len(_ports) == 2 and all(p is not None for p in _ports) and len(set(_ports)) == 2)
-        # BACKWARD COMPAT: a pre-#312 lease carries only the legacy single `marker_key`. It must
-        # still be read correctly (a pre-#312 lease can only carry a tmux key, and that
-        # derivation is unchanged, so the legacy fallback stays exact).
+        # BACKWARD COMPAT with a REAL pre-#312 lease. It carries only the legacy single
+        # `marker_key`, and that key can only ever be a TMUX key - pre-#312 no other derivation
+        # existed. Keying this fixture with a ccsid would fabricate a lease that could never have
+        # been written and would prove nothing about the fallback. Arm the matching TMUX marker so
+        # the fallback has a real marker to find.
+        open(os.path.join(floor_asym, _tmux_key_asym), "w").close()
         _st = json.load(open(st_asym))
         _st["leases"][0].pop("marker_keys", None)
-        _st["leases"][0]["marker_key"] = CCKEY
+        _st["leases"][0]["marker_key"] = _tmux_key_asym
         _st["leases"][0]["created"] = _aged2.strftime("%Y-%m-%dT%H:%M:%SZ")
         json.dump(_st, open(st_asym, "w"))
         rc, out, err = run(["allocate", "--session", "S3", "--teammate", "t3"],
                            env_overrides=ov_asym, tmux="/tmp/tmux-501/default,99,0", ccsid=CCSID)
         _sessions = sorted(ln.get("session") for ln in json.load(open(st_asym)).get("leases", []))
-        check("#312 resources: a LEGACY lease (marker_key only, no marker_keys) is still honored",
-              rc == 0 and "S1" in _sessions)
+        check("#312 resources: a REAL legacy lease (tmux marker_key only, no marker_keys) is "
+              "still honored via the fallback", rc == 0 and "S1" in _sessions)
 
         # And the fail-closed end still holds: NEITHER identifier -> no key -> "" -> reclaimable,
         # which is the ORIGINAL, still-correct meaning of an empty marker_key.

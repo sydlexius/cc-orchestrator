@@ -159,6 +159,40 @@ def main():
     check("#312 neither $TMUX nor ccsid -> exit 1, no token (fail closed)",
           rc == 1 and not os.path.exists(token_path(fd)))
 
+    # #312 END-TO-END CONTRACT: feed the token THIS HELPER ACTUALLY WROTE into the REAL guard.
+    # Checking the token's PATH here and the guard's behavior over there, separately, never
+    # proves the two agree - and "the two agree" IS the contract. If they ever diverge, the
+    # token lands under a name the guard does not read and every authorized merge is silently
+    # denied, with nothing failing loudly. This is the only case that would catch that.
+    print("== #312 end-to-end: real armed token -> real guard (non-tmux session) ==")
+    CCSID_E2E = "e2e-auth-sess"
+    rc, out, err, fd, _ = run(["265"], tmux=None, ccsid=CCSID_E2E, preflight_mode="pass", ttl_min=10)
+    guard = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "orchestrate-guard.sh")
+    if rc == 0 and os.path.isfile(guard):
+        # Arm the marker so Tier-2 actually engages; without it the merge is allowed for the
+        # boring reason (solo/non-marker), which would make this case vacuous.
+        open(os.path.join(fd, "ccsid_" + _key(CCSID_E2E)), "w").close()
+        genv = {k: v for k, v in os.environ.items() if k not in ("TMUX", "CLAUDE_CODE_SESSION_ID")}
+        genv.update({"ORCHESTRATE_FLOOR_DIR": fd, "ORCHESTRATE_FLOOR_TTL_HOURS": "24",
+                     "CLAUDE_CODE_SESSION_ID": CCSID_E2E})
+        genv.pop("TOOL_INPUT", None)
+        # The sanctioned command the helper itself printed: pr-first, SHA-pinned.
+        cmd_ok = "gh " + "pr " + f"merge 265 --squash --match-head-commit {SHA}"
+        p_ok = subprocess.run(["bash", guard], input=json.dumps(
+            {"tool_name": "Bash", "tool_input": {"command": cmd_ok}}),
+            env=genv, capture_output=True, text=True, timeout=15)
+        check("#312 E2E: the token this helper armed is ACCEPTED by the real guard -> merge ALLOWED",
+              p_ok.returncode == 0)
+        # The bind still holds end-to-end: a DIFFERENT pr with the same token must be denied.
+        cmd_bad = "gh " + "pr " + f"merge 999 --squash --match-head-commit {SHA}"
+        p_bad = subprocess.run(["bash", guard], input=json.dumps(
+            {"tool_name": "Bash", "tool_input": {"command": cmd_bad}}),
+            env=genv, capture_output=True, text=True, timeout=15)
+        check("#312 E2E: the same token does NOT authorize a DIFFERENT pr -> BLOCK",
+              p_bad.returncode == 2)
+    else:
+        check("#312 E2E: helper armed a token and the real guard is available", False)
+
     print()
     if FAILS:
         print(f"FAILED ({len(FAILS)}):"); [print("  - " + f) for f in FAILS]; sys.exit(1)

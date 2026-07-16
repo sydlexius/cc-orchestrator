@@ -651,6 +651,50 @@ def main():
         expect("#312: marker armed under ccsid but guard sees $TMUX -> STILL gated "
                "(arm/check asymmetry closed)", _p312.returncode, "block")
 
+    # ---- #312 + CR round 1: the merge-auth token contract in a NON-tmux session -----------
+    # CR Major: merge_authorized used to break on the first candidate that merely EXISTED, so
+    # an expired/malformed token under the first-precedence (tmux) key SHADOWED a valid ccsid
+    # token and denied an authorized merge - defeating the arm/check-mismatch recovery the
+    # candidate set exists for. Every candidate must be VALIDATED, not just the first found.
+    VSHA312 = "c" * 40
+    def _tok312(pr=42, sha=VSHA312, ttl=600):
+        return {"pr": pr, "head_sha": sha, "expiry": int(time.time()) + ttl}
+    MERGE312 = f"gh pr merge 42 --squash --match-head-commit {VSHA312}"
+
+    # Baseline: a ccsid session with a valid ccsid token -> ALLOWED (the token relaxation
+    # works at all without tmux). This is the end-to-end non-tmux merge-auth contract.
+    rc, _o, _e = run_guard(MERGE312, marker_active=True, channel="stdin",
+                           tmux=None, ccsid="tok-sess", merge_token=_tok312())
+    expect("#312 piece-b: non-tmux session, valid ccsid token -> ALLOW (token works without tmux)",
+           rc, "allow")
+    # THE SHADOW CASE: both identifiers; an EXPIRED token under the tmux key, a VALID one under
+    # the ccsid key. Must still authorize - the expired first candidate must not shadow it.
+    with tempfile.TemporaryDirectory() as _td:
+        _fd = os.path.join(_td, "orchestrate-floor.d"); os.makedirs(_fd)
+        _auth = os.path.join(_fd, "merge-auth"); os.makedirs(_auth)
+        open(os.path.join(_fd, _key(DEFAULT_TMUX)), "w").close()          # marker -> gated
+        json.dump({"pr": 42, "head_sha": VSHA312, "expiry": int(time.time()) - 60},
+                  open(os.path.join(_auth, _key(DEFAULT_TMUX)), "w"))     # EXPIRED (first)
+        json.dump(_tok312(), open(os.path.join(_auth, "ccsid_" + _key("tok-sess")), "w"))  # VALID
+        _env = dict(os.environ)
+        _env.update({"ORCHESTRATE_FLOOR_DIR": _fd, "ORCHESTRATE_FLOOR_TTL_HOURS": "24",
+                     "TMUX": DEFAULT_TMUX, "CLAUDE_CODE_SESSION_ID": "tok-sess"})
+        _env.pop("TOOL_INPUT", None)
+        _p = subprocess.run([GUARD], env=_env, capture_output=True, text=True, timeout=15,
+                            input=json.dumps({"tool_name": "Bash",
+                                              "tool_input": {"command": MERGE312}}))
+        expect("#312 piece-b: an EXPIRED first-candidate token does NOT shadow a VALID second "
+               "(every candidate validated)", _p.returncode, "allow")
+        # And the deny side is unweakened: make the VALID token's SHA wrong -> no candidate
+        # authorizes -> BLOCK. Trying all candidates must widen nothing.
+        json.dump({"pr": 42, "head_sha": "d" * 40, "expiry": int(time.time()) + 600},
+                  open(os.path.join(_auth, "ccsid_" + _key("tok-sess")), "w"))
+        _p = subprocess.run([GUARD], env=_env, capture_output=True, text=True, timeout=15,
+                            input=json.dumps({"tool_name": "Bash",
+                                              "tool_input": {"command": MERGE312}}))
+        expect("#312 piece-b: NO candidate token valid (SHA mismatch) -> still BLOCK "
+               "(scanning all candidates widens nothing)", _p.returncode, "block")
+
     print()
     if FAILS:
         print(f"{len(FAILS)} FAILED:")
