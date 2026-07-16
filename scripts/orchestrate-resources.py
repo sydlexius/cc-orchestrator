@@ -58,10 +58,30 @@ def _now_iso():
 
 
 def _marker_key():
+    """This session's floor-marker key, for lease liveness (_marker_absent -> reclaimable).
+
+    #312: MIRRORS the derivation in the DERIVATION REGISTRY in `scripts/orchestrate-guard.sh`
+    (SIX live copies - keep them in lockstep). $TMUX wins, sanitized and UNPREFIXED; else
+    'ccsid_' + the sanitized $CLAUDE_CODE_SESSION_ID; else "" (no key).
+
+    WHY THIS HAD TO CHANGE WITH #312, and why "" is no longer a safe default: pre-#312, no
+    $TMUX genuinely meant no marker could exist, so "" was TRUE and a lease keyed "" was
+    correctly reclaimable. #312 lets a NON-tmux session arm a marker, so a tmux-only key
+    reports "" for a session that IS armed and alive -> _marker_absent() reads True ->
+    the GC reclaims a LIVE teammate's lease once past the grace window -> the next allocate
+    hands out a port that is still in use. Verified: identical steps under $TMUX keep the
+    lease; without it the lease is GC'd. Returning the real key restores the invariant that
+    "" means "genuinely unkeyed" (neither identifier - a session the floor can never gate)."""
+    def _sanitize(value):
+        return re.sub(rb'[^A-Za-z0-9]', b'_', value.encode("utf-8", "surrogateescape")).decode("ascii")
+
     tmux = os.environ.get("TMUX", "")
-    if not tmux:
-        return ""
-    return re.sub(rb'[^A-Za-z0-9]', b'_', tmux.encode("utf-8", "surrogateescape")).decode("ascii")
+    if tmux:
+        return _sanitize(tmux)
+    ccsid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if ccsid:
+        return "ccsid_" + _sanitize(ccsid)
+    return ""
 
 
 def _empty_state():

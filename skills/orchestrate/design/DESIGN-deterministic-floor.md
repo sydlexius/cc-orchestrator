@@ -2,8 +2,14 @@
 
 > SUPERSEDED (marker only) by P3-A: the single global marker file
 > `~/.claude/orchestrate-floor.active` described below is now a per-session
-> `$TMUX`-keyed file `~/.claude/orchestrate-floor.d/<sanitized-$TMUX>` with a 72h
-> TTL, and an empty `$TMUX` is never gated. See
+> SESSION-KEYED file `~/.claude/orchestrate-floor.d/<session-key>` with a 72h TTL.
+> **#312 update:** the session key is the sanitized `$TMUX` when set, else `ccsid_` +
+> the sanitized `$CLAUDE_CODE_SESSION_ID` - so **tmux is NOT required to run a GATED
+> session** (the iTerm2 / in-process backend is gated identically), and only a session
+> with NEITHER identifier is unkeyed and therefore never gated. The guard matches ANY
+> candidate key (`_session_keys()`), so an arm-side/check-side scheme disagreement
+> cannot silently disarm the gate. This SUPERSEDES the "empty `$TMUX` is never gated"
+> rule stated below and in D2 of `DESIGN-phase3a-marker-refcounting.md`. See
 > `DESIGN-phase3a-marker-refcounting.md`. The mentions below are kept as the
 > Phase-1 design record. (#105 update: `gh pr merge` is NOW also marker-gated on
 > the floor - see the "Tier-2: #105 floor-gate supersedes allow-list-omission"

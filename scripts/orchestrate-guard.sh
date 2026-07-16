@@ -17,8 +17,10 @@
 # NO `set -e`: a grep no-match returns 1 and is normal control flow here.
 set -u
 
-# P3-A: per-session marker is a $TMUX-keyed file under FLOOR_DIR (refcounting).
-# No $TMUX => not an orchestrate session => never gated (see marker_active).
+# P3-A: per-session marker is a SESSION-KEYED file under FLOOR_DIR (refcounting). #312: the
+# key is $TMUX-derived when $TMUX is set, else derived from $CLAUDE_CODE_SESSION_ID - tmux is
+# NOT required to run a gated session. No identifier at all => no key => never gated (see
+# _session_keys / marker_active).
 FLOOR_DIR="${ORCHESTRATE_FLOOR_DIR:-$HOME/.claude/orchestrate-floor.d}"
 TTL_HOURS="${ORCHESTRATE_FLOOR_TTL_HOURS:-72}"
 # Reject a non-positive-integer TTL (negative, decimal, "abc", 0). A bad TTL must NOT
@@ -238,23 +240,134 @@ is_pr_merge() {
 # it a multibyte $TMUX would sanitize to a different length under a UTF-8 vs C locale,
 # silently diverging the sides' keys (a silent fail-open). Factored (#263 Piece B) so
 # the marker gate and the merge-auth token check can NEVER drift on key derivation.
-# Returns non-zero (no key) when $TMUX is unset - a non-tmux/solo session, never gated.
-_session_key() {
-  [ -n "${TMUX:-}" ] || return 1
-  printf '%s' "$TMUX" | LC_ALL=C tr -c 'A-Za-z0-9' '_'
+# Returns non-zero (no key) only when NEITHER identifier is available - then this is a
+# session the floor can never gate, exactly as an $TMUX-less session was before #312.
+#
+# #312 - TWO-STEP PRECEDENCE. tmux is no longer REQUIRED to run a gated orchestrate
+# session (the iTerm2 / in-process backend is supported and preferred), so the key falls
+# back to the Claude Code session id. The order and the shapes are BOTH load-bearing:
+#
+#   1. $TMUX  -> the sanitized value, BYTE-IDENTICAL to the pre-#312 key. NO prefix. This
+#      is a hard compatibility requirement, not style: reshaping it would ORPHAN the marker
+#      of every CURRENTLY-ARMED session the moment this guard is redeployed, silently
+#      dropping its Tier-2 gate. tmux keeps precedence so an existing tmux session is
+#      bit-for-bit unaffected by this change.
+#   2. $CLAUDE_CODE_SESSION_ID -> `ccsid_` + sanitized. Claude Code exports this into every
+#      child process, so the guard (a PreToolUse hook subprocess) and orchestrate-setup.py
+#      (a Bash-tool subprocess) both read the SAME value. VERIFIED: a subagent's id is
+#      byte-identical to its lead's, so in-process teammates - what a teammate IS outside
+#      tmux - key identically to the lead and stay gated.
+#      The `ccsid_` prefix NAMESPACES the schemes so a sanitized session id can never
+#      collide with a sanitized $TMUX.
+#   3. neither -> non-zero, fail closed (no key -> no marker -> not gated), as today.
+#
+# WHY THIS IS THE RIGHT BOUNDARY: the key must be shared by the lead AND its teammates but
+# NOT by the maintainer's separate plain terminal (which is the documented human-merge
+# escape hatch). $TMUX does that across panes; the session id does it across in-process
+# teammates, and the human's other terminal is a DIFFERENT Claude Code session -> different
+# id -> ungated. Both halves hold. (A per-pane id like $TERM_SESSION_ID does NOT: teammates
+# would fall outside the marker - the gate off for exactly the processes it must gate.)
+#
+# ===== DERIVATION REGISTRY - FIVE live copies. Update them TOGETHER. =====
+#   1. THIS FILE, `_session_keys()`                      - the deny authority (gates merges)
+#   2. scripts/orchestrate-setup.py `_session_key()`     - ARMS the marker (first-precedence)
+#   3. scripts/orchestrate-authorize-merge.sh            - writes the merge-auth token
+#   4. scripts/orchestrate-steer.sh `_session_keys()`    - advisory nudges (marker-gated rules)
+#   5. commands/merge-pr.md (the marker-detect snippet)  - routes solo-vs-handoff
+#
+# This registry is LOAD-BEARING, not bookkeeping: it previously listed only 1-3, and #312's
+# first pass updated exactly those three - leaving 4 and 5 silently on the old tmux-only
+# derivation. An incomplete registry IS the drift mechanism. If you add a sixth copy, add it
+# here; better, do not add one.
+#
+# All copies MUST agree byte for byte: drift means the marker is armed under one key and
+# looked up under another, and the gate goes SILENTLY OFF. TWO suites pin this, and BOTH must
+# be run after touching this function - they cover different halves:
+#   - test-orchestrate-setup.py pins CROSS-LANGUAGE agreement (it derives the key through the
+#     REAL bash function AND the real python one and asserts byte equality), plus end-to-end
+#     arm-then-deny.
+#   - test-orchestrate-guard.py pins this guard's own GATING BEHAVIOR under each scheme
+#     (#312 cases), including the arm/check asymmetry.
+# Do not edit one side alone.
+#
+# COLLISION, precisely: `_` is NOT in `A-Za-z0-9`, so tr maps it to itself and `ccsid_` is a
+# CONVENTION, not a reserved namespace - a crafted $TMUX of literally `ccsid_a_b` would key
+# the same as session id `a-b`. Unreachable in practice (a real $TMUX is a SOCKET PATH and
+# always begins with `/`, which sanitizes to a leading `_`), and out of the threat model
+# (honest bot, not adversarial evasion). Stated as a limitation, not a guarantee.
+_sanitize_key() {
+  printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9' '_'
 }
 
+# EVERY key this session could have armed under, FIRST-PRECEDENCE FIRST ($TMUX, then ccsid).
+# Non-zero if none. This is the guard's ONLY key derivation - there is deliberately no
+# separate single-key helper, because a second one would be dead code that the cross-language
+# test could pin while the gate actually used the other (a test passing on code the guard
+# never runs is worse than no test).
+#
+# The FIRST line is the ARMING key: it corresponds exactly to what orchestrate-setup.py's
+# `_session_key()` returns and what orchestrate-authorize-merge.sh writes under, so that is
+# what the cross-language agreement test compares against.
+#
+# Failure is propagated honestly: a sanitize failure (e.g. `tr` unreachable on a stripped
+# PATH) returns NON-ZERO rather than emitting a silent empty / bare-`ccsid_` key. A single
+# `printf '%s%s' "$prefix" "$(...)"` pipeline would return PRINTF's status and mask a 127.
+#
+# WHY THIS EXISTS (and why the gate does NOT just use _session_key). Be precise about the
+# reachability here, because an overstated rationale in the floor is its own defect:
+#
+# $TMUX does NOT change within a session. This hook is spawned BY claude with CLAUDE's env,
+# fixed at launch, so a command's own env fiddling (`env -u TMUX`, `tmux new-session`) never
+# reaches the hook. Launched inside tmux -> every check sees $TMUX; launched outside -> none
+# do. The scheme cannot flip under the guard's feet.
+#
+# The REAL asymmetry is the ARM side: orchestrate-setup.py `up` runs as a Bash TOOL CALL, so
+# ITS env IS command-controllable (`env -u TMUX ... up`, or any env-sanitizing wrapper) while
+# the guard's never is. So the two sides can disagree WITHOUT $TMUX ever changing: `up` arms
+# under ccsid while the guard, holding claude's real $TMUX, looks under the tmux key, finds
+# nothing, and ALLOWS the merge. Narrow, but real - and silent, which is what makes it worth
+# ten lines.
+#
+# Matching ANY candidate is strictly more fail-CLOSED and provably cannot OVER-gate: a
+# different session's ccsid is unique to it, and a different tmux session yields a different
+# tmux key, so the maintainer's separate merge terminal is still never gated.
+_session_keys() {
+  local key found=0
+  if [ -n "${TMUX:-}" ]; then
+    key=$(_sanitize_key "$TMUX") || return 1
+    if [ -n "$key" ]; then printf '%s\n' "$key"; found=1; fi
+  fi
+  if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+    key=$(_sanitize_key "$CLAUDE_CODE_SESSION_ID") || return 1
+    if [ -n "$key" ]; then printf 'ccsid_%s\n' "$key"; found=1; fi
+  fi
+  [ "$found" -eq 1 ]
+}
+
+# ACTIVE if ANY candidate key (#312: tmux AND/OR ccsid) has a fresh marker. Checking every
+# candidate - not just first-precedence - is what stops an env change between ARM and CHECK
+# from silently orphaning the marker and disarming the gate. See _session_keys().
 marker_active() {
   local key marker mtime now age_h
-  key=$(_session_key) || return 1
-  marker="$FLOOR_DIR/$key"
-  [ -f "$marker" ] || return 1
-  mtime=$(stat -c %Y "$marker" 2>/dev/null || stat -f %m "$marker" 2>/dev/null) || return 1
-  # Fail OPEN (return inactive) if date fails: an empty `now` would arithmetic to 0,
-  # making age_h negative and the marker wrongly read as active (fail-CLOSED).
-  now=$(date +%s) || return 1
-  age_h=$(( (now - mtime) / 3600 ))
-  [ "$age_h" -lt "$TTL_HOURS" ]
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    marker="$FLOOR_DIR/$key"
+    [ -f "$marker" ] || continue
+    mtime=$(stat -c %Y "$marker" 2>/dev/null || stat -f %m "$marker" 2>/dev/null) || continue
+    # Fail OPEN (abandon ALL remaining candidates, not just this one) if date fails: an empty
+    # `now` would arithmetic to 0, making age_h negative and the marker wrongly read as active
+    # (fail-CLOSED). `date` failing is environmental, so it would fail for every candidate
+    # anyway - returning here is equivalent and simpler than continuing. Deliberately unlike
+    # the `mtime=... || continue` above, which is a PER-MARKER condition.
+    now=$(date +%s) || return 1
+    age_h=$(( (now - mtime) / 3600 ))
+    if [ "$age_h" -lt "$TTL_HOURS" ]; then
+      return 0
+    fi
+  done <<EOF
+$(_session_keys)
+EOF
+  return 1
 }
 
 # #263 Piece B: does a fresh, session-scoped merge-auth token AUTHORIZE the current
@@ -269,9 +382,22 @@ marker_active() {
 # or a moved HEAD, and the floor need not re-parse the PR number. Reads $cmd.
 merge_authorized() {
   local key tok msha tsha texp now cpr tpr
-  key=$(_session_key) || return 1
-  tok="$FLOOR_DIR/merge-auth/$key"
-  [ -f "$tok" ] || return 1
+  # #312: follow the SAME candidate set as marker_active, so an arm-side/check-side scheme
+  # disagreement cannot strand a legitimately-armed token under an unread name (which would
+  # deny every authorized merge - the safe direction, but a broken feature). Each candidate
+  # token is still this session's OWN, oracle-verified and SHA-pinned below, so accepting any
+  # of them widens nothing: the bind, not the filename, is what authorizes the merge.
+  tok=""
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    if [ -f "$FLOOR_DIR/merge-auth/$key" ]; then
+      tok="$FLOOR_DIR/merge-auth/$key"
+      break
+    fi
+  done <<EOF
+$(_session_keys)
+EOF
+  [ -n "$tok" ] || return 1
   # Deny on an AMBIGUOUS pin: gh's pflag honors the LAST --match-head-commit, but we
   # validate one occurrence; if the command carries MORE THAN ONE, refuse rather than
   # risk validating a different SHA than gh will actually enforce (deny-on-doubt).

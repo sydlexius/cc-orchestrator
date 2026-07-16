@@ -273,18 +273,48 @@ is_raw_gh_pr_mutation() {
   return 1
 }
 
-# THIS session's marker present AND fresh. Verbatim mirror of the guard's marker_active so the two
-# sides never drift (keyed by sanitized $TMUX; non-tmux/solo is never gated; GNU stat then BSD).
+# #312: EVERY key this session could have armed under, first-precedence first. Mirrors the guard's
+# _session_keys() exactly. See the DERIVATION REGISTRY in orchestrate-guard.sh: FIVE live copies of
+# this derivation exist and must move together.
+_sanitize_key() {
+  printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9' '_'
+}
+
+_session_keys() {
+  local key found=0
+  if [ -n "${TMUX:-}" ]; then
+    key=$(_sanitize_key "$TMUX") || return 1
+    if [ -n "$key" ]; then printf '%s\n' "$key"; found=1; fi
+  fi
+  if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+    key=$(_sanitize_key "$CLAUDE_CODE_SESSION_ID") || return 1
+    if [ -n "$key" ]; then printf 'ccsid_%s\n' "$key"; found=1; fi
+  fi
+  [ "$found" -eq 1 ]
+}
+
+# THIS session's marker present AND fresh. Mirrors the guard's marker_active so the two sides never
+# drift (GNU stat then BSD). #312: the session key is the sanitized $TMUX when set, AND/OR
+# `ccsid_` + the sanitized $CLAUDE_CODE_SESSION_ID - tmux is NOT required for a gated session, so
+# checking only $TMUX made every steer rule silently NO-OP for the whole non-tmux mode (rules 1 and 5
+# are marker-gated). Like the guard, match ANY candidate key: an arm-side/check-side scheme
+# disagreement must not silently drop the nudge. Only a session with NEITHER identifier is unkeyed.
 marker_active() {
-  [ -n "${TMUX:-}" ] || return 1
   local key marker mtime now age_h
-  key=$(printf '%s' "$TMUX" | LC_ALL=C tr -c 'A-Za-z0-9' '_')
-  marker="$FLOOR_DIR/$key"
-  [ -f "$marker" ] || return 1
-  mtime=$(stat -c %Y "$marker" 2>/dev/null || stat -f %m "$marker" 2>/dev/null) || return 1
-  now=$(date +%s) || return 1
-  age_h=$(( (now - mtime) / 3600 ))
-  [ "$age_h" -lt "$TTL_HOURS" ]
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    marker="$FLOOR_DIR/$key"
+    [ -f "$marker" ] || continue
+    mtime=$(stat -c %Y "$marker" 2>/dev/null || stat -f %m "$marker" 2>/dev/null) || continue
+    now=$(date +%s) || return 1
+    age_h=$(( (now - mtime) / 3600 ))
+    if [ "$age_h" -lt "$TTL_HOURS" ]; then
+      return 0
+    fi
+  done <<EOF
+$(_session_keys)
+EOF
+  return 1
 }
 
 # A redundant re-Read: a 2nd+ Read of a path already read THIS session whose mtime+size are unchanged

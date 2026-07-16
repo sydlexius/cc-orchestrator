@@ -35,7 +35,18 @@ def _key(tmux):
     return re.sub(rb'[^A-Za-z0-9]', b'_', tmux.encode("utf-8", "surrogateescape")).decode("ascii")
 
 
-def run_guard(command, *, marker_active, channel, tmux=DEFAULT_TMUX,
+def _self_key(tmux, ccsid):
+    """The key the guard derives for THIS session - mirrors orchestrate-guard.sh's
+    _session_keys() precedence (#312): $TMUX wins unprefixed, else 'ccsid_' + sanitized
+    session id, else no key at all."""
+    if tmux is not None:
+        return _key(tmux)
+    if ccsid is not None:
+        return "ccsid_" + _key(ccsid)
+    return None
+
+
+def run_guard(command, *, marker_active, channel, tmux=DEFAULT_TMUX, ccsid=None,
               foreign_keys=(), stale_self=False, ttl_hours=24,
               merge_token=None, token_tmux=None):
     """Invoke the guard. Returns (exit_code, stdout, stderr). channel in {'stdin','env'}.
@@ -50,19 +61,21 @@ def run_guard(command, *, marker_active, channel, tmux=DEFAULT_TMUX,
     with tempfile.TemporaryDirectory() as td:
         floor_dir = os.path.join(td, "orchestrate-floor.d")
         os.makedirs(floor_dir, exist_ok=True)
+        self_key = _self_key(tmux, ccsid)
         if merge_token is not None:
             auth = os.path.join(floor_dir, "merge-auth")
             os.makedirs(auth, exist_ok=True)
-            tt = token_tmux if token_tmux is not None else tmux
-            with open(os.path.join(auth, _key(tt)), "w") as f:
+            # token_tmux overrides the SESSION's key to exercise a foreign/mismatched token.
+            tt = _key(token_tmux) if token_tmux is not None else self_key
+            with open(os.path.join(auth, tt), "w") as f:
                 f.write(merge_token if isinstance(merge_token, str) else json.dumps(merge_token))
         # Default 24 (not the guard's 72h default) so the stale_self case only needs a
         # ~25h-old file; passed to the guard via ORCHESTRATE_FLOOR_TTL_HOURS below.
         # Overridable per-case (e.g. ttl_hours=0/-5) to exercise the guard's TTL clamp.
-        if marker_active and tmux is not None:
-            open(os.path.join(floor_dir, _key(tmux)), "w").close()  # fresh mtime
-        if stale_self and tmux is not None:
-            p = os.path.join(floor_dir, _key(tmux))
+        if marker_active and self_key is not None:
+            open(os.path.join(floor_dir, self_key), "w").close()  # fresh mtime
+        if stale_self and self_key is not None:
+            p = os.path.join(floor_dir, self_key)
             open(p, "w").close()
             old = time.time() - (ttl_hours + 1) * 3600
             os.utime(p, (old, old))
@@ -75,6 +88,13 @@ def run_guard(command, *, marker_active, channel, tmux=DEFAULT_TMUX,
             env.pop("TMUX", None)
         else:
             env["TMUX"] = tmux
+        # #312 DETERMINISM: the guard now falls back to $CLAUDE_CODE_SESSION_ID when $TMUX is
+        # absent, and the harness runs INSIDE a real Claude Code session that exports one. Strip
+        # it by default so a `tmux=None` case genuinely means "no key at all" instead of
+        # silently keying off the ambient session id; pass ccsid= to exercise the fallback.
+        env.pop("CLAUDE_CODE_SESSION_ID", None)
+        if ccsid is not None:
+            env["CLAUDE_CODE_SESSION_ID"] = ccsid
         env.pop("TOOL_INPUT", None)
         env.pop("ORCHESTRATE_FLOOR_MARKER", None)  # legacy var is gone
         stdin_data = ""
@@ -574,6 +594,63 @@ def main():
                            marker_active=True, channel="stdin", merge_token=_tok(pr=265, sha=VSHA))
     expect("piece-b: quoted 'merge 265' in --body, real pr 999 -> BLOCK (no scrape)", rc, "block")
 
+    # ---- #312: tmux is no longer required to run a GATED session -------------------------
+    # This block exists because the guard's OWN suite previously had ZERO coverage of the
+    # session-key contract: reverting the derivation to tmux-only left this file PASSING, so a
+    # maintainer editing the deny authority and running the deny authority's tests saw green
+    # while the Tier-2 gate was off. Cross-LANGUAGE agreement is pinned in
+    # test-orchestrate-setup.py; what is pinned HERE is the guard's own gating BEHAVIOR.
+    MERGE_CMD = "gh " + "pr " + "merge 42 --squash"   # built here, never on a Bash line
+
+    rc, _o, _e = run_guard(MERGE_CMD, marker_active=True, channel="stdin",
+                           tmux=None, ccsid="sess-aaaa-bbbb")
+    expect("#312: non-tmux session + ccsid-keyed marker -> Tier-2 BLOCK (gated without tmux)",
+           rc, "block")
+    rc, _o, _e = run_guard("ls -la", marker_active=True, channel="stdin",
+                           tmux=None, ccsid="sess-aaaa-bbbb")
+    expect("#312: non-tmux marker-active session, benign command -> allow (no over-blocking)",
+           rc, "allow")
+    rc, _o, _e = run_guard(MERGE_CMD, marker_active=False, channel="stdin",
+                           tmux=None, ccsid="sess-aaaa-bbbb")
+    expect("#312: ccsid session with NO marker -> allow (solo/non-marker is never gated)",
+           rc, "allow")
+    # THE ESCAPE HATCH: the maintainer's separate terminal is a DIFFERENT Claude Code session,
+    # so its ccsid differs and another session's marker must never gate it.
+    rc, _o, _e = run_guard(MERGE_CMD, marker_active=False, channel="stdin",
+                           tmux=None, ccsid="a-different-session",
+                           foreign_keys=("/tmp/tmux-other,9,9",))
+    expect("#312: a DIFFERENT session's marker does NOT gate this one (escape hatch intact)",
+           rc, "allow")
+    # Neither identifier -> no key -> nothing to look up -> never gated (fail closed).
+    rc, _o, _e = run_guard(MERGE_CMD, marker_active=False, channel="stdin",
+                           tmux=None, ccsid=None)
+    expect("#312: no $TMUX and no ccsid -> no key -> not gated (fail closed)", rc, "allow")
+    # A stale ccsid marker must expire exactly like a stale tmux one.
+    rc, _o, _e = run_guard(MERGE_CMD, marker_active=False, channel="stdin",
+                           tmux=None, ccsid="sess-stale", stale_self=True)
+    expect("#312: STALE ccsid marker (older than TTL) -> not gated", rc, "allow")
+    # BOTH identifiers present: $TMUX wins for arming, and the tmux-keyed marker still gates.
+    rc, _o, _e = run_guard(MERGE_CMD, marker_active=True, channel="stdin",
+                           tmux=DEFAULT_TMUX, ccsid="sess-ignored")
+    expect("#312: both identifiers -> tmux key wins and still gates", rc, "block")
+    # THE ARM/CHECK ASYMMETRY (the reason marker_active scans EVERY candidate, not just the
+    # first-precedence one): `up` runs as a Bash tool call, so its env is command-controllable
+    # (`env -u TMUX ... up`) while the guard's never is. A session that armed under ccsid while
+    # the guard holds a real $TMUX must STILL be gated - first-precedence alone would look only
+    # under the tmux key, find nothing, and silently allow the merge.
+    with tempfile.TemporaryDirectory() as _td312:
+        _fd312 = os.path.join(_td312, "orchestrate-floor.d"); os.makedirs(_fd312)
+        open(os.path.join(_fd312, "ccsid_" + _key("armed-via-ccsid")), "w").close()
+        _env312 = dict(os.environ)
+        _env312.update({"ORCHESTRATE_FLOOR_DIR": _fd312, "ORCHESTRATE_FLOOR_TTL_HOURS": "24",
+                        "TMUX": DEFAULT_TMUX, "CLAUDE_CODE_SESSION_ID": "armed-via-ccsid"})
+        _env312.pop("TOOL_INPUT", None)
+        _p312 = subprocess.run(["bash", GUARD], env=_env312, capture_output=True, text=True,
+                               input=json.dumps({"tool_name": "Bash",
+                                                 "tool_input": {"command": MERGE_CMD}}), timeout=15)
+        expect("#312: marker armed under ccsid but guard sees $TMUX -> STILL gated "
+               "(arm/check asymmetry closed)", _p312.returncode, "block")
+
     print()
     if FAILS:
         print(f"{len(FAILS)} FAILED:")
@@ -581,7 +658,7 @@ def main():
             print(f"  - {f}")
         sys.exit(1)
     print(f"All {len(CASES)} allow/block cases + P3-A refcount/key-contract cases "
-          f"+ {len(HARD_DENY) + 1} regressions passed.")
+          f"+ #312 session-key cases + {len(HARD_DENY) + 1} regressions passed.")
     sys.exit(0)
 
 

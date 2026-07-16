@@ -38,6 +38,13 @@ orchestrate session?", not "does any marker exist?".
 - **D2 - Empty `$TMUX` => INACTIVE (never gated).** A non-tmux session cannot be an
   orchestrate session (`up`'s doctor REQUIRES `$TMUX`), so it is always solo. With no
   `$TMUX` there is no key, so no marker can ever match -> airtight, trivial immunity.
+  > **SUPERSEDED by #312.** Both premises are now false: doctor's tmux checks are
+  > advisory WARNs (#294) and `up` arms outside tmux, because the session key falls back
+  > to `ccsid_` + the sanitized `$CLAUDE_CODE_SESSION_ID`. A non-tmux session IS a gated
+  > orchestrate session, keyed and merge-gated exactly like a tmux one. Only a session
+  > with NEITHER identifier is unkeyed -> never gated (the immunity D2 describes now
+  > attaches to that case, not to "no tmux"). The guard matches ANY candidate key; see
+  > the DERIVATION REGISTRY in `scripts/orchestrate-guard.sh`.
   Trade-off accepted: a (never-actually-used) non-tmux orchestrate session would not get
   the merge-by-API hook deny - acceptable, it is an unsupported config and the
   allow-list + auto-mode still block an autonomous bot merge.

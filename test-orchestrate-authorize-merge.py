@@ -33,7 +33,7 @@ def _key(tmux):
     return re.sub(rb'[^A-Za-z0-9]', b'_', tmux.encode("utf-8", "surrogateescape")).decode("ascii")
 
 
-def run(args, *, tmux="/tmp/tmux-x,1,0", preflight_mode="pass", ttl_min=None, via_plugin_root=False):
+def run(args, *, tmux="/tmp/tmux-x,1,0", ccsid=None, preflight_mode="pass", ttl_min=None, via_plugin_root=False):
     """Run the helper with a stubbed ship-gate-preflight on PATH-independent lookup.
 
     preflight_mode: 'pass' (exit 0, prints a RESULT line with headRefOid=SHA),
@@ -73,6 +73,14 @@ def run(args, *, tmux="/tmp/tmux-x,1,0", preflight_mode="pass", ttl_min=None, vi
         env.pop("TMUX", None)
     else:
         env["TMUX"] = tmux
+    # #312: the helper's key now falls back to $CLAUDE_CODE_SESSION_ID when $TMUX is absent, so
+    # the harness must CONTROL it rather than inherit the ambient one - otherwise "no $TMUX"
+    # cases would silently key off the real session id and stop testing what they claim.
+    # Default: strip it, so the tmux leg is exercised in isolation. Pass ccsid= to test the
+    # fallback leg explicitly.
+    env.pop("CLAUDE_CODE_SESSION_ID", None)
+    if ccsid is not None:
+        env["CLAUDE_CODE_SESSION_ID"] = ccsid
     p = subprocess.run(["bash", HELPER] + args, env=env, capture_output=True, text=True, timeout=15)
     return p.returncode, p.stdout, p.stderr, floor_dir, home
 
@@ -137,8 +145,19 @@ def main():
     check("no <pr> arg -> exit 1 (usage)", rc == 1)
     rc, _, _, fd, _ = run(["abc"], preflight_mode="pass")
     check("non-numeric <pr> -> exit 1 (usage)", rc == 1)
-    rc, _, _, fd, _ = run(["265"], tmux=None, preflight_mode="pass")
-    check("no $TMUX (not an orchestrate session) -> exit 1, no token", rc == 1 and not os.path.exists(token_path(fd)))
+    # #312: "no $TMUX" is NO LONGER "not an orchestrate session" - tmux is not required. The
+    # helper must key off $CLAUDE_CODE_SESSION_ID instead, MIRRORING the floor's precedence
+    # exactly. If this helper and the guard ever disagree, the token lands under a name the
+    # guard never reads and every authorized merge is silently denied.
+    rc, _, _, fd, _ = run(["265"], tmux=None, ccsid="auth-fallback-session", preflight_mode="pass")
+    check("#312 no $TMUX but a ccsid -> token IS armed, under the ccsid key",
+          rc == 0 and os.path.exists(os.path.join(fd, "merge-auth", "ccsid_auth_fallback_session")))
+    check("#312 the ccsid token is NOT written under a tmux-shaped key",
+          not os.path.exists(token_path(fd)))
+    # FAIL CLOSED: with NEITHER identifier there is no key, so there is nothing to arm.
+    rc, _, _, fd, _ = run(["265"], tmux=None, ccsid=None, preflight_mode="pass")
+    check("#312 neither $TMUX nor ccsid -> exit 1, no token (fail closed)",
+          rc == 1 and not os.path.exists(token_path(fd)))
 
     print()
     if FAILS:

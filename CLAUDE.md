@@ -41,10 +41,10 @@ Runtime (`scripts/`; canonical source is this repo):
   the `gh pr merge` CLI (`is_pr_merge`, #105) AND merge-by-API (`gh api ... pulls/N/merge`);
   a SOLO/non-marker session is never Tier-2-gated. #263 PIECE B: the `gh pr merge` CLI leg is
   RELAXED to ALLOW in a marker session iff a fresh session-scoped merge-auth token
-  (`merge-auth/<sanitized-$TMUX>`, armed by `orchestrate-authorize-merge.sh` only after the
+  (`merge-auth/<session-key>`, armed by `orchestrate-authorize-merge.sh` only after the
   readiness oracle PASSed) has a `head_sha` matching the command's pinned `--match-head-commit`
   (deny on any doubt; local read, NO network I/O in the floor; merge-by-API stays hard-denied).
-  `_session_key()` is factored so the marker gate and the token check never drift. Fails OPEN on any
+  `_session_keys()` is the guard's SINGLE key derivation, so the marker gate and the token check never drift; #312 keys off `$TMUX` when set, else `$CLAUDE_CODE_SESSION_ID` (tmux is NOT required for a gated session), and both gates match ANY candidate key. Fails OPEN on any
   internal error. Threat model = honest bot on the obvious path, NOT adversarial evasion (it is a
   guardrail, not a sandbox).
 - `scripts/orchestrate-authorize-merge.sh` - the #263 Piece B lead helper (NOT the floor). On the

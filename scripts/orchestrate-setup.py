@@ -158,24 +158,25 @@ def check_agent_teams(settings):
 
 
 def check_tmux():
-    """Doctor check (WARN-level, #294): tmux is the PREFERRED teammate backend, NOT a
+    """Doctor check (WARN-level, #294/#312): tmux is the PREFERRED teammate backend, NOT a
     requirement - this check WARNs, never FAILs. Outside tmux, teammates still spawn via the
     documented iTerm2 / in-process backend; only the pane layout differs, and the pipeline plus
     the deterministic floor are entirely unaffected. PASS = tmux installed AND lead inside it.
     Read-only: inspects $TMUX + PATH, changes nothing.
 
-    NOTE: marker-arming genuinely REQUIRES $TMUX - `_session_key()` returns None without it, so
-    a non-tmux session can never arm or own an orchestrate marker (by design). That is the one
-    capability that really needs tmux, so each WARN names it rather than implying tmux is
-    optional for everything."""
+    #312 removed the LAST genuine tmux dependency: marker-arming now falls back to
+    $CLAUDE_CODE_SESSION_ID, so a non-tmux session arms a marker and IS merge-gated exactly
+    like a tmux one. These WARNs are therefore pure UX advice - say so, and do not imply any
+    loss of gating (the earlier wording named marker-arming as a real cost; that is now stale
+    and would be a FALSE warning, which is the class of defect #294 existed to remove)."""
     fallback = ("teammates spawn via the iTerm2 / in-process backend instead "
                 "(pane layout differs; pipeline + deterministic floor unaffected)")
-    marker = ("NOTE: marker-arming still requires $TMUX by design (_session_key), so no "
-              "orchestrate marker can be armed here")
+    gated = ("the session is still merge-gated: the floor marker keys off "
+             "$CLAUDE_CODE_SESSION_ID when $TMUX is absent (#312)")
     if not shutil.which("tmux"):
-        return _emit(WARN, f"tmux not installed - {fallback}. {marker}.")
+        return _emit(WARN, f"tmux not installed - {fallback}. NOTE: {gated}.")
     if not os.environ.get("TMUX"):
-        return _emit(WARN, f"lead is not inside tmux ($TMUX empty) - {fallback}. {marker}.")
+        return _emit(WARN, f"lead is not inside tmux ($TMUX empty) - {fallback}. NOTE: {gated}.")
     return _emit(PASS, "tmux installed and lead is inside it")
 
 
@@ -899,43 +900,62 @@ def _now_iso():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# #294: the single honest explanation for "up cannot arm here". Held as ONE constant so the
+# #312: the single honest explanation for "up cannot arm here". Held as ONE constant so the
 # fail-fast pre-check and the arm_marker backstop can never drift into telling the operator two
-# different stories. Deliberately states the REAL reason (marker-arming needs a $TMUX-derived
-# key that must match the guard's) instead of the old, false "teammates will not spawn".
+# different stories. After #312 this is a NARROW case: tmux is NOT required (the session id is
+# the fallback), so reaching this means NEITHER identifier exists - a session the floor could
+# never gate anyway.
 _NO_SESSION_KEY_ABORT = (
-    "\nup: ABORT - cannot arm the floor marker: no session key ($TMUX is empty).\n"
-    "  The marker is keyed off $TMUX because orchestrate-guard.sh derives its key the\n"
-    "  same way; with no key the marker-gated merge deny cannot engage, and a team\n"
-    "  stood up here would run with the Tier-2 merge gate OFF.\n"
-    "  This is NOT a teammate-spawning problem: teammates spawn fine outside tmux via\n"
-    "  the iTerm2 / in-process backend. Only marker-arming needs tmux.\n"
-    "  Fix: relaunch claude inside tmux to stand up a gated team session (or work solo,\n"
-    "  where no marker is needed because the merge is yours to run anyway)."
+    "\nup: ABORT - cannot arm the floor marker: no session key.\n"
+    "  Neither $TMUX nor $CLAUDE_CODE_SESSION_ID is set, so this session cannot be keyed.\n"
+    "  orchestrate-guard.sh derives its key from the same two, in the same order; with no\n"
+    "  key the marker-gated merge deny cannot engage, and a team stood up here would run\n"
+    "  with the Tier-2 merge gate OFF. Refusing is the safe direction.\n"
+    "  tmux is NOT required (#312): a normal Claude Code session always exports\n"
+    "  $CLAUDE_CODE_SESSION_ID, so this should not happen in practice - if it does, the\n"
+    "  environment is stripping it (check any env-sanitizing wrapper)."
 )
 
 
 def _session_key():
-    """This session's marker key, mirroring the guard's sanitization EXACTLY.
-    Returns None when $TMUX is empty (a non-tmux session is never an orchestrate
-    session and must never arm/own a marker).
+    """This session's marker key, mirroring the guard's derivation EXACTLY.
 
-    #294 INVARIANT - DO NOT RELAX THIS $TMUX REQUIREMENT. Doctor's tmux CHECK was
-    downgraded FAIL -> WARN because tmux is only a UX preference for teammate panes.
-    Marker-arming is the exception: it is a GENUINE tmux dependency, because the key
-    must match `orchestrate-guard.sh`'s own `$TMUX`-derived key BYTE FOR BYTE - the
-    guard's marker gate and this function are two halves of one contract. Keying a
-    marker off anything else (or defaulting it when $TMUX is empty) would let a
-    non-tmux session arm a marker the guard cannot see, silently breaking the
-    marker-gated merge deny. Advisory checks may soften; this may not."""
-    tmux = os.environ.get("TMUX", "")
-    if not tmux:
-        return None
-    # Byte-mode to match the guard's `LC_ALL=C tr -c 'A-Za-z0-9' '_'` (each non-alnum
-    # BYTE -> '_'), so the two sides key identically regardless of locale. surrogateescape
+    #312 TWO-STEP PRECEDENCE (tmux is no longer required to run a GATED session):
+      1. $TMUX -> sanitized, NO prefix, BYTE-IDENTICAL to the pre-#312 key. Compatibility
+         requirement, not style: reshaping it would ORPHAN every currently-armed session's
+         marker on redeploy, silently dropping its Tier-2 merge gate.
+      2. $CLAUDE_CODE_SESSION_ID -> 'ccsid_' + sanitized. Exported by Claude Code into every
+         child process, so this script and the guard hook read the SAME value. A subagent's
+         id is byte-identical to its lead's - verified by execution, and pinned by the #312
+         end-to-end case in test-orchestrate-setup.py - so in-process teammates (what a
+         teammate IS outside tmux) key with the lead and stay gated.
+      3. neither -> None: no key, no marker, not gated. Fail closed, as before.
+
+    The 'ccsid_' prefix is a CONVENTION, not a reserved namespace: '_' is not in [A-Za-z0-9],
+    so the sanitizer maps it to itself and a crafted $TMUX of literally 'ccsid_a_b' would key
+    the same as session id 'a-b'. Unreachable in practice (a real $TMUX is a socket path and
+    always begins with '/', which sanitizes to a leading '_') and outside the threat model
+    (honest bot, not adversarial evasion) - recorded as a limitation, never claimed as a
+    guarantee.
+
+    INVARIANT - THIS FUNCTION AND `orchestrate-guard.sh`'s `_session_keys()` FIRST candidate (and
+    `orchestrate-authorize-merge.sh`) ARE ONE CONTRACT IN THREE LANGUAGES. They must agree
+    byte for byte. Drift means a marker armed under one key and looked up under another,
+    i.e. the merge gate SILENTLY OFF - the worst failure this repo has. Never edit one side
+    alone; test-orchestrate-setup.py pins cross-language agreement against the real guard."""
+    # Byte-mode to match the guard's `LC_ALL=C tr -c 'A-Za-z0-9' '_'` (each non-alnum BYTE
+    # -> '_'), so the two sides key identically regardless of locale. surrogateescape
     # round-trips the original env bytes; the result is pure ASCII alnum/underscore.
-    raw = tmux.encode("utf-8", "surrogateescape")
-    return re.sub(rb'[^A-Za-z0-9]', b'_', raw).decode("ascii")
+    def _sanitize(value):
+        return re.sub(rb'[^A-Za-z0-9]', b'_', value.encode("utf-8", "surrogateescape")).decode("ascii")
+
+    tmux = os.environ.get("TMUX", "")
+    if tmux:
+        return _sanitize(tmux)
+    ccsid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if ccsid:
+        return "ccsid_" + _sanitize(ccsid)
+    return None
 
 
 def _marker_path():
@@ -1330,12 +1350,11 @@ def cmd_up(args):
     # doctor already WARNs at check_guard_stale(); this adds a more prominent block with the
     # specific remedy so the operator cannot miss it at `up` time.
     _check_stale_guard_at_up()
-    # #294 FAIL FAST, BEFORE scaffold_artifacts. Doctor's tmux checks are ADVISORY now, so a
-    # non-tmux `up` sails past the doctor gate above where it previously stopped there. Check
-    # the ONE genuine tmux dependency here, so a session that provably cannot arm refuses
-    # WITHOUT first littering the artifact dir (stack.json / profile.env / brief / planner
-    # seed) on a pure refusal path. arm_marker's RuntimeError is still caught below as a
-    # backstop - $TMUX could in principle vanish between this check and that call.
+    # #312 FAIL FAST, BEFORE scaffold_artifacts. tmux is NOT required to arm (the key falls
+    # back to $CLAUDE_CODE_SESSION_ID), so this fires only when NEITHER identifier exists - a
+    # session the floor could never gate. Checking here means such a session refuses WITHOUT
+    # first littering the artifact dir (stack.json / profile.env / brief / planner seed) on a
+    # pure refusal path. arm_marker's RuntimeError is still caught below as a backstop.
     if _session_key() is None:
         print(_NO_SESSION_KEY_ABORT, file=sys.stderr)
         return 1
