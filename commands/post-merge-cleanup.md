@@ -260,6 +260,42 @@ suggest `/reclaim-cache`; do not reclaim anything here.
 
 ---
 
+## Step 8c -- Open-PR staleness sweep (advisory; never blocks)
+
+This merge just advanced the base branch, which silently left every OTHER open PR on that base
+BEHIND. Surface that now, while the merge is fresh, rather than discovering it at the next merge
+gate. The sweep EXCLUDES the PR that just merged.
+
+```bash
+if [ -f scripts/open-pr-staleness-sweep.sh ]; then SW=scripts/open-pr-staleness-sweep.sh
+elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/open-pr-staleness-sweep.sh" ]; then SW="${CLAUDE_PLUGIN_ROOT}/scripts/open-pr-staleness-sweep.sh"
+else SW=""; fi
+[ -n "$SW" ] && bash "$SW" "$pr_number" "$repo" || true
+```
+
+The sweep is ADVISORY and FAIL-OPEN by contract: it exits 0 on every operational path (including a
+read failure), so it can never block cleanup. Its routing is the safety hinge:
+
+- **behind + NO review activity yet** -> it refreshes the PR itself with a plain
+  `gh pr update-branch <n>` (DEFAULT merge-commit mode, additive). It NEVER passes `--rebase`.
+- **behind + REVIEWED** (any submitted review, review thread, or comment) -> SURFACED ONLY, never
+  touched. A HEAD-moving commit dismisses a bot's prior approval and disturbs the incremental-review
+  delta, and a rewrite would orphan every cited fix SHA. The LEAD decides when that ref moves.
+- **review state indeterminate / unreadable** -> treated as REVIEWED and surfaced. It fails toward
+  surfacing, never toward acting.
+- **cross-repository (fork) PR** -> SKIPPED and surfaced, never measured and never mutated: its
+  `headRefName` names a branch in the FORK, so `origin/<head>` is at best absent and at worst an
+  unrelated same-named origin branch. An unreadable `isCrossRepository` is treated AS cross-repo.
+- **head fetch failed** -> reported as undetermined, never measured against a stale local ref.
+- **the open-PR list hits the `--limit` cap** -> the report says so explicitly; it never claims a
+  clean "nothing to do" over a set that may be truncated.
+- **`gh pr update-branch` not permitted** (the `Bash(gh pr update-branch *)` allow-list entry is the
+  maintainer's to grant) -> it degrades to REPORT-ONLY and still prints the behind list.
+
+Surface any `NEEDS THE LEAD` lines to the user; do not act on them here.
+
+---
+
 ## Step 9 -- Summary
 
 Report:
