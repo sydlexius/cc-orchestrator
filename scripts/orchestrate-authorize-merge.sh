@@ -37,14 +37,24 @@ case "$pr" in
   ''|*[!0-9]*) echo "usage: orchestrate-authorize-merge.sh: <pr> must be numeric (got '$pr')" >&2; exit 1 ;;
 esac
 
-# A merge-auth token is session-scoped. No $TMUX => not an orchestrate session =>
-# the floor never gates a merge here, so there is nothing to arm.
-if [ -z "${TMUX:-}" ]; then
-  echo "authorize-merge: not in an orchestrate session (no \$TMUX); the floor does not gate merges here, nothing to arm." >&2
+# A merge-auth token is session-scoped. With NEITHER identifier available this is a session
+# the floor can never gate, so there is nothing to arm.
+#
+# #312: MUST mirror the floor's _session_keys() FIRST candidate EXACTLY - same precedence,
+# same LC_ALL=C byte-mode sanitization. $TMUX first and UNPREFIXED (byte-identical to the
+# pre-#312 key, so a live tmux session's token keeps working across the redeploy), else the
+# Claude Code session id with the `ccsid_` namespace prefix. A divergence here does not fail
+# loudly: it writes the token under a key the guard never reads, so every authorized merge
+# is silently denied (safe direction) - or, if it ever diverged the other way, a token could
+# outlive its session. Keep the three implementations in lockstep.
+if [ -n "${TMUX:-}" ]; then
+  key=$(printf '%s' "$TMUX" | LC_ALL=C tr -c 'A-Za-z0-9' '_')
+elif [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+  key="ccsid_$(printf '%s' "$CLAUDE_CODE_SESSION_ID" | LC_ALL=C tr -c 'A-Za-z0-9' '_')"
+else
+  echo "authorize-merge: not in an orchestrate session (no \$TMUX and no \$CLAUDE_CODE_SESSION_ID); the floor does not gate merges here, nothing to arm." >&2
   exit 1
 fi
-# Session key: MUST mirror the floor's _session_key() exactly (LC_ALL=C byte-mode).
-key=$(printf '%s' "$TMUX" | LC_ALL=C tr -c 'A-Za-z0-9' '_')
 
 FLOOR_DIR="${ORCHESTRATE_FLOOR_DIR:-$HOME/.claude/orchestrate-floor.d}"
 TTL_MIN="${ORCHESTRATE_MERGE_AUTH_TTL_MIN:-10}"

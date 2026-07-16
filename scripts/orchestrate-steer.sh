@@ -273,18 +273,48 @@ is_raw_gh_pr_mutation() {
   return 1
 }
 
-# THIS session's marker present AND fresh. Verbatim mirror of the guard's marker_active so the two
-# sides never drift (keyed by sanitized $TMUX; non-tmux/solo is never gated; GNU stat then BSD).
+# #312: EVERY key this session could have armed under, first-precedence first. Mirrors the guard's
+# _session_keys() exactly. See the DERIVATION REGISTRY in orchestrate-guard.sh: SIX live copies of
+# this derivation exist and must move together.
+_sanitize_key() {
+  printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9' '_'
+}
+
+_session_keys() {
+  local key found=0
+  if [ -n "${TMUX:-}" ]; then
+    key=$(_sanitize_key "$TMUX") || return 1
+    if [ -n "$key" ]; then printf '%s\n' "$key"; found=1; fi
+  fi
+  if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+    key=$(_sanitize_key "$CLAUDE_CODE_SESSION_ID") || return 1
+    if [ -n "$key" ]; then printf 'ccsid_%s\n' "$key"; found=1; fi
+  fi
+  [ "$found" -eq 1 ]
+}
+
+# THIS session's marker present AND fresh. Mirrors the guard's marker_active so the two sides never
+# drift (GNU stat then BSD). #312: the session key is the sanitized $TMUX when set, AND/OR
+# `ccsid_` + the sanitized $CLAUDE_CODE_SESSION_ID - tmux is NOT required for a gated session, so
+# checking only $TMUX made every steer rule silently NO-OP for the whole non-tmux mode (rules 1 and 5
+# are marker-gated). Like the guard, match ANY candidate key: an arm-side/check-side scheme
+# disagreement must not silently drop the nudge. Only a session with NEITHER identifier is unkeyed.
 marker_active() {
-  [ -n "${TMUX:-}" ] || return 1
   local key marker mtime now age_h
-  key=$(printf '%s' "$TMUX" | LC_ALL=C tr -c 'A-Za-z0-9' '_')
-  marker="$FLOOR_DIR/$key"
-  [ -f "$marker" ] || return 1
-  mtime=$(stat -c %Y "$marker" 2>/dev/null || stat -f %m "$marker" 2>/dev/null) || return 1
-  now=$(date +%s) || return 1
-  age_h=$(( (now - mtime) / 3600 ))
-  [ "$age_h" -lt "$TTL_HOURS" ]
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    marker="$FLOOR_DIR/$key"
+    [ -f "$marker" ] || continue
+    mtime=$(stat -c %Y "$marker" 2>/dev/null || stat -f %m "$marker" 2>/dev/null) || continue
+    now=$(date +%s) || return 1
+    age_h=$(( (now - mtime) / 3600 ))
+    if [ "$age_h" -lt "$TTL_HOURS" ]; then
+      return 0
+    fi
+  done <<EOF
+$(_session_keys)
+EOF
+  return 1
 }
 
 # A redundant re-Read: a 2nd+ Read of a path already read THIS session whose mtime+size are unchanged
@@ -372,9 +402,12 @@ fi
 # Earlier drafts of this rule shipped each half alone; both were wrong, in opposite directions.
 #
 # THREE ACCEPTED LIMITATIONS, stated so nobody mistakes this for full enforcement:
-#  (a) ~15% BLIND. marker_active() is $TMUX-keyed, and $TMUX was ABSENT on 7 of the 45 live spawns the
-#      #221 spike captured (the in-process spawn case), where this rule silently no-ops. It is a
-#      NUDGE on the common path, NOT a guarantee.
+#  (a) NUDGE, NOT A GUARANTEE. (#312 CLOSED the old "~15% blind" gap: marker_active() used to be
+#      $TMUX-keyed, so it silently no-opped on the 7-of-45 live spawns the #221 spike captured
+#      where $TMUX was ABSENT - exactly the in-process spawn case this rule most wants to catch.
+#      The key now falls back to $CLAUDE_CODE_SESSION_ID, so those spawns ARE covered.) It remains
+#      a nudge: an UNKEYED session (neither identifier) is still never gated, and this is advisory
+#      either way.
 #  (b) OVER-APPROXIMATES "team is live". The CLAUDE.md override forbids a foreground agent when the
 #      lead has LIVE NAMED TEAMMATES, and re-sanctions the foreground one-shot when SOLO. A marker is
 #      the closest proxy the hook can see, but it has a 72h TTL - so a lead who tore the team down and

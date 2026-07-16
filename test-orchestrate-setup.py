@@ -193,10 +193,11 @@ def main():
         # The message must NOT resurrect the false claim it replaces.
         check("#294 not-in-tmux message drops the false 'teammates will not spawn' claim",
               "will not spawn" not in out)
-        # $TMUX IS a genuine dependency for marker-arming (_session_key returns None without
-        # it). The WARN must say so - that is the one capability that really needs tmux.
-        check("#294 not-in-tmux WARN still surfaces the marker-arming $TMUX dependency",
-              "marker" in out.lower())
+        # #312: the WARN must NOT claim any loss of gating - marker-arming falls back to
+        # $CLAUDE_CODE_SESSION_ID, so a non-tmux session is merge-gated exactly like a tmux one.
+        # Pin the CURRENT claim; a bare "marker" substring would pass on the OLD false wording too.
+        check("#294/#312 not-in-tmux WARN says the session is still merge-gated",
+              "still merge-gated" in out and "CLAUDE_CODE_SESSION_ID" in out)
 
         # #294: a resolved NON-tmux backend is a working configuration, not a failure.
         for mode in ("iterm2", "in-process"):
@@ -273,14 +274,16 @@ def main():
                                                  "PATH": fakebin + os.pathsep + sanibin}, tmux=False)
         check("#294 tmux INSTALLED + $TMUX empty -> WARN 'not inside tmux' (deterministic branch)",
               rc == 0 and "not inside tmux" in out and "[WARN]" in out and "iTerm2" in out)
-        check("#294 tmux-installed-not-inside WARN surfaces marker-arming", "marker" in out.lower())
+        check("#294/#312 tmux-installed-not-inside WARN says the session is still merge-gated",
+              "still merge-gated" in out)
         # No tmux anywhere on PATH -> the "not installed" branch, on ANY host.
         rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": wired, "ORCHESTRATE_GUARD": guard,
                                                  "PATH": sanibin}, tmux=False)
         check("#294 tmux NOT INSTALLED -> WARN 'tmux not installed' (deterministic branch)",
               rc == 0 and "tmux not installed" in out and "[WARN]" in out and "iTerm2" in out)
-        # Both branches must keep surfacing the ONE genuine tmux dependency.
-        check("#294 tmux-not-installed WARN still surfaces marker-arming", "marker" in out.lower())
+        # #312: both branches must keep telling the truth - the session is STILL merge-gated.
+        check("#294/#312 tmux-not-installed WARN says the session is still merge-gated",
+              "still merge-gated" in out)
 
         # PRESERVED genuine dependency: Agent Teams actually DISABLED is still a hard fail.
         # #294 only stops the FAIL on a WORKING non-tmux backend.
@@ -351,41 +354,48 @@ def main():
         check("#11 up scaffolds <team>/planner/proposed.json={\"flags\": []}",
               os.path.exists(planner_seed) and json.load(open(planner_seed)) == {"flags": []})
 
-        # #294 SCOPE BOUNDARY - read this before "fixing" the expectation below to rc0.
-        # `up` outside tmux still REFUSES, and that is correct TODAY: the marker key is derived
-        # from $TMUX, and orchestrate-guard.sh derives ITS key identically - no $TMUX, no key, no
-        # marker. A TEAM session with no marker runs with the Tier-2 merge gate OFF, so standing
-        # one up would silently disarm the merge deny for every teammate. Refusing is the safe
-        # direction. What #294 fixes HERE is the FAILURE MODE, not the refusal: an uncaught
-        # RuntimeError traceback becomes an honest abort naming marker-arming (the ONE genuine
-        # tmux dependency) instead of the old, false "teammates will not spawn" claim.
-        # Generalizing the key so a non-tmux session CAN arm is a deny-authority floor change
-        # tracked separately; when it lands, this expectation flips to rc0 + scaffold assertions.
+        # #312: `up` OUTSIDE TMUX NOW WORKS - it arms, and the session is fully merge-gated.
+        # This is the point of #312 and it replaces the old "refuse outside tmux" contract:
+        # tmux is no longer required for anything. The marker keys off $CLAUDE_CODE_SESSION_ID
+        # when $TMUX is absent (the guard derives its key the same way, byte for byte), so the
+        # Tier-2 merge deny engages exactly as it does under tmux. run() inherits a real
+        # CLAUDE_CODE_SESSION_ID from the ambient env; pin an explicit one so the case is
+        # deterministic even if the harness is ever run outside a Claude Code session.
         art_notmux = os.path.join(td, "artifacts-notmux"); os.makedirs(art_notmux)
+        floor_notmux = os.path.join(td, "floor-notmux"); os.makedirs(floor_notmux)
         upov_notmux = dict(ov)
-        upov_notmux.update({"ORCHESTRATE_ARTIFACT_DIR": art_notmux, "ORCHESTRATE_FLOOR_DIR": floor_dir})
-        # Snapshot the floor dir: the earlier tmux=True `up` legitimately armed a marker in here,
-        # so "no marker exists" would be a false assertion. What must hold is that the non-tmux
-        # run adds NOTHING - it must never arm under a half-derived or defaulted key.
-        floor_before = sorted(os.listdir(floor_dir)) if os.path.isdir(floor_dir) else []
+        upov_notmux.update({"ORCHESTRATE_ARTIFACT_DIR": art_notmux,
+                            "ORCHESTRATE_FLOOR_DIR": floor_notmux,
+                            "CLAUDE_CODE_SESSION_ID": "harness-notmux-session"})
         rc_nt, out_nt = run(["up", "--team", "demo", "--repo", repo],
                             env_overrides=upov_notmux, tmux=False)
-        floor_after = sorted(os.listdir(floor_dir)) if os.path.isdir(floor_dir) else []
-        check("#294 up outside tmux aborts CLEANLY (rc1), never a raw traceback",
-              rc_nt == 1 and "Traceback" not in out_nt and "RuntimeError" not in out_nt)
-        check("#294 up outside tmux abort names marker-arming + $TMUX as the REAL reason",
-              "marker" in out_nt.lower() and "$TMUX" in out_nt)
-        check("#294 up outside tmux abort drops the false 'teammates will not spawn' claim",
-              "will not spawn" not in out_nt)
-        # The refusal must be TOTAL: never arm under a half-derived or defaulted key.
-        check("#294 up outside tmux arms NO new marker (floor dir unchanged)",
-              floor_after == floor_before)
-        # ...and it must not LITTER. Doctor's tmux checks are advisory now, so up sails past the
-        # doctor gate where it used to stop; without the fail-fast pre-check it would scaffold
-        # stack.json / profile.env / the brief before refusing at arm time. A pure refusal path
-        # must create nothing.
-        check("#294 up outside tmux scaffolds NOTHING on the refusal path",
-              not os.path.exists(os.path.join(art_notmux, "demo")))
+        nt_dir = os.path.join(art_notmux, "demo")
+        check("#312 up OUTSIDE tmux succeeds (rc0) - tmux is no longer required",
+              rc_nt == 0 and "Traceback" not in out_nt)
+        check("#312 up outside tmux ARMS a marker under the ccsid key",
+              os.path.exists(os.path.join(floor_notmux, "ccsid_harness_notmux_session")))
+        check("#312 up outside tmux reports the session ARMED", "SESSION ARMED" in out_nt)
+        check("#312 up outside tmux scaffolds stack.json + pr-triage + adv-review",
+              os.path.exists(os.path.join(nt_dir, "stack.json")) and
+              os.path.isdir(os.path.join(nt_dir, "pr-triage")) and
+              os.path.isdir(os.path.join(nt_dir, "adv-review")))
+        # FAIL CLOSED remains: with NEITHER identifier there is no key, so up must still refuse
+        # cleanly rather than stand up an ungated team.
+        art_nokey = os.path.join(td, "artifacts-nokey"); os.makedirs(art_nokey)
+        floor_nokey = os.path.join(td, "floor-nokey"); os.makedirs(floor_nokey)
+        upov_nokey = dict(ov)
+        upov_nokey.update({"ORCHESTRATE_ARTIFACT_DIR": art_nokey,
+                           "ORCHESTRATE_FLOOR_DIR": floor_nokey,
+                           "CLAUDE_CODE_SESSION_ID": ""})
+        rc_nk, out_nk = run(["up", "--team", "demo", "--repo", repo],
+                            env_overrides=upov_nokey, tmux=False)
+        check("#312 up with NEITHER $TMUX nor ccsid -> clean rc1, never a raw traceback",
+              rc_nk == 1 and "Traceback" not in out_nk and "RuntimeError" not in out_nk)
+        check("#312 no-key abort names BOTH identifiers as the reason",
+              "$TMUX" in out_nk and "CLAUDE_CODE_SESSION_ID" in out_nk)
+        check("#312 no-key abort arms NO marker", os.listdir(floor_nokey) == [])
+        check("#312 no-key abort scaffolds NOTHING (fails fast, before scaffolding)",
+              not os.path.exists(os.path.join(art_nokey, "demo")))
         brief = open(os.path.join(team_dir, "pr-shipper-brief.md")).read()
         # Verify: brief body contains the owner/name SLUG (derived from the remote), not the
         # raw path. The header comment records the path for diagnostics, so we check the
@@ -583,9 +593,19 @@ def main():
         check("marker has a header", "team: demo" in open(marker).read())
         check("marker records tmux", "tmux:" in open(marker).read())
         os.remove(marker)
-        # up refuses to arm when $TMUX is empty: doctor hard-fails first -> non-zero exit, no marker.
-        rc, out = run(["up", "--team", "demo", "--repo", repo], env_overrides=upov, tmux=False)
-        check("up without $TMUX exits non-zero and arms no marker", rc != 0 and not os.path.exists(marker))
+        # #312 (REPLACES the old "up refuses without $TMUX" contract - tmux is no longer required):
+        # with $TMUX empty, up ARMS under the ccsid key and the session is fully merge-gated. The
+        # invariant that still matters, and the reason this case survives: it must NOT arm under
+        # the TMUX-derived key: a real $TMUX is a socket path, so the two never alias, and a
+        # non-tmux session must never read or clobber a tmux session's marker.
+        _upov_ccsid = dict(upov); _upov_ccsid["CLAUDE_CODE_SESSION_ID"] = "arm-case-session"
+        rc, out = run(["up", "--team", "demo", "--repo", repo], env_overrides=_upov_ccsid, tmux=False)
+        _ccsid_marker = os.path.join(floor_dir, "ccsid_arm_case_session")
+        check("#312 up without $TMUX ARMS under the ccsid key (rc0)",
+              rc == 0 and os.path.exists(_ccsid_marker))
+        check("#312 up without $TMUX does NOT arm under the tmux key (schemes never alias)",
+              not os.path.exists(marker))
+        os.remove(_ccsid_marker)
         openguard = os.path.join(td, "openguard.sh"); write_stub_guard(openguard, selftest_rc=0)
         open(openguard, "w").write("#!/usr/bin/env bash\n[ \"$1\" = \"--self-test\" ] && exit 0\nexit 0\n")
         os.chmod(openguard, 0o755)
@@ -1856,6 +1876,141 @@ def main():
         check("#294 arm-time backstop names it was raised at arm time (distinguishable in logs)",
               "raised at arm time" in _out294)
         check("#294 arm-time backstop arms NO marker", os.listdir(_floor294) == [])
+
+    # #312 CROSS-LANGUAGE KEY AGREEMENT - the load-bearing test of the whole change.
+    # setup.py arms the marker; orchestrate-guard.sh looks it up; authorize-merge.sh writes the
+    # merge-auth token under the same name. If ANY of the three derives a different key, the
+    # marker is armed under one name and read under another and the Tier-2 merge gate goes
+    # SILENTLY OFF - no error, no log, just an ungated session. So do not eyeball the
+    # implementations: DERIVE the key from the same inputs through the REAL bash guard and the
+    # REAL python function and assert byte equality.
+    import importlib.util as _ilu312
+    _spec312 = _ilu312.spec_from_file_location("orchestrate_setup_key", SCRIPT)
+    _mod312 = _ilu312.module_from_spec(_spec312)
+    _spec312.loader.exec_module(_mod312)
+    _real_guard = os.path.join(os.path.dirname(os.path.abspath(SCRIPT)), "orchestrate-guard.sh")
+
+    def _bash_key(env_extra):
+        """Derive the ARMING key from the REAL guard's own derivation text.
+
+        Extracts `_sanitize_key` + `_session_keys` - the guard's ONLY key derivation - and
+        takes the FIRST line, which is the first-precedence key: exactly what setup.py arms
+        under and what authorize-merge.sh writes its token under. Pinning the guard's real
+        derivation matters: an earlier revision had a separate single-key helper that the gate
+        no longer called, so this test would have been pinning DEAD code while the gate used
+        something else.
+
+        The guard cannot be SOURCED to reach these: it has no BASH_SOURCE reentrancy guard, so
+        sourcing runs its main body and hits `exit 0` first. Restructuring the deny authority
+        to suit a test is the wrong trade, so extract the literal text instead. If a function
+        is renamed or reshaped so an extraction misses, the call is undefined -> non-zero +
+        empty output -> these checks FAIL LOUDLY rather than pass on a stale copy."""
+        fns = ""
+        for _fn in ("_sanitize_key", "_session_keys"):
+            fns += subprocess.run(["sed", "-n", f"/^{_fn}()/,/^}}/p", _real_guard],
+                                  capture_output=True, text=True, timeout=15).stdout + "\n"
+        env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "CLAUDE_CODE_SESSION_ID")}
+        env.update(env_extra)
+        # Take the first line in PYTHON, not via `| head -1`: a pipeline returns the LAST
+        # command's status, so `head` would mask _session_keys' own non-zero and the
+        # fail-closed assertion below would silently pass. (`set -o pipefail` is not the fix
+        # either - head closing the pipe can SIGPIPE the producer on a multi-key session.)
+        p = subprocess.run(["bash", "-c", f'set -u\n{fns}\n_session_keys'],
+                           env=env, capture_output=True, text=True, timeout=15)
+        lines = [ln for ln in p.stdout.splitlines() if ln.strip()]
+        return (p.returncode, lines[0].strip() if lines else "")
+
+    def _py_key(env_extra):
+        _saved = {k: os.environ.get(k) for k in ("TMUX", "CLAUDE_CODE_SESSION_ID")}
+        try:
+            for k in ("TMUX", "CLAUDE_CODE_SESSION_ID"):
+                os.environ.pop(k, None)
+            os.environ.update(env_extra)
+            return _mod312._session_key()
+        finally:
+            for k, v in _saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+
+    if os.path.isfile(_real_guard):
+        # Cases span both precedence legs, the tmux-wins overlap, the fail-closed floor, and
+        # non-ASCII (the reason both sides sanitize in BYTE mode: a multibyte value must not
+        # sanitize to a different length under a UTF-8 vs C locale).
+        for _label, _env in [
+            ("tmux only", {"TMUX": "/tmp/tmux-501/default,60037,0"}),
+            ("ccsid only", {"CLAUDE_CODE_SESSION_ID": "77c3fda7-57c9-4842-bbe5-4248d7cae658"}),
+            ("BOTH -> tmux wins", {"TMUX": "/tmp/tmux-501/default,1,0",
+                                   "CLAUDE_CODE_SESSION_ID": "aaaa-bbbb"}),
+            ("non-ASCII tmux", {"TMUX": "/tmp/tmux-éü/default,1,0"}),
+            ("non-ASCII ccsid", {"CLAUDE_CODE_SESSION_ID": "id-éü-9"}),
+            ("weird chars", {"CLAUDE_CODE_SESSION_ID": "a b:c/d,e"}),
+        ]:
+            _brc, _bkey = _bash_key(_env)
+            _pkey = _py_key(_env)
+            check(f"#312 key agreement ({_label}): bash == python, both non-empty",
+                  _brc == 0 and _bkey != "" and _bkey == _pkey)
+        # FAIL CLOSED: neither identifier -> no key on BOTH sides (no marker -> not gated).
+        _brc, _bkey = _bash_key({})
+        check("#312 no identifier -> bash _session_keys returns non-zero (fail closed)", _brc != 0)
+        check("#312 no identifier -> python _session_key returns None (fail closed)",
+              _py_key({}) is None)
+        # BACKWARD COMPATIBILITY: the tmux key is byte-identical to the PRE-#312 derivation, so a
+        # redeploy never orphans a live session's marker. Pinned against the harness's own
+        # independent _key() helper, which encodes the original algorithm.
+        _tmux_fixture = {"TMUX": TEST_TMUX}
+        check("#312 tmux key is UNCHANGED from the pre-#312 derivation (no marker orphaning)",
+              _py_key(_tmux_fixture) == _key(TEST_TMUX) and _bash_key(_tmux_fixture)[1] == _key(TEST_TMUX))
+        # The ccsid_ prefix separates the two schemes for every REAL input. It is a convention,
+        # not a reserved namespace ('_' sanitizes to itself, so a crafted $TMUX of 'ccsid_a_b'
+        # would alias session id 'a-b') - unreachable in practice because a real $TMUX is a
+        # socket path starting with '/'. Assert the property that actually holds.
+        check("#312 ccsid key is namespaced with the ccsid_ prefix",
+              (_py_key({"CLAUDE_CODE_SESSION_ID": "x"}) or "").startswith("ccsid_"))
+        check("#312 a real (socket-path) $TMUX can never alias a ccsid key",
+              not (_py_key({"TMUX": "/tmp/tmux-501/default,1,0"}) or "").startswith("ccsid_"))
+
+        # #312 END-TO-END, the test that actually proves the contract. String equality above
+        # pins the derivation; THIS pins the BEHAVIOR: setup.py arms a marker in a NON-TMUX
+        # session, and the REAL guard - given the same environment - must SEE that marker and
+        # HARD-DENY a merge. That is the whole point of the change: a non-tmux team session is
+        # gated exactly like a tmux one. The merge payload is built HERE, inside the harness
+        # file, never on a Bash command line (the live hook greps command lines).
+        with tempfile.TemporaryDirectory() as _e2e:
+            _floor_e2e = os.path.join(_e2e, "floor"); os.makedirs(_floor_e2e)
+            _ccsid = "e2e-1111-2222-3333"
+            _key_e2e = "ccsid_" + re.sub(r'[^A-Za-z0-9]', '_', _ccsid)
+            # Arm the marker by hand under the derived key (arm_marker's own write), so this
+            # case tests the KEY CONTRACT, not cmd_up's unrelated scaffolding.
+            open(os.path.join(_floor_e2e, _key_e2e), "w").write("orchestrate session\nteam: e2e\n")
+
+            _merge_payload = json.dumps({"tool_name": "Bash", "tool_input": {
+                "command": "gh " + "pr " + "merge 42 --squash"}})
+            _benign_payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls -la"}})
+
+            def _run_guard(payload, env_extra):
+                env = {k: v for k, v in os.environ.items()
+                       if k not in ("TMUX", "CLAUDE_CODE_SESSION_ID")}
+                env["ORCHESTRATE_FLOOR_DIR"] = _floor_e2e
+                env.update(env_extra)
+                return subprocess.run(["bash", _real_guard], input=payload, env=env,
+                                      capture_output=True, text=True, timeout=15).returncode
+
+            check("#312 E2E: non-tmux session WITH a ccsid-keyed marker -> guard HARD-DENIES the merge",
+                  _run_guard(_merge_payload, {"CLAUDE_CODE_SESSION_ID": _ccsid}) == 2)
+            check("#312 E2E: same session, benign command -> still allowed (no over-blocking)",
+                  _run_guard(_benign_payload, {"CLAUDE_CODE_SESSION_ID": _ccsid}) == 0)
+            # THE ESCAPE HATCH, and the reason this must be session-scoped rather than
+            # repo/user-scoped: the maintainer's SEPARATE terminal is a DIFFERENT Claude Code
+            # session -> different id -> different key -> NOT gated. If this ever denies, the
+            # documented human-merge path is broken.
+            check("#312 E2E: a DIFFERENT session id is NOT gated (human merge escape hatch intact)",
+                  _run_guard(_merge_payload, {"CLAUDE_CODE_SESSION_ID": "some-other-session"}) == 0)
+            # And with no identifier at all there is no key, so nothing is gated - fail closed.
+            check("#312 E2E: no identifier -> no key -> not gated (fail closed, unchanged)",
+                  _run_guard(_merge_payload, {}) == 0)
+    else:
+        check("#312 real guard accessible for cross-language key agreement", False)
 
     # #107: _missing_allow_entries harvester over-harvest guard (Option A: a deliberately
     # SIMPLE parser - every backticked Bash/Write/Edit/Read(...) token on a non-NOTE line in

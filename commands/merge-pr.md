@@ -202,9 +202,15 @@ merge step itself branches on whether an **orchestrate floor marker** is active.
 
 First detect the marker. This MUST mirror the deterministic floor's
 `marker_active()` (in `orchestrate-guard.sh`) exactly, so `/merge-pr` and the guard
-never disagree: keyed by `$TMUX` (sanitized, `LC_ALL=C` so the byte length matches
-the guard), under `$FLOOR_DIR`, fresh within `$TTL_HOURS`. A non-tmux (solo)
-session can never be an orchestrate session and is never gated.
+never disagree: keyed by the SESSION KEY (sanitized, `LC_ALL=C` so the byte length
+matches the guard), under `$FLOOR_DIR`, fresh within `$TTL_HOURS`.
+
+#312: the session key is the sanitized `$TMUX` when set, else `ccsid_` + the sanitized
+`$CLAUDE_CODE_SESSION_ID` - **tmux is NOT required for a gated session**, so a non-tmux
+session is NOT automatically solo. Only a session with NEITHER identifier is unkeyed and
+therefore never gated. Match ANY candidate key, like the guard does. (This is one of the
+SIX live copies of the derivation listed in `orchestrate-guard.sh`'s DERIVATION REGISTRY;
+they must move together.)
 
 ```bash
 FLOOR_DIR="${ORCHESTRATE_FLOOR_DIR:-$HOME/.claude/orchestrate-floor.d}"
@@ -212,16 +218,31 @@ TTL_HOURS="${ORCHESTRATE_FLOOR_TTL_HOURS:-72}"
 case "$TTL_HOURS" in ''|*[!0-9]*) TTL_HOURS=72 ;; esac          # bad TTL must not disarm
 [ "$TTL_HOURS" -ge 1 ] 2>/dev/null || TTL_HOURS=72
 marker_active=0
+# #312: candidate keys, first-precedence first - the sanitized $TMUX when set, AND/OR
+# `ccsid_` + the sanitized $CLAUDE_CODE_SESSION_ID. Check EVERY candidate, exactly like the
+# guard: checking only $TMUX reported marker_active=0 for a gated NON-tmux session, routing
+# this command to the "solo -> merge directly" path while the floor then hard-denied the very
+# command that path emits.
+keys=""
 if [ -n "${TMUX:-}" ]; then
-  key=$(printf '%s' "$TMUX" | LC_ALL=C tr -c 'A-Za-z0-9' '_')
-  marker="$FLOOR_DIR/$key"
-  if [ -f "$marker" ]; then
-    mtime=$(stat -c %Y "$marker" 2>/dev/null || stat -f %m "$marker" 2>/dev/null) || mtime=0  # GNU stat -c || BSD stat -f (mirrors the guard)
-    now=$(date +%s)
-    age_h=$(( (now - mtime) / 3600 ))
-    [ "$mtime" -gt 0 ] && [ "$age_h" -lt "$TTL_HOURS" ] && marker_active=1
-  fi
+  keys="$(printf '%s' "$TMUX" | LC_ALL=C tr -c 'A-Za-z0-9' '_')"
 fi
+if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+  keys="$keys
+ccsid_$(printf '%s' "$CLAUDE_CODE_SESSION_ID" | LC_ALL=C tr -c 'A-Za-z0-9' '_')"
+fi
+for key in $keys; do
+  [ -n "$key" ] || continue
+  marker="$FLOOR_DIR/$key"
+  [ -f "$marker" ] || continue
+  mtime=$(stat -c %Y "$marker" 2>/dev/null || stat -f %m "$marker" 2>/dev/null) || mtime=0  # GNU stat -c || BSD stat -f (mirrors the guard)
+  now=$(date +%s)
+  age_h=$(( (now - mtime) / 3600 ))
+  if [ "$mtime" -gt 0 ] && [ "$age_h" -lt "$TTL_HOURS" ]; then
+    marker_active=1
+    break
+  fi
+done
 echo "marker_active=$marker_active"
 ```
 

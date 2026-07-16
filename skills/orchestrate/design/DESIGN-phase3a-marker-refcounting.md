@@ -38,9 +38,25 @@ orchestrate session?", not "does any marker exist?".
 - **D2 - Empty `$TMUX` => INACTIVE (never gated).** A non-tmux session cannot be an
   orchestrate session (`up`'s doctor REQUIRES `$TMUX`), so it is always solo. With no
   `$TMUX` there is no key, so no marker can ever match -> airtight, trivial immunity.
-  Trade-off accepted: a (never-actually-used) non-tmux orchestrate session would not get
+  > **SUPERSEDED by #312.** Both premises are now false: doctor's tmux checks are
+  > advisory WARNs (#294) and `up` arms outside tmux, because the session key falls back
+  > to `ccsid_` + the sanitized `$CLAUDE_CODE_SESSION_ID`. A non-tmux session IS a gated
+  > orchestrate session, keyed and merge-gated exactly like a tmux one. Only a session
+  > with NEITHER identifier is unkeyed -> never gated (the immunity D2 describes now
+  > attaches to that case, not to "no tmux"). The guard matches ANY candidate key; see
+  > the DERIVATION REGISTRY in `scripts/orchestrate-guard.sh`.
+  >
+  > The trade-off recorded immediately below is therefore VOID, and its premise was wrong
+  > even before #312: it accepted that "a (never-actually-used) non-tmux orchestrate session
+  > would not get the merge-by-API hook deny" on the grounds that non-tmux was "an
+  > unsupported config". Non-tmux is now the maintainer's PREFERRED config (the iTerm2 /
+  > in-process backend), and it IS gated. The fallback the trade-off leaned on ("the
+  > allow-list + auto-mode still block an autonomous bot merge") was never load-bearing
+  > either: the allow-list now carries an EXPLICIT `Bash(gh pr merge *)` entry (#105),
+  > precisely because the FLOOR deny - not the allow-list - is what stops a bot merge.
+  ~~Trade-off accepted: a (never-actually-used) non-tmux orchestrate session would not get
   the merge-by-API hook deny - acceptable, it is an unsupported config and the
-  allow-list + auto-mode still block an autonomous bot merge.
+  allow-list + auto-mode still block an autonomous bot merge.~~ (VOID - see above.)
 - **D3 - Wipe the legacy single-file config (maintainer: "wipe the deck").** Drop
   `ORCHESTRATE_FLOOR_MARKER` entirely. New config: `ORCHESTRATE_FLOOR_DIR` (default
   `~/.claude/orchestrate-floor.d`) + the `$TMUX` key. Tests are rewritten to set

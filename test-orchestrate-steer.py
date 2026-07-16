@@ -30,7 +30,18 @@ def _key(tmux):
     return re.sub(rb'[^A-Za-z0-9]', b'_', tmux.encode("utf-8", "surrogateescape")).decode("ascii")
 
 
-def run_steer(tool_input, *, channel, marker_active=False, tmux=DEFAULT_TMUX, ttl_hours=24,
+def _self_key(tmux, ccsid):
+    """The key steer derives for THIS session - mirrors orchestrate-steer.sh's _session_keys()
+    precedence (#312): $TMUX wins unprefixed, else 'ccsid_' + sanitized session id, else none."""
+    if tmux is not None:
+        return _key(tmux)
+    if ccsid is not None:
+        return "ccsid_" + _key(ccsid)
+    return None
+
+
+def run_steer(tool_input, *, channel, marker_active=False, tmux=DEFAULT_TMUX, ccsid=None,
+              ttl_hours=24,
               stale_self=False, tool_name="Bash", session_id=None, read_state_dir=None):
     """Invoke the steer hook. Returns (exit_code, stderr). channel in {'stdin','env'}.
     tool_input is the dict passed as .tool_input (e.g. {'file_path': ...} or {'command': ...}).
@@ -40,10 +51,11 @@ def run_steer(tool_input, *, channel, marker_active=False, tmux=DEFAULT_TMUX, tt
     with tempfile.TemporaryDirectory() as td:
         floor_dir = os.path.join(td, "orchestrate-floor.d")
         os.makedirs(floor_dir, exist_ok=True)
-        if marker_active and tmux is not None:
-            open(os.path.join(floor_dir, _key(tmux)), "w").close()  # fresh mtime
-        if stale_self and tmux is not None:
-            p = os.path.join(floor_dir, _key(tmux))
+        self_key = _self_key(tmux, ccsid)
+        if marker_active and self_key is not None:
+            open(os.path.join(floor_dir, self_key), "w").close()  # fresh mtime
+        if stale_self and self_key is not None:
+            p = os.path.join(floor_dir, self_key)
             open(p, "w").close()
             old = time.time() - (ttl_hours + 1) * 3600
             os.utime(p, (old, old))
@@ -55,6 +67,12 @@ def run_steer(tool_input, *, channel, marker_active=False, tmux=DEFAULT_TMUX, tt
             env.pop("TMUX", None)
         else:
             env["TMUX"] = tmux
+        # #312 DETERMINISM: steer's marker now falls back to $CLAUDE_CODE_SESSION_ID when $TMUX is
+        # absent, and this harness runs INSIDE a real Claude Code session that exports one. Strip it
+        # by default so `tmux=None` genuinely means "no key"; pass ccsid= to exercise the fallback.
+        env.pop("CLAUDE_CODE_SESSION_ID", None)
+        if ccsid is not None:
+            env["CLAUDE_CODE_SESSION_ID"] = ccsid
         env.pop("TOOL_INPUT", None)
         stdin_data = ""
         if channel == "stdin":
@@ -526,6 +544,34 @@ def main():
         # contract is silence, not merely a zero exit).
         check("#231: jq absent -> exit 0, silent (fail-open, never blocks the spawn)",
               p.returncode == 0 and not warned(p.stderr) and p.stderr.strip() == "")
+
+    # ---- #312: the MARKER-GATED rules must fire in a NON-TMUX gated session --------------
+    # steer's marker_active checked ONLY $TMUX, so once #312 let a session arm outside tmux,
+    # every marker-gated rule (1 = mid-run canonical edit, 5 = foreground Agent spawn) went
+    # SILENTLY DEAD for the whole newly-supported mode - the nudges simply never fired, with
+    # no signal. Advisory tier, so a missing nudge is the blast radius, not a deny hole.
+    CANON = "/Users/jesse/Developer/cc-orchestrator/scripts/safe-push.sh"
+    rc, err = run_steer({"file_path": CANON}, channel="stdin", tool_name="Edit",
+                        marker_active=True, tmux=None, ccsid="steer-ccsid-session")
+    check("#312 steer: canonical edit in a ccsid-gated session -> rule 1 WARNs (was silent)",
+          rc == 0 and warned(err))
+    rc, err = run_steer({"run_in_background": False}, channel="stdin", tool_name="Agent",
+                        marker_active=True, tmux=None, ccsid="steer-ccsid-session")
+    check("#312 steer: foreground Agent in a ccsid-gated session -> rule 5 WARNs (was silent)",
+          rc == 0 and warned(err))
+    # Still silent where it should be: no marker, and no identifier at all.
+    rc, err = run_steer({"file_path": CANON}, channel="stdin", tool_name="Edit",
+                        marker_active=False, tmux=None, ccsid="steer-ccsid-session")
+    check("#312 steer: ccsid session with NO marker -> silent (marker-gated, not always-on)",
+          rc == 0 and not warned(err))
+    rc, err = run_steer({"file_path": CANON}, channel="stdin", tool_name="Edit",
+                        marker_active=True, tmux=None, ccsid=None)
+    check("#312 steer: NEITHER identifier -> no key -> silent", rc == 0 and not warned(err))
+    # A stale ccsid marker expires exactly like a stale tmux one.
+    rc, err = run_steer({"file_path": CANON}, channel="stdin", tool_name="Edit",
+                        marker_active=False, stale_self=True, tmux=None, ccsid="steer-stale")
+    check("#312 steer: STALE ccsid marker -> silent (TTL honored per candidate)",
+          rc == 0 and not warned(err))
 
     print()
     if FAILS:

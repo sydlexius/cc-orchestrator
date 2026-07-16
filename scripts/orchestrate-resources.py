@@ -57,11 +57,42 @@ def _now_iso():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _marker_key():
+def _session_keys():
+    """EVERY key this session could have armed a floor marker under, first-precedence first.
+
+    #312: MIRRORS the DERIVATION REGISTRY in `scripts/orchestrate-guard.sh` (SIX live copies -
+    keep them in lockstep). $TMUX -> sanitized, UNPREFIXED; $CLAUDE_CODE_SESSION_ID ->
+    'ccsid_' + sanitized. Empty list = genuinely unkeyed (neither identifier).
+
+    WHY ALL CANDIDATES, not just first-precedence (the guard does the same, for the same
+    reason): the key is derived at ALLOCATE time from this process's env, but the marker was
+    written at ARM time by `up` - and `up` runs as a Bash TOOL CALL, so ITS env is
+    command-controllable (`env -u TMUX ... up`) while a later allocate's may not be. Recording
+    only the first-precedence key means a scheme disagreement makes the lease look UNOWNED,
+    the GC reclaims it past the grace window, and the next allocate hands out a port that is
+    still in use. Two teammates, one port - silently.
+
+    NOTE the GC cannot simply re-derive at reclaim time: it runs inside ANOTHER session's
+    `allocate`, so the ambient env is not the lease owner's. The candidates must be RECORDED
+    on the lease when it is created."""
+    def _sanitize(value):
+        return re.sub(rb'[^A-Za-z0-9]', b'_', value.encode("utf-8", "surrogateescape")).decode("ascii")
+
+    keys = []
     tmux = os.environ.get("TMUX", "")
-    if not tmux:
-        return ""
-    return re.sub(rb'[^A-Za-z0-9]', b'_', tmux.encode("utf-8", "surrogateescape")).decode("ascii")
+    if tmux:
+        keys.append(_sanitize(tmux))
+    ccsid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if ccsid:
+        keys.append("ccsid_" + _sanitize(ccsid))
+    return keys
+
+
+def _marker_key():
+    """The FIRST-PRECEDENCE key, kept for the lease's legacy `marker_key` field (readable by
+    an older reader). `_session_keys()` is the authority; see it for the full rationale."""
+    keys = _session_keys()
+    return keys[0] if keys else ""
 
 
 def _empty_state():
@@ -247,6 +278,7 @@ def cmd_allocate(args):
             "id": lease_id, "session": args.session, "teammate": args.teammate,
             "profile": args.profile, "created": _now_iso(), "ttl_hours": TTL_HOURS,
             "marker_key": _marker_key(),
+            "marker_keys": _session_keys(),
             "resources": {"port": {"kind": "port", "value": port},
                           "data_dir": {"kind": "dir", "value": data_dir}},
             "env": {}, "env_file": None, "meta": {},
@@ -277,10 +309,21 @@ def _lease_age_hours(lease):
 
 
 def _marker_absent(lease):
-    key = lease.get("marker_key") or ""
-    if not key:
+    """True when NO recorded owning marker is present -> the lease cannot be kept alive by one.
+
+    #312: checks EVERY recorded candidate (`marker_keys`), mirroring the guard's any-candidate
+    match, so an arm/check scheme disagreement cannot make a LIVE session's lease look unowned
+    and get its port reclaimed out from under it. Falls back to the legacy single `marker_key`
+    for leases written before #312 (a pre-#312 lease can only ever carry a tmux key, and that
+    derivation is unchanged, so the fallback stays exact)."""
+    keys = lease.get("marker_keys")
+    if not isinstance(keys, list) or not keys:
+        legacy = lease.get("marker_key") or ""
+        keys = [legacy] if legacy else []
+    keys = [k for k in keys if isinstance(k, str) and k]
+    if not keys:
         return True  # no owning marker recorded -> cannot be kept alive by one
-    return not os.path.isfile(os.path.join(FLOOR_DIR, key))
+    return not any(os.path.isfile(os.path.join(FLOOR_DIR, k)) for k in keys)
 
 
 def _scan_listening_ports(ports, snapshot=None):

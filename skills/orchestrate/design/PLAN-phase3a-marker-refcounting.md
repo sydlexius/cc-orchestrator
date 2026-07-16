@@ -1,5 +1,14 @@
 # P3-A Marker Refcounting Implementation Plan
 
+> **SUPERSEDED IN PART by #312 (2026-07-16).** This build plan's `$TMUX`-keyed derivation
+> and its "empty `$TMUX` => never gated" premise no longer hold: the session key falls back
+> to `ccsid_` + the sanitized `$CLAUDE_CODE_SESSION_ID`, so a NON-tmux session arms a marker
+> and IS merge-gated exactly like a tmux one. Only a session with NEITHER identifier is
+> unkeyed and therefore never gated. Kept as the historical build plan; the live contract is
+> the DERIVATION REGISTRY in `scripts/orchestrate-guard.sh` (SIX copies) and
+> `DESIGN-phase3a-marker-refcounting.md`.
+
+
 > SUPERSEDED (#139): `TeamCreate`/`TeamDelete` referenced below were REMOVED by Anthropic. The team is now IMPLICIT (spawn named teammates directly via the `Agent` tool) and teardown is `shutdown_request` -> wait for each "terminated" notice (no `TeamDelete` step). The live `SKILL.md` teardown is authoritative; this historical doc is left as-is.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

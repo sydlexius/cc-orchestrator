@@ -33,7 +33,7 @@ def _key(tmux):
     return re.sub(rb'[^A-Za-z0-9]', b'_', tmux.encode("utf-8", "surrogateescape")).decode("ascii")
 
 
-def run(args, *, tmux="/tmp/tmux-x,1,0", preflight_mode="pass", ttl_min=None, via_plugin_root=False):
+def run(args, *, tmux="/tmp/tmux-x,1,0", ccsid=None, preflight_mode="pass", ttl_min=None, via_plugin_root=False):
     """Run the helper with a stubbed ship-gate-preflight on PATH-independent lookup.
 
     preflight_mode: 'pass' (exit 0, prints a RESULT line with headRefOid=SHA),
@@ -73,6 +73,14 @@ def run(args, *, tmux="/tmp/tmux-x,1,0", preflight_mode="pass", ttl_min=None, vi
         env.pop("TMUX", None)
     else:
         env["TMUX"] = tmux
+    # #312: the helper's key now falls back to $CLAUDE_CODE_SESSION_ID when $TMUX is absent, so
+    # the harness must CONTROL it rather than inherit the ambient one - otherwise "no $TMUX"
+    # cases would silently key off the real session id and stop testing what they claim.
+    # Default: strip it, so the tmux leg is exercised in isolation. Pass ccsid= to test the
+    # fallback leg explicitly.
+    env.pop("CLAUDE_CODE_SESSION_ID", None)
+    if ccsid is not None:
+        env["CLAUDE_CODE_SESSION_ID"] = ccsid
     p = subprocess.run(["bash", HELPER] + args, env=env, capture_output=True, text=True, timeout=15)
     return p.returncode, p.stdout, p.stderr, floor_dir, home
 
@@ -137,8 +145,53 @@ def main():
     check("no <pr> arg -> exit 1 (usage)", rc == 1)
     rc, _, _, fd, _ = run(["abc"], preflight_mode="pass")
     check("non-numeric <pr> -> exit 1 (usage)", rc == 1)
-    rc, _, _, fd, _ = run(["265"], tmux=None, preflight_mode="pass")
-    check("no $TMUX (not an orchestrate session) -> exit 1, no token", rc == 1 and not os.path.exists(token_path(fd)))
+    # #312: "no $TMUX" is NO LONGER "not an orchestrate session" - tmux is not required. The
+    # helper must key off $CLAUDE_CODE_SESSION_ID instead, MIRRORING the floor's precedence
+    # exactly. If this helper and the guard ever disagree, the token lands under a name the
+    # guard never reads and every authorized merge is silently denied.
+    rc, _, _, fd, _ = run(["265"], tmux=None, ccsid="auth-fallback-session", preflight_mode="pass")
+    check("#312 no $TMUX but a ccsid -> token IS armed, under the ccsid key",
+          rc == 0 and os.path.exists(os.path.join(fd, "merge-auth", "ccsid_auth_fallback_session")))
+    check("#312 the ccsid token is NOT written under a tmux-shaped key",
+          not os.path.exists(token_path(fd)))
+    # FAIL CLOSED: with NEITHER identifier there is no key, so there is nothing to arm.
+    rc, _, _, fd, _ = run(["265"], tmux=None, ccsid=None, preflight_mode="pass")
+    check("#312 neither $TMUX nor ccsid -> exit 1, no token (fail closed)",
+          rc == 1 and not os.path.exists(token_path(fd)))
+
+    # #312 END-TO-END CONTRACT: feed the token THIS HELPER ACTUALLY WROTE into the REAL guard.
+    # Checking the token's PATH here and the guard's behavior over there, separately, never
+    # proves the two agree - and "the two agree" IS the contract. If they ever diverge, the
+    # token lands under a name the guard does not read and every authorized merge is silently
+    # denied, with nothing failing loudly. This is the only case that would catch that.
+    print("== #312 end-to-end: real armed token -> real guard (non-tmux session) ==")
+    CCSID_E2E = "e2e-auth-sess"
+    rc, out, err, fd, _ = run(["265"], tmux=None, ccsid=CCSID_E2E, preflight_mode="pass", ttl_min=10)
+    guard = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "orchestrate-guard.sh")
+    if rc == 0 and os.path.isfile(guard):
+        # Arm the marker so Tier-2 actually engages; without it the merge is allowed for the
+        # boring reason (solo/non-marker), which would make this case vacuous.
+        open(os.path.join(fd, "ccsid_" + _key(CCSID_E2E)), "w").close()
+        genv = {k: v for k, v in os.environ.items() if k not in ("TMUX", "CLAUDE_CODE_SESSION_ID")}
+        genv.update({"ORCHESTRATE_FLOOR_DIR": fd, "ORCHESTRATE_FLOOR_TTL_HOURS": "24",
+                     "CLAUDE_CODE_SESSION_ID": CCSID_E2E})
+        genv.pop("TOOL_INPUT", None)
+        # The sanctioned command the helper itself printed: pr-first, SHA-pinned.
+        cmd_ok = "gh " + "pr " + f"merge 265 --squash --match-head-commit {SHA}"
+        p_ok = subprocess.run(["bash", guard], input=json.dumps(
+            {"tool_name": "Bash", "tool_input": {"command": cmd_ok}}),
+            env=genv, capture_output=True, text=True, timeout=15)
+        check("#312 E2E: the token this helper armed is ACCEPTED by the real guard -> merge ALLOWED",
+              p_ok.returncode == 0)
+        # The bind still holds end-to-end: a DIFFERENT pr with the same token must be denied.
+        cmd_bad = "gh " + "pr " + f"merge 999 --squash --match-head-commit {SHA}"
+        p_bad = subprocess.run(["bash", guard], input=json.dumps(
+            {"tool_name": "Bash", "tool_input": {"command": cmd_bad}}),
+            env=genv, capture_output=True, text=True, timeout=15)
+        check("#312 E2E: the same token does NOT authorize a DIFFERENT pr -> BLOCK",
+              p_bad.returncode == 2)
+    else:
+        check("#312 E2E: helper armed a token and the real guard is available", False)
 
     print()
     if FAILS:

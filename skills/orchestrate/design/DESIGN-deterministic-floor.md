@@ -2,12 +2,32 @@
 
 > SUPERSEDED (marker only) by P3-A: the single global marker file
 > `~/.claude/orchestrate-floor.active` described below is now a per-session
-> `$TMUX`-keyed file `~/.claude/orchestrate-floor.d/<sanitized-$TMUX>` with a 72h
-> TTL, and an empty `$TMUX` is never gated. See
-> `DESIGN-phase3a-marker-refcounting.md`. The mentions below are kept as the
-> Phase-1 design record. (#105 update: `gh pr merge` is NOW also marker-gated on
-> the floor - see the "Tier-2: #105 floor-gate supersedes allow-list-omission"
-> section below; it supersedes the "allow-list-gated" record in this header.)
+> SESSION-KEYED file `~/.claude/orchestrate-floor.d/<session-key>` with a 72h TTL.
+> **#312 update:** the session key is the sanitized `$TMUX` when set, else `ccsid_` +
+> the sanitized `$CLAUDE_CODE_SESSION_ID` - so **tmux is NOT required to run a GATED
+> session** (the iTerm2 / in-process backend is gated identically), and only a session
+> with NEITHER identifier is unkeyed and therefore never gated. The guard matches ANY
+> candidate key (`_session_keys()`), so an arm-side/check-side scheme disagreement
+> cannot silently disarm the gate. This SUPERSEDES the "empty `$TMUX` is never gated"
+> rule stated below and in D2 of `DESIGN-phase3a-marker-refcounting.md`. See
+> `DESIGN-phase3a-marker-refcounting.md`. (#105 update: `gh pr merge` is NOW also
+> marker-gated on the floor - see the "Tier-2: #105 floor-gate supersedes
+> allow-list-omission" section below; it supersedes the "allow-list-gated" record in
+> this header.)
+>
+> **READ EVERYTHING BELOW AS THE PHASE-1 DESIGN RECORD, NOT AS CURRENT GUIDANCE.**
+> Naming the dimensions explicitly, because a reader who hits one of them mid-document
+> has no way to tell it is stale - EVERY later statement about the marker's:
+>   - **PATH** (a single global `~/.claude/orchestrate-floor.active`),
+>   - **TTL** (24h),
+>   - **SCOPE** (per-user / global rather than per-session), and
+>   - **non-tmux behavior** ("never gated")
+>
+> is SUPERSEDED and must not be implemented from. The AUTHORITY for the marker contract
+> is, in order: the DERIVATION REGISTRY + `marker_active()` in
+> `scripts/orchestrate-guard.sh` (the code), then
+> `DESIGN-phase3a-marker-refcounting.md` (the design of record). This document remains
+> authoritative ONLY for the Tier-1/Tier-2 rationale and the threat model.
 
 Date: 2026-06-05
 Status: APPROVED (brainstorm), pre-implementation

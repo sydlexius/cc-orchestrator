@@ -4,6 +4,7 @@ Run: python3 test-orchestrate-resources.py"""
 import datetime as _dt
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -13,17 +14,29 @@ import tempfile
 def _nowish():
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+
+def _key(value):
+    """Mirror the sanitization in the DERIVATION REGISTRY (orchestrate-guard.sh) EXACTLY:
+    byte-mode, so the key matches regardless of locale (#312)."""
+    return re.sub(rb'[^A-Za-z0-9]', b'_', value.encode("utf-8", "surrogateescape")).decode("ascii")
+
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "orchestrate-resources.py")
 FAILS = []
 
 
-def run(args, *, env_overrides=None, tmux="/tmp/tmux-test,1,0"):
+def run(args, *, env_overrides=None, tmux="/tmp/tmux-test,1,0", ccsid=None):
     env = dict(os.environ)
     env.pop("TOOL_INPUT", None)
     if tmux is None:
         env.pop("TMUX", None)
     else:
         env["TMUX"] = tmux
+    # #312 DETERMINISM: _marker_key() now falls back to $CLAUDE_CODE_SESSION_ID when $TMUX is
+    # absent, and this harness runs INSIDE a real Claude Code session that exports one. Strip it
+    # by default so `tmux=None` genuinely means "no key"; pass ccsid= to exercise the fallback.
+    env.pop("CLAUDE_CODE_SESSION_ID", None)
+    if ccsid is not None:
+        env["CLAUDE_CODE_SESSION_ID"] = ccsid
     if env_overrides:
         env.update(env_overrides)
     p = subprocess.run([sys.executable, SCRIPT, *args], env=env,
@@ -507,6 +520,117 @@ def main():
         rc, out, err = run(["release", "--lease", "R7b/t",
                             "--session", "R7b", "--teammate", "t"], env_overrides=ov)
         check("fix7b: matching selectors -> exits 0", rc == 0)
+
+    # ---- #312: _marker_key() must follow the floor's session key, not $TMUX alone ----------
+    # THE BUG #312 CREATED HERE (found by an adversarial round, not by this suite): pre-#312 no
+    # $TMUX genuinely meant no marker could exist, so marker_key="" was TRUE and a lease keyed ""
+    # was correctly reclaimable. Once #312 let a NON-tmux session ARM a marker, a tmux-only
+    # _marker_key() reported "" for a session that is armed and ALIVE -> _marker_absent() reads
+    # True -> the GC reclaims a LIVE teammate's lease once past the grace window -> the next
+    # allocate hands out a port that is still in use. Two teammates, one port.
+    with tempfile.TemporaryDirectory() as td312:
+        st312 = os.path.join(td312, "resources.json")
+        base312 = os.path.join(td312, "rbase")
+        floor312 = os.path.join(td312, "floor.d"); os.makedirs(floor312)
+        ov312 = {"ORCHESTRATE_RESOURCES_FILE": st312, "ORCHESTRATE_RESOURCE_BASE": base312,
+                 "ORCHESTRATE_PORT_RANGE": "2100-2200", "ORCHESTRATE_FLOOR_DIR": floor312}
+        CCSID = "res-sess-9x"
+        CCKEY = "ccsid_res_sess_9x"
+        # A NON-tmux session that armed a marker: its lease must record the ccsid key, so the
+        # marker is found and the lease is NOT reclaimable.
+        open(os.path.join(floor312, CCKEY), "w").close()
+        rc, out, err = run(["allocate", "--session", "S1", "--teammate", "t1"],
+                           env_overrides=ov312, tmux=None, ccsid=CCSID)
+        check("#312 resources: allocate in a non-tmux session succeeds", rc == 0)
+        lease = json.load(open(st312))["leases"][0] if os.path.exists(st312) else {}
+        check("#312 resources: the lease records the ccsid marker key, not an empty string",
+              lease.get("marker_key") == CCKEY)
+        # THE REGRESSION ITSELF: with the marker present, the lease must survive GC. Age it PAST
+        # THE GRACE WINDOW (300s) but WELL INSIDE the TTL (72h), so the marker check is the only
+        # thing that can save it. Ageing it to 2000-01-01 instead would trip the HARD TTL
+        # BACKSTOP, which reclaims regardless of the marker - the test would then fail for a
+        # reason that has nothing to do with the key derivation under test.
+        st = json.load(open(st312))
+        _aged = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=30)
+        st["leases"][0]["created"] = _aged.strftime("%Y-%m-%dT%H:%M:%SZ")
+        json.dump(st, open(st312, "w"))
+        rc, out, err = run(["allocate", "--session", "S2", "--teammate", "t2"],
+                           env_overrides=ov312, tmux=None, ccsid=CCSID)
+        _leases = json.load(open(st312)).get("leases", [])
+        # The port lives at resources.port.value, NOT a top-level "port" key - reading the wrong
+        # field yields [None, None], which silently "passes" a distinctness check for the wrong
+        # reason and would have hidden a real double-allocation.
+        ports = [ln.get("resources", {}).get("port", {}).get("value") for ln in _leases]
+        sessions = sorted(ln.get("session") for ln in _leases)
+        check("#312 resources: a LIVE non-tmux session's lease is NOT GC'd (marker found)",
+              rc == 0 and sessions == ["S1", "S2"])
+        check("#312 resources: both live non-tmux leases hold DISTINCT ports (no double-allocation)",
+              len(ports) == 2 and all(p is not None for p in ports) and len(set(ports)) == 2)
+        # THE ASYMMETRIC CASE (round-5 finding; the symmetric case above did NOT cover it).
+        # `up` runs as a Bash TOOL CALL so its env is command-controllable (`env -u TMUX ... up`)
+        # -> the marker can be armed under the CCSID key while a later allocate sees a real
+        # $TMUX. Recording only the first-precedence key made the lease look UNOWNED, so the GC
+        # reclaimed a LIVE session's lease and the next allocate handed out its port. The lease
+        # must record EVERY candidate and be alive if ANY marker is present, mirroring the guard.
+        # (Re-deriving at GC time would be WRONG: the GC runs inside ANOTHER session's allocate,
+        # so the ambient env is not the lease owner's.)
+        floor_asym = os.path.join(td312, "floor-asym"); os.makedirs(floor_asym)
+        st_asym = os.path.join(td312, "asym.json")
+        ov_asym = dict(ov312); ov_asym.update({"ORCHESTRATE_FLOOR_DIR": floor_asym,
+                                               "ORCHESTRATE_RESOURCES_FILE": st_asym,
+                                               "ORCHESTRATE_PORT_RANGE": "2300-2400"})
+        # Marker armed under the CCSID key only (the env-sanitized `up`)...
+        open(os.path.join(floor_asym, CCKEY), "w").close()
+        # ...while allocate runs WITH a real $TMUX (so first-precedence would be the tmux key).
+        rc, out, err = run(["allocate", "--session", "S1", "--teammate", "t1"],
+                           env_overrides=ov_asym, tmux="/tmp/tmux-501/default,99,0", ccsid=CCSID)
+        check("#312 resources: asymmetric-env allocate succeeds", rc == 0)
+        _l1 = json.load(open(st_asym))["leases"][0]
+        # Pin the EXACT candidate list, in precedence order. A membership check
+        # (`CCKEY in marker_keys`) is too weak: it passes on `[CCKEY]` alone - a lease that
+        # silently DROPPED the tmux candidate, which is the very defect this case exists to catch.
+        _tmux_key_asym = _key("/tmp/tmux-501/default,99,0")
+        check("#312 resources: lease records the EXACT candidate list [tmux_key, ccsid_key]",
+              (_l1.get("marker_keys") or []) == [_tmux_key_asym, CCKEY])
+        check("#312 resources: legacy marker_key stays the FIRST-PRECEDENCE (tmux) key",
+              _l1.get("marker_key") == _tmux_key_asym)
+        _aged2 = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=30)
+        _st = json.load(open(st_asym))
+        _st["leases"][0]["created"] = _aged2.strftime("%Y-%m-%dT%H:%M:%SZ")
+        json.dump(_st, open(st_asym, "w"))
+        rc, out, err = run(["allocate", "--session", "S2", "--teammate", "t2"],
+                           env_overrides=ov_asym, tmux="/tmp/tmux-501/default,99,0", ccsid=CCSID)
+        _ls = json.load(open(st_asym)).get("leases", [])
+        _sessions = sorted(ln.get("session") for ln in _ls)
+        _ports = [ln.get("resources", {}).get("port", {}).get("value") for ln in _ls]
+        check("#312 resources: ARM/CHECK ASYMMETRY - a live lease is NOT GC'd (marker found via "
+              "the ccsid candidate)", rc == 0 and _sessions == ["S1", "S2"])
+        check("#312 resources: asymmetric case keeps DISTINCT ports (no double-allocation)",
+              len(_ports) == 2 and all(p is not None for p in _ports) and len(set(_ports)) == 2)
+        # BACKWARD COMPAT with a REAL pre-#312 lease. It carries only the legacy single
+        # `marker_key`, and that key can only ever be a TMUX key - pre-#312 no other derivation
+        # existed. Keying this fixture with a ccsid would fabricate a lease that could never have
+        # been written and would prove nothing about the fallback. Arm the matching TMUX marker so
+        # the fallback has a real marker to find.
+        open(os.path.join(floor_asym, _tmux_key_asym), "w").close()
+        _st = json.load(open(st_asym))
+        _st["leases"][0].pop("marker_keys", None)
+        _st["leases"][0]["marker_key"] = _tmux_key_asym
+        _st["leases"][0]["created"] = _aged2.strftime("%Y-%m-%dT%H:%M:%SZ")
+        json.dump(_st, open(st_asym, "w"))
+        rc, out, err = run(["allocate", "--session", "S3", "--teammate", "t3"],
+                           env_overrides=ov_asym, tmux="/tmp/tmux-501/default,99,0", ccsid=CCSID)
+        _sessions = sorted(ln.get("session") for ln in json.load(open(st_asym)).get("leases", []))
+        check("#312 resources: a REAL legacy lease (tmux marker_key only, no marker_keys) is "
+              "still honored via the fallback", rc == 0 and "S1" in _sessions)
+
+        # And the fail-closed end still holds: NEITHER identifier -> no key -> "" -> reclaimable,
+        # which is the ORIGINAL, still-correct meaning of an empty marker_key.
+        rc, out, err = run(["allocate", "--session", "S3", "--teammate", "t3"],
+                           env_overrides=ov312, tmux=None, ccsid=None)
+        lease3 = [ln for ln in json.load(open(st312)).get("leases", []) if ln.get("session") == "S3"]
+        check("#312 resources: an UNKEYED session records marker_key='' (unchanged semantics)",
+              rc == 0 and lease3 and lease3[0].get("marker_key") == "")
 
     print()
     if FAILS:
