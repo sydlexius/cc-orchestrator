@@ -556,7 +556,7 @@ leaving for a follow-up.
 
 ---
 
-## Step 7 -- Commit, get SHA, then post replies
+## Step 7 -- Commit, push, then post replies
 
 Commit all fixes in a single commit:
 
@@ -574,6 +574,24 @@ Get the short SHA:
 ```bash
 git rev-parse --short HEAD
 ```
+
+### Push first (default order)
+
+The DEFAULT order is PUSH-FIRST: commit -> push -> reply-with-hash -> resolve.
+CR auto-review is OFF org-wide, so a push triggers no automatic re-review, and a
+SHA-citing reply to a not-yet-pushed commit 404s (the #2038 failure). Pushing first
+makes the cited commit reachable before any reply references it. Push now:
+
+```bash
+git push origin $(git branch --show-current) 2>&1
+```
+
+Report the result. If the push fails, explain why -- do not retry automatically.
+
+**EXCEPTION -- CR auto-review is ON for this repo** (CodeRabbit posts an unsolicited
+review with no trigger, i.e. it auto-dismisses + re-triggers on every push): use the
+REPLY-FIRST order instead -- reply + resolve, THEN push (Step 8.5). The org default is
+auto-review OFF, so push-first is the standing case; see Step 8.5 for the full rule.
 
 Now substitute the real SHA into all "Fixed in <sha>" reply drafts from step 6.
 
@@ -663,14 +681,13 @@ Step 9 summary so the reader knows it was handled but not threaded.
 
 ---
 
-## Step 8 -- Resolve review threads (BEFORE push)
+## Step 8 -- Resolve review threads
 
-After replies are posted in Step 7 and **before** running `git push`, resolve the
-threads that were replied to in this round. Resolving before push is mandatory:
-pushing first races CodeRabbit's automatic re-review, which can auto-resolve fresh
-threads from the new round and lock them out of inline replies. The resolve step
-acts on already-replied threads and does not require the new commit to be visible
-on origin.
+After the replies are posted (Step 7, against the already-pushed SHA), resolve the
+threads that were replied to in this round. In the push-first default the commit is
+already on origin, so every cited "Fixed in <sha>" is reachable before the thread is
+resolved. (In the reply-first EXCEPTION -- Step 8.5, CR auto-review ON -- this resolve
+runs before the push instead; it acts on already-replied threads either way.)
 
 ### CodeRabbit threads -- `@coderabbitai resolve`
 
@@ -722,20 +739,34 @@ reflect thread resolution status across both bots.
 
 ---
 
-## Step 8.5 -- Push
+## Step 8.5 -- Push order (default vs the one exception)
 
-Only after all resolves above have been requested (CR) and applied (Copilot +
-Greptile via GraphQL), push.
+In the default flow the push already happened in Step 7. This section records WHY,
+and the single case where you invert it. It mirrors the push-order rule in the
+user-global CLAUDE.md; keep the two in agreement.
 
-Then push:
+**DEFAULT = PUSH-FIRST** (commit -> push -> reply-with-hash -> resolve). This is the
+standing order because CR auto-review is OFF org-wide (`.coderabbit.yaml`
+`auto_review.enabled: false`): a push triggers no automatic re-review, and a
+SHA-citing reply to a not-yet-pushed commit 404s (the #2038 failure). Push first so
+the cited commit is reachable, then reply-with-hash and resolve.
+
+**EXCEPTION = REPLY-FIRST** -- only when CR auto-review is ON for this repo (CodeRabbit
+posts an unsolicited review with no trigger, i.e. it auto-dismisses + re-triggers on
+every push). There a fix-round push races CR's automatic re-review and can auto-resolve
+fresh threads before they are replied to. In that case invert: reply (Step 7 replies)
+and resolve (Step 8) FIRST, then push here --
 
 ```bash
 git push origin $(git branch --show-current) 2>&1
 ```
 
-Report the result. If the push fails, explain why -- do not retry automatically.
-Do not invert this order: resolving after push races CR's automatic re-review and
-has caused fresh threads to be auto-resolved before they could be replied to.
+-- annotating the replies "push in-flight" so the re-triggered review never runs ahead
+of the thread handling.
+
+Either way, "never ship with unhandled review" is enforced at the pre-MERGE ship-gate
+(`ship-gate-preflight` + `pr-unreplied-comments`), NOT by push order. If a push fails,
+explain why -- do not retry automatically.
 
 ---
 

@@ -5,7 +5,7 @@ description: Use when scaffolding and running a lead-orchestrated multi-agent se
 
 # Orchestrate: lead-run multi-agent PR pipeline
 
-**Version 0.84.0** (semver; releases tagged `vX.Y.Z`). Bump on any material change to this skill, its templates, or the runtime - PATCH for a fix, MINOR for a new rule/feature, MAJOR for a breaking charter or deterministic-floor change - so `/reload-skills` surfaces the new number and drift between the symlinked repo and the loaded skill is visible. History: `git log` + the GitHub Release notes cut at each `vX.Y.Z` tag.
+**Version 0.84.1** (semver; releases tagged `vX.Y.Z`). Bump on any material change to this skill, its templates, or the runtime - PATCH for a fix, MINOR for a new rule/feature, MAJOR for a breaking charter or deterministic-floor change - so `/reload-skills` surfaces the new number and drift between the symlinked repo and the loaded skill is visible. History: `git log` + the GitHub Release notes cut at each `vX.Y.Z` tag.
 
 You are the LEAD (orchestrator). You delegate building and the mechanical PR
 lifecycle to single-purpose teammates, and you keep for yourself the decisions
