@@ -126,21 +126,56 @@ def _load_settings():
         return None
 
 
+# #294: the teammate backends that are DOCUMENTED and actually spawn teammates. `tmux` gives
+# the pane-split UX; `iterm2` splits an iTerm2 pane; `in-process` runs async agents in-session;
+# `auto` resolves to whichever the terminal supports. ALL are working configurations - only the
+# pane layout differs. Doctor used to hard-fail everything except `tmux`, which was false (both
+# CLAUDE.md files document the iTerm2 / in-process fallback) and aborted `up` for a condition
+# the maintainer PREFERS. Keep in lockstep with the harness `teammateMode` enum.
+SUPPORTED_TEAMMATE_MODES = ("tmux", "iterm2", "in-process", "auto")
+
+
 def check_agent_teams(settings):
+    """Doctor check: Agent Teams ENABLED is a genuine dependency (teammates cannot spawn at
+    all without it) and stays a FAIL. The BACKEND is advisory (#294): any documented
+    teammateMode is a PASS; an unrecognized one is a WARN, never a FAIL - doctor cannot know
+    that a mode it does not recognize is broken, and a false hard-fail is the defect #294
+    fixes. Read-only: inspects the env + settings, changes nothing."""
     on = os.environ.get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS") == "1"
     if not on and settings:
         on = settings.get("env", {}).get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS") == "1"
     mode = (settings or {}).get("teammateMode")
-    if on and mode == "tmux":
-        return _emit(PASS, "Agent Teams enabled (env=1, teammateMode=tmux)")
-    return _emit(FAIL, f"Agent Teams not ready (enabled={on}, teammateMode={mode!r}); set CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 + teammateMode=tmux")
+    if not on:
+        return _emit(FAIL, f"Agent Teams not ready (enabled={on}, teammateMode={mode!r}); "
+                           "set CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1")
+    if mode in SUPPORTED_TEAMMATE_MODES:
+        return _emit(PASS, f"Agent Teams enabled (env=1, teammateMode={mode})")
+    if mode is None:
+        return _emit(WARN, "Agent Teams enabled (env=1) but teammateMode is UNSET; the harness picks "
+                           f"a backend ({'/'.join(SUPPORTED_TEAMMATE_MODES)}). Set it explicitly to pin the UX.")
+    return _emit(WARN, f"Agent Teams enabled (env=1) but teammateMode={mode!r} is not a documented "
+                       f"backend ({'/'.join(SUPPORTED_TEAMMATE_MODES)}); teammates may not spawn as expected")
 
 
 def check_tmux():
+    """Doctor check (WARN-level, #294): tmux is the PREFERRED teammate backend, NOT a
+    requirement - this check WARNs, never FAILs. Outside tmux, teammates still spawn via the
+    documented iTerm2 / in-process backend; only the pane layout differs, and the pipeline plus
+    the deterministic floor are entirely unaffected. PASS = tmux installed AND lead inside it.
+    Read-only: inspects $TMUX + PATH, changes nothing.
+
+    NOTE: marker-arming genuinely REQUIRES $TMUX - `_session_key()` returns None without it, so
+    a non-tmux session can never arm or own an orchestrate marker (by design). That is the one
+    capability that really needs tmux, so each WARN names it rather than implying tmux is
+    optional for everything."""
+    fallback = ("teammates spawn via the iTerm2 / in-process backend instead "
+                "(pane layout differs; pipeline + deterministic floor unaffected)")
+    marker = ("NOTE: marker-arming still requires $TMUX by design (_session_key), so no "
+              "orchestrate marker can be armed here")
     if not shutil.which("tmux"):
-        return _emit(FAIL, "tmux not installed")
+        return _emit(WARN, f"tmux not installed - {fallback}. {marker}.")
     if not os.environ.get("TMUX"):
-        return _emit(FAIL, "lead is NOT inside tmux ($TMUX empty) - teammates will not spawn; relaunch claude inside tmux")
+        return _emit(WARN, f"lead is not inside tmux ($TMUX empty) - {fallback}. {marker}.")
     return _emit(PASS, "tmux installed and lead is inside it")
 
 
@@ -864,10 +899,35 @@ def _now_iso():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# #294: the single honest explanation for "up cannot arm here". Held as ONE constant so the
+# fail-fast pre-check and the arm_marker backstop can never drift into telling the operator two
+# different stories. Deliberately states the REAL reason (marker-arming needs a $TMUX-derived
+# key that must match the guard's) instead of the old, false "teammates will not spawn".
+_NO_SESSION_KEY_ABORT = (
+    "\nup: ABORT - cannot arm the floor marker: no session key ($TMUX is empty).\n"
+    "  The marker is keyed off $TMUX because orchestrate-guard.sh derives its key the\n"
+    "  same way; with no key the marker-gated merge deny cannot engage, and a team\n"
+    "  stood up here would run with the Tier-2 merge gate OFF.\n"
+    "  This is NOT a teammate-spawning problem: teammates spawn fine outside tmux via\n"
+    "  the iTerm2 / in-process backend. Only marker-arming needs tmux.\n"
+    "  Fix: relaunch claude inside tmux to stand up a gated team session (or work solo,\n"
+    "  where no marker is needed because the merge is yours to run anyway)."
+)
+
+
 def _session_key():
     """This session's marker key, mirroring the guard's sanitization EXACTLY.
     Returns None when $TMUX is empty (a non-tmux session is never an orchestrate
-    session and must never arm/own a marker)."""
+    session and must never arm/own a marker).
+
+    #294 INVARIANT - DO NOT RELAX THIS $TMUX REQUIREMENT. Doctor's tmux CHECK was
+    downgraded FAIL -> WARN because tmux is only a UX preference for teammate panes.
+    Marker-arming is the exception: it is a GENUINE tmux dependency, because the key
+    must match `orchestrate-guard.sh`'s own `$TMUX`-derived key BYTE FOR BYTE - the
+    guard's marker gate and this function are two halves of one contract. Keying a
+    marker off anything else (or defaulting it when $TMUX is empty) would let a
+    non-tmux session arm a marker the guard cannot see, silently breaking the
+    marker-gated merge deny. Advisory checks may soften; this may not."""
     tmux = os.environ.get("TMUX", "")
     if not tmux:
         return None
@@ -1270,6 +1330,15 @@ def cmd_up(args):
     # doctor already WARNs at check_guard_stale(); this adds a more prominent block with the
     # specific remedy so the operator cannot miss it at `up` time.
     _check_stale_guard_at_up()
+    # #294 FAIL FAST, BEFORE scaffold_artifacts. Doctor's tmux checks are ADVISORY now, so a
+    # non-tmux `up` sails past the doctor gate above where it previously stopped there. Check
+    # the ONE genuine tmux dependency here, so a session that provably cannot arm refuses
+    # WITHOUT first littering the artifact dir (stack.json / profile.env / brief / planner
+    # seed) on a pure refusal path. arm_marker's RuntimeError is still caught below as a
+    # backstop - $TMUX could in principle vanish between this check and that call.
+    if _session_key() is None:
+        print(_NO_SESSION_KEY_ABORT, file=sys.stderr)
+        return 1
     # Reuse HEAD from doctor's check_repo_main; add timeout + empty-tolerant fallback.
     _repo_status, head = check_repo_main(args.repo)
     if not head:
@@ -1287,6 +1356,13 @@ def cmd_up(args):
         # FLOOR_DIR unwritable or not a directory: abort cleanly (safe direction - not
         # armed) instead of a raw traceback.
         print(f"\nup: ABORT - cannot arm the floor marker under {FLOOR_DIR}: {e}", file=sys.stderr)
+        return 1
+    except RuntimeError as e:
+        # #294 BACKSTOP. The fail-fast pre-check above catches the normal no-$TMUX case before
+        # any scaffolding; this stays for the race where $TMUX vanishes between that check and
+        # here. Previously this RuntimeError was UNCAUGHT (cmd_up handled only OSError) and `up`
+        # died on a raw traceback. Fail toward NOT armed, with the same single explanation.
+        print(f"{_NO_SESSION_KEY_ABORT}\n  (raised at arm time: {e})", file=sys.stderr)
         return 1
     # Treat an exception from the self-test (e.g. the guard binary vanished between
     # doctor and here) the same as a failed test: never leave a half-armed orphan marker.
