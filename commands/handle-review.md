@@ -708,7 +708,18 @@ Report that CR resolve was requested.
 
 Copilot (`copilot-pull-request-reviewer[bot]`), Greptile (`greptile-apps[bot]`),
 and Codoki (`codoki-pr-intelligence[bot]`) threads must all be resolved via
-GraphQL -- none of them has a `@<bot> resolve` slash command. The default
+GraphQL -- none of them has a `@<bot> resolve` slash command.
+
+**NEVER `@`-mention Copilot** (#295). Unlike CodeRabbit -- whose mention is
+load-bearing for acknowledgement/resolution -- Copilot NEVER responds to a mention:
+`@copilot-pull-request-reviewer[bot]` is an inert login, not an invocation, so the
+mention buys nothing (the reply still posts, cites the fix SHA, and resolves via the
+GraphQL call below), and dropping it removes any premium-request doubt. And NEVER
+write a bare `@copilot` in a PR comment -- that invokes the paid Copilot CODING AGENT
+(agentic, spends premium requests), not the reviewer. The same holds for Greptile and
+a legacy Codoki thread: resolve via GraphQL, do not `@`-mention.
+
+The default
 `--bot` regex on `resolve-threads.sh` is `copilot|greptile|codoki`, so a single
 call covers all three bots when the IDs span them:
 
