@@ -964,10 +964,17 @@ def _marker_path():
 
 
 def arm_marker(team, repo, head):
-    """Arm THIS session's keyed marker. Refuses without $TMUX (cannot key it)."""
+    """Arm THIS session's keyed marker. Refuses only when the session has NO key at all.
+
+    #312: tmux is NOT required - `_session_key()` falls back to $CLAUDE_CODE_SESSION_ID, so
+    this raises only when NEITHER identifier is set. The message must not name $TMUX as the
+    cause: it is interpolated into cmd_up's operator-facing abort, which would then print
+    `_NO_SESSION_KEY_ABORT` ("tmux is NOT required (#312)") immediately followed by a
+    contradicting "without $TMUX" - two stories in one message, the exact failure the shared
+    constant exists to prevent."""
     path = _marker_path()
     if not path:
-        raise RuntimeError("cannot arm the floor without $TMUX (no session key)")
+        raise RuntimeError("no session key: neither $TMUX nor $CLAUDE_CODE_SESSION_ID is set")
     os.makedirs(FLOOR_DIR, exist_ok=True)
     with open(path, "w") as f:
         f.write(f"orchestrate session\nteam: {team}\nstarted: {_now_iso()}\n"

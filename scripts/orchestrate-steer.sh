@@ -402,9 +402,12 @@ fi
 # Earlier drafts of this rule shipped each half alone; both were wrong, in opposite directions.
 #
 # THREE ACCEPTED LIMITATIONS, stated so nobody mistakes this for full enforcement:
-#  (a) ~15% BLIND. marker_active() is $TMUX-keyed, and $TMUX was ABSENT on 7 of the 45 live spawns the
-#      #221 spike captured (the in-process spawn case), where this rule silently no-ops. It is a
-#      NUDGE on the common path, NOT a guarantee.
+#  (a) NUDGE, NOT A GUARANTEE. (#312 CLOSED the old "~15% blind" gap: marker_active() used to be
+#      $TMUX-keyed, so it silently no-opped on the 7-of-45 live spawns the #221 spike captured
+#      where $TMUX was ABSENT - exactly the in-process spawn case this rule most wants to catch.
+#      The key now falls back to $CLAUDE_CODE_SESSION_ID, so those spawns ARE covered.) It remains
+#      a nudge: an UNKEYED session (neither identifier) is still never gated, and this is advisory
+#      either way.
 #  (b) OVER-APPROXIMATES "team is live". The CLAUDE.md override forbids a foreground agent when the
 #      lead has LIVE NAMED TEAMMATES, and re-sanctions the foreground one-shot when SOLO. A marker is
 #      the closest proxy the hook can see, but it has a 72h TTL - so a lead who tore the team down and

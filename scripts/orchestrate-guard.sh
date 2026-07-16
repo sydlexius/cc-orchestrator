@@ -268,17 +268,20 @@ is_pr_merge() {
 # id -> ungated. Both halves hold. (A per-pane id like $TERM_SESSION_ID does NOT: teammates
 # would fall outside the marker - the gate off for exactly the processes it must gate.)
 #
-# ===== DERIVATION REGISTRY - FIVE live copies. Update them TOGETHER. =====
+# ===== DERIVATION REGISTRY - SIX live copies. Update them TOGETHER. =====
 #   1. THIS FILE, `_session_keys()`                      - the deny authority (gates merges)
 #   2. scripts/orchestrate-setup.py `_session_key()`     - ARMS the marker (first-precedence)
 #   3. scripts/orchestrate-authorize-merge.sh            - writes the merge-auth token
 #   4. scripts/orchestrate-steer.sh `_session_keys()`    - advisory nudges (marker-gated rules)
 #   5. commands/merge-pr.md (the marker-detect snippet)  - routes solo-vs-handoff
+#   6. scripts/orchestrate-resources.py `_marker_key()`   - lease liveness (GC reclaim)
 #
-# This registry is LOAD-BEARING, not bookkeeping: it previously listed only 1-3, and #312's
-# first pass updated exactly those three - leaving 4 and 5 silently on the old tmux-only
-# derivation. An incomplete registry IS the drift mechanism. If you add a sixth copy, add it
-# here; better, do not add one.
+# This registry is LOAD-BEARING, not bookkeeping. It listed 1-3, and #312's first pass updated
+# exactly those three - leaving 4 and 5 on the old tmux-only derivation. Corrected to five; an
+# adversarial round then found 6 (which #312 had newly BROKEN: a tmux-only key reported "no
+# marker" for an armed non-tmux session, so the lease GC reclaimed a LIVE teammate's lease and
+# double-allocated its port). An incomplete registry IS the drift mechanism - each miss was
+# exactly a copy nobody thought to update. If you add a seventh, add it here; better, do not.
 #
 # All copies MUST agree byte for byte: drift means the marker is armed under one key and
 # looked up under another, and the gate goes SILENTLY OFF. TWO suites pin this, and BOTH must
