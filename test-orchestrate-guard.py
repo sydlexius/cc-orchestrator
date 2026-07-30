@@ -710,7 +710,8 @@ def main():
     # proves three properties the block/allow table cannot: every BLOCK vector clears the
     # short-circuit, every fragment is independently load-bearing, and the live use site
     # interpolates the derived union rather than a hand-written literal.
-    _ac = subprocess.run([GUARD, "--assert-coverage"], capture_output=True, text=True)
+    _ac = subprocess.run([GUARD, "--assert-coverage"], capture_output=True, text=True,
+                         timeout=30)
     if _ac.returncode != 0:
         FAILS.append(f"#324: --assert-coverage failed (rc={_ac.returncode}): "
                      f"{(_ac.stderr or _ac.stdout).strip()[:300]}")
@@ -733,10 +734,22 @@ def main():
          '_pf_rc=0; printf \'%s\' "$orig_cmd" | grep -Eq -e "$_PREFILTER_PARTS" || _pf_rc=$?',
          '_pf_rc=0; printf \'%s\' "$orig_cmd" | grep -Eq -e \'push|--admin\' || _pf_rc=$?', True),
         # --- the four below came from adversarial review of this very diff ------------------
-        # A fragment REORDER is a security event, not a style choice: a fragment beginning with
-        # `--` landing first would be parsed as a grep flag. `-e` at the use site defuses it;
-        # this mutation is what proves `-e` is actually there and load-bearing.
-        ("fragment reordered so a `--` fragment is FIRST (flag-parse hazard)",
+        # WHAT THIS MUTANT ACTUALLY PROVES (corrected after a CodeRabbit finding; the earlier
+        # comment claimed it proved `-e` was load-bearing, which is false twice over).
+        #
+        # It replaces the FIRST assignment, so `$_PF_PUSH` leaves the union entirely. It is
+        # therefore caught by the same reachability property as the other omission mutants: the
+        # `safe-push-main` vector is no longer admitted. Nothing here exercises grep's flag
+        # parsing.
+        #
+        # And measured (6 probes, 0 divergences): `-e` is NOT independently load-bearing at all,
+        # because the fail-closed change subsumes it. Dropping `-e` with a `--`-prefixed fragment
+        # first makes grep exit 2, and `2 != 1` ENTERS the loop, so every deny still fires. The
+        # two hardenings are DEFENSE IN DEPTH, not one mechanism: fail-closed is what preserves
+        # the floor, `-e` keeps the fast path working by intent rather than by accident. There is
+        # deliberately no "-e removed" mutant, because removing it is not observable in the floor's
+        # behavior - only in whether the prefilter can do its job.
+        ("first fragment unregistered via reorder (push fragment leaves the union)",
          '_PREFILTER_PARTS="$_PF_PUSH"\n', '_PREFILTER_PARTS="$_PF_NO_VERIFY"\n', True),
         # A malformed union makes `grep -E` exit 2. With a bare `if` that read as "no trigger
         # present" and skipped the loop, disabling EVERY deny; the `-ne 1` fail-closed test is
@@ -772,7 +785,10 @@ def main():
             os.chmod(_mp, 0o755)
             # Invoke via an explicit path: --assert-coverage re-invokes "$0" for the
             # end-to-end leg, which needs $0 to be executable (the ./ rule in CLAUDE.md).
-            _r = subprocess.run([_mp, "--assert-coverage"], capture_output=True, text=True)
+            # timeout: a MUTANT guard is deliberately broken, so it is exactly the code most
+            # likely to hang. Without this a bad mutation stalls CI instead of failing it.
+            _r = subprocess.run([_mp, "--assert-coverage"], capture_output=True, text=True,
+                                timeout=30)
             _caught = _r.returncode != 0
             if _must_catch is None:
                 # Detection is grep-implementation-dependent for this mutant (see its comment);
@@ -800,7 +816,7 @@ def main():
                     ["bash", _mp], input=json.dumps(
                         {"tool_name": "Bash",
                          "tool_input": {"command": "git " + "push origin " + "main"}}),
-                    capture_output=True, text=True, env=_penv)
+                    capture_output=True, text=True, env=_penv, timeout=15)
                 if _live.returncode != 2:
                     FAILS.append(
                         f"#324 mutation '{_label}' [{_plabel}]: the mutant ALLOWED a Tier-1 "

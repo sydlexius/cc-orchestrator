@@ -146,7 +146,14 @@ pr-merge-cli|gh pr merge 1 --squash"
     if [ "$ac_rc" -ne 2 ]; then
       case "$ac_label" in
         merge-by-api|pr-merge-cli)
-          # marker-GATED: allowed in a solo session by design, so exit 0 here is correct.
+          # marker-GATED: ALLOW (exit 0) in a solo session is correct by design. But pin that
+          # exactly rather than accepting "anything but 2": a guard that ABORTS (rc=1, or any
+          # error) is not an intentional allow, and treating it as one would let this leg pass
+          # silently on a crashing guard - a green check that proves nothing.
+          if [ "$ac_rc" -ne 0 ]; then
+            echo "GUARD ERROR: $ac_label expected exit 0 (solo allow) or 2 (gated block), got $ac_rc" >&2
+            ac_fail=1
+          fi
           ;;
         *)
           echo "NOT BLOCKED: $ac_label expected exit 2, got $ac_rc" >&2
@@ -726,11 +733,13 @@ is_push_clause=0
 #
 # TWO NON-OBVIOUS HARDENINGS, both load-bearing (found by adversarial review of #324):
 #
-# `-e` is REQUIRED, not stylistic. The union is interpolated, and a fragment may legitimately
-# begin with `--` (`$_PF_NO_VERIFY` does). Without `-e`, if such a fragment ever lands FIRST in
-# the alternation, grep parses the whole pattern as one of its own flags, errors, and - with a
-# bare `if` - the loop is SKIPPED, disabling EVERY deny for EVERY command. Registry order must
-# never be a security property.
+# `-e` keeps the PREFILTER FUNCTIONAL. The union is interpolated, and a fragment may legitimately
+# begin with `--` (`$_PF_NO_VERIFY` does). Without `-e`, such a fragment landing FIRST makes grep
+# parse the whole pattern as one of its own flags and error out. Note precisely what that costs
+# GIVEN the fail-closed test below: the floor still holds (an error is not exit 1, so the loop is
+# ENTERED and every deny fires) - what breaks is the OPTIMIZATION, since every command then takes
+# the slow path. So `-e` is defense in depth, not the safety property; measured, dropping it
+# changes no verdict. It is kept so registry ORDER is never load-bearing in either direction.
 #
 # FAIL CLOSED on a pattern error. `grep -Eq` exits 0 = matched, 1 = definitively did not match,
 # 2 = the pattern itself is broken (unbalanced bracket/paren, empty subexpression). Only exit 1
