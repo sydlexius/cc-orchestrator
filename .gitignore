@@ -10,6 +10,11 @@
 # `*.bak` glob above). Machine-local session state, not repo content.
 .claude/memory-*.json
 .claude/*.bak-*
+# Hookify rules are machine-local by convention (the `.local.md` suffix). Keep them out of
+# git: a rule can encode a property of THIS machine rather than of the project (the lsof
+# block, for instance, exists because lsof does not complete on the maintainer's Mac - a
+# contributor whose lsof works would be blocked for no reason).
+.claude/hookify.*.local.md
 
 # Python
 __pycache__/

@@ -12,14 +12,15 @@ Design: ~/.claude/skills/orchestrate/design/DESIGN-phase3a-resource-registry.md
 """
 import argparse
 import datetime
+import errno
 import fcntl
 import json
 import os
 import re
 import shlex
 import shutil
+import socket
 import sqlite3
-import subprocess
 import sys
 import urllib.parse
 
@@ -165,40 +166,56 @@ def cmd_list(args):
     return 0
 
 
-def _listening_ports_snapshot():
-    """Set of all TCP ports with an active LISTENer, from a SINGLE lsof enumeration.
+def _port_is_listening(port):
+    """True if `port` has a live TCP LISTENer, decided by ASKING THE KERNEL (a bind
+    attempt), not by parsing a process-inventory tool (#352).
 
-    #98: the old code fanned out one `lsof -iTCP:PORT` per port across the whole
-    ORCHESTRATE_PORT_RANGE (~101 calls for the default 1980-2080). When lsof is slow
-    (e.g. it crawls the macOS TimeMachine localsnapshot volumes), that fan-out makes
-    `allocate` hang past the harness timeout. One `lsof -nP -iTCP -sTCP:LISTEN` enumerates
-    every listener in a single crawl, so a slow lsof costs one call, not N.
+    WHY NOT lsof (the history matters, because this was optimized twice before being
+    questioned once). The original code ran one `lsof -iTCP:PORT` PER PORT across the
+    whole range (~101 calls). #98 made that ONE global `lsof -nP -iTCP -sTCP:LISTEN`
+    enumerating every listener on the machine, then filtered to the range -- a faster
+    version of the wrong question. The allocator needs a LOCAL answer ("may I have port
+    N?"); enumerating every listener system-wide to derive it is what made the probe
+    slow, tool-dependent, permission-sensitive, and silently fail-open.
 
-    Listener-scoped via `-sTCP:LISTEN` (never a bare lsof that also matches client
-    connections). `-Fn` gives field-prefixed machine output: each `n` line is a network
-    name like `n*:8080` / `n127.0.0.1:2000` / `n[::1]:2000`; the port is the token after
-    the last ':'. lsof unavailable / slow-failure -> empty set: do not block allocation
-    (the eventual bind fails loudly later), exactly as the per-port fallback did."""
+    That fail-open is what #176 and #352 both misread. On a host where lsof does not
+    complete, the timeout returns an EMPTY set, which is indistinguishable from "nothing
+    is listening" -- so the allocator hands out a live port and gc reaps a live lease,
+    with no error anywhere. Measured on the maintainer's Mac (2026-07-30): `lsof -nP
+    -iTCP -sTCP:LISTEN -Fn` never returned, rc=124 at BOTH a 25s and a 60s ceiling, 0
+    lines of output, 6 consecutive attempts. It is not a flake and not port contention;
+    it is deterministic on that machine and had been misfiled twice as both.
+
+    A bind attempt is the kernel's own authority on the only question being asked. It
+    needs no external binary, no output parsing, and no privileges. Measured at 0.00s
+    against lsof's >60s.
+
+    SO_REUSEADDR is deliberately NOT set: with it, a probe bound to 127.0.0.1 fails to
+    see a listener on 0.0.0.0 (and vice versa), so the probe would under-report. Without
+    it, a listener on EITHER address is detected from either probe address (verified both
+    directions), which is the conservative behavior an allocator wants.
+
+    Errors other than "address in use" (EADDRNOTAVAIL, EACCES on a privileged port, ...)
+    report NOT listening: they mean this process cannot bind here, which is a question for
+    the caller's own bind, not evidence of a live listener. The eventual real bind still
+    fails loudly, exactly as before."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        r = subprocess.run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fn"],
-                           capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        return set()  # lsof missing or timed out -> treat as "nothing known to listen"
-    ports = set()
-    for line in r.stdout.splitlines():
-        if not line.startswith("n"):
-            continue
-        name = line[1:]
-        if "->" in name:  # a peer address means an established conn, not a pure listener; skip
-            continue
-        _host, sep, port = name.rpartition(":")
-        if not sep:
-            continue
-        try:
-            ports.add(int(port))
-        except ValueError:
-            continue
-    return ports
+        s.bind(("127.0.0.1", port))
+        return False
+    except OSError as e:
+        return e.errno == errno.EADDRINUSE
+    finally:
+        s.close()
+
+
+def _listening_among(ports):
+    """The subset of `ports` that currently has a live LISTENer.
+
+    No shared-snapshot parameter, and no amortization machinery: the per-port probe costs
+    ~0.00s, so the single-global-scan indirection that existed purely to amortize one slow
+    lsof call is now pure complexity. An empty input still short-circuits."""
+    return {p for p in ports if isinstance(p, int) and _port_is_listening(p)}
 
 
 def _port_range():
@@ -223,14 +240,11 @@ def _leased_ports(state):
     return out
 
 
-def _scan_listening(lo, hi, snapshot=None):
-    """Pre-scan OS-LISTENing ports in [lo, hi], called OUTSIDE the state lock so LOCK_EX is
-    never held across an lsof subprocess (the in-memory pick is the only locked work). #98:
-    ONE lsof enumeration (via `_listening_ports_snapshot`) filtered to the range, not one
-    lsof per port. Pass a shared `snapshot` to reuse a single enumeration across callers."""
-    if snapshot is None:
-        snapshot = _listening_ports_snapshot()
-    return {p for p in snapshot if lo <= p <= hi}
+def _scan_listening(lo, hi):
+    """OS-LISTENing ports in [lo, hi]. Still called OUTSIDE the state lock: the probe is
+    now cheap, but holding LOCK_EX across any syscall loop is the invariant, not an
+    optimization, so the in-memory pick stays the only locked work."""
+    return _listening_among(range(lo, hi + 1))
 
 
 def _free_port(state, listening):
@@ -258,13 +272,13 @@ def cmd_allocate(args):
                      "(must be non-empty and contain no '/' and not be '.' or '..').")
     lease_id = f"{args.session}/{args.teammate}"
     lo, hi = _port_range()
-    # Scan liveness OUTSIDE the lock (I-1: keep LOCK_EX short - no lsof under the lock).
-    # Cover the alloc range AND any already-leased port (a lease may sit outside the range
-    # if the range changed), so the lazy gc below has accurate liveness for every lease.
-    # #98: take ONE lsof enumeration and reuse it for both filters (no per-port fan-out,
-    # no double crawl), so a slow lsof costs a single call.
-    snapshot = _listening_ports_snapshot()
-    listening = _scan_listening(lo, hi, snapshot) | _scan_listening_ports(_leased_ports(_read_state()), snapshot)
+    # Scan liveness OUTSIDE the lock (I-1: keep LOCK_EX short - never hold it across a
+    # syscall loop). Cover the alloc range AND any already-leased port (a lease may sit
+    # outside the range if the range changed), so the lazy gc below has accurate liveness
+    # for every lease. #352: the shared-snapshot plumbing this used to thread through both
+    # calls existed only to amortize ONE slow lsof crawl; a bind probe is ~0.00s per port,
+    # so each call just probes what it needs.
+    listening = _scan_listening(lo, hi) | _scan_listening_ports(_leased_ports(_read_state()))
 
     def mutate(state):
         _gc_inplace(state, listening)  # reclaim dead leases before allocating
@@ -326,21 +340,15 @@ def _marker_absent(lease):
     return not any(os.path.isfile(os.path.join(FLOOR_DIR, k)) for k in keys)
 
 
-def _scan_listening_ports(ports, snapshot=None):
-    """Liveness-scan a set of ports OUTSIDE any lock, from a SINGLE lsof enumeration (#98:
-    was one lsof per port). Pass a shared `snapshot` to reuse one enumeration across callers;
-    an empty `ports` short-circuits with no lsof call at all."""
-    wanted = {p for p in ports if isinstance(p, int)}
-    if not wanted:
-        return set()
-    if snapshot is None:
-        snapshot = _listening_ports_snapshot()
-    return wanted & snapshot
+def _scan_listening_ports(ports):
+    """Liveness-scan a set of ports OUTSIDE any lock. Thin alias over `_listening_among`,
+    kept because two call sites read better with the intent-named form."""
+    return _listening_among(ports)
 
 
 def _reclaimable(lease, listening):
     """`listening` is a pre-scanned set of currently-LISTENing ports (scanned outside the
-    lock, so this stays pure in-memory and LOCK_EX is never held across lsof).
+    lock, so this stays pure in-memory and LOCK_EX is never held across a syscall loop).
 
     Liveness wins over TTL: if the port is currently LISTENing, spare the lease
     unconditionally -- even if it is ancient.  NOT-listening is a precondition for
