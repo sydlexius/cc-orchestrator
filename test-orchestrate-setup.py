@@ -1007,7 +1007,8 @@ def main():
     # path (Option A), retiring claude-kit symlinks; doctor WARNs (never FAILs) on a stale copy.
     HELPERS = ("pr-watch.sh", "pr-unreplied-comments.sh", "pr-read-comments.sh", "reply-comment.sh",
                "resolve-threads.sh", "cleanup-worktree.sh", "patch-coverage.sh",
-               "pr-codeql-autofixes.sh", "safe-push.sh", "ship-gate-preflight.sh", "issue-watch.sh")
+               "pr-codeql-autofixes.sh", "safe-push.sh", "ship-gate-preflight.sh", "issue-watch.sh",
+               "run-paths.sh")
     GUARD_HOOK = {"matcher": "Bash", "hooks": [{"type": "command",
                   "command": 'bash "$HOME/.claude/scripts/orchestrate-guard.sh"'}]}
     with tempfile.TemporaryDirectory() as td:
