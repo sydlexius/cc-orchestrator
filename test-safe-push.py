@@ -70,7 +70,12 @@ GIT_STUB = (
     '  # Stateful: after a push has been recorded, the remote matches local (the push\n'
     '  # landed). Before any push, return the configurable OLD remote SHA (empty = no ref).\n'
     '  if [ -s "$PUSHLOG" ]; then\n'
-    '    printf "%s\\trefs/heads/x\\n" "$LOCAL_SHA"\n'
+    '    # POST_PUSH_REMOTE overrides what the remote reports AFTER the push, so a test can\n'
+    '    # exercise the two VERIFICATION failure branches: unset -> the push landed (default);\n'
+    '    # "none" -> the ref is absent; anything else -> the ref exists but holds that SHA.\n'
+    '    if [ "${POST_PUSH_REMOTE:-}" = "none" ]; then :\n'
+    '    elif [ -n "${POST_PUSH_REMOTE:-}" ]; then printf "%s\\trefs/heads/x\\n" "$POST_PUSH_REMOTE"\n'
+    '    else printf "%s\\trefs/heads/x\\n" "$LOCAL_SHA"; fi\n'
     '  elif [ -n "${REMOTE_SHA:-}" ]; then\n'
     '    printf "%s\\trefs/heads/x\\n" "$REMOTE_SHA"\n'
     "  fi\n"
@@ -81,7 +86,8 @@ GIT_STUB = (
 
 
 def run(args, *, cur_branch="feature/x", local_sha="aaaa111", remote_sha="",
-        mb_r_anc_l=1, mb_l_anc_r=1, cat_file_rc=0, push_rc=0, push_transcript=""):
+        mb_r_anc_l=1, mb_l_anc_r=1, cat_file_rc=0, push_rc=0, push_transcript="",
+        post_push_remote=None):
     """Invoke safe-push.sh with a stubbed git. Returns (rc, stdout, stderr, pushes, log)
     where pushes is the list of recorded `git push ...` argument strings and log is the
     content of safe-push's own log file (read before the tempdir is cleaned up)."""
@@ -105,6 +111,10 @@ def run(args, *, cur_branch="feature/x", local_sha="aaaa111", remote_sha="",
         env["CAT_FILE_RC"] = str(cat_file_rc)
         env["PUSH_RC"] = str(push_rc)
         env["PUSH_TRANSCRIPT"] = push_transcript
+        if post_push_remote is not None:
+            env["POST_PUSH_REMOTE"] = post_push_remote
+        else:
+            env.pop("POST_PUSH_REMOTE", None)
         env["PUSHLOG"] = pushlog
         if cur_branch is not None:
             env["CUR_BRANCH"] = cur_branch
@@ -205,6 +215,49 @@ def main():
     check("failure emits a bounded-tail header", "last" in err.lower() and "lines" in err.lower())
     check("failure surfaces the transcript via the tail", "REMOTE_REJECTED_MARKER" in err)
     check("failure names the log path", "safe-push.log" in err)
+
+    # The single-marker test above proves a tail is EMITTED, not that it is BOUNDED - it would
+    # pass identically if emit_log_tail dumped the whole log. Prove the bound with a transcript
+    # longer than the 30-line window: the NEWEST lines must appear and the OLDEST must not.
+    # (CodeRabbit finding on PR #351: "it would still pass if emit_log_tail dumped the entire log".)
+    print("== #293 FAILURE tail is BOUNDED to the last 30 lines (oldest excluded) ==")
+    long_transcript = "\n".join(f"XSCRIPT_LINE_{i:03d}" for i in range(1, 61))
+    rc, out, err, pushes, log = run(["feature/x"], push_rc=1, push_transcript=long_transcript)
+    check("bounded: exit 1", rc == 1)
+    check("bounded: NEWEST line is in the tail", "XSCRIPT_LINE_060" in err)
+    check("bounded: OLDEST line is NOT in the tail (30-line bound enforced)",
+          "XSCRIPT_LINE_001" not in err)
+    check("bounded: an out-of-window middle line is NOT in the tail",
+          "XSCRIPT_LINE_020" not in err)
+    check("bounded: the FULL transcript is still in the log (both ends)",
+          "XSCRIPT_LINE_001" in log and "XSCRIPT_LINE_060" in log)
+
+    # The other TWO failure branches: git push exits 0 but verification fails. Both must exit 1
+    # through safe-push's own handler with the same bounded tail + log path, or a silently-failed
+    # push reads as success - the exact mode this wrapper exists to catch.
+    print("== #293 VERIFICATION failures: missing ref and SHA mismatch ==")
+    rc, out, err, pushes, log = run(["feature/x"], push_transcript="MISSING_REF_MARKER",
+                                    post_push_remote="none")
+    check("missing-ref: exit 1 (push exited 0 but origin has no ref)", rc == 1)
+    # Assert the DISTINGUISHING phrase, not loose substrings. `"no" in err and "ref" in err`
+    # also matched the SHA-mismatch fallback ("does NOT match" contains "no"; the log path
+    # contains "ref"), so the check passed even with the missing-ref branch disabled - a test
+    # with no teeth. The two branches deliberately overlap (an empty remote_sha also fails the
+    # mismatch check), so only the message text tells them apart.
+    check("missing-ref: reports the ABSENT-ref case specifically (not the mismatch fallback)",
+          "has no" in err and "does not match" not in err)
+    check("missing-ref: emits the bounded-tail header",
+          "last" in err.lower() and "lines" in err.lower())
+    check("missing-ref: names the log path", "safe-push.log" in err)
+
+    rc, out, err, pushes, log = run(["feature/x"], local_sha="aaaa111",
+                                    push_transcript="SHA_MISMATCH_MARKER",
+                                    post_push_remote="bbbb222")
+    check("sha-mismatch: exit 1 (remote ref moved to a DIFFERENT sha)", rc == 1)
+    check("sha-mismatch: reports both shas", "aaaa111" in err and "bbbb222" in err)
+    check("sha-mismatch: emits the bounded-tail header",
+          "last" in err.lower() and "lines" in err.lower())
+    check("sha-mismatch: names the log path", "safe-push.log" in err)
 
     print()
     if FAILS:
