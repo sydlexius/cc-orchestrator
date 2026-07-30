@@ -14,8 +14,10 @@
 #
 # What this wrapper does:
 #   1. Resolves the local HEAD and the branch (or current symbolic-ref).
-#   2. Runs `git push` with full output captured to a log AND mirrored to
-#      stderr so the caller can stream it.
+#   2. Runs `git push` with full output captured to a log ONLY (not mirrored
+#      into the caller's context). On success the one-line verification is all
+#      the caller needs; on failure a BOUNDED tail of the log is surfaced. The
+#      complete transcript always lives in the log file.
 #   3. After push returns, queries `git ls-remote origin <branch>` and
 #      verifies the remote SHA matches local HEAD.
 #   4. Exits non-zero with a clear message if push's exit code OR the post-push
@@ -78,6 +80,16 @@ LOG="$git_dir/safe-push.log"
 # from git defaults, so the file's own mode is what protects it.
 : >"$LOG"
 chmod 600 "$LOG"
+
+# emit_log_tail: on a failure, surface a BOUNDED tail of the push transcript (kept in
+# full in $LOG) plus the log path -- so the caller can diagnose without the entire
+# stream being mirrored into context on every push. Factored so all failure branches
+# emit identical, delimited output and cannot drift.
+emit_log_tail() {
+  echo "safe-push: --- last ${LOG_TAIL_LINES:-30} lines of $LOG ---" >&2
+  tail -n "${LOG_TAIL_LINES:-30}" "$LOG" >&2 2>/dev/null || true
+  echo "safe-push: --- end of $LOG ---" >&2
+}
 
 branch="${1:-}"
 shift_count=0
@@ -191,22 +203,22 @@ case "$push_kind" in
     ;;
 esac
 
-# Capture full output to a log AND mirror to stderr. `tee` writes to both;
-# `set -o pipefail` ensures git push's non-zero exit propagates through the
-# pipeline rather than being hidden by tee's exit (which is the bug this
-# wrapper exists to prevent).
+# Capture git push's full output to $LOG ONLY -- never mirrored into the caller's
+# context. On success the one-line verification below is all the caller needs; on
+# failure emit_log_tail surfaces a bounded tail. The if/then/else is REQUIRED for
+# set -e safety: `if cmd; then` suspends set -e for the condition, so a non-zero
+# push lands in the else with its real exit code intact. A bare
+# `git push ... >"$LOG" 2>&1; push_status=$?` would instead ABORT the whole script
+# at the push line under `set -euo pipefail` -- never capturing the code, never
+# verifying the ref, never emitting the tail: the exact silent-failure this wrapper
+# exists to prevent. (No pipe now, so `set -o pipefail` is neither needed nor used.)
 echo "safe-push: pushing $branch ($local_sha) to origin" >&2
 push_status=0
-set -o pipefail
-# Capture git push's real exit code. `if ! cmd; then` would set $? to the
-# negated value (0) inside the then-block, masking the actual failure --
-# the exact silent-failure mode this wrapper exists to prevent.
-if git push -u origin "$branch" ${push_args[@]+"${push_args[@]}"} 2>&1 | tee "$LOG" >&2; then
+if git push -u origin "$branch" ${push_args[@]+"${push_args[@]}"} >"$LOG" 2>&1; then
   push_status=0
 else
   push_status=$?
 fi
-set +o pipefail
 
 # Independent verification: read the remote ref directly. ls-remote bypasses
 # any local cache (no `git fetch` needed) and returns the authoritative SHA
@@ -216,14 +228,15 @@ remote_line=$(git ls-remote origin "refs/heads/$branch" 2>/dev/null || true)
 remote_sha=${remote_line%%$'\t'*}
 
 if [ "$push_status" -ne 0 ]; then
-  echo "safe-push: git push exited $push_status -- see $LOG" >&2
+  echo "safe-push: git push exited $push_status" >&2
+  emit_log_tail
   exit 1
 fi
 
 if [ -z "$remote_sha" ]; then
   echo "safe-push: git push exited 0 but origin has no '$branch' ref" >&2
   echo "          local HEAD: $local_sha" >&2
-  echo "          full log:   $LOG" >&2
+  emit_log_tail
   exit 1
 fi
 
@@ -231,7 +244,7 @@ if [ "$remote_sha" != "$local_sha" ]; then
   echo "safe-push: git push exited 0 but origin/'$branch' does not match local HEAD" >&2
   echo "          local:  $local_sha" >&2
   echo "          remote: $remote_sha" >&2
-  echo "          full log: $LOG" >&2
+  emit_log_tail
   exit 1
 fi
 
