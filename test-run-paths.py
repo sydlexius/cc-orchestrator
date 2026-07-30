@@ -78,7 +78,7 @@ def source_producer(td, *, cwd, porcelain_text, env_overrides=None, no_mkdir=Tru
     Sources under `set -eu` on purpose: a producer that leaked a failing command or an
     unbound variable into the caller would abort here, so the sourcing contract is
     exercised by construction rather than by a separate assertion.
-    Returns (rc, {name: value}, git_invocation_log).
+    Returns (rc, {name: value}, git_invocation_log, stderr).
     """
     bindir = os.path.join(td, "bin"); os.makedirs(bindir, exist_ok=True)
     gitp = os.path.join(bindir, "git")

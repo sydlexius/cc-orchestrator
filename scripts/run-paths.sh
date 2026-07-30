@@ -159,9 +159,6 @@ if [ -n "$_ccrp_wt" ]; then
   _ccrp_id="$(_ccrp_sha12 "$_ccrp_wt")" || _ccrp_id=""
 fi
 
-# Every component must be present and sane. A "/" basename (from a path of "/") would
-# collapse the run dir to `$CC_RUN_ROOT//`, silently merging artifacts from unrelated
-# invocations into one bucket -- degrade to empty instead.
 # The cache root. `${XDG_CACHE_HOME:-}` / `${HOME:-}` -- NEVER a bare `$HOME`. This runs at
 # FILE SCOPE in the CALLER'S shell, so under `set -u` an unset HOME (cron, systemd User=
 # without PAM, a CI runner, `env -i`) is an unbound-variable error that kills the SOURCING

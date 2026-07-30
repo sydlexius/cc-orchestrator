@@ -341,9 +341,6 @@ def main():
               rc == 0 and not os.path.isdir(run_dir))
 
     # ---------------------------------------------------------------------
-    # CASE I: no run dir on disk -- cleanup stays idempotent and quiet.
-    # ---------------------------------------------------------------------
-    # ---------------------------------------------------------------------
     # CASE I2: a FAILING `git worktree remove` is the one remaining command that could
     # abort above local cleanup (it refuses on a dirty worktree -- an untracked build
     # artifact is enough). It must not resurrect the #302 leak shape. The run dir is
