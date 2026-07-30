@@ -29,6 +29,45 @@ TTL_HOURS="${ORCHESTRATE_FLOOR_TTL_HOURS:-72}"
 case "$TTL_HOURS" in ''|*[!0-9]*) TTL_HOURS=72 ;; esac
 [ "$TTL_HOURS" -ge 1 ] 2>/dev/null || TTL_HOURS=72
 
+# =====================================================================================
+# PREFILTER FRAGMENT REGISTRY  (#324)
+# =====================================================================================
+# Defined HERE, above the special modes, because `--assert-coverage` reads
+# `$_PREFILTER_PARTS` and `set -u` is in force - a later definition would abort that mode.
+#
+# THE COUPLING THIS SOLVES. Every per-clause deny lives inside a loop that is gated by a
+# single perf short-circuit (see "Perf short-circuit" far below). If a deny's trigger token
+# is absent from that short-circuit, the loop is never entered and THE DENY SILENTLY NEVER
+# FIRES - it reads as correct, passes `bash -n`, and denies nothing. That happened twice, both
+# times in an out-of-tree credential deny applied only to the DEPLOYED copy (#327 drift, so the
+# tokens below are NOT reproducible from this repo's history): once when the deny was added with
+# no short-circuit edit at all, and again when the hand-written fix registered most of its
+# matcher's flags but omitted three (`--client-secret`, `--access-token`, `--auth-token`),
+# leaving them matched-but-unreachable.
+#
+# THE RULE. Each deny declares the cheap token(s) that must appear ANYWHERE in the raw
+# command for that deny to be able to fire. The short-circuit is the DERIVED UNION of these
+# fragments - never a hand-maintained parallel list. A fragment must be WEAKER than (or
+# equal to) its matcher: it may admit commands the matcher rejects (costing only a wasted
+# clause split), but it must NEVER reject a command the matcher would block. That direction
+# is the whole safety property, and `--assert-coverage` proves it per-vector.
+#
+# ADDING A DENY: declare its fragment here, add it to _PREFILTER_PARTS below, and add a
+# BLOCK vector to `--assert-coverage` plus `test-orchestrate-guard.py`. assert-coverage fails
+# loudly if a BLOCK vector cannot clear the short-circuit, so a forgotten fragment can no
+# longer ship inert. Anything expensive (marker/token reads, git, network) stays OUT.
+_PF_PUSH='push'                     # is_push (git push + safe-push, incl. main/force denies)
+_PF_NO_VERIFY='--no-verify'         # has_no_verify (git hook-skip)
+_PF_ADMIN='--admin'                 # is_gh_admin (branch-protection bypass)
+_PF_GH_GIT='(^|[^[:alnum:]_-])(gh|git)([[:space:]]|$)'   # is_git / is_merge_api / is_pr_merge
+
+# The derived union. One `grep -Eq` at run time, exactly as before: these are concatenated
+# at load, so the O(1) fast path is preserved and no extra process is spawned.
+_PREFILTER_PARTS="$_PF_PUSH"
+_PREFILTER_PARTS="$_PREFILTER_PARTS|$_PF_NO_VERIFY"
+_PREFILTER_PARTS="$_PREFILTER_PARTS|$_PF_ADMIN"
+_PREFILTER_PARTS="$_PREFILTER_PARTS|$_PF_GH_GIT"
+
 # --- self-test: `orchestrate-guard.sh --self-test` feeds a known Tier-1 block
 # payload and asserts exit 2; used by install/setup to catch a silently
 # failing-open guard. Prints PASS/FAIL, exits 0 on pass, 1 on fail.
@@ -49,6 +88,201 @@ if [ "${1:-}" = "--self-test" ]; then
     exit 1
   fi
   echo "orchestrate-guard self-test PASS (Tier-1 push-main blocked; tag push exempt from advisory)"
+  exit 0
+fi
+
+# --- assert-coverage (#324): prove no deny is INERT behind the perf short-circuit ---------
+# THE PROPERTY. Every per-clause deny lives inside a loop gated by one short-circuit grep. A
+# deny whose trigger token is missing from that grep never fires: the loop is never entered.
+# A plain block/allow vector does NOT catch this - it passes for the tokens that happen to be
+# prefiltered while a missing one sits inert until some future command uses it. So this mode
+# asserts the stronger, direction-correct property per vector:
+#
+#     for every BLOCK vector: the short-circuit MUST admit it
+#
+# A fragment is allowed to be WEAKER than its matcher (admitting extra commands only wastes a
+# clause split). It must never be STRONGER, because that silently disables the deny. This
+# checks exactly that asymmetry, which is why it catches a forgotten fragment that
+# `--self-test` and the full block/allow harness both pass straight through.
+#
+# Vectors are the guard's OWN payload shapes, kept here so the check travels with the file
+# (a fragment edit and its proof cannot drift into separate files). Add one line per new deny.
+if [ "${1:-}" = "--assert-coverage" ]; then
+  ac_fail=0
+  # Each entry: <label>|<command that MUST be blocked>. Payloads live in this string table,
+  # never on a Bash command line (the live hook greps command lines - see CLAUDE.md ISOLATION).
+  ac_vectors="push-main|git push origin main
+push-force|git push --force origin feat
+safe-push-main|scripts/safe-push.sh main
+git-no-verify|git commit --no-verify -m x
+gh-admin|gh pr merge 1 --admin
+merge-by-api|gh api -X PUT repos/o/r/pulls/1/merge
+pr-merge-cli|gh pr merge 1 --squash"
+  while IFS='|' read -r ac_label ac_cmd; do
+    [ -n "$ac_label" ] || continue
+    # 1. the short-circuit must ADMIT it (the property under test)
+    # `-e` for the same reason as the live use site, and treat ONLY exit 1 as a genuine skip so
+    # a malformed union is reported as a failure here instead of masquerading as "not admitted".
+    ac_pf_rc=0
+    printf '%s' "$ac_cmd" | grep -Eq -e "$_PREFILTER_PARTS" || ac_pf_rc=$?
+    if [ "$ac_pf_rc" -eq 2 ]; then
+      echo "BROKEN UNION: the derived \$_PREFILTER_PARTS is not a valid ERE (grep exit 2), so" >&2
+      echo "  the live short-circuit cannot evaluate it. Check the fragments for an unbalanced" >&2
+      echo "  bracket/paren or an empty branch." >&2
+      ac_fail=1
+      break
+    fi
+    if [ "$ac_pf_rc" -ne 0 ]; then
+      echo "INERT: prefilter SKIPS a BLOCK vector, so its deny can never fire: $ac_label" >&2
+      ac_fail=1
+      continue
+    fi
+    # 2. and the guard must actually block it end-to-end (catches a matcher that regressed
+    #    independently of the prefilter). Tier-2 vectors need a fresh marker, so accept a
+    #    block under either condition rather than teaching this mode the marker lifecycle.
+    ac_rc=0
+    printf '%s' "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"$ac_cmd\"}}" \
+      | "$0" >/dev/null 2>&1 || ac_rc=$?
+    if [ "$ac_rc" -ne 2 ]; then
+      case "$ac_label" in
+        merge-by-api|pr-merge-cli)
+          # marker-GATED: allowed in a solo session by design, so exit 0 here is correct.
+          ;;
+        *)
+          echo "NOT BLOCKED: $ac_label expected exit 2, got $ac_rc" >&2
+          ac_fail=1
+          ;;
+      esac
+    fi
+  done <<AC_EOF
+$ac_vectors
+AC_EOF
+  # --- part 2: prove every FRAGMENT is load-bearing (no shielded-by-overlap blind spot) -----
+  # WHY THIS IS NEEDED. Part 1 alone can pass while a fragment is missing, because a vector may
+  # clear the short-circuit via a DIFFERENT fragment. Measured example: dropping $_PF_NO_VERIFY
+  # keeps `git commit --no-verify -m x` admitted, because the same string also carries the `git`
+  # word matched by $_PF_GH_GIT. The vector looks like it covers the no-verify fragment and does
+  # not. A coverage vector is only diagnostic for fragment F when F is the SOLE reason the
+  # command clears the prefilter.
+  #
+  # So: for each fragment, assert at least one BLOCK vector is admitted by that fragment ALONE.
+  # A fragment with no such vector is UNPROVEN - it could be deleted with every test still
+  # green, which is exactly how an inert deny ships.
+  # Iterate name|pattern pairs rather than `eval`-ing a variable name. Two reasons: the linter
+  # can see every assignment (indirect expansion reads as an unassigned variable), and the deny
+  # authority never evals a derived string. NB a comment line must not START with the linter's
+  # name or it is parsed as a directive and errors out.
+  ac_frags="_PF_PUSH|$_PF_PUSH
+_PF_NO_VERIFY|$_PF_NO_VERIFY
+_PF_ADMIN|$_PF_ADMIN
+_PF_GH_GIT|$_PF_GH_GIT"
+  while IFS='|' read -r ac_frag_name ac_frag; do
+    [ -n "$ac_frag_name" ] || continue
+    # SUBSUMED fragments: deliberately NOT independently provable, with the reason recorded.
+    # Running this check for the first time surfaced that two fragments are strictly redundant,
+    # which is worth stating rather than papering over with a contrived vector:
+    #   _PF_NO_VERIFY - its deny is `is_git && has_no_verify && has_noverify_subcmd`, so a
+    #                   blockable command ALWAYS carries the `git` word and is already admitted
+    #                   by _PF_GH_GIT.
+    #   _PF_ADMIN     - `is_gh_admin` is anchored on `gh ... pr ... merge`, so a blockable
+    #                   command ALWAYS carries the `gh` word, likewise already admitted.
+    # They are kept because they are free (one alternation branch, no extra process) and they
+    # keep each deny's trigger self-documenting at its declaration site. If either matcher is
+    # ever loosened to fire WITHOUT a gh/git word, its fragment stops being redundant and must
+    # move out of this list and gain an isolating vector.
+    case "$ac_frag_name" in
+      _PF_NO_VERIFY|_PF_ADMIN) continue ;;
+    esac
+    ac_sole=0
+    while IFS='|' read -r ac_label ac_cmd; do
+      [ -n "$ac_label" ] || continue
+      # admitted by THIS fragment...
+      # `-e` is REQUIRED: a fragment can begin with `--` (e.g. `--no-verify`), which grep
+      # would otherwise parse as one of its own flags ("unrecognized option").
+      printf '%s' "$ac_cmd" | grep -Eq -e "$ac_frag" || continue
+      # ...and by NO other fragment (so this vector ISOLATES it). Same name|pattern table,
+      # skipping the fragment under test.
+      ac_others=0
+      while IFS='|' read -r ac_other_name ac_other; do
+        [ -n "$ac_other_name" ] || continue
+        [ "$ac_other_name" = "$ac_frag_name" ] && continue
+        if printf '%s' "$ac_cmd" | grep -Eq -e "$ac_other"; then ac_others=1; break; fi
+      done <<AC_FRAGS2
+$ac_frags
+AC_FRAGS2
+      if [ "$ac_others" -eq 0 ]; then ac_sole=1; break; fi
+    done <<AC_EOF2
+$ac_vectors
+AC_EOF2
+    if [ "$ac_sole" -eq 0 ]; then
+      echo "UNPROVEN FRAGMENT: $ac_frag_name has no BLOCK vector that it ALONE admits, so" >&2
+      echo "  deleting it would leave every test green. Add an isolating vector." >&2
+      ac_fail=1
+    fi
+  done <<AC_FRAGS
+$ac_frags
+AC_FRAGS
+  # --- part 3: prove the LIVE short-circuit actually uses the derived union -----------------
+  # WHY. Parts 1 and 2 both evaluate `$_PREFILTER_PARTS`, the REGISTRY. If someone hand-writes
+  # a literal alternation at the short-circuit's use site instead of interpolating the derived
+  # variable, both parts keep passing while the guard runs a DIFFERENT, possibly incomplete
+  # pattern - the exact hand-maintained-list bug this whole mode exists to prevent, just moved
+  # one line. Caught by mutation testing: replacing the use site with a literal that omits the
+  # gh/git branch passed parts 1 and 2 cleanly.
+  #
+  # HOW, and why NOT a source-text grep. The first version grepped this file for the use site's
+  # literal text. Two defects, both found by adversarial review: `grep` matches COMMENT lines, so
+  # a decoy comment carrying that text made the check pass while both Tier-2 denies went dead
+  # (verified: merge payloads flipped from BLOCK to ALLOW with assert-coverage still PASSing);
+  # and it pinned the exact spelling, so hardening the use site (adding `-e`) FAILED the check
+  # that was supposed to protect it - the gate rejected the fix and passed the vulnerable form.
+  #
+  # Instead, extract the EXECUTABLE gate line (the `printf ... | grep -Eq ... "$orig_cmd"`
+  # pipeline, excluding comments) and require that it references the registry variable by name.
+  # That is spelling-tolerant about flags while still catching a hand-written literal, and a
+  # comment can no longer satisfy it. Degrades to a WARNING when `$0` is unreadable, since a
+  # read failure must never manufacture a false FAIL.
+  if [ -r "$0" ]; then
+    # Non-comment lines only (strip anything whose first non-blank char is `#`), narrowed to the
+    # gate's own subject `$orig_cmd` piped into a grep. SC2016 is deliberate here and below: the
+    # point is to find the LITERAL source text `$_PREFILTER_PARTS`, so it must not expand.
+    # SELF-MATCH HAZARD, hit twice while writing this. Any search built from the gate's own
+    # tokens also matches THIS code, because the searcher necessarily contains what it searches
+    # for. Two earlier attempts reported their own source line as "the gate line".
+    #
+    # Fix: locate the gate by a UNIQUE MARKER COMMENT placed at the gate, then inspect the line
+    # AFTER it. The marker string appears in exactly one other place (the grep below), and the
+    # `-A 1 | tail -1` step means what gets INSPECTED is always the following line, never the
+    # matching one - so a self-match cannot satisfy the check.
+    ac_gate_line=$(grep -A 1 -F '#PREFILTER-GATE-BELOW' "$0" | tail -1)
+    ac_gate_ok=0
+    # SC2016 is deliberate: the point is to find the LITERAL source text `$_PREFILTER_PARTS`,
+    # so single quotes are required and expansion must NOT happen.
+    # shellcheck disable=SC2016
+    if [ -n "$ac_gate_line" ]; then
+      printf '%s' "$ac_gate_line" | grep -Fq '$_PREFILTER_PARTS' && ac_gate_ok=1
+    fi
+    if [ -z "$ac_gate_line" ]; then
+      echo "DRIFT: cannot locate the clause-loop short-circuit line in \$0 - it was renamed or" >&2
+      echo "  restructured, so this check can no longer verify it. Update assert-coverage." >&2
+      ac_fail=1
+    fi
+    if [ -n "$ac_gate_line" ] && [ "$ac_gate_ok" -ne 1 ]; then
+      echo "DRIFT: the clause-loop short-circuit does not interpolate \$_PREFILTER_PARTS." >&2
+      echo "  A hand-written literal there defeats this whole check - the registry would be" >&2
+      echo "  verified while the guard runs something else. Restore the derived union." >&2
+      echo "  gate line: $ac_gate_line" >&2
+      ac_fail=1
+    fi
+  else
+    echo "assert-coverage WARN: cannot read \$0 ($0); skipped the use-site drift check" >&2
+  fi
+
+  if [ "$ac_fail" -ne 0 ]; then
+    echo "assert-coverage FAIL - a deny is unreachable, regressed, or unproven (see above)" >&2
+    exit 1
+  fi
+  echo "assert-coverage PASS (every BLOCK vector clears the short-circuit; every fragment is load-bearing)"
   exit 0
 fi
 
@@ -476,12 +710,42 @@ orig_cmd="$cmd"
 # Tracks whether ANY clause is a real push INVOCATION (command-position anchored), for the
 # advisory gate after the loop. Initialized here so it is always defined under `set -u`.
 is_push_clause=0
-# Perf short-circuit: every per-clause check needs one of the word `push` (is_push,
-# incl. safe-push), a `gh` word (merge-by-API or gh --admin), a `git` word (git
-# --no-verify), or the tokens `--no-verify` / `--admin` (the broadened Tier-1 flags).
-# If NONE is anywhere in the command, no check can fire - skip the clause split entirely
-# so ordinary pipelines stay O(1) rather than O(clauses) and the ~5ms budget holds.
-if printf '%s' "$orig_cmd" | grep -Eq 'push|--no-verify|--admin|(^|[^[:alnum:]_-])(gh|git)([[:space:]]|$)'; then
+# Perf short-circuit: every per-clause check needs one of the cheap trigger tokens declared
+# in the PREFILTER FRAGMENT REGISTRY above. If NONE is anywhere in the command, no check can
+# fire - skip the clause split entirely so ordinary pipelines stay O(1) rather than
+# O(clauses). The pattern is the DERIVED union `$_PREFILTER_PARTS`, NOT a hand-maintained
+# copy: a deny whose token is missing here can never fire, and keeping a second list in sync
+# by hand has already failed twice (#324).
+#
+# MEASURED COST (macOS, 2026-07-29), correcting a long-standing "~5ms budget" claim in this
+# comment that was never true: ~12ms for a non-matching command (bash + jq startup dominates)
+# and ~42ms for a single-clause match. The per-clause loop costs roughly 28ms per additional
+# clause, so the short-circuit is load-bearing for long `&&` chains - a 200-clause pipeline
+# that enters the loop takes seconds. Widening a fragment widens the population that pays
+# that cost, so keep fragments cheap and specific.
+#
+# TWO NON-OBVIOUS HARDENINGS, both load-bearing (found by adversarial review of #324):
+#
+# `-e` is REQUIRED, not stylistic. The union is interpolated, and a fragment may legitimately
+# begin with `--` (`$_PF_NO_VERIFY` does). Without `-e`, if such a fragment ever lands FIRST in
+# the alternation, grep parses the whole pattern as one of its own flags, errors, and - with a
+# bare `if` - the loop is SKIPPED, disabling EVERY deny for EVERY command. Registry order must
+# never be a security property.
+#
+# FAIL CLOSED on a pattern error. `grep -Eq` exits 0 = matched, 1 = definitively did not match,
+# 2 = the pattern itself is broken (unbalanced bracket/paren, empty subexpression). Only exit 1
+# is a real "no trigger present", so ONLY exit 1 may skip the loop; anything else enters it and
+# lets the per-clause matchers decide. A bare `if` treated an ERROR as a no-match and turned a
+# malformed union into a total floor bypass - verified live: a mutated fragment made a
+# push-to-main payload ALLOW. Note exit 2 is also how BSD/macOS grep reports an empty
+# alternation branch that GNU grep silently accepts, so this also removes a real
+# grep-implementation dependence rather than a theoretical one.
+# The marker below is READ BY `--assert-coverage` (part 3) to locate this gate. Keep it on the
+# line immediately ABOVE the gate; assert-coverage inspects the NEXT line and will FAIL loudly
+# if the marker is missing or the gate stops interpolating the derived union.
+#PREFILTER-GATE-BELOW
+_pf_rc=0; printf '%s' "$orig_cmd" | grep -Eq -e "$_PREFILTER_PARTS" || _pf_rc=$?
+if [ "$_pf_rc" -ne 1 ]; then
   while IFS= read -r clause || [ -n "$clause" ]; do
     cmd="$clause"
     if is_push && has_main_dest; then

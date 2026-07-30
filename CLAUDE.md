@@ -44,6 +44,9 @@ Runtime (`scripts/`; canonical source is this repo):
   (`merge-auth/<session-key>`, armed by `orchestrate-authorize-merge.sh` only after the
   readiness oracle PASSed) has a `head_sha` matching the command's pinned `--match-head-commit`
   (deny on any doubt; local read, NO network I/O in the floor; merge-by-API stays hard-denied).
+  #324: the per-clause deny loop's perf short-circuit is DERIVED from a PREFILTER FRAGMENT
+  REGISTRY (`_PF_*` -> `_PREFILTER_PARTS`) instead of a hand-maintained parallel token list, and
+  `--assert-coverage` proves no deny is unreachable behind it (see the floor rules below).
   `_session_keys()` is the guard's SINGLE key derivation, so the marker gate and the token check never drift; #312 keys off `$TMUX` when set, else `$CLAUDE_CODE_SESSION_ID` (tmux is NOT required for a gated session), and both gates match ANY candidate key. Fails OPEN on any
   internal error. Threat model = honest bot on the obvious path, NOT adversarial evasion (it is a
   guardrail, not a sandbox).
@@ -243,6 +246,8 @@ shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orc
 ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-open-pr-staleness-sweep.py
 ./scripts/orchestrate-guard.sh --self-test    # MUST use ./ - the self-test re-invokes "$0";
                                               # `bash scripts/orchestrate-guard.sh` makes $0 a bare name -> 127
+./scripts/orchestrate-guard.sh --assert-coverage  # #324: no deny is unreachable behind the perf
+                                              # short-circuit (also re-invokes "$0", so ./ likewise)
 ./scripts/orchestrate-steer.sh --self-test    # advisory WARN-level steering hook (#95)
 ./scripts/orchestrate-context-meter.sh --self-test  # advisory PostToolUse context-budget meter (#228)
 python3 test-orchestrate-guard.py
@@ -296,6 +301,23 @@ drives `/plugin marketplace` update-detection, so they must never diverge. The C
 
 ## Working ON the security floor (critical rules)
 
+- ADDING A DENY TO THE GUARD: declare its cheap trigger token as a `_PF_*` fragment in the
+  PREFILTER FRAGMENT REGISTRY (top of `orchestrate-guard.sh`), add it to `_PREFILTER_PARTS`, and
+  add a BLOCK vector to `--assert-coverage`. The per-clause deny loop is gated by ONE perf
+  short-circuit; a deny whose token is missing from it is UNREACHABLE and denies NOTHING while
+  reading as correct and passing `bash -n` + `--self-test` (#324 - it shipped twice, the second
+  time in the very commit that fixed the first, which omitted 3 of its own 11 tokens). The
+  short-circuit is now DERIVED from the fragments, never a hand-maintained parallel list.
+  `./scripts/orchestrate-guard.sh --assert-coverage` (a `.gates.toml` step) proves three things
+  the 139-case block/allow harness cannot: every BLOCK vector clears the short-circuit, every
+  fragment is independently load-bearing (a vector shielded by incidental token overlap proves
+  nothing - `git commit --no-verify` also carries `git`), and the live use site interpolates the
+  derived union instead of a hand-written literal. A fragment may be WEAKER than its matcher
+  (over-admitting only wastes a clause split) but NEVER stronger. `test-orchestrate-guard.py`
+  mutation-proves the mode has teeth, so a silently-passing check cannot masquerade as a correct
+  one. Two fragments (`_PF_NO_VERIFY`, `_PF_ADMIN`) are documented as SUBSUMED by `_PF_GH_GIT`
+  and skipped in the isolation check; loosening either matcher to fire without a gh/git word
+  means removing it from that skip list and giving it an isolating vector.
 - The live guard greps Bash COMMAND LINES. When editing the guard, NEVER put a trigger substring
   (`git push`, a push destination `main`/`master`, `gh pr merge`, `gh ... --admin`,
   `git ... --no-verify`, `pulls/N/merge`) on a Bash command line. Keep all such payloads INSIDE the
