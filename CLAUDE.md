@@ -88,8 +88,8 @@ Runtime (`scripts/`; canonical source is this repo):
   [--apply]` is the consent-based path that wires the floor hook + missing allow-list entries into
   settings.json, DEPLOYS the bundled guard to the stable `~/.claude/scripts/` path (so a fresh
   plugin install has a working floor; idempotent, refreshes a stale copy, warns on a missing source),
-  DEPLOYS the 15 bundled PR-lifecycle helpers (HELPER_NAMES) the same Option-A way (#133; #234 added
-  `gh-react.sh`; retiring any claude-kit
+  DEPLOYS the 16 bundled PR-lifecycle helpers (HELPER_NAMES) the same Option-A way (#133; #234 added
+  `gh-react.sh`, #303 added `run-paths.sh`; retiring any claude-kit
   symlink, backed up to `<dest>.bak`), and (unless `--no-steer`) DEPLOYS + wires the advisory
   steering hook `orchestrate-steer.sh` for Edit/Write/Bash/Read/Agent (#95/#226/#231; doctor only ever WARNs about it),
   DEPLOYS this script to the stable path + wires a read-only SessionStart `init` advisory hook (#162;
@@ -203,6 +203,57 @@ Runtime (`scripts/`; canonical source is this repo):
   operational path including a read failure, so it can never block cleanup; exit 2 ONLY on a malformed
   invocation. Needs the maintainer-granted `Bash(gh pr update-branch *)` allow-list entry; without it
   the report-only degradation is the normal path. No floor/guard change.
+- `scripts/run-paths.sh` - THE single producer of a worktree's run-artifact directory (#303),
+  SOURCED (never executed). Exports `CC_RUN_ROOT`, `CC_RUN_DIR`
+  (`<XDG_CACHE_HOME>/<repo-prefix>-run/<basename>-<sha12>`), and `GOLANGCI_LINT_CACHE`
+  (`$CC_RUN_DIR/golangci`). It exists because a SHARED consumer (`cleanup-worktree.sh`, which runs
+  in every worktree) previously depended on a PER-REPO producer with the contract living only in a
+  comment: the producer wrote `<basename>-<sha12>`, the consumer removed `<basename>`, so removal
+  never matched and 170+ stale dirs (922M) accumulated. One producer makes that drift
+  UNREPRESENTABLE rather than merely detectable. TWO MODES: `CC_RUN_WORKTREE` SET (consumer) hashes
+  the handed-over path string VERBATIM - no `git worktree list` lookup, no realpath, no existence
+  check, which is LOAD-BEARING because cleanup must compute the same path for an already-removed or
+  pruned worktree, exactly when a lookup returns nothing; UNSET (dev) resolves the current worktree
+  by matching `$PWD` against the porcelain list and returns the RECORDED string - deliberately NOT
+  `git rev-parse --show-toplevel`, which realpath-resolves and hits the macOS /tmp vs /private/tmp
+  divergence (resolution may PICK the record; only the recorded string is ever hashed). SOURCING
+  CONTRACT: never leaks `set -e`/`-u`/`pipefail`, never aborts the sourcing shell, degrades every
+  failure to an EMPTY `CC_RUN_DIR` that consumers' `[ -d ]` guard skips (loud on stderr, never
+  silent). That contract is NOT free: every file-scope command substitution is `|| <empty>`-guarded
+  and the internal `git | awk` carries `|| true`, because a caller running `pipefail` surfaces a
+  git that exits 128 as the PIPELINE's status and the caller's errexit then kills the sourcing
+  shell (`_ccrp_current_worktree` is only accidentally immune - `local` masks a command's status).
+  The harness sources under full `set -euo pipefail` with a git stub that CAN fail; a `set -eu`
+  harness with an always-succeeding stub cannot construct the abort at all.
+  Creates the dir 0700 by default; `CC_RUN_NO_MKDIR=1` computes the path only (what
+  cleanup uses, so it never resurrects the dir it is deleting). The per-worktree
+  `GOLANGCI_LINT_CACHE` makes cross-worktree stale-path lint phantoms IMPOSSIBLE rather than
+  cleaned-up-after; GOCACHE is untouched. Downstream repos keep a 2-line shim
+  (`SW_RUN_DIR="$CC_RUN_DIR"`). Pure path/env producer: reads `git worktree list`, hashes, exports -
+  no `gh`, no network mutation, no floor/allow-list touch. Deployed via `HELPER_NAMES`.
+- `scripts/cleanup-worktree.sh` - post-merge worktree + branch removal. Two structural properties
+  earned the hard way. (1) ORDERING (#302): ALL local cleanup (run-dir rm, lint-cache clean) runs
+  BEFORE any network call, and every command that could abort above it - `git worktree remove`
+  (which refuses on a dirty worktree), `git worktree prune`, `git fetch --prune` - is
+  failure-TOLERANT and reports rather than exiting. It used to sit at the end, downstream of the
+  remote DELETE and the prune, so under `set -euo pipefail` the MOST COMMON path - a squash-merge
+  with auto-delete-branch, whose DELETE returns 422 - aborted above it and neither step ever ran.
+  A failed worktree removal is the one case that deliberately KEEPS the run dir: the worktree is
+  still live and its run dir may hold an in-flight gate's lock, so reclaiming it there would be a
+  concurrency wipe (a worse bug than the leak). (2) VERIFY, DO NOT CLASSIFY (#337): the remote-branch delete decides
+  success with `git ls-remote --exit-code`, not by grepping the HTTP status. Ref absent = success
+  whatever the API said; ref present = a real failure that surfaces the captured stderr and exits 1.
+  This is immune to every status-code variation (a widened `404|422` grep would swallow genuine
+  422s, and matching the message text pins on error PROSE, not a contract) and matches the house
+  pattern - `safe-push.sh` verifies the remote ref MOVED rather than trusting an exit code. The run
+  dir comes SOLELY from the sourced `run-paths.sh` (captured BEFORE `git worktree remove`); no path
+  is reassembled and no hash computed here. The blunt global `golangci-lint cache clean` stays as a
+  MID-TRANSITION fallback for worktrees predating per-worktree-cache adoption, opt out with
+  `CC_SKIP_GLOBAL_LINT_CACHE_CLEAN=1`; it runs under `env -u GOLANGCI_LINT_CACHE` because sourcing
+  the producer EXPORTED that variable into this shell, and golangci-lint honors it over the default
+  location - without the `env -u` the fallback would clean the per-worktree cache just deleted with
+  the run dir and NEVER the shared one, leaving it inert while still logging a clean (the harness
+  therefore asserts the ENVIRONMENT of the call, not just its argv).
 - `scripts/prefs-coverage.py` - opt-in UI-preference-coverage HARD-GATE (a repo enables it by adding a
   `.prefs.toml` + a `.gates.toml` step; schema `skills/orchestrate/templates/prefs.toml.md`). For each
   `[[pref]]` it greps the directly-changed governed surfaces for the pref's `verify` regex; a governed,
@@ -242,8 +293,8 @@ clean-worktree check, so an unchanged committed tree skips re-running it
 `skills/orchestrate/templates/gates.toml.md`.
 
 ```sh
-shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/orchestrate-authorize-merge.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh scripts/base-freshness.sh scripts/open-pr-staleness-sweep.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
-ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-open-pr-staleness-sweep.py
+shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/orchestrate-authorize-merge.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh scripts/base-freshness.sh scripts/open-pr-staleness-sweep.sh scripts/run-paths.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
+ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py
 ./scripts/orchestrate-guard.sh --self-test    # MUST use ./ - the self-test re-invokes "$0";
                                               # `bash scripts/orchestrate-guard.sh` makes $0 a bare name -> 127
 ./scripts/orchestrate-guard.sh --assert-coverage  # #324: no deny is unreachable behind the perf
@@ -280,6 +331,8 @@ python3 test-resolve-threads.py
 python3 test-cache-reclaim.py
 python3 test-base-freshness.py
 python3 test-open-pr-staleness-sweep.py
+python3 test-run-paths.py
+python3 test-cleanup-worktree.py
 ```
 
 ## Versioning

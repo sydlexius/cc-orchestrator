@@ -206,7 +206,8 @@ is_canonical_path() {
       */scripts/patch-coverage.sh|*/scripts/safe-push.sh|*/scripts/gate-runner.py|\
       */scripts/pre-push-hook.sh|*/scripts/prefs-coverage.py|*/scripts/issue-watch.sh|\
       */scripts/ship-gate-preflight.sh|*/scripts/orchestrate-context-meter.sh|\
-      */scripts/orchestrate-setup.py|*/scripts/orchestrate-authorize-merge.sh)
+      */scripts/orchestrate-setup.py|*/scripts/orchestrate-authorize-merge.sh|\
+      */scripts/run-paths.sh)
         return 0 ;;
       */scripts/pr-*.sh|*/scripts/gh-*.sh) return 0 ;;
       */commands/*.md) return 0 ;;

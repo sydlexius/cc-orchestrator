@@ -132,45 +132,51 @@ script stops and warns rather than silently leaving it (or force-deleting it).
 
 ## Step 5 -- Delete remote branch
 
+VERIFY THE OUTCOME; do not infer it from the HTTP status (#337). GitHub returns
+404 OR 422 "Reference does not exist" for an absent ref depending on the path
+taken, so the old `grep -q '404'` test was incomplete BY CONSTRUCTION -- and a
+squash-merge with auto-delete-branch (the common case here) returns exactly the
+422, which this step then misreported as an error on a branch that was deleted
+correctly. Widening the grep to `404|422` was rejected: 422 is generic
+Unprocessable Entity, so the bare code would also swallow genuine failures, and
+matching the message text pins on error PROSE rather than an API contract.
+
+So: attempt the delete capturing stderr for DIAGNOSTICS ONLY, then let
+`git ls-remote --exit-code` decide. This tests the condition actually being
+asserted, is immune to every status-code variation, and is already the house
+pattern -- `safe-push.sh` verifies the remote ref MOVED rather than trusting an
+exit code. Use the fully-qualified ref form so it cannot match a tag or be
+ambiguous.
+
 ```bash
 encoded_branch=$(printf '%s' "$branch" | jq -sRr @uri)
 err_file=$(mktemp)
-if gh api "repos/$repo/git/refs/heads/$encoded_branch" -X DELETE 2>"$err_file"; then
-  echo "deleted remote $branch"
-elif grep -q '404' "$err_file"; then
-  echo "remote branch $branch already deleted (404)"
-else
-  echo "ERROR: failed to delete remote branch $branch:" >&2
-  cat "$err_file" >&2
+del_rc=0
+gh api "repos/$repo/git/refs/heads/$encoded_branch" -X DELETE >/dev/null 2>"$err_file" || del_rc=$?
+
+# GIT_TERMINAL_PROMPT=0 + SSH BatchMode so an auth-required origin fails FAST
+# rather than hanging cleanup on a credential prompt; a caller's own
+# GIT_SSH_COMMAND is preserved. Matches scripts/cleanup-worktree.sh exactly.
+if GIT_TERMINAL_PROMPT=0 \
+   GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes" \
+   git ls-remote --exit-code origin "refs/heads/$branch" >/dev/null 2>&1; then
+  # Ref STILL PRESENT: a genuine failure regardless of what the API reported.
+  # This also catches the inverse trap -- a DELETE that reports success while the
+  # ref survives, which trusting the exit code would have called clean.
+  echo "ERROR: remote head refs/heads/$branch is STILL PRESENT after delete." >&2
+  [ -s "$err_file" ] && cat "$err_file" >&2
+  echo "  Investigate: git ls-remote origin \"refs/heads/$branch\"" >&2
   rm -f "$err_file"
   exit 1
+elif [ "$del_rc" -eq 0 ]; then
+  echo "deleted remote $branch (verified absent on origin)"
+else
+  # The DELETE complained but the ref is verifiably gone -- the already-deleted
+  # case (404, or the 422 GitHub returns after auto-delete). Annotate, don't fail.
+  echo "remote branch $branch already deleted (verified absent; DELETE reported an error)"
+  [ -s "$err_file" ] && sed 's/^/  api: /' "$err_file"
 fi
 rm -f "$err_file"
-```
-
-404 is expected if GitHub deleted it automatically on merge (`--delete-branch` flag). Note and continue. Any non-404 error is surfaced and stops the run rather than being mistaken for an "already deleted" 404.
-
-Note: this same inline `gh api -X DELETE` of the remote head also lives in
-`scripts/cleanup-worktree.sh` (around line 191) for consistency. This verify
-substep does NOT touch that file; the note is for cross-reference only.
-
-### Verify the remote head is actually gone
-
-After the delete above reports success or a 404, confirm the remote ref no
-longer exists, using the fully-qualified ref form so it cannot match a tag or
-be ambiguous. WARN-ONLY: a lingering head is surfaced for manual investigation,
-never auto-retried or force-deleted (the warning is sufficient to flag the
-anomaly).
-
-```bash
-if git ls-remote --exit-code origin "refs/heads/$branch" >/dev/null 2>&1; then
-  echo "WARNING: remote head refs/heads/$branch is STILL PRESENT after delete." >&2
-  echo "  The DELETE call reported success/404 but the ref persists. Investigate manually:" >&2
-  echo "    git ls-remote origin \"refs/heads/$branch\"" >&2
-  echo "    gh api \"repos/$repo/git/refs/heads/<encoded>\" -X DELETE   # re-run by hand if appropriate" >&2
-else
-  echo "verified remote head refs/heads/$branch is gone"
-fi
 
 # Confidence guard: the local branch should already be absent after Step 4.
 if git show-ref --verify --quiet "refs/heads/$branch"; then
@@ -178,8 +184,15 @@ if git show-ref --verify --quiet "refs/heads/$branch"; then
 fi
 ```
 
-`git ls-remote --exit-code` exits non-zero when the ref is absent (the expected,
-quiet outcome) and zero when it still exists (the warned anomaly).
+`git ls-remote --exit-code` exits non-zero when the ref is absent (the expected
+outcome, and the success verdict here) and zero when it still exists (the
+failure verdict). Note the inversion relative to the old code: the status text
+now only ANNOTATES the message, it never decides it.
+
+Note: `scripts/cleanup-worktree.sh` carries the same verify-based delete. The two
+copies previously shared this defect and had DRIFTED IN SEVERITY -- the script
+`exit 1`-ed a whole cleanup run on the benign 422 (#302) while this file merely
+printed a spurious error. Keep them consistent; if one changes, change both.
 
 ---
 

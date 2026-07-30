@@ -103,6 +103,13 @@ HELPER_NAMES = (
     # Codoki-root-ack gate invokes ${HOME}/.claude/scripts/gh-react.sh behind an `[ -x ]`
     # gate and FAILS CLOSED when it is absent (#234). It must deploy or the ack gate blocks.
     "gh-react.sh",
+    # run-paths.sh (#303) is a LIVE dependency of cleanup-worktree.sh, which SOURCES it
+    # from the stable path as THE single producer of $CC_RUN_DIR. It is also the file
+    # downstream repos source from their own dev/Makefile flows via a 2-line shim, so it
+    # must exist at a stable location independent of any plugin install dir. Absent, the
+    # consumer WARNs and skips run-dir cleanup rather than reconstructing the path (that
+    # second derivation is the drift #303 exists to eliminate).
+    "run-paths.sh",
 )
 # The _helper_deploy_action results that warrant an actual deploy write (vs. None / informational).
 HELPER_DEPLOY_ACTIONS = ("deploy", "refresh", "replace-symlink", "replace-broken-symlink")

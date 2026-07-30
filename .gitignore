@@ -5,6 +5,11 @@
 # and the configure --apply backup; never commit - the user owns every grant)
 .claude/settings.local.json
 .claude/*.bak
+# The memory-MCP knowledge-graph store for this project (and the dated backups the
+# server writes beside it, whose suffix is `.bak-<timestamp>` and so escapes the
+# `*.bak` glob above). Machine-local session state, not repo content.
+.claude/memory-*.json
+.claude/*.bak-*
 
 # Python
 __pycache__/
