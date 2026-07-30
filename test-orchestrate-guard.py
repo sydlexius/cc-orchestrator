@@ -18,6 +18,7 @@ Run: python3 test-orchestrate-guard.py
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -694,6 +695,138 @@ def main():
                                               "tool_input": {"command": MERGE312}}))
         expect("#312 piece-b: NO candidate token valid (SHA mismatch) -> still BLOCK "
                "(scanning all candidates widens nothing)", _p.returncode, "block")
+
+    # ---- #324: the perf short-circuit must never hide a deny ------------------------------
+    # WHY THIS BLOCK EXISTS. Every per-clause deny sits inside a loop gated by ONE
+    # short-circuit grep. A deny whose trigger token is missing from that grep is UNREACHABLE:
+    # the loop is never entered. It reads as correct, passes `bash -n`, passes --self-test, and
+    # denies nothing. That shipped twice. Critically, this suite ALSO passed both times - so
+    # what is pinned here is the REACHABILITY of each deny, which no allow/block case can see
+    # (an allow/block case only proves the denies that ARE reachable still work).
+    print()
+    print("  --- #324 short-circuit coverage ---")
+
+    # The guard's own --assert-coverage mode is the mechanism; run it and require PASS. It
+    # proves three properties the block/allow table cannot: every BLOCK vector clears the
+    # short-circuit, every fragment is independently load-bearing, and the live use site
+    # interpolates the derived union rather than a hand-written literal.
+    _ac = subprocess.run([GUARD, "--assert-coverage"], capture_output=True, text=True,
+                         timeout=30)
+    if _ac.returncode != 0:
+        FAILS.append(f"#324: --assert-coverage failed (rc={_ac.returncode}): "
+                     f"{(_ac.stderr or _ac.stdout).strip()[:300]}")
+        print(f"  [FAIL] #324: --assert-coverage rc={_ac.returncode}")
+    else:
+        print("  [ok] #324: --assert-coverage PASS")
+
+    # MUTATION PROOF: the check must have TEETH. Copy the guard, break the registry the exact
+    # way it broke in the field (a fragment that is never registered), and require a FAILURE.
+    # Without this, a silently-passing assert-coverage would be indistinguishable from a
+    # correct one - the same class of defect the mode exists to catch.
+    _src = open(GUARD, encoding="utf-8").read()
+    _MUTANTS = [
+        # (label, find, replace, must_be_caught)
+        ("push fragment never registered",
+         '_PREFILTER_PARTS="$_PF_PUSH"\n', '_PREFILTER_PARTS="__NEVER_MATCHES__"\n', True),
+        ("gh/git fragment never registered",
+         '_PREFILTER_PARTS="$_PREFILTER_PARTS|$_PF_GH_GIT"\n', '# MUTATED: omitted\n', True),
+        ("use site hand-writes a literal instead of the derived union",
+         '_pf_rc=0; printf \'%s\' "$orig_cmd" | grep -Eq -e "$_PREFILTER_PARTS" || _pf_rc=$?',
+         '_pf_rc=0; printf \'%s\' "$orig_cmd" | grep -Eq -e \'push|--admin\' || _pf_rc=$?', True),
+        # --- the four below came from adversarial review of this very diff ------------------
+        # WHAT THIS MUTANT ACTUALLY PROVES (corrected after a CodeRabbit finding; the earlier
+        # comment claimed it proved `-e` was load-bearing, which is false twice over).
+        #
+        # It replaces the FIRST assignment, so `$_PF_PUSH` leaves the union entirely. It is
+        # therefore caught by the same reachability property as the other omission mutants: the
+        # `safe-push-main` vector is no longer admitted. Nothing here exercises grep's flag
+        # parsing.
+        #
+        # And measured (6 probes, 0 divergences): `-e` is NOT independently load-bearing at all,
+        # because the fail-closed change subsumes it. Dropping `-e` with a `--`-prefixed fragment
+        # first makes grep exit 2, and `2 != 1` ENTERS the loop, so every deny still fires. The
+        # two hardenings are DEFENSE IN DEPTH, not one mechanism: fail-closed is what preserves
+        # the floor, `-e` keeps the fast path working by intent rather than by accident. There is
+        # deliberately no "-e removed" mutant, because removing it is not observable in the floor's
+        # behavior - only in whether the prefilter can do its job.
+        ("first fragment unregistered via reorder (push fragment leaves the union)",
+         '_PREFILTER_PARTS="$_PF_PUSH"\n', '_PREFILTER_PARTS="$_PF_NO_VERIFY"\n', True),
+        # A malformed union makes `grep -E` exit 2. With a bare `if` that read as "no trigger
+        # present" and skipped the loop, disabling EVERY deny; the `-ne 1` fail-closed test is
+        # what these two prove.
+        ("malformed fragment: unclosed bracket (grep exit 2)",
+         "_PF_PUSH='push'", "_PF_PUSH='push[abc'", True),
+        ("malformed fragment: unbalanced paren (grep exit 2)",
+         "_PF_PUSH='push'", "_PF_PUSH='push(foo'", True),
+        # An empty alternation branch is the one mutation that is NOT required to be caught, and
+        # the reason is worth recording rather than asserting either way blindly. GNU grep accepts
+        # it and matches everything (so the union over-admits: a perf cost, denies all still
+        # reachable); BSD/macOS grep rejects it with "empty (sub)expression" and exits 2. So
+        # whether assert-coverage notices is grep-implementation-dependent, and pinning
+        # must_catch=True would make this suite fail on a GNU-grep PATH for a mutant that is
+        # harmless there. What is NOT implementation-dependent, and IS asserted unconditionally
+        # below for every mutant on both PATHs, is that the floor still BLOCKS. Under the old bare
+        # `if` this exact mutant took the floor DOWN on stock macOS while passing on a GNU PATH.
+        ("empty first fragment (GNU accepts, BSD errors)",
+         '_PREFILTER_PARTS="$_PF_PUSH"\n', '_PREFILTER_PARTS=""\n', None),
+    ]
+    _mdir = tempfile.mkdtemp(prefix="guard-324-mut-")
+    try:
+        for _label, _find, _repl, _must_catch in _MUTANTS:
+            _mut = _src.replace(_find, _repl, 1)
+            if _mut == _src:
+                FAILS.append(f"#324 mutation '{_label}': pattern not found - the harness is "
+                             "stale relative to the guard, so this mutation proves nothing")
+                print(f"  [FAIL] #324 mutation '{_label}': pattern not found (stale harness)")
+                continue
+            _mp = os.path.join(_mdir, "mutant.sh")
+            with open(_mp, "w", encoding="utf-8") as fh:
+                fh.write(_mut)
+            os.chmod(_mp, 0o755)
+            # Invoke via an explicit path: --assert-coverage re-invokes "$0" for the
+            # end-to-end leg, which needs $0 to be executable (the ./ rule in CLAUDE.md).
+            # timeout: a MUTANT guard is deliberately broken, so it is exactly the code most
+            # likely to hang. Without this a bad mutation stalls CI instead of failing it.
+            _r = subprocess.run([_mp, "--assert-coverage"], capture_output=True, text=True,
+                                timeout=30)
+            _caught = _r.returncode != 0
+            if _must_catch is None:
+                # Detection is grep-implementation-dependent for this mutant (see its comment);
+                # only the floor-holds assertion below is binding.
+                print(f"  [ok] #324 mutation (detection not required, floor is): {_label}")
+            elif _caught == _must_catch:
+                print(f"  [ok] #324 mutation caught: {_label}")
+            else:
+                FAILS.append(f"#324 mutation '{_label}': assert-coverage returned "
+                             f"rc={_r.returncode} - a broken registry was NOT caught, so the "
+                             "check has no teeth")
+                print(f"  [FAIL] #324 mutation NOT caught: {_label}")
+
+            # THE PROPERTY THAT ACTUALLY MATTERS: a broken registry must never take the FLOOR
+            # down. Independent of whether the gate NOTICES, the mutant must still block a
+            # Tier-1 push-to-main. Before the fail-closed fix several of these mutants ALLOWED
+            # it (verified under BSD grep), which is a total floor bypass - the gate noticing is
+            # good, the floor holding is non-negotiable. Run under a stock BSD-grep PATH too,
+            # since GNU and BSD grep disagree on an empty alternation branch.
+            for _penv, _plabel in (
+                (None, "inherited PATH"),
+                ({**os.environ, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}, "stock BSD-grep PATH"),
+            ):
+                _live = subprocess.run(
+                    ["bash", _mp], input=json.dumps(
+                        {"tool_name": "Bash",
+                         "tool_input": {"command": "git " + "push origin " + "main"}}),
+                    capture_output=True, text=True, env=_penv, timeout=15)
+                if _live.returncode != 2:
+                    FAILS.append(
+                        f"#324 mutation '{_label}' [{_plabel}]: the mutant ALLOWED a Tier-1 "
+                        f"push-to-main (exit {_live.returncode}) - a broken registry took the "
+                        "whole floor down, which fail-closed must prevent")
+                    print(f"  [FAIL] #324 mutation '{_label}' [{_plabel}]: FLOOR DOWN")
+                else:
+                    print(f"  [ok] #324 mutation '{_label}' [{_plabel}]: floor still blocks")
+    finally:
+        shutil.rmtree(_mdir, ignore_errors=True)
 
     print()
     if FAILS:

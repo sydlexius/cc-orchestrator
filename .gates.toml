@@ -24,6 +24,13 @@
   name = "guard-self-test"
   run = "./scripts/orchestrate-guard.sh --self-test"
 
+  # #324: proves no deny is unreachable behind the guard's perf short-circuit. Distinct from
+  # guard-self-test, which only checks that ONE known Tier-1 deny still blocks - it passes
+  # even when a newly added deny is wholly inert.
+  [[prep_pr.steps]]
+  name = "guard-assert-coverage"
+  run = "./scripts/orchestrate-guard.sh --assert-coverage"
+
   [[prep_pr.steps]]
   name = "steer-self-test"
   run = "./scripts/orchestrate-steer.sh --self-test"
