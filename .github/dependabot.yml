@@ -1,0 +1,20 @@
+version: 2
+updates:
+  # github-actions is the only ecosystem here: the Python in this repo has no
+  # dependency manifest (no requirements.txt, pyproject.toml, or Pipfile), so a
+  # pip entry would track nothing. Add pip alongside the first manifest.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "ci"
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    groups:
+      actions-all:
+        patterns:
+          - "*"
