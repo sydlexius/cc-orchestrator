@@ -171,6 +171,17 @@ Runtime (`scripts/`; canonical source is this repo):
   never read as "fine" in a fail-closed gate. #315: a null `reviewDecision` is now QUALIFIED in
   the PASS line (approved-on-head / nobody-reviewed / unreadable) instead of a bare `<none>`
   that read as "review state is fine" - REPORTING only, fail-soft, never changes the verdict.
+  #301 PART 1 is the one change here that RELAXES the gate: CheckRuns are reduced LATEST-PER-NAME
+  before evaluation, because GitHub CANCELS in-flight duplicates on every push and the flat
+  evaluation blocked on the superseded corpse beside the later same-name SUCCESS. The sort contract
+  is part of the recorded invariant, since both halves defend a distinct false-green: `startedAt` is
+  the PRIMARY key (sorting on `completedAt` lets a stale SUCCESS outrank a newer IN_PROGRESS run,
+  whose `completedAt` is null), and NULL TIMESTAMPS SORT NEWEST (so a QUEUED re-run beats an old
+  SUCCESS and the gate blocks on the pending run). Only CheckRuns are grouped - StatusContexts and
+  unknown-`__typename` entries keep their fail-closed path untouched. #301 PART 2: the PASS line may
+  now carry a review-coverage `WARN` (no review covers the current head) or `NOTE` (coverage
+  unreadable). ADVISORY and fail-OPEN by construction - it never changes the verdict, so anyone
+  parsing the PASS line or reasoning about the fail-closed posture should read it as commentary.
   CODOKI IS NOT IN SERVICE (subscription lapsed 2026-07-12; no free tier). No trigger is ever posted
   and no check ever appears, so every Codoki gate ON A LIVE PR PATH is INERT BY DESIGN and PASSes on
   absence: `--codoki-gate` (what `pr-watch.sh` calls) and the FULL-mode root-ack gate. The STRICT
