@@ -296,6 +296,51 @@ on real work.
 useful independent of step 3, and step 3 should wait for a branch that genuinely accumulates WIP
 commits, which this one did not.
 
+## Trial round 2 (2026-07-31, same day): three more PRs
+
+The verdict above was written after ONE branch. Three more shipped the same session (#357 elmer,
+#359 floor-hardening, #360 four doc fixes), and they add two findings the single-branch trial could
+not produce.
+
+### The predicate generalizes beyond commits - measured accidentally
+
+#359 fell behind base mid-review and needed refreshing. The choice between rebase and
+`update-branch` turned entirely on ONE branch property: **does this branch carry cited fix SHAs?**
+It did (`f9db038` was cited in a CodeRabbit reply), so a rebase would have orphaned the citation
+and emptied the incremental-review delta; the additive merge was correct.
+
+That is the SAME SHAPE as the WIP predicate this document proposes - a property OF THE BRANCH
+selects the method, rather than a standing policy applied uniformly and relitigated at each edge
+case. The repo already reasons this way in one place and not the other. This is evidence FOR the
+derived-predicate architecture that arrived from outside the trial, which makes it worth more than
+the trial's own confirmation: nobody was looking for it.
+
+### The review-time and history-time audiences want DIFFERENT granularity
+
+#359 accumulated four commits - the feature, a CR fix round, a doc addition, and a merge commit -
+and squashing it at merge is RIGHT, not a compromise. During review the per-commit history was
+genuinely useful: the fix round is legible as its own unit, and a reviewer can see exactly what
+changed in response to feedback. In `main` that same structure is noise.
+
+The single-branch trial could not surface this, because #357 was one clean series where both
+audiences happened to want the same thing. The generalization: **merge method should be DERIVED AT
+MERGE TIME from the branch's final shape, not decided when the commits are written.** That is
+already this document's architecture, and it now has a second, independent argument - the first
+was bisect/blame legibility, this one is review legibility, and they point the same way.
+
+### Still unexercised, now across four branches
+
+The squash-iff-WIP leg has STILL never run on real work. Every branch this session was honest end
+to end, so the predicate has only ever been evaluated on inputs where it returns MERGE-COMMIT. Four
+branches of evidence for one leg and zero for the other is worth stating plainly rather than
+letting the count read as broader validation than it is.
+
+The recommendation is unchanged and now better supported: rollout steps 1-2 (read-only oracle +
+observed hook) are useful independent of step 3, and step 3 should wait for a branch that genuinely
+accumulates WIP commits. Note the mild irony that the honest-commit discipline this model
+encourages makes such a branch RARER, so the squash leg may need a deliberate test rather than an
+organic one.
+
 ## Open items (not blockers)
 
 - **Hook install is manual and per-machine**
