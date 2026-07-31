@@ -52,6 +52,16 @@ case "$TTL_HOURS" in ''|*[!0-9]*) TTL_HOURS=72 ;; esac
 # clause split), but it must NEVER reject a command the matcher would block. That direction
 # is the whole safety property, and `--assert-coverage` proves it per-vector.
 #
+# DO NOT ADD A CREDENTIAL-IN-ARGV DENY HERE (or to orchestrate-steer.sh). Three attempts
+# have failed BY MEASUREMENT against a real 5,358-rule corpus holding 14 real secrets:
+# value-detection reached 14/14 recall only with 18 false positives (including flagging the
+# very remedy it recommends), and blessed-absence caught 4/14 and 0/10 on the DOMINANT
+# carrier. Both directions are unbounded for the same reason - the dominant carrier hands a
+# secret to an ARBITRARY program (`ENV=value nohup ./svc`), so neither "is this a secret"
+# nor "which tools take credentials" is a closed set. Do not build a third; see #350 and
+# DESIGN-deterministic-floor.md. Detection (#349) and storage-side redaction (#326) are the
+# live directions.
+#
 # ADDING A DENY: declare its fragment here, add it to _PREFILTER_PARTS below, and add a
 # BLOCK vector to `--assert-coverage` plus `test-orchestrate-guard.py`. assert-coverage fails
 # loudly if a BLOCK vector cannot clear the short-circuit, so a forgotten fragment can no

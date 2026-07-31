@@ -477,6 +477,62 @@ teardown clean-worktree assertion. Track as a phase-3 tranche. Adversarial-
 evasion containment (a true allowlist-only/sandbox model) is explicitly not
 attempted.
 
+## DO NOT ADD A CREDENTIAL-IN-ARGV MATCHER (measured dead, both directions; #350)
+
+Binding for BOTH the guard and the advisory steer hook. Three attempts have now failed
+BY MEASUREMENT against a real corpus - not by review, and not because the implementations
+were buggy. Each reached the point of passing its own tests and its author's own vector
+table before an independent corpus was run against it.
+
+The corpus: a redacted census of 5,358 recorded approval rules on one machine, holding 14
+real secrets. Their carriers, which is the whole point:
+
+| carrier | count | |
+|---|---|---|
+| env-prefix (`ENV=value cmd`) | 10 | THE DOMINANT CARRIER |
+| auth-header (`Authorization: Bearer`) | 2 | |
+| short-flag (`-w`, `-p`) | 2 | |
+| long-flag (`--api-key`, `--token`) | **0** | every hit was the literal string `test` |
+
+Note the last row: the shape that LOOKS most like a credential carried none of them. A
+matcher designed from intuition targets the empty set.
+
+**Attempt 1 - detect secret VALUES in argv.** Round 1 caught 5 of 14. After a full rework
+it reached 14/14 recall with 18 NEW false positives, the worst being
+`API_KEY_FILE=/run/secrets/api_key` and `TOKEN_PATH=~/.config/gh/hosts.yml` - THE RULE
+FLAGGING THE VERY REMEDY IT RECOMMENDS. An earlier emergency deny on the same surface
+caught 2 of 15 and its block message steered users toward the largest uncaught carrier.
+
+**Attempt 2 - ignore values; flag a listed tool invoked without the blessed form.** Reused
+the command-position anchoring that has held for years in `looks_like_git_push`, and it IS
+prose-immune as designed (zero false positives; `man psql`, `brew install mysql`, `ls |
+grep mysql` all silent). It caught 4 of 14, and **0 of 10 on the dominant carrier**,
+because those commands invoke `nohup ./some-svc serve` or `env` - an ARBITRARY binary on
+no list.
+
+**Why both fail for the same reason** (the reusable part): the dominant carrier hands a
+secret to an ARBITRARY program. Value-detection fails because "is this string a secret" is
+unbounded - it cannot separate HOLDING a secret from REFERRING to one. Blessed-absence
+fails because "which tools take credentials" is ALSO unbounded - any program can read
+`$MY_TOKEN`. The pivot was justified on the claim that it moved the problem into a bounded
+domain; it moved it into a different unbounded one.
+
+WHAT TO DO INSTEAD: detection over prevention (a periodic redacted scan does not depend on
+anticipating the shape, #349), storage-side redaction as the only fix for the durable half
+(#326 - it operates on stored rules, so it is spelling-independent and cannot false-positive
+on prose), and FIX THE DOCS THAT TEACH THE LEAK (the two LDAP credentials in this census
+leaked because a runbook documented `ldapsearch ... -w '<pass>'`; that was fixed at source).
+A documented instruction to do the wrong thing is not something a matcher should be asked
+to catch.
+
+TWO SECONDARY LESSONS, both generalizable beyond credentials:
+- Every defect across both attempts was **a regex that silently captured NOTHING while
+  reading as correct** (`\b` unsupported by BSD sed; a greedy class eating its own keyword;
+  a space-separated `for` list splitting mid-entry). Each passed `shellcheck`, `bash -n`,
+  and its author's tests. This is the argument for the mutation-testing requirement (#324).
+- **An author-written vector table is not evidence.** Attempt 1's table read 37/37 clean;
+  an independent corpus found 35 deviations. Test against real recorded command lines.
+
 ## Known honest-path limitations (documented + accepted)
 
 These are NOT closed, by design - they fall outside the "honest-but-misaligned
