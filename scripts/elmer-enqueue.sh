@@ -58,8 +58,19 @@ esac
 pr=""; repo=""; receipt_path=""; form="incremental"
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --receipt) receipt_path="${2:-}"; shift 2 || true ;;
-    --form)    form="${2:-}"; shift 2 || true ;;
+    # The `|| true` on a `shift 2` is a TRAP, not a safety net. With only one argument
+    # left (a trailing `--receipt`), `shift 2` FAILS, the `|| true` swallows it, `$#`
+    # never decreases, and this loop spins forever at 100% CPU with no output. An agent
+    # that fumbles the trailing argument gets a Bash call that never returns - the same
+    # class of harm as a permission prompt (a silent unattended stall), by a different
+    # cause. Measured: rc=137 after a 4s SIGKILL on three separate arg shapes.
+    # So the value is REQUIRED to exist before shifting past it.
+    --receipt)
+      [ "$#" -ge 2 ] || { echo "setup error: --receipt requires a path" >&2; exit 2; }
+      receipt_path="$2"; shift 2 ;;
+    --form)
+      [ "$#" -ge 2 ] || { echo "setup error: --form requires a value" >&2; exit 2; }
+      form="$2"; shift 2 ;;
     -*) echo "setup error: unknown flag: $1" >&2; exit 2 ;;
     */*) repo="$1"; shift ;;
     *) if [ -z "$pr" ]; then pr="$1"; else echo "setup error: unexpected argument: $1" >&2; exit 2; fi; shift ;;

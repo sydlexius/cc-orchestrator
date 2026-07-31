@@ -52,6 +52,19 @@ fi
 # whether elmer-tick.sh runs from the repo or from the deployed ~/.claude/scripts path.
 SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
+# jq is a HARD dependency, checked up front like elmer-enqueue.sh does. Without this
+# every jq read degrades to an empty string behind a `|| true`, so a full queue reads
+# as unreadable and the tick prints "queue empty; nothing to do" at exit 0 - a silent
+# wrong answer under an environment fault, which is precisely what the exit contract
+# above forbids. Fail-safe for POSTING is not the same as fail-safe for REPORTING.
+# Probed by RUNNING it, not by `command -v`: a jq that is present but broken (a bad
+# install, a wrapper that exits 127) passes a presence check and then fails every
+# read. Both failure modes produce the same silent wrong answer, so both are caught.
+echo '{}' | jq -e . >/dev/null 2>&1 || {
+  echo "setup error: jq is required and must be working (probe failed)." >&2
+  exit 2
+}
+
 ELMER_HOME="${ELMER_HOME:-$HOME/.claude/elmer}"
 inbox="$ELMER_HOME/inbox"
 drained="$ELMER_HOME/drained"
@@ -82,16 +95,63 @@ lock_age_secs() {
   echo $(( now - t ))
 }
 
+lock_inode() {
+  # The lock's IDENTITY, read the same portable way as its age: BSD stat (macOS)
+  # then GNU stat (Linux). An unreadable inode returns nonzero and the caller backs
+  # off rather than breaking a lock it cannot identify - the same deny-on-doubt
+  # posture lock_age_secs already takes with an unreadable mtime.
+  local i
+  i="$(stat -f %i "$LOCK_DIR" 2>/dev/null || stat -c %i "$LOCK_DIR" 2>/dev/null || true)"
+  [ -n "$i" ] || return 1
+  printf '%s\n' "$i"
+}
+
 acquire_lock() {
   if mkdir "$LOCK_DIR" 2>/dev/null; then
     return 0
   fi
-  local age
+  # IDENTITY FIRST, AGE SECOND. The inode is captured BEFORE the age is read so the
+  # two readings describe the same directory, and re-checked immediately before the
+  # break so the thing being broken is still the thing judged stale.
+  local ino age now_ino
+  ino="$(lock_inode)" || return 1
   if age="$(lock_age_secs)" && [ "$age" -gt "$LOCK_STALE_SECS" ]; then
-    echo "note: breaking a stale tick lock (${age}s old, threshold ${LOCK_STALE_SECS}s)" >&2
-    rmdir "$LOCK_DIR" 2>/dev/null || true
-    mkdir "$LOCK_DIR" 2>/dev/null || return 1
-    return 0
+    # BREAK BY RENAME, NOT BY rmdir+mkdir. The obvious form is TOCTOU-racy: every
+    # contending tick independently sees "stale", rmdirs, and mkdirs, and their
+    # windows interleave so SEVERAL come away believing they hold the lock. Measured
+    # at 8 concurrent ticks against a stale lock: 2-4 posts per trial, where the
+    # normal path gives exactly 1 every time. The self-healing path was breaking the
+    # very mutual exclusion the lock exists to provide - and a wedged-then-reclaimed
+    # lock is EXACTLY when a human opens a second window.
+    #
+    # `mv` of a directory onto a unique name is atomic on one filesystem and succeeds
+    # for exactly ONE racer; every other tick's mv fails because the source is gone,
+    # and they fall through to the normal contended path. The winner then mkdirs.
+    #
+    # ATOMICITY ALONE IS NOT ENOUGH, because mv answers "did I move A directory" and
+    # never "did I move THE directory I judged stale". A racer reads the OLD lock's
+    # age, is descheduled, and by the time it runs again the winner has already
+    # broken the lock and mkdir'd a FRESH one at the same path. The racer's mv then
+    # succeeds - against the wrong directory - and it too believes it holds the lock,
+    # so two ticks post at once, which is precisely what the lock exists to prevent.
+    # Measured with overlapping post intervals: 2-3 of 6 trials at 8 concurrent ticks.
+    # The staleness reading offers no protection here: the fresh lock's mtime is NOW,
+    # so a racer that re-read the age would correctly see "not stale" - the damage
+    # comes from acting on a reading taken before the swap.
+    #
+    # So the break is conditioned on IDENTITY, not just on atomicity: re-read the
+    # inode and refuse unless it is the same directory that was judged stale. An
+    # unreadable inode is "cannot verify" and backs off, never breaks.
+    now_ino="$(lock_inode)" || return 1
+    [ "$now_ino" = "$ino" ] || return 1
+    local dead="$LOCK_DIR.dead.$$"
+    if mv "$LOCK_DIR" "$dead" 2>/dev/null; then
+      echo "note: breaking a stale tick lock (${age}s old, threshold ${LOCK_STALE_SECS}s)" >&2
+      rmdir "$dead" 2>/dev/null || true
+      mkdir "$LOCK_DIR" 2>/dev/null || return 1
+      return 0
+    fi
+    return 1
   fi
   return 1
 }
@@ -157,15 +217,35 @@ fi
 # never a remaining-slot count, so "no announced limit" means EITHER plenty of budget
 # OR one review from the wall. Posting a batch on a single all-clear reading would
 # blow past the wall unseen. Post one, then re-read the signal.
+UNREADABLE_LOG="$(mktemp)"
+trap 'rmdir "$LOCK_DIR" 2>/dev/null || true; rm -f "$UNREADABLE_LOG" 2>/dev/null || true' EXIT
+
 pick_entry() {
   local f best="" best_at="" repo at
   for f in "$inbox"/*.json; do
     [ -e "$f" ] || continue
+    # ANYTHING ALREADY DRAINED IS NEVER RE-POSTED, and that is checked HERE rather
+    # than trusted. The header long claimed this invariant while nothing in the tick
+    # ever read `drained/` - the de-dup lived only in elmer-enqueue.sh, a different
+    # process at a different time. The invariant then rested entirely on the `rm -f`
+    # below always succeeding; an unwritable inbox (permissions drift, a restored
+    # backup) leaves the entry in BOTH directories and the next tick posts it again.
+    # A claimed invariant that no code enforces is worse than no claim at all.
+    [ -e "$drained/$(basename "$f")" ] && continue
+
     repo="$(jq -r '.repo // ""' "$f" 2>/dev/null || true)"
     at="$(jq -r '.enqueued_at // ""' "$f" 2>/dev/null || true)"
-    # An entry we cannot read is left alone rather than guessed at: it will be
-    # surfaced by the triage/audit path, not silently posted for.
-    [ -n "$repo" ] && [ -n "$at" ] || continue
+    # An entry we cannot read is SKIPPED here and reported after the loop - never
+    # guessed at, and never silently invisible either (see the unreadable report
+    # below; an earlier comment claimed the triage path surfaced these, which it
+    # does not - triage takes PR numbers and never reads the queue).
+    # Recorded to a FILE, not a variable: pick_entry runs in a command substitution,
+    # so a shell variable set here dies with the subshell and the report would never
+    # reach the caller.
+    if [ -z "$repo" ] || [ -z "$at" ]; then
+      printf '%s\n' "$f" >> "$UNREADABLE_LOG"
+      continue
+    fi
     # Sort key puts the priority repo ahead of everything, then orders by ISO
     # timestamp, which sorts lexically because it is fixed-width UTC.
     case "$repo" in
@@ -180,7 +260,18 @@ pick_entry() {
   printf '%s\n' "$best"
 }
 
-if ! entry="$(pick_entry)"; then
+entry="$(pick_entry)" || entry=""
+
+# An unreadable entry is REPORTED, never silently invisible. It cannot be posted for
+# (it was skipped above), but a queue quietly accumulating malformed files while the
+# tick prints "queue empty" is exactly the silent-wrong-answer this script's contract
+# forbids. Reported on every path, including the empty-queue one.
+if [ -s "$UNREADABLE_LOG" ]; then
+  echo "elmer-tick: WARNING - $(wc -l < "$UNREADABLE_LOG" | tr -d ' ') unreadable queue entr(y/ies), skipped:" >&2
+  sed 's/^/  /' "$UNREADABLE_LOG" >&2
+fi
+
+if [ -z "$entry" ]; then
   echo "elmer-tick: queue empty; nothing to do."
   exit 0
 fi
@@ -258,10 +349,23 @@ esac
 # about it. Note this check is sound in the direction it is used -- it can only
 # SUPPRESS a post, never authorize one -- which is why the racy inverse (asking
 # GitHub "has a review happened" as the idempotency mechanism) is still not used.
+# THE FIELD IS `commit.oid`, NOT `commit_id`. Verified live against the GitHub API:
+# `gh pr view --json reviews` emits {author:{login}, state, commit:{oid}} and has NO
+# `commit_id` key at all. The first cut of this guard compared `.commit_id == $s`,
+# i.e. `null == <sha>`, which is ALWAYS false - so the guard never fired and read as
+# correct. Its harness stub encoded the same invented shape, so the test and the bug
+# agreed with each other and the mutation-proof passed against a fictional field.
+# If this ever needs changing, re-verify the shape against a REAL PR first.
+#
+# Scoped to CodeRabbit's own login on purpose: a human approval or another bot's
+# review at this SHA must NOT suppress a wanted CR pass. Only a CR review at this
+# exact head means the slot would be spent on work already done.
 if revs="$(gh pr view "$e_pr" --repo "$e_repo" --json reviews 2>/dev/null)"; then
   if [ "$(jq -r --arg s "$e_sha" \
-        '[.reviews[]? | select(.commit_id == $s)] | length' <<<"$revs" 2>/dev/null || echo 0)" -gt 0 ]; then
-    echo "REFUSED: a review already exists at ${e_sha:0:12}; not spending a slot." >&2
+        '[.reviews[]? | select((.commit.oid // "") == $s)
+                      | select((.author.login // "") | test("^coderabbitai"))] | length' \
+        <<<"$revs" 2>/dev/null || echo 0)" -gt 0 ]; then
+    echo "REFUSED: CodeRabbit has already reviewed ${e_sha:0:12}; not spending a slot." >&2
     exit 1
   fi
 fi
@@ -300,7 +404,23 @@ tmp="$drained/.$base.tmp.$$"
 if jq --arg t "$now" --arg out "$post_out" \
      '. + {triggered_at: $t, trigger: "'"$TRIGGER"'", response: $out}' \
      "$entry" > "$tmp" 2>/dev/null && mv -f "$tmp" "$drained/$base"; then
-  rm -f "$entry"
+  # THE POST HAS HAPPENED. From here on, no failure may exit 1: the contract defines
+  # 1 as "POSTED NOTHING", and the loop runbook tells the operator to hand the entry
+  # back to the TL on a 1. A successful post reported as rc=1 makes every downstream
+  # human decision rest on a false premise, about the one outcome that spends a slot.
+  #
+  # `rm -f` does NOT succeed unconditionally - it fails on an unwritable inbox
+  # (permissions drift, a restored backup), and under `set -e` that failure used to
+  # kill the script at rc=1 right here, with the success lines below never printed.
+  # The drained/ check in pick_entry now prevents the resulting double-post, so this
+  # is reported loudly as exit 2 and never mistaken for a refusal.
+  if ! rm -f "$entry" 2>/dev/null || [ -e "$entry" ]; then
+    echo "elmer-tick: POSTED $e_repo #$e_pr at ${e_sha:0:12}, drained to $drained/$base" >&2
+    echo "setup error: could not remove the inbox entry $entry after a SUCCESSFUL post." >&2
+    echo "             The drain record exists, so the next tick will NOT re-post it." >&2
+    echo "             Remove the stale inbox file by hand." >&2
+    exit 2
+  fi
   echo "elmer-tick: POSTED an incremental review request -- $e_repo #$e_pr at ${e_sha:0:12}"
   echo "            drained: $drained/$base"
   exit 0

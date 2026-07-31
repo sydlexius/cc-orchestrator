@@ -69,7 +69,8 @@ def pr_json(head=SHA_A, state="OPEN"):
 
 
 def run(args, *, receipt_obj="__default__", pr=None, api_fail=False,
-        repo_fail=False, home=None, write_receipt=True, raw_receipt=None):
+        repo_fail=False, home=None, write_receipt=True, raw_receipt=None,
+        timeout=30):
     """Invoke enqueue with a stubbed gh + isolated ELMER_HOME.
 
     Returns (rc, stdout, stderr, inbox_entries, home_dir_kept_alive)."""
@@ -110,7 +111,7 @@ def run(args, *, receipt_obj="__default__", pr=None, api_fail=False,
         env["GH_REPO_FAIL"] = "1"
 
     full = [SCRIPT] + [a.replace("__RECEIPT__", rpath) for a in args]
-    p = subprocess.run(full, env=env, capture_output=True, text=True, timeout=30)
+    p = subprocess.run(full, env=env, capture_output=True, text=True, timeout=timeout)
 
     inbox = os.path.join(elmer_home, "inbox")
     entries = sorted(os.listdir(inbox)) if os.path.isdir(inbox) else []
@@ -129,6 +130,25 @@ def main():
     check("missing --receipt -> exit 2", rc == 2 and "receipt" in err.lower())
     rc, _, err, _, _ = run(["42", "--receipt", "__RECEIPT__"], repo_fail=True)
     check("repo unresolvable -> exit 2", rc == 2 and "setup error" in err)
+
+    # A TRAILING FLAG WITH NO VALUE MUST FAIL, NOT SPIN. With `shift 2 || true` the
+    # failed shift is swallowed, `$#` never decreases, and the arg loop runs forever
+    # at 100% CPU with no output - an unattended stall in a Bash call that never
+    # returns. `run()` passes a subprocess timeout, so a regression FAILS this case
+    # instead of hanging the harness (`timeout(1)` is not available on macOS, so the
+    # bound is enforced in python).
+    for args, label in (
+        (["42", "owner/repo", "--receipt"], "trailing --receipt with no value"),
+        (["42", "owner/repo", "--form"], "trailing --form with no value"),
+        (["--receipt"], "bare --receipt alone"),
+    ):
+        try:
+            rc, _, err, entries, _ = run(args, timeout=10)
+            check(f"{label} -> exit 2 promptly", rc == 2)
+            check(f"{label} -> nothing queued", entries == [])
+        except subprocess.TimeoutExpired:
+            check(f"{label} -> exit 2 promptly", False)
+            check(f"{label} -> nothing queued", False)
 
     print("== the happy path ==")
     rc, out, err, entries, _ = run(["42", "owner/repo", "--receipt", "__RECEIPT__"])

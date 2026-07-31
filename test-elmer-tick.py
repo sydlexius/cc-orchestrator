@@ -51,13 +51,23 @@ GH_STUB = r"""#!/usr/bin/env bash
 [ "${GH_FAIL:-0}" = "1" ] && exit 1
 if [ "$1" = "pr" ] && [ "$2" = "comment" ]; then
   [ "${GH_POST_FAIL:-0}" = "1" ] && { echo "post rejected" >&2; exit 1; }
+  # CONCURRENCY INSTRUMENTATION (only when GH_INTERVAL_LOG is set, so every other
+  # case is unaffected). A post takes real time in reality, so the stub occupies the
+  # critical section for GH_POST_SLEEP seconds and records the START and END of that
+  # occupancy as ONE line. One python3 invocation does the timing AND the sleep, so
+  # the appended line is short enough to be atomic under O_APPEND from N racers.
+  if [ -n "${GH_INTERVAL_LOG:-}" ]; then
+    python3 -c 'import sys,time
+s=time.time(); time.sleep(float(sys.argv[1])); print(s, time.time())' \
+      "${GH_POST_SLEEP:-1.5}" >> "$GH_INTERVAL_LOG"
+  fi
   printf '%s\n' "$*" >> "$GH_POSTLOG"
   echo "https://github.com/x/y/pull/1#issuecomment-1"
   exit 0
 fi
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   case "$*" in
-    *reviews*) printf '{"reviews":%s}\n' "${GH_REVIEWS:-[]}" ; exit 0 ;;
+    *reviews*) printf '{"reviews":%s}\n' "${GH_REVIEWS:-[]}" ; exit 0 ;;   # shape: [{author:{login},state,commit:{oid}}]
     *) printf '{"headRefOid":"%s","state":"%s"}\n' \
          "${GH_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" "${GH_STATE:-OPEN}" ; exit 0 ;;
   esac
@@ -243,10 +253,20 @@ def _(env):
     check("names the form", "'full'" in r.stderr)
 
 
-@case("a review already exists at this head -> refuse")
+# The fixtures below use the REAL `gh pr view --json reviews` shape:
+#   {"author": {"login": ...}, "state": ..., "commit": {"oid": ...}}
+# There is NO `commit_id` key. The first cut of both the guard AND this stub used one,
+# so the test agreed with the bug and the guard was dead in production while every
+# assertion passed. Verified live against a real PR before rewriting these.
+# If a fixture here ever needs a new field, check it against a real PR first.
+def review(sha, login="coderabbitai", state="COMMENTED"):
+    return {"author": {"login": login}, "state": state, "commit": {"oid": sha}}
+
+
+@case("a CodeRabbit review already exists at this head -> refuse")
 def _(env):
     env.queue(354)
-    r = env.run(GH_REVIEWS=json.dumps([{"commit_id": SHA}]))
+    r = env.run(GH_REVIEWS=json.dumps([review(SHA)]))
     check("exit 1", r.returncode == 1)
     check("posted nothing", env.posts == [])
 
@@ -254,9 +274,25 @@ def _(env):
 @case("a review at a DIFFERENT head does not block")
 def _(env):
     env.queue(354)
-    r = env.run(GH_REVIEWS=json.dumps([{"commit_id": OTHER_SHA}]))
+    r = env.run(GH_REVIEWS=json.dumps([review(OTHER_SHA)]))
     check("posted once", len(env.posts) == 1)
     check("exit 0", r.returncode == 0)
+
+
+@case("a HUMAN review at this head must NOT suppress a wanted CR pass")
+def _(env):
+    env.queue(354)
+    r = env.run(GH_REVIEWS=json.dumps([review(SHA, login="sydlexius", state="APPROVED")]))
+    check("posted once", len(env.posts) == 1)
+    check("exit 0", r.returncode == 0)
+
+
+@case("the bot login is matched as coderabbitai[bot] too")
+def _(env):
+    env.queue(354)
+    r = env.run(GH_REVIEWS=json.dumps([review(SHA, login="coderabbitai[bot]")]))
+    check("exit 1", r.returncode == 1)
+    check("posted nothing", env.posts == [])
 
 
 # --- Setup errors: exit 2, never mistaken for "nothing to do" ---------------------
@@ -352,6 +388,65 @@ def _(env):
     check("posted nothing", env.posts == [])
 
 
+@case("an entry ALREADY in drained/ is never posted for (idempotency read, not trust)")
+def _(env):
+    # The tick used to claim "anything in drained/ is never re-posted" while nothing in
+    # it ever READ drained/ - the de-dup lived only in elmer-enqueue.sh, a different
+    # process. This asserts the tick enforces it itself.
+    env.queue(354)
+    env.drain_record("e-354.json", "2020-01-01T00:00:00Z")
+    r = env.run()
+    check("exit 0 (nothing pickable)", r.returncode == 0)
+    check("posted nothing", env.posts == [])
+
+
+@case("a post whose inbox rm fails exits 2, NEVER 1, and cannot double-post")
+def _(env):
+    # rc=1 means "POSTED NOTHING" per the contract, and the loop runbook hands the entry
+    # back to the TL on a 1. A successful post reported as 1 makes every downstream
+    # decision rest on a false premise. An unwritable inbox used to do exactly that via
+    # `set -e` on the `rm -f`.
+    env.queue(354)
+    os.chmod(env.inbox, 0o555)
+    try:
+        r = env.run()
+        check("posted once", len(env.posts) == 1)
+        check("exit 2, not 1", r.returncode == 2)
+        check("says POSTED", "POSTED" in r.stderr)
+        check("drain record written", env.ls("drained") == ["e-354.json"])
+    finally:
+        os.chmod(env.inbox, 0o755)
+    # The stale inbox entry now co-exists with its drain record; the next tick must
+    # NOT post again.
+    env.run()
+    check("next tick does NOT re-post", len(env.posts) == 1)
+
+
+@case("an unreadable entry is REPORTED, not silently invisible")
+def _(env):
+    with open(os.path.join(env.inbox, "bad.json"), "w") as f:
+        f.write('{"broken":')
+    r = env.run()
+    check("exit 0", r.returncode == 0)
+    check("posted nothing", env.posts == [])
+    check("warns about the unreadable entry", "unreadable" in r.stderr.lower())
+    check("names the file", "bad.json" in r.stderr)
+
+
+@case("jq missing -> exit 2, never a false 'queue empty'")
+def _(env):
+    # Without an explicit check, every jq read degrades behind a `|| true`, a full queue
+    # reads as unreadable, and the tick prints "queue empty" at exit 0 - a silent wrong
+    # answer under an environment fault.
+    env.queue(354)
+    broken = os.path.join(env.bin, "jq")
+    Env._write(broken, "#!/usr/bin/env bash\nexit 127\n")
+    r = env.run()
+    check("exit 2", r.returncode == 2)
+    check("posted nothing", env.posts == [])
+    check("does NOT claim the queue is empty", "queue empty" not in r.stdout)
+
+
 @case("dry run posts nothing but shows the exact command")
 def _(env):
     env.queue(354)
@@ -360,6 +455,67 @@ def _(env):
     check("posted nothing", env.posts == [])
     check("shows the trigger", "@coderabbitai review" in r.stdout)
     check("entry left queued", env.ls("inbox") == ["e-354.json"])
+
+
+@case("concurrent ticks against a STALE lock never hold it simultaneously")
+def _(env):
+    # THE ONLY VALID EVIDENCE IS OVERLAP, NOT A POST COUNT. A tick that starts after
+    # the winner RELEASED the lock and posts is succession, which is correct
+    # behaviour; counting posts cannot tell it apart from a race and an earlier pass
+    # nearly filed a false accusation on exactly that confusion. Simultaneity is the
+    # one thing succession can never produce, so the stub brackets each post with a
+    # START/END timestamp and holds the critical section for a real interval; the
+    # assertion is that no two of those intervals overlap.
+    #
+    # This case is what separates the identity-checked break from a merely ATOMIC
+    # one. `mv` succeeds for one racer at a time but does not verify WHICH directory
+    # it moved, so a tick that read the old lock's age can break a FRESH lock the
+    # winner already installed. Reverting the inode check (or going back to
+    # rmdir+mkdir) makes overlaps appear here.
+    ilog = os.path.join(env.tmp, "intervals")
+    open(ilog, "w").close()
+
+    e = dict(os.environ)
+    e["PATH"] = env.bin + os.pathsep + e["PATH"]
+    e["ELMER_HOME"] = env.home
+    e["GH_POSTLOG"] = env.postlog
+    e["GH_INTERVAL_LOG"] = ilog
+    e["GH_POST_SLEEP"] = "1.5"
+    # The hourly cap is a DIFFERENT bound and must not mask the race: raised so a
+    # racy lock is free to post as many times as it can.
+    e["ELMER_MAX_PER_HR"] = "999"
+
+    # THREE ROUNDS, not one. The race window is small and process start-up spread is
+    # widest on the first burst (cold caches), so a single burst detects the racy form
+    # only about 5 times in 6 - measured, not assumed. Rounds are strictly sequential
+    # (every process is waited on before the next round starts), so no interval can
+    # span a round boundary and pooling them into one overlap sweep is sound.
+    spans = []
+    for _round in range(3):
+        lock = os.path.join(env.home, ".tick.lock")
+        if os.path.isdir(lock):
+            os.rmdir(lock)
+        os.makedirs(lock)
+        os.utime(lock, (1, 1))  # 1970: far past any threshold, so every tick sees stale
+        for pr in range(400, 408):
+            env.queue(pr)
+        procs = [subprocess.Popen([env.script], stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, env=e) for _ in range(8)]
+        for p in procs:
+            p.wait(timeout=60)
+
+    with open(ilog) as f:
+        spans = [tuple(float(x) for x in ln.split()) for ln in f.read().split("\n") if ln.strip()]
+    spans.sort()
+    # Sweep with a running max end rather than comparing adjacent pairs: a fully
+    # CONTAINED interval overlaps its predecessor without adjoining it in sort order.
+    overlaps = 0; max_end = None
+    for start, end in spans:
+        if max_end is not None and start < max_end:
+            overlaps += 1
+        max_end = end if max_end is None else max(max_end, end)
+    check(f"at least one post happened ({len(spans)} intervals)", len(spans) >= 1)
+    check(f"zero overlapping post intervals (found {overlaps})", overlaps == 0)
 
 
 print()
