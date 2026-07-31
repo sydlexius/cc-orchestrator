@@ -438,9 +438,11 @@ def main():
     _osetup = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(_osetup)
     helper_names = list(_osetup.HELPER_NAMES)
-    # 20 = 16 + the four elmer helpers (cr-quota-watch, elmer-enqueue, elmer-triage, elmer-tick).
+    # 21 = 16 + the four elmer helpers (cr-quota-watch, elmer-enqueue, elmer-triage,
+    # elmer-tick) + base-freshness.sh, which #330 made a live stable-path dependency
+    # of the DEPLOYED safe-push.sh.
     check("#284 lockstep: HELPER_NAMES imported (exact count -- a truncated parse must not pass)",
-          len(helper_names) == 20)
+          len(helper_names) == 21)
     for h in helper_names:
         p = os.path.join(repo, "scripts", h)
         rc, err = run_steer({"file_path": p}, channel="stdin", tool_name="Edit", marker_active=True)

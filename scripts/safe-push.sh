@@ -31,6 +31,8 @@
 #   bash safe-push.sh <branch>         # push named branch -u origin
 #   bash safe-push.sh <branch> --force-with-lease   # extra flags forwarded to git push
 #   bash safe-push.sh <branch> --rewrite            # DECLARE a history rewrite (see below)
+#   bash safe-push.sh <branch> --base release/1.2   # measure freshness against a NON-DEFAULT base
+#   bash safe-push.sh <branch> --stale-ok           # DECLARE an intentional behind-base upload
 #
 # ADDITIVE vs REWRITE (#148): before pushing, the wrapper classifies the push
 # against a FRESH `git ls-remote` SHA (not the stale local tracking ref):
@@ -54,7 +56,9 @@
 # Exit codes:
 #   0 -- push succeeded AND the remote ref matches local HEAD
 #   1 -- push exited non-zero, the remote ref does not match local HEAD, the push
-#        was REFUSED as a silent rewrite (no --rewrite/--rebased), the remote is
+#        was REFUSED as a stale-base upload (#330: definitively BEHIND the base and no
+#        --stale-ok declared; --base <name> corrects a wrong base), was REFUSED as a
+#        silent rewrite (no --rewrite/--rebased), the remote is
 #        ahead (diverged) and must be integrated first, or the remote tip is not
 #        in local history (run `git fetch origin` first so it can be classified)
 #   2 -- invalid invocation / not in a git repo / cannot resolve branch
@@ -128,10 +132,22 @@ fi
 # (they are safe-push's own signal, NOT git-push flags) and forward everything
 # else verbatim. Accumulating into an array keeps flags-with-spaces intact.
 rewrite_intent=0
+stale_ok=0
+base_override=""
 push_args=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --rewrite|--rebased) rewrite_intent=1; shift ;;
+    --stale-ok) stale_ok=1; shift ;;
+    --base)
+      # A VALUE is mandatory. Defaulting a missing one would silently measure against the
+      # wrong base, which is the exact false-BEHIND this flag exists to prevent.
+      if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+        echo "safe-push: --base requires a branch NAME (e.g. --base release/1.2)." >&2
+        echo "           Usage: safe-push.sh <branch> [--base <name>] [--stale-ok] [git-push flags]" >&2
+        exit 2
+      fi
+      base_override="$2"; shift 2 ;;
     *) push_args+=("$1"); shift ;;
   esac
 done
@@ -140,6 +156,91 @@ local_sha=$(git rev-parse --verify "refs/heads/$branch" 2>/dev/null || true)
 if [ -z "$local_sha" ]; then
   echo "safe-push: local branch 'refs/heads/$branch' does not exist" >&2
   exit 2
+fi
+
+# --- BASE FRESHNESS (#330) ------------------------------------------------------------
+# The rewrite classifier below asks only about this branch's OWN remote ref. It never asks
+# whether HEAD is behind the BASE, so the first additive upload of a stale-base branch passed
+# clean and opened a PR on a stale base. base-freshness.sh (#282) already answers exactly that
+# question; it was simply unwired here, and a check that exists but is not wired where it
+# matters is indistinguishable from no check (the #324 shape).
+#
+# GIT-ONLY, DELIBERATELY. No `gh` is called here and none should be: this is the most-used
+# script in the repo, and a `gh` lookup would put a network dependency (and a rate-limit /
+# auth failure mode) on every push. PR review state is therefore not consulted - the caller
+# DECLARES intent with --stale-ok, mirroring the existing --rewrite intent flag.
+#
+# --base IS THE FIX FOR A NON-DEFAULT BASE, NOT --stale-ok. A backport off release/1.2
+# measured against origin/HEAD yields a FALSE behind-count. If the only escape were the
+# override, backport authors would learn to reach for it reflexively, training the override
+# to mean "dismiss the guard" rather than "the gate genuinely passed" - the corrosion #345
+# documents. A wrong base gets a CORRECT remedy instead.
+#
+# BLOCKS ONLY ON A DEFINITIVE BEHIND (the helper's exit 1). Its exit 0 covers fresh AND
+# unknown by design, so an unreachable origin, a shallow clone, or an unresolvable base
+# DEGRADES to a report and never blocks a push.
+if [ "$stale_ok" -eq 1 ]; then
+  echo "safe-push: --stale-ok declared; base-freshness gate skipped for this push." >&2
+else
+  # Resolve the base git-only: an explicit --base wins, else the recorded default branch.
+  # Never hard-coded, so a non-main base is correct by construction (the helper's contract).
+  fresh_base="$base_override"
+  if [ -z "$fresh_base" ]; then
+    fresh_base=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+    fresh_base="${fresh_base#origin/}"
+  fi
+  if [ -z "$fresh_base" ]; then
+    # origin/HEAD is commonly unset on a fresh clone. Say so and PROCEED: guessing `main`
+    # here would reintroduce exactly the hard-coded base the helper refuses to assume.
+    echo "safe-push: freshness: unknown - no base could be resolved (origin/HEAD unset; pass --base <name> to check)." >&2
+  else
+    bf=""
+    for cand in "$(dirname "$0")/base-freshness.sh" "${CLAUDE_PLUGIN_ROOT:-}/scripts/base-freshness.sh"; do
+      [ -f "$cand" ] && { bf="$cand"; break; }
+    done
+    if [ -z "$bf" ]; then
+      echo "safe-push: freshness: unknown - base-freshness.sh not found; skipping the check." >&2
+    else
+      # Capture rather than inherit stdout: the helper's one labeled line is surfaced on
+      # stderr with safe-push's own prefix, keeping this wrapper's output shape stable.
+      set +e
+      fresh_out=$(bash "$bf" "$fresh_base" HEAD 2>&1)
+      fresh_rc=$?
+      set -e
+      case "$fresh_rc" in
+        1)
+          echo "safe-push: REFUSING a stale-base push." >&2
+          echo "          $fresh_out" >&2
+          echo "          Refresh ADDITIVELY, never with a rebase (a rewrite orphans every fix SHA cited in review replies):" >&2
+          echo "            git merge origin/$fresh_base       # in this worktree" >&2
+          echo "            gh pr update-branch <n>            # for an OPEN PR (default merge-commit mode)" >&2
+          echo "          Wrong base? Pass --base <name> (e.g. a backport's real base) - that is the fix, not the override." >&2
+          echo "          Deliberately uploading behind-base WIP? Re-run with --stale-ok to declare it." >&2
+          exit 1 ;;
+        0)
+          # fresh OR unknown - both non-blocking. Stay quiet on a plain 'fresh', but ALWAYS
+          # surface an unknown: a degraded answer is the one a caller most needs to see.
+          #
+          # MATCH THE FULL LABEL, NOT `*fresh*`. The word "freshness" CONTAINS "fresh", so the
+          # substring glob also matched `freshness: unknown - ...` and silently discarded every
+          # degraded report - the exact "reports nothing and is believed" failure this whole
+          # gate exists to prevent, hidden inside the gate itself. An exit-code-only assertion
+          # kept it green (CR caught it; harness assertion added alongside this fix).
+          case "$fresh_out" in
+            *"freshness: fresh"*) : ;;
+            *)
+              # An `if`, not `[ -n ... ] && echo`: under `set -euo pipefail` an empty
+              # $fresh_out makes the test the arm's LAST command, so the arm returns 1 and
+              # errexit kills a push that had passed every gate.
+              if [ -n "$fresh_out" ]; then
+                echo "safe-push: $fresh_out" >&2
+              fi ;;
+          esac ;;
+        *)
+          echo "safe-push: freshness: unknown - base-freshness.sh exited $fresh_rc; proceeding." >&2 ;;
+      esac
+    fi
+  fi
 fi
 
 # --- Pre-push classification (#148): distinguish an ADDITIVE push (first push or
