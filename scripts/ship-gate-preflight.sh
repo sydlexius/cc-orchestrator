@@ -434,7 +434,34 @@ fi
 # StatusContext is never wrongly treated as a (possibly-conclusion-bearing)
 # CheckRun. Anything not matching the per-shape PASS rule blocks (fail closed).
 bad="$(jq -r --argjson ok "$ACCEPTABLE_CONCLUSIONS" '
-  (.statusCheckRollup // [])[]
+  # LATEST-PER-NAME REDUCTION for CheckRuns (#301 Part 1). GitHub CANCELS in-flight
+  # duplicates on every new push, so a superseded CANCELLED run sits in the rollup
+  # alongside the LATER same-name run that SUCCEEDED - and evaluating the list flat
+  # blocked on the corpse. That is normal push behavior, not an edge case.
+  #
+  # THIS MOVES IN THE RELAXING DIRECTION (it makes the gate block LESS), which for a
+  # fail-closed oracle is the dangerous one, so the sort is specified defensively:
+  #
+  #   PRIMARY KEY = startedAt, NOT completedAt. Sorting by completedAt is a FALSE-GREEN:
+  #   a newer IN_PROGRESS run has completedAt = null, so a stale SUCCESS would sort
+  #   above it and win. startedAt is monotonic per run and always set for a started run.
+  #
+  #   NULL TIMESTAMPS SORT AS NEWEST, never oldest. A QUEUED re-run has startedAt = null
+  #   and MUST beat an old SUCCESS, so the gate blocks on the pending re-run rather than
+  #   the stale pass. Ordering nulls last would invert exactly this case.
+  #
+  # ONLY CheckRuns are reduced. StatusContexts have no re-run/name-collision semantics,
+  # and the unknown-__typename entries must keep their fail-closed path untouched - so
+  # both bypass the grouping entirely.
+  ( (.statusCheckRollup // [])
+    | map(select((.__typename // "") == "CheckRun"))
+    | group_by(.name // .context // "unknown")
+    | map( sort_by( [ (if .startedAt   == null then "9999" else .startedAt   end),
+                      (if .completedAt == null then "9999" else .completedAt end) ] )
+           | last )
+  ) as $latest_runs
+  | ( (.statusCheckRollup // []) | map(select((.__typename // "") != "CheckRun")) ) as $others
+  | ($latest_runs + $others)[]
   | (.__typename // "") as $t
   | if $t == "StatusContext" then
       { name: (.context // "unknown"),

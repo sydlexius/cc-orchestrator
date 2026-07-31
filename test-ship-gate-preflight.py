@@ -96,8 +96,20 @@ def threads_doc(unresolved=0, resolved=0, total=None, raw_nodes=None):
 DEFAULT_THREADS = threads_doc(unresolved=0, resolved=0)
 
 
-def checkrun(name, status, conclusion):
-    return {"__typename": "CheckRun", "name": name, "status": status, "conclusion": conclusion}
+def checkrun(name, status, conclusion, started_at="__OMIT__", completed_at="__OMIT__"):
+    """A CheckRun rollup entry.
+
+    started_at / completed_at (#301 Part 1) drive the latest-per-name reduction. Both
+    default to OMITTED so every pre-existing fixture is unchanged - and note that an
+    omitted timestamp reads as NULL, which the reduction sorts as NEWEST (fail-closed:
+    a QUEUED re-run with no startedAt must beat a stale SUCCESS). Pass an ISO string to
+    order runs explicitly, or None to emit an explicit JSON null."""
+    d = {"__typename": "CheckRun", "name": name, "status": status, "conclusion": conclusion}
+    if started_at != "__OMIT__":
+        d["startedAt"] = started_at
+    if completed_at != "__OMIT__":
+        d["completedAt"] = completed_at
+    return d
 
 
 def statusctx(context, state):
@@ -657,6 +669,79 @@ def main():
                       fixture_json=rollup(checkrun("Codoki PR Review", "COMPLETED", "SUCCESS")),
                       threads_json=threads_doc(unresolved=9))
     check("--codoki-only ignores the thread gate (9 unresolved) -> exit 0", rc == 0)
+
+    print("== #301 Part 1: latest-per-name CheckRun reduction ==")
+    # GitHub CANCELS in-flight duplicates on every push, so a superseded CANCELLED run
+    # sits in the rollup beside the LATER same-name run that SUCCEEDED. Evaluating the
+    # list flat blocked on the corpse - normal push behavior, not an edge case.
+    #
+    # This RELAXES the gate, which for a fail-closed oracle is the dangerous direction,
+    # so cases (c)(d)(e) below are the mandatory false-green traps: each one must still
+    # BLOCK, and each fails if the sort keys are reverted.
+    T1, T2 = "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"
+    # (a) earlier CANCELLED + later SUCCESS, same name -> PASS (the defect being fixed).
+    rc, out, _, _ = run(["1", "owner/repo"],
+                        fixture_json=rollup(checkrun("ci", "COMPLETED", "CANCELLED", started_at=T1),
+                                            checkrun("ci", "COMPLETED", "SUCCESS", started_at=T2)),
+                        unreplied_findings=0)
+    check("#301a: superseded CANCELLED + later SUCCESS (same name) -> PASS", rc == 0)
+    # (b) a LONE CANCELLED with no later same-name run must still BLOCK - the reduction
+    # must not swallow a genuine failure just because it dedupes.
+    rc, _, _, _ = run(["1", "owner/repo"],
+                      fixture_json=rollup(checkrun("ci", "COMPLETED", "CANCELLED", started_at=T1)),
+                      unreplied_findings=0)
+    check("#301b: lone CANCELLED (no later same-name) -> BLOCK", rc == 2)
+    # (c) A newer IN_PROGRESS run (completedAt=null) must beat a stale SUCCESS.
+    rc, _, _, _ = run(["1", "owner/repo"],
+                      fixture_json=rollup(
+                          checkrun("ci", "COMPLETED", "SUCCESS", started_at=T1, completed_at=T1),
+                          checkrun("ci", "IN_PROGRESS", "", started_at=T2, completed_at=None)),
+                      unreplied_findings=0)
+    check("#301c: stale SUCCESS + newer IN_PROGRESS(null completedAt) -> BLOCK", rc == 2)
+    # (c2) THE CASE THAT ACTUALLY PROVES THE KEY *ORDER*. Cases (c) and (d) are both
+    # carried by the null-sorts-newest rule, so they pass under EITHER key ordering -
+    # verified by mutation: swapping startedAt/completedAt broke nothing until this case
+    # existed. Here BOTH timestamps are present and they DISAGREE: a run STARTED later
+    # FINISHED earlier (a fast re-run overtaking a slow original, which is ordinary when
+    # a re-run skips cached steps). startedAt-primary correctly picks the later-started
+    # FAILURE; completedAt-primary picks the SUCCESS that finished last and false-greens.
+    rc, _, _, _ = run(["1", "owner/repo"],
+                      fixture_json=rollup(
+                          checkrun("ci", "COMPLETED", "SUCCESS", started_at=T1,
+                                   completed_at="2026-01-03T00:00:00Z"),
+                          checkrun("ci", "COMPLETED", "FAILURE", started_at=T2,
+                                   completed_at="2026-01-02T12:00:00Z")),
+                      unreplied_findings=0)
+    check("#301c2: later-STARTED FAILURE that finished FIRST -> BLOCK (startedAt is primary)",
+          rc == 2)
+    # (d) FALSE-GREEN TRAP: a QUEUED re-run has startedAt=null. Nulls must sort NEWEST,
+    # not oldest, or the old SUCCESS wins and the pending re-run is invisible.
+    rc, _, _, _ = run(["1", "owner/repo"],
+                      fixture_json=rollup(
+                          checkrun("ci", "COMPLETED", "SUCCESS", started_at=T1, completed_at=T1),
+                          checkrun("ci", "QUEUED", "", started_at=None, completed_at=None)),
+                      unreplied_findings=0)
+    check("#301d: old SUCCESS + newer QUEUED(null startedAt) -> BLOCK (nulls sort newest)", rc == 2)
+    # (e) the reduction must not be a blanket "any SUCCESS wins": a LATER FAILURE over an
+    # earlier SUCCESS still blocks.
+    rc, _, _, _ = run(["1", "owner/repo"],
+                      fixture_json=rollup(
+                          checkrun("ci", "COMPLETED", "SUCCESS", started_at=T1),
+                          checkrun("ci", "COMPLETED", "FAILURE", started_at=T2)),
+                      unreplied_findings=0)
+    check("#301e: latest same-name is FAILURE over earlier SUCCESS -> BLOCK", rc == 2)
+    # StatusContexts have no re-run semantics and must bypass the grouping untouched.
+    rc, _, _, _ = run(["1", "owner/repo"],
+                      fixture_json=rollup(checkrun("ci", "COMPLETED", "SUCCESS", started_at=T2),
+                                          statusctx("legacy", "FAILURE")),
+                      unreplied_findings=0)
+    check("#301: a failing StatusContext still BLOCKS (not swallowed by the reduction)", rc == 2)
+    # The unknown-__typename fail-closed path must survive the restructure.
+    rc, _, _, _ = run(["1", "owner/repo"],
+                      fixture_json=rollup(checkrun("ci", "COMPLETED", "SUCCESS", started_at=T2),
+                                          unknowntype("mystery")),
+                      unreplied_findings=0)
+    check("#301: unknown __typename still BLOCKS (fail-closed path intact)", rc == 2)
 
     print("== #334: GitHub's aggregate verdict gates the PASS ==")
     # THE DEFECT: the oracle returned PASS on a PR sitting at mergeStateStatus=BLOCKED,
