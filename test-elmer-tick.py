@@ -148,6 +148,23 @@ class Env:
                               capture_output=True, text=True, env=self._env(env),
                               timeout=120)
 
+    def run_stderr_closed(self, **env):
+        """Run the tick with fd 2 CLOSED -- the STDERR twin of run_stdout_closed.
+
+        The suite mutation-proved five fixes and still passed with an unguarded
+        `report_queue_health` in the file, for one reason: there was no closed-STDERR
+        case at all. Every earlier case that exercised a stderr write had a working
+        fd 2, so a write that could not fail was the only write ever tested. The
+        queue-health report is stderr-ONLY by contract (the contended path must stay
+        silent on stdout), so a stdout-closed run never touches it.
+
+        stdout stays CAPTURED here, deliberately: the assertions need to see that the
+        no-op paths still print their normal line while the stderr report is failing.
+        """
+        return subprocess.run(["bash", "-c", 'exec "$1" 2>&-', "sh", self.script],
+                              capture_output=True, text=True, env=self._env(env),
+                              timeout=120)
+
     @property
     def posts(self):
         with open(self.postlog) as f:
@@ -638,6 +655,148 @@ def _(env):
     r = env.run(GH_REVIEWS=json.dumps([review(SHA, login="coderabbitai2")]))
     check("posted once", len(env.posts) == 1)
     check("exit 0", r.returncode == 0)
+
+
+# --- The stderr side of the same class: a report that forges a refusal --------------
+
+@case("a stderr write failure on the CONTENDED path never reports rc=1")
+def _(env):
+    # THE FIX THAT REINTRODUCED THE BUG IT FIXED. `report_queue_health` was moved above
+    # the lock so the report would survive the two routinely-taken early exits - and its
+    # four writes were left bare. Both callers are contractually 0, so with fd 2 closed
+    # and an unhealthy queue, `set -e` turned the REPORT into rc=1: a refusal for an
+    # entry nobody refused, on the exact path a human creates by opening a second
+    # /elmer-loop window. The runbook then sends the TL to re-queue nothing.
+    # An unreadable entry is REQUIRED here: without one the report writes nothing at
+    # all and the closed fd is never touched, which is precisely why the suite could
+    # mutation-prove five fixes and still miss this.
+    with open(os.path.join(env.inbox, "bad.json"), "w") as f:
+        f.write('{"broken":')
+    os.makedirs(os.path.join(env.home, ".tick.lock"))
+    r = env.run_stderr_closed()
+    check(f"rc is NOT 1 (got {r.returncode})", r.returncode != 1)
+    check("rc is 0", r.returncode == 0)
+    check("still silent on stdout", r.stdout.strip() == "")
+    check("posted nothing", env.posts == [])
+
+
+@case("a stderr write failure on the CAP-REACHED path never reports rc=1")
+def _(env):
+    # The cap fires under any steady load, so this is the other routinely-taken exit.
+    # It also asserts the STDOUT line still prints: a guard that swallowed the whole
+    # function's output would pass the rc check while silently losing the report.
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for i in range(4):
+        env.drain_record(f"old-{i}.json", now)
+    with open(os.path.join(env.inbox, "bad.json"), "w") as f:
+        f.write('{"broken":')
+    r = env.run_stderr_closed()
+    check(f"rc is NOT 1 (got {r.returncode})", r.returncode != 1)
+    check("rc is 0", r.returncode == 0)
+    check("stdout line still printed", "hourly cap reached" in r.stdout)
+    check("posted nothing", env.posts == [])
+
+
+@case("a stderr write failure with a STALE entry queued never reports rc=1")
+def _(env):
+    # The stale branch of the report is a SEPARATE `if` with three writes of its own,
+    # so a guard applied to only the unreadable branch would pass the two cases above
+    # and still fail here. An entry in BOTH inbox/ and drained/ is the state the
+    # exit-2 rm-failure path leaves behind, i.e. reachable in production.
+    env.queue(354)
+    env.drain_record("e-354.json", "2020-01-01T00:00:00Z")
+    r = env.run_stderr_closed()
+    check(f"rc is NOT 1 (got {r.returncode})", r.returncode != 1)
+    check("rc is 0", r.returncode == 0)
+    check("posted nothing", env.posts == [])
+
+
+@case("report_queue_health still PRINTS when stderr works (the guard is not a mute)")
+def _(env):
+    # THE OVER-HARDENING CHECK, and the reason it is a case rather than a manual pass:
+    # `{ ... } >&2 || true` is one edit away from `{ ... } >/dev/null`, and both make
+    # every rc assertion above pass. Converting a real report into a silent success
+    # would be a worse defect than the rc=1 being fixed here, so the suite asserts the
+    # output SURVIVES the guard on both branches.
+    with open(os.path.join(env.inbox, "bad.json"), "w") as f:
+        f.write('{"broken":')
+    env.queue(355)
+    env.drain_record("e-355.json", "2020-01-01T00:00:00Z")
+    r = env.run()
+    check("exit 0", r.returncode == 0)
+    check("unreadable branch still warns", "unreadable" in r.stderr.lower())
+    check("names the unreadable file", "bad.json" in r.stderr)
+    check("stale branch still warns", "stale" in r.stderr.lower())
+    check("names the stale file", "e-355.json" in r.stderr)
+    check("still tells the operator to remove it", "by hand" in r.stderr)
+
+
+# --- mktemp: a SETUP error, never a silent 1 ----------------------------------------
+
+@case("mktemp failure -> exit 2 with a message, never a silent 1")
+def _(env):
+    # The two mktemps moved ABOVE the lock, so they now gate EVERY tick including pure
+    # no-ops, unguarded under `set -e`. An unwritable or full TMPDIR exited 1 with no
+    # output whatsoever - the runbook reads that as "an entry was refused" and sends the
+    # TL to re-queue an entry nothing ever touched. An unavailable mktemp is a broken
+    # dependency, the same shape as the jq probe, so it is exit 2 and it says so.
+    Env._write(os.path.join(env.bin, "mktemp"), "#!/usr/bin/env bash\nexit 1\n")
+    env.queue(354)
+    r = env.run()
+    check(f"exit 2, not 1 (got {r.returncode})", r.returncode == 2)
+    check("says setup error", "setup error" in r.stderr.lower())
+    check("names mktemp", "mktemp" in r.stderr)
+    check("posted nothing", env.posts == [])
+    check("entry left queued", env.ls("inbox") == ["e-354.json"])
+
+
+@case("a mktemp that fails on the SECOND call strands no temp file")
+def _(env):
+    # The trap was armed only after BOTH calls, so a second failure leaked the first
+    # file into TMPDIR on every tick - unbounded, since this now runs on no-ops too.
+    # Arming the trap after the FIRST mktemp is what closes it; the stub hands out
+    # files from a directory the case can then inspect.
+    leak = os.path.join(env.tmp, "leak"); os.makedirs(leak)
+    Env._write(os.path.join(env.bin, "mktemp"), f"""#!/usr/bin/env bash
+c="{env.tmp}/mkcount"
+n=$(cat "$c" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$c"
+[ "$n" -ge 2 ] && exit 1
+f="{leak}/t.$n"; : > "$f"; printf '%s\\n' "$f"
+""")
+    env.queue(354)
+    r = env.run()
+    check(f"exit 2, not 1 (got {r.returncode})", r.returncode == 2)
+    check(f"nothing stranded in TMPDIR (found {os.listdir(leak)})", os.listdir(leak) == [])
+    check("posted nothing", env.posts == [])
+
+
+# --- Saying the true thing about a queue that is not empty --------------------------
+
+@case("an ALL-STALE queue does not claim 'queue empty' on stdout")
+def _(env):
+    # Every inbox entry also in drained/ selects nothing, and the stdout line used to
+    # assert "queue empty" over a directory with files in it - literally false, and read
+    # by an operator as "the queue drained normally", so the stranded files are never
+    # looked at. The stderr warning already named them; stdout now agrees with it.
+    env.queue(354)
+    env.drain_record("e-354.json", "2020-01-01T00:00:00Z")
+    r = env.run()
+    check("exit 0", r.returncode == 0)
+    check("does NOT claim the queue is empty", "queue empty" not in r.stdout)
+    check("says there is nothing postable", "no postable entries" in r.stdout)
+    check("stale warning still on stderr", "stale" in r.stderr.lower())
+    check("posted nothing", env.posts == [])
+    check("entry left in place", env.ls("inbox") == ["e-354.json"])
+
+
+@case("a GENUINELY empty queue still says 'queue empty'")
+def _(env):
+    # The other half of the wording fix: the new branch must not swallow the true case.
+    r = env.run()
+    check("exit 0", r.returncode == 0)
+    check("still says queue empty", "queue empty" in r.stdout)
+    check("posted nothing", env.posts == [])
 
 
 print()

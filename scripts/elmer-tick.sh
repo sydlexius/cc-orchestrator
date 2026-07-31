@@ -238,15 +238,32 @@ scan_queue() {
 # contended path stays silent on stdout as its own contract requires.
 report_queue_health() {
   [ "$SCANNED" = 1 ] || scan_queue
-  if [ -s "$UNREADABLE_LOG" ]; then
-    echo "elmer-tick: WARNING - $(wc -l < "$UNREADABLE_LOG" | tr -d ' ') unreadable queue entr(y/ies), skipped:" >&2
-    sed 's/^/  /' "$UNREADABLE_LOG" >&2
-  fi
-  if [ -s "$STALE_LOG" ]; then
-    echo "elmer-tick: WARNING - $(wc -l < "$STALE_LOG" | tr -d ' ') inbox entr(y/ies) already drained (stale, never re-posted):" >&2
-    sed 's/^/  /' "$STALE_LOG" >&2
-    echo "            Remove the stale inbox file(s) by hand." >&2
-  fi
+  # EVERY WRITE BELOW IS INSIDE ONE GUARDED GROUP, and that is load-bearing rather
+  # than tidy. This function is called from the lock-contended exit and the cap-reached
+  # exit, both of which are contractually 0 -- yet its writes used to be four bare
+  # `>&2` commands, so under `set -e` a failing stderr write (EBADF: a timer loop
+  # redirecting into a closed or rotated fd) exited 1 from a tick that refused nothing.
+  # 1 is the code the contract reserves for "POSTED NOTHING because an entry was
+  # REFUSED", and the loop runbook tells the operator to hand that entry back to the
+  # TL, so the report about a broken queue was forging a refusal out of a no-op.
+  # Reproduced with `elmer-tick.sh 2>&-` and an unreadable entry queued: rc=1 on both
+  # paths, rc=0 without the entry. Same template as the exit-2 echo group below the
+  # post: group the writes, redirect ONCE, `|| true` so no write can change the exit
+  # status. `set -e` is suspended inside a group that is the left operand of `||`,
+  # which is what makes the guard cover every command in the body and not just the last.
+  # The scan stays OUTSIDE the group: it writes no output, and swallowing its status
+  # would hide a genuine failure rather than an unwanted one.
+  {
+    if [ -s "$UNREADABLE_LOG" ]; then
+      echo "elmer-tick: WARNING - $(wc -l < "$UNREADABLE_LOG" | tr -d ' ') unreadable queue entr(y/ies), skipped:"
+      sed 's/^/  /' "$UNREADABLE_LOG"
+    fi
+    if [ -s "$STALE_LOG" ]; then
+      echo "elmer-tick: WARNING - $(wc -l < "$STALE_LOG" | tr -d ' ') inbox entr(y/ies) already drained (stale, never re-posted):"
+      sed 's/^/  /' "$STALE_LOG"
+      echo "            Remove the stale inbox file(s) by hand."
+    fi
+  } >&2 || true
 }
 
 # --- Queue-health reporting, armed BEFORE the first early exit ---------------------
@@ -256,8 +273,29 @@ report_queue_health() {
 # routinely - lock contention is the DESIGNED outcome of a second loop window, and the
 # cap fires under any steady load - and a queue accumulating malformed files could
 # stay invisible indefinitely while the comment claimed "reported on every path".
-UNREADABLE_LOG="$(mktemp)"
-STALE_LOG="$(mktemp)"
+#
+# BOTH mktemps ARE GUARDED, and each one arms the trap that covers it BEFORE the next
+# runs. Two reasons, and neither is hypothetical:
+#
+# 1. EXIT CODE. Moving these above the lock put them on EVERY tick including the pure
+#    no-ops, where an unwritable or full TMPDIR made an unguarded `$(mktemp)` exit 1
+#    under `set -e` -- silently, with no message at all, on a path the contract defines
+#    as 0. A bare 1 is read by the runbook as "an entry was refused", so the operator
+#    is sent to re-queue an entry that nothing ever touched. An unavailable mktemp is a
+#    SETUP ERROR, exactly like the jq probe above ("a dependency that is present but
+#    broken"), so it exits 2 with a message naming what failed.
+# 2. LEAK. The trap used to be armed only after BOTH calls, so a second mktemp that
+#    failed stranded the first file in TMPDIR forever. Arming after the first closes
+#    that window: whichever call fails, everything already created is cleaned up.
+UNREADABLE_LOG="$(mktemp)" || {
+  echo "setup error: mktemp failed (TMPDIR unwritable or full); cannot arm queue-health reporting." >&2
+  exit 2
+}
+trap 'rm -f "$UNREADABLE_LOG" 2>/dev/null || true' EXIT
+STALE_LOG="$(mktemp)" || {
+  echo "setup error: mktemp failed (TMPDIR unwritable or full); cannot arm queue-health reporting." >&2
+  exit 2
+}
 trap 'rm -f "$UNREADABLE_LOG" "$STALE_LOG" 2>/dev/null || true' EXIT
 
 if ! acquire_lock; then
@@ -320,7 +358,18 @@ entry="$PICKED"
 report_queue_health
 
 if [ -z "$entry" ]; then
-  echo "elmer-tick: queue empty; nothing to do."
+  # NOTHING PICKABLE IS NOT THE SAME AS NOTHING QUEUED, and saying the wrong one is the
+  # silent-wrong-answer class this script's contract is built against. An inbox whose
+  # every entry is also in `drained/` (the stranded-file state the exit-2 rm-failure
+  # path leaves behind) selects nothing, and a flat "queue empty" is then a literally
+  # false assertion about a directory with files in it - the operator reads it as "the
+  # queue drained normally" and never looks. The stderr warning already names each
+  # stale file; this makes the STDOUT line agree with it instead of contradicting it.
+  if [ -s "$STALE_LOG" ]; then
+    echo "elmer-tick: no postable entries (see the stale-inbox warning above); nothing to do."
+  else
+    echo "elmer-tick: queue empty; nothing to do."
+  fi
   exit 0
 fi
 
