@@ -996,8 +996,12 @@ def main():
         # #30: doctor WARNs (never FAILs) on a stale deployed guard.
         open(cdest, "w").write("#!/bin/sh\nexit 1\n# drifted again\n")
         rc, out = run(["doctor"], env_overrides=cov, tmux=True)
-        check("#30: doctor WARNs on a stale deployed guard (not a hard fail)",
-              "STALE vs the bundled plugin guard" in out)
+        check("#30: doctor WARNs on a differing deployed guard (not a hard fail)",
+              "DIFFERS from the bundled plugin guard" in out)
+        # #292/#327: the guard WARN is the highest-stakes direction-blind case - a blind refresh
+        # can drop a floor deny that only exists on the deployed copy.
+        check("#292: the guard WARN warns that a refresh could DROP a deployed-only floor deny",
+              "PORT IT INTO THE REPO FIRST" in out and "silently drop that floor behavior" in out)
         open(cs, "w").write("{not json")
         rc, out = run(["configure", "--apply", "--yes"], env_overrides=cov)
         check("configure REFUSES to overwrite an unparseable settings.json (no clobber)",
@@ -1055,16 +1059,44 @@ def main():
         rc, out = run(["configure", "--apply", "--yes"], env_overrides=hov)
         check("#133: configure --apply REFRESHES a stale helper back to the bundled content",
               rc == 0 and open(one, "rb").read() == open(os.path.join(hbundle, "safe-push.sh"), "rb").read())
+        # #292: the OVERWRITTEN copy must survive as <dest>.bak. The staleness check is a pure
+        # byte-compare and so DIRECTION-BLIND - it calls the deployed copy "stale" even when the
+        # deployed copy is the NEWER, CORRECT one (an older plugin cache running configure; an
+        # emergency patch applied to the deployed path per #327). This does not make the check
+        # direction-aware; it makes the wrong-direction overwrite RECOVERABLE, which is the
+        # property that was missing. The symlink path already backed itself up and the far more
+        # common regular-file path did not.
+        _bak = one + ".bak"
+        check("#292: refreshing a stale helper BACKS UP the overwritten copy to <dest>.bak",
+              os.path.isfile(_bak) and "drifted" in open(_bak).read())
+        # A backup that cannot be written must ABORT the overwrite, never silently proceed - the
+        # whole point is that the old bytes survive. Forced by making <dest>.bak a DIRECTORY, so
+        # copy2 raises IsADirectoryError (an OSError) while leaving the temp-file path usable.
+        # The assertion is single-sided on purpose: an earlier `A or B` form passed even with the
+        # backup mutated away, i.e. it could not fail and proved nothing.
+        open(one, "w").write("#!/bin/sh\n# drifted a third time\n")
+        os.remove(_bak); os.makedirs(_bak)
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=hov)
+        check("#292: a failed backup REFUSES the overwrite (original bytes intact, not clobbered)",
+              "drifted a third time" in open(one).read())
+        check("#292: the refusal is REPORTED, not silent",
+              "refusing to replace it unbacked" in out or "could not back up" in out)
+        shutil.rmtree(_bak)
         # Doctor WARNs (never FAILs) on a stale deployed helper, naming the configure remedy.
         open(one, "w").write("#!/bin/sh\n# drifted again\n")
         rc, out = run(["doctor"], env_overrides=hov, tmux=True)
         # The helper check is WARN-level (never FAIL): assert the [WARN] tag on the helper line +
         # the remedy. (Doctor's overall rc tracks the teams/tmux checks, which are env-dependent on
         # CI - so we assert the helper line's tag directly, not the aggregate exit code.)
-        check("#133: doctor WARNs (not FAILs) on a stale helper + names configure --apply remedy",
-              "[WARN] deployed helper script(s) STALE vs the bundled plugin copies" in out
+        check("#133: doctor WARNs (not FAILs) on a differing helper + names configure --apply remedy",
+              "[WARN] deployed helper script(s) DIFFER from the bundled plugin copies" in out
               and "configure --apply" in out
               and "[FAIL] deployed helper script(s)" not in out)
+        # #292: the WARN must not ASSERT a direction the byte-compare never established, and must
+        # tell the operator what to do in the other direction (deployed-is-newer), where a blind
+        # refresh reverts a correct script.
+        check("#292: the WARN names the deployed-is-newer direction instead of assuming STALE",
+              "If the DEPLOYED copy is the newer" in out and "would revert it" in out)
 
     # #133b: claude-kit symlink retirement + broken-symlink + missing-source edge cases.
     with tempfile.TemporaryDirectory() as td:

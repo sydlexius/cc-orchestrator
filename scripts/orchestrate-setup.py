@@ -342,8 +342,15 @@ def check_guard_stale():
     already covered by check_guard_wired/healthy; 'missing-source' is a dev-layout issue, not drift."""
     action = _guard_deploy_action()
     if action == "refresh":
-        return _emit(WARN, f"deployed guard at {GUARD} is STALE vs the bundled plugin guard - run "
-                           "`orchestrate-setup.py configure --apply` to refresh it")
+        # DIFFERS, not STALE (#292/#327). Same direction-blindness as the helper check, and the
+        # highest-stakes instance of it: reverting the guard reverts the deterministic FLOOR, so a
+        # blind refresh can silently delete a deny that is actively protecting this machine (#327
+        # is exactly that - an emergency deny added to the deployed copy and never to the repo).
+        return _emit(WARN, f"deployed guard at {GUARD} DIFFERS from the bundled plugin guard - "
+                           "usually the bundle is newer: run `orchestrate-setup.py configure "
+                           "--apply` to refresh it. If the DEPLOYED guard is the newer one (a "
+                           "patch applied straight to the deployed path), PORT IT INTO THE REPO "
+                           "FIRST - a refresh would silently drop that floor behavior")
     if action in ("deploy", "missing-source"):
         return _emit(WARN, f"could not compare the deployed guard to the bundled guard ({action})")
     return _emit(PASS, "deployed guard matches the bundled plugin guard")
@@ -617,6 +624,39 @@ def _deploy_helper(name):
         # renames the symlink itself, never its target.
         if os.path.islink(dest):
             os.replace(dest, dest + ".bak")
+        elif action == "refresh":
+            # BACK UP A REGULAR FILE BEFORE OVERWRITING IT (#292). The staleness check is a pure
+            # byte-compare and therefore DIRECTION-BLIND: it reports "deployed is STALE" whenever
+            # the two differ, including when the DEPLOYED copy is the NEWER, CORRECT one (an older
+            # plugin cache running configure, or an emergency patch applied to the deployed path
+            # per #327). Following doctor's advice then silently replaces a correct script with a
+            # known-buggy older one - unrecoverable from local state, which is the part that makes
+            # it serious rather than merely wrong. Measured on stillwater 2026-07-12: 4 helpers,
+            # including a patch-coverage fix, would have been reverted.
+            #
+            # This does NOT make the check direction-aware (a real fix needs a version/provenance
+            # notion, not a timestamp - mtime is preserved by copy2 and so cannot order them). It
+            # makes the mistake RECOVERABLE, which is the property that was missing: the symlink
+            # path already backed itself up and the regular-file path did not, so the more common
+            # case had the weaker guarantee. copy2, not replace: the original must stay in place
+            # if anything below fails.
+            # VERIFY THE BACKUP LANDED, do not trust the call (the house verify-don't-classify
+            # pattern, cf. #337). `shutil.copy2(src, dir)` does NOT raise when the destination is
+            # a DIRECTORY - it copies INTO it, so the bytes end up at <dest>.bak/<name> while this
+            # code believes <dest>.bak holds them. A bare try/except therefore reports a backup
+            # that does not exist and proceeds to overwrite the original. Caught by the harness
+            # only after the assertion was tightened; the earlier `A or B` form could not fail.
+            bak = dest + ".bak"
+            try:
+                if os.path.isdir(bak):
+                    raise IsADirectoryError(f"{bak} is a directory")
+                shutil.copy2(dest, bak)
+                if not os.path.isfile(bak):
+                    raise OSError(f"{bak} missing after copy")
+            except OSError as e:
+                # A backup that cannot be written must not silently proceed to the overwrite.
+                return False, (f"helper {name}: could not back up {dest} before overwriting it "
+                               f"({e}); refusing to replace it unbacked")
         fd, tmp = tempfile.mkstemp(dir=SCRIPTS_DIR, prefix=".orch-helper-")
         os.close(fd)
         try:
@@ -660,8 +700,20 @@ def check_helpers_stale():
         return _emit(WARN, "deployed helper script(s) exist but are unreadable "
                            f"({', '.join(unreadable)}) - cannot verify; check permissions")
     if stale:
-        return _emit(WARN, "deployed helper script(s) STALE vs the bundled plugin copies "
-                           f"({', '.join(stale)}) - run `orchestrate-setup.py configure --apply` to refresh")
+        # DIFFER, not STALE (#292). This is a byte-compare, so it cannot tell WHICH copy is newer:
+        # it fires identically when the bundled copy is ahead (the normal case) and when the
+        # DEPLOYED copy is ahead (an older plugin cache running doctor, or an emergency patch
+        # applied to the deployed path per #327). Saying "STALE" asserts a direction the check
+        # never established, and the prescribed remedy then reverts a correct script to a buggy
+        # older one. The wording now states the fact observed and names the other direction, so
+        # the operator can check before acting; `configure --apply` backs the overwritten copy up
+        # to <dest>.bak, so the mistake is recoverable rather than terminal.
+        return _emit(WARN, "deployed helper script(s) DIFFER from the bundled plugin copies "
+                           f"({', '.join(stale)}) - usually the bundle is newer: run "
+                           "`orchestrate-setup.py configure --apply` to refresh (the overwritten "
+                           "copy is backed up to <dest>.bak). If the DEPLOYED copy is the newer "
+                           "one (an older plugin cache, or a patch applied to the deployed path), "
+                           "port it into the repo FIRST - a refresh would revert it")
     if missing:
         return _emit(WARN, "bundled helper source(s) missing "
                            f"({', '.join(missing)}); cannot verify the deployed copies")
