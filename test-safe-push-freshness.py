@@ -180,6 +180,12 @@ check("--base with no value -> usage error (exit 2), never a guess", rc == 2)
 print("\n== UNKNOWN degrades: reported, never enforced ==")
 rc, out, _, pushed = run(["feature-branch"], fetch_rc=1, behind=0)
 check("unreachable origin (fetch fails) -> push still proceeds", rc == 0)
+# ASSERT THE REPORT, NOT ONLY THE EXIT CODE. Checking rc alone let a real bug stay green:
+# the rc-0 arm matched the glob `*fresh*`, and "freshness" CONTAINS "fresh", so every
+# degraded answer was silently discarded while the exit code stayed correct. A gate that
+# reports nothing and is believed is the failure this feature exists to prevent.
+check("...and the degraded answer is REPORTED, not silently swallowed",
+      "unknown" in out.lower())
 rc, out, _, pushed = run(["feature-branch"], origin_head="", behind=3)
 check("origin/HEAD unset -> cannot resolve a base -> does NOT block", rc == 0)
 check("...and says why rather than failing silently", "freshness" in out.lower() or "base" in out.lower())

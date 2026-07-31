@@ -218,11 +218,23 @@ else
           echo "          Deliberately uploading behind-base WIP? Re-run with --stale-ok to declare it." >&2
           exit 1 ;;
         0)
-          # fresh OR unknown - both non-blocking. Echo the helper's line only when it is not
-          # a plain 'fresh', so a current branch stays quiet.
+          # fresh OR unknown - both non-blocking. Stay quiet on a plain 'fresh', but ALWAYS
+          # surface an unknown: a degraded answer is the one a caller most needs to see.
+          #
+          # MATCH THE FULL LABEL, NOT `*fresh*`. The word "freshness" CONTAINS "fresh", so the
+          # substring glob also matched `freshness: unknown - ...` and silently discarded every
+          # degraded report - the exact "reports nothing and is believed" failure this whole
+          # gate exists to prevent, hidden inside the gate itself. An exit-code-only assertion
+          # kept it green (CR caught it; harness assertion added alongside this fix).
           case "$fresh_out" in
-            *fresh*) : ;;
-            *) [ -n "$fresh_out" ] && echo "safe-push: $fresh_out" >&2 ;;
+            *"freshness: fresh"*) : ;;
+            *)
+              # An `if`, not `[ -n ... ] && echo`: under `set -euo pipefail` an empty
+              # $fresh_out makes the test the arm's LAST command, so the arm returns 1 and
+              # errexit kills a push that had passed every gate.
+              if [ -n "$fresh_out" ]; then
+                echo "safe-push: $fresh_out" >&2
+              fi ;;
           esac ;;
         *)
           echo "safe-push: freshness: unknown - base-freshness.sh exited $fresh_rc; proceeding." >&2 ;;

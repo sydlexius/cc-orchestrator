@@ -114,14 +114,25 @@ if [ -z "$base_name" ]; then
   base_name=$(gh repo view --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null || true)
 fi
 
+# Every path must END with a printed fresh_rc: each fenced block runs in its OWN shell, so
+# a variable set here does not survive into the interpretation below - an unprinted value is
+# invisible to the step that reads it. Both degraded paths NORMALISE to 0 (non-blocking):
+# an unresolvable base and a missing helper are "cannot determine", never "behind", and a
+# missing helper would otherwise surface as 127, which matches no documented branch.
+fresh_rc=0
 if [ -z "$base_name" ]; then
   echo "freshness: unknown -- no base could be resolved; skipping the check."
 else
   if [ -f scripts/base-freshness.sh ]; then BF=scripts/base-freshness.sh
   else BF="${CLAUDE_PLUGIN_ROOT:-}/scripts/base-freshness.sh"; fi
-  bash "$BF" "$base_name" HEAD
-  fresh_rc=$?
+  if [ -f "$BF" ]; then
+    bash "$BF" "$base_name" HEAD
+    fresh_rc=$?
+  else
+    echo "freshness: unknown -- base-freshness.sh not found; skipping the check."
+  fi
 fi
+echo "fresh_rc=$fresh_rc"
 ```
 
 **Interpret `fresh_rc`:**

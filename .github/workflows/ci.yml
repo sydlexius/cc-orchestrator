@@ -61,6 +61,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           scripts=(
+            scripts/base-freshness.sh
             scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-feedback.sh
             scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh
             scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh
