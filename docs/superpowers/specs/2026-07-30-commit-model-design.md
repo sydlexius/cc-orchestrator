@@ -269,6 +269,33 @@ Sequencing is load-bearing.
 
 Steps 1-2 are useful even if 3 is never taken.
 
+## Trial verdict (2026-07-31)
+
+The maintainer chose to TRY the model on one branch rather than adopt the policy on paper first.
+That trial was `feat/cr-quota-watch` (the elmer series, PR #357), and it is now merged.
+
+**What the trial exercised.** 18 commits, written honestly at write time - no `wip(` prefixes, each
+commit naming what it did - across a feature build plus three adversarial fix rounds and two
+CodeRabbit review rounds. By the predicate in this document, that branch carries no WIP commits, so
+the oracle would have chosen MERGE-COMMIT. It was in fact squash-merged, because `/merge-pr` still
+hard-codes the policy constant (rollout step 3 is not taken).
+
+**What it confirms.** The load-bearing claim held: writing honest commits at the moment of the
+change cost nothing and needed no discipline that was not already there. No commit wanted a `wip(`
+prefix in retrospect. The predicate was never ambiguous on a real branch - at no point was "is this
+a WIP branch?" a judgment call, which is the property the derived predicate exists to buy over the
+relitigated constant.
+
+**What it did NOT test, and is the real risk.** An open PR forbids rewriting pushed history (a new
+SHA orphans every cited fix SHA and empties the incremental-review delta). So the trial never
+exercised the case this model most changes: a branch that DID accumulate WIP commits and needs them
+squashed. The trial shows the honest-commit half works; the squash-iff-WIP half remains unexercised
+on real work.
+
+**Recommendation.** Proceed with rollout steps 1-2 (oracle + hook, read-only and observed). They are
+useful independent of step 3, and step 3 should wait for a branch that genuinely accumulates WIP
+commits, which this one did not.
+
 ## Open items (not blockers)
 
 - **Hook install is manual and per-machine**
