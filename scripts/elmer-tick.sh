@@ -48,6 +48,10 @@ if [ "$#" -gt 0 ]; then
   exit 2
 fi
 
+# Resolve this script's own directory so the sibling cr-quota-watch.sh is found
+# whether elmer-tick.sh runs from the repo or from the deployed ~/.claude/scripts path.
+SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 ELMER_HOME="${ELMER_HOME:-$HOME/.claude/elmer}"
 inbox="$ELMER_HOME/inbox"
 drained="$ELMER_HOME/drained"
@@ -226,5 +230,82 @@ if [ "$pr_head" != "$e_sha" ]; then
   exit 1
 fi
 
-echo "elmer-tick: entry ok -- $e_repo #$e_pr at ${e_sha:0:12} ($recent/$ELMER_MAX_PER_HR this hour)"
-exit 0
+# --- Is CR throttled right now? ----------------------------------------------------
+# Ask BEFORE posting. Whether a trigger posted DURING a limit is harmless (CR ignores
+# it) or costly (burns the slot without reviewing) is UNMEASURED, so the conservative
+# order is the one that cannot be wrong: query first, post only on a clear reading.
+#
+# cr-quota-watch.sh exit contract: 0 = no active limit, 1 = limited, 2 = setup error.
+# The 2 case must NOT fall through to a post -- a failed read is not an all-clear.
+quota_rc=0
+if [ -x "$SELF_DIR/cr-quota-watch.sh" ]; then
+  "$SELF_DIR/cr-quota-watch.sh" "$e_pr" "$e_repo" >/dev/null 2>&1 || quota_rc=$?
+else
+  echo "setup error: cr-quota-watch.sh not found beside $0; refusing to post blind." >&2
+  exit 2
+fi
+case "$quota_rc" in
+  0) : ;;
+  1) echo "elmer-tick: CodeRabbit is throttled; nothing posted. Entry stays queued."
+     exit 0 ;;
+  *) echo "setup error: quota read failed (rc=$quota_rc). Not posting." >&2
+     exit 2 ;;
+esac
+
+# --- Has CR already reviewed this exact head? --------------------------------------
+# Cheap insurance against a double-post that the drain record cannot catch: a review
+# triggered by the MAINTAINER by hand leaves no queue entry, so only GitHub knows
+# about it. Note this check is sound in the direction it is used -- it can only
+# SUPPRESS a post, never authorize one -- which is why the racy inverse (asking
+# GitHub "has a review happened" as the idempotency mechanism) is still not used.
+if revs="$(gh pr view "$e_pr" --repo "$e_repo" --json reviews 2>/dev/null)"; then
+  if [ "$(jq -r --arg s "$e_sha" \
+        '[.reviews[]? | select(.commit_id == $s)] | length' <<<"$revs" 2>/dev/null || echo 0)" -gt 0 ]; then
+    echo "REFUSED: a review already exists at ${e_sha:0:12}; not spending a slot." >&2
+    exit 1
+  fi
+fi
+
+# --- THE POST ----------------------------------------------------------------------
+# The only outward write in the entire elmer system. The trigger string is a FIXED
+# literal, never composed from entry data: an entry is queue data, and letting it
+# reach the comment body is how a hand-edited entry would post something other than
+# an incremental review.
+TRIGGER='@coderabbitai review'
+
+if [ "${ELMER_DRY_RUN:-0}" = "1" ]; then
+  echo "DRY RUN: would post to $e_repo #$e_pr at ${e_sha:0:12}:"
+  echo "         $TRIGGER"
+  exit 0
+fi
+
+if ! post_out="$(gh pr comment "$e_pr" --repo "$e_repo" --body "$TRIGGER" 2>&1)"; then
+  echo "setup error: the post failed; entry stays queued for the next tick." >&2
+  printf '%s\n' "$post_out" >&2
+  exit 2
+fi
+
+# --- Drain: the record IS the idempotency mechanism ---------------------------------
+# Written the INSTANT the post succeeds, closing the double-post window immediately.
+# Asking GitHub "has a review happened yet" would be racy in the dangerous direction:
+# CR takes minutes to post, so a tick 30 seconds later would see nothing and fire
+# again. Anything in drained/ is never re-posted, and the directory doubles as the
+# permanent audit trail the carve-out requires.
+#
+# A drain failure after a SUCCESSFUL post is the one genuinely bad state here (the
+# next tick could re-post), so it is loud and exits 2 rather than pretending success.
+now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+base="$(basename "$entry")"
+tmp="$drained/.$base.tmp.$$"
+if jq --arg t "$now" --arg out "$post_out" \
+     '. + {triggered_at: $t, trigger: "'"$TRIGGER"'", response: $out}' \
+     "$entry" > "$tmp" 2>/dev/null && mv -f "$tmp" "$drained/$base"; then
+  rm -f "$entry"
+  echo "elmer-tick: POSTED an incremental review request -- $e_repo #$e_pr at ${e_sha:0:12}"
+  echo "            drained: $drained/$base"
+  exit 0
+fi
+rm -f "$tmp"
+echo "setup error: POSTED but could not write the drain record for $entry." >&2
+echo "             Move or delete it by hand before the next tick, or it may re-post." >&2
+exit 2
