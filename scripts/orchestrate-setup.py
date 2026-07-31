@@ -110,6 +110,13 @@ HELPER_NAMES = (
     # consumer WARNs and skips run-dir cleanup rather than reconstructing the path (that
     # second derivation is the drift #303 exists to eliminate).
     "run-paths.sh",
+    # base-freshness.sh became a LIVE dependency at the stable path in #330: the DEPLOYED
+    # safe-push.sh resolves it via `dirname "$0"`, which IS ~/.claude/scripts. Omitting it
+    # is the #216/#217 failure exactly - the helper degrades to its "not found" branch, so
+    # the stale-base gate silently never fires for a plugin user while passing every test
+    # in this repo (where the repo-local copy is always found). A gate that is absent only
+    # in deployment is worse than no gate: it reports nothing and is believed.
+    "base-freshness.sh",
     # The "elmer" review-requester front half. Deployment is LOAD-BEARING here, not a
     # convenience: the whole permission story is that a script under the stable path is
     # already covered by the existing `Bash(bash ~/.claude/scripts/*.sh *)` grant, so an

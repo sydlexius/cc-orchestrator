@@ -78,7 +78,7 @@ jobs:
 
       - name: ruff (F,E741)
         if: runner.os == 'Linux'
-        run: ruff check --select F,E741 scripts/orchestrate-resources.py scripts/orchestrate-setup.py scripts/planner_classify.py scripts/gate-runner.py test-orchestrate-guard.py test-orchestrate-steer.py test-orchestrate-resources.py test-orchestrate-setup.py test-orchestrate-feedback.py test-planner-classify.py test-gh-wrappers.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-cr-quota-watch.py test-elmer-enqueue.py test-elmer-triage.py test-elmer-tick.py
+        run: ruff check --select F,E741 scripts/orchestrate-resources.py scripts/orchestrate-setup.py scripts/planner_classify.py scripts/gate-runner.py test-orchestrate-guard.py test-orchestrate-steer.py test-orchestrate-resources.py test-orchestrate-setup.py test-orchestrate-feedback.py test-planner-classify.py test-gh-wrappers.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-safe-push-freshness.py test-prep-pr-freshness.py test-pr-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-cr-quota-watch.py test-elmer-enqueue.py test-elmer-triage.py test-elmer-tick.py
 
       # Platform-sensitive: run on BOTH macOS (BSD stat) and Linux (GNU stat).
       # Must invoke via ./ so the self-test's "$0" re-invocation resolves
@@ -103,6 +103,14 @@ jobs:
       # Pure classification logic (planner role, #11) - platform-independent, runs on both.
       - name: harness - planner-classify
         run: python3 test-planner-classify.py
+
+      # Base-freshness wiring (#329/#330): safe-push's git-only gate (stubs git AND
+      # asserts no gh is ever invoked) plus the /prep-pr prose wiring. Host-independent.
+      - name: harness - safe-push-freshness
+        run: python3 test-safe-push-freshness.py
+
+      - name: harness - prep-pr-freshness
+        run: python3 test-prep-pr-freshness.py
 
       # P3-F gh-* wrappers (#24): black-box, stubs gh via PATH - platform-independent.
       - name: harness - gh-wrappers

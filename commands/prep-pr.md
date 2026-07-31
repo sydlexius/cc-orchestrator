@@ -89,6 +89,87 @@ If both thresholds are within bounds: print the hand-written totals
 
 ---
 
+## Step 1c -- Base freshness
+
+A branch behind its base passes every gate and opens `BEHIND` -- 36 green checks and a
+stale branch are otherwise indistinguishable (#329). `scripts/base-freshness.sh` (#282)
+already answers this; the gap was that nothing on the PR-open path asked it.
+
+Checked HERE, before the gate run, because behind-ness is independent of the gates and of
+the squash: catching it early avoids spending a full gate run on a branch that must
+refresh first.
+
+**Resolve the base -- never assume `main`.** A backport or release-base branch measured
+against `main` yields a false BEHIND:
+
+```bash
+# 1. An existing PR's own base wins (also correct on a re-run against a non-main base).
+base_name=$(gh pr view --json baseRefName --jq .baseRefName 2>/dev/null || true)
+# 2. Else the recorded default branch (git-only, then gh).
+if [ -z "$base_name" ]; then
+  base_name=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+  base_name="${base_name#origin/}"
+fi
+if [ -z "$base_name" ]; then
+  base_name=$(gh repo view --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null || true)
+fi
+
+if [ -z "$base_name" ]; then
+  echo "freshness: unknown -- no base could be resolved; skipping the check."
+else
+  if [ -f scripts/base-freshness.sh ]; then BF=scripts/base-freshness.sh
+  else BF="${CLAUDE_PLUGIN_ROOT:-}/scripts/base-freshness.sh"; fi
+  bash "$BF" "$base_name" HEAD
+  fresh_rc=$?
+fi
+```
+
+**Interpret `fresh_rc`:**
+
+- `0` -- fresh, or undeterminable (unreachable origin, shallow clone, unresolvable ref).
+  Print the `freshness:` line and continue. **Never block on unknown** -- the helper
+  returns 0 for both precisely so best-effort degradation cannot wedge a push.
+- `2` -- malformed invocation. Warn and continue; a tooling fault is not the branch's fault.
+- `1` -- **definitively BEHIND.** What happens next depends on whether the PR has been
+  reviewed, because refreshing is not always the safe move:
+
+```bash
+# Has anyone reviewed it yet? Mirrors the safety hinge in open-pr-staleness-sweep.sh:
+# review ACTIVITY, never `reviewDecision` (which is null on a PR carrying bot findings
+# and cited fix SHAs -- exactly the PR that must not be disturbed).
+gh pr view --json reviews,comments \
+  --jq '[(.reviews|length), (.comments|length)] | @tsv' 2>/dev/null || true
+```
+
+- **No PR yet, or a PR with zero reviews and zero comments** -> **STOP.** Refreshing is
+  free here, so say:
+  > "This branch is `<N>` commits behind `<base>`. Refresh before pushing -- a PR opened
+  > BEHIND has to be refreshed later anyway, when it is more expensive.
+  > `git merge origin/<base>` here, or `gh pr update-branch <n>` on an open PR.
+  > (refresh / override `<rationale>`)"
+
+  On "override", record the rationale verbatim and carry it into the Step 8b PR-body
+  Summary as `Base-freshness override: <rationale>`, the same way the Step 1b size
+  override is threaded through.
+
+- **The PR has review activity** (any review, thread, or comment), **or the counts are
+  unreadable** -> **WARN and continue.** Do not stop, and do not refresh mid-review: a
+  HEAD-moving commit dismisses a bot's prior approval and disturbs the incremental-review
+  delta. Say which, and when to act:
+  > "Behind `<base>` by `<N>`, but this PR has already been reviewed. NOT refreshing now
+  > -- that would dismiss the existing review. Refresh after the fix round lands and its
+  > replies are posted, immediately before merge."
+
+  An unreadable count takes this same branch deliberately: fail toward surfacing rather
+  than toward acting, matching the sweep's own indeterminate handling.
+
+**Never `--rebase`, on any path.** It rewrites every commit SHA, orphaning the fix SHAs
+cited in review replies and emptying the bot's incremental-review delta. The additive
+`gh pr update-branch` (default merge-commit mode) is the only sanctioned refresh for an
+open PR.
+
+---
+
 ## Step 2 -- Tests and gates (delegate to gate-runner)
 
 This command ships in a plugin installed into arbitrary repos, so it must run

@@ -229,6 +229,24 @@ Runtime (`scripts/`; canonical source is this repo):
   malformed invocation. Read-only: no `gh`, no remote mutation, no working-tree/index change. Used by
   the pr-shipper fix-round advisory and by open-pr-staleness-sweep.sh (which does NOT reimplement the
   fetch + rev-list idiom).
+  #329/#330 WIRED IT INTO THE TWO PUSH-SIDE PATHS, where it existed but was never consulted - a
+  check that is correct and unwired is indistinguishable from no check (the #324 shape). The two
+  callers get DIFFERENT policies on purpose, because they hold different information:
+  `safe-push.sh` stays GIT-ONLY and BLOCKS on a definitive BEHIND. It resolves the base from
+  `--base <name>` or `origin/HEAD` and never calls `gh`: a `gh` lookup would put a network
+  dependency (and a rate-limit/auth failure mode) on the most-used script in the repo. So it
+  cannot know whether a PR was reviewed, and the caller DECLARES intent with `--stale-ok`
+  (mirroring `--rewrite`). `--base` EXISTS SO THE OVERRIDE IS NOT THE ONLY EXIT: a backport off
+  `release/1.2` measured against `origin/HEAD` yields a FALSE behind-count, and if the only escape
+  were `--stale-ok`, backport authors would learn to reach for it reflexively - training an
+  override to mean "dismiss the guard" rather than "the gate genuinely passed" (#345's corrosion).
+  `/prep-pr` Step 1c already speaks `gh`, so it is STATE-DEPENDENT: it STOPS when refreshing is
+  free (no PR, or a PR with no review activity) and only WARNS once the PR has been reviewed,
+  because a HEAD-moving refresh there dismisses a bot's prior approval and disturbs the
+  incremental-review delta. Its reviewed predicate is review ACTIVITY, never `reviewDecision`
+  (null on exactly the PR carrying bot findings and cited fix SHAs), and an UNREADABLE count takes
+  the WARN branch - fail toward surfacing, never toward acting. Both paths block ONLY on the
+  helper's exit 1; unknown stays non-blocking on every path, and NEITHER ever suggests `--rebase`.
 - `scripts/open-pr-staleness-sweep.sh` - the merge-side open-PR staleness sweep (#282), called from
   `/post-merge-cleanup` with the just-merged PR (which it EXCLUDES). A merge advances the base and
   silently leaves every OTHER open PR behind it; this notices them. THE SAFETY HINGE is the reviewed
@@ -413,7 +431,7 @@ clean-worktree check, so an unchanged committed tree skips re-running it
 
 ```sh
 shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/orchestrate-authorize-merge.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh scripts/base-freshness.sh scripts/open-pr-staleness-sweep.sh scripts/run-paths.sh scripts/cr-quota-watch.sh scripts/elmer-enqueue.sh scripts/elmer-triage.sh scripts/elmer-tick.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
-ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py test-cr-quota-watch.py test-elmer-enqueue.py test-elmer-triage.py test-elmer-tick.py
+ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-safe-push-freshness.py test-prep-pr-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py test-cr-quota-watch.py test-elmer-enqueue.py test-elmer-triage.py test-elmer-tick.py
 ./scripts/orchestrate-guard.sh --self-test    # MUST use ./ - the self-test re-invokes "$0";
                                               # `bash scripts/orchestrate-guard.sh` makes $0 a bare name -> 127
 ./scripts/orchestrate-guard.sh --assert-coverage  # #324: no deny is unreachable behind the perf
@@ -449,6 +467,8 @@ python3 test-prose-lint.py
 python3 test-resolve-threads.py
 python3 test-cache-reclaim.py
 python3 test-base-freshness.py
+python3 test-safe-push-freshness.py
+python3 test-prep-pr-freshness.py
 python3 test-open-pr-staleness-sweep.py
 python3 test-run-paths.py
 python3 test-cleanup-worktree.py
