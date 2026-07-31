@@ -99,5 +99,49 @@ if ! acquire_lock; then
 fi
 trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 
-echo "elmer-tick: lock acquired ($ELMER_HOME)"
+# --- The hourly cap: a bound that does not consult the queue -----------------------
+# The carve-out requires a hard posts-per-hour cap INDEPENDENT of queue depth. That
+# independence is the point: every other guard in this script reasons about whether a
+# PARTICULAR entry deserves a post, so a bug in that reasoning is unbounded. The cap
+# bounds the blast radius of ANY such bug, including one not yet written.
+#
+# The count comes from the drained/ records, which are the audit trail of what was
+# actually posted -- not from a counter file that could drift from reality. Each
+# drained entry carries `triggered_at`; the cap counts those inside the trailing hour.
+#
+# Reading a drained entry that is malformed or missing its timestamp counts it AS a
+# recent post (see the || echo below). That is deliberate: an unreadable record must
+# never buy an extra post, and the conservative direction here is to post less.
+ELMER_MAX_PER_HR="${ELMER_MAX_PER_HR:-4}"
+
+posts_last_hour() {
+  local cutoff n=0 f ts
+  cutoff="$(( $(date +%s) - 3600 ))"
+  # A glob with no matches expands to the literal pattern under default shell
+  # options, so the -e guard is what makes an empty drained/ read as zero.
+  for f in "$drained"/*.json; do
+    [ -e "$f" ] || continue
+    ts="$(jq -r '.triggered_at // empty' "$f" 2>/dev/null || true)"
+    if [ -z "$ts" ]; then
+      # Unreadable/malformed: count it, never discount it.
+      n=$(( n + 1 )); continue
+    fi
+    # A timestamp that will not parse is likewise counted, not skipped.
+    local epoch
+    epoch="$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null \
+             || date -u -d "$ts" +%s 2>/dev/null || echo "")"
+    if [ -z "$epoch" ] || [ "$epoch" -ge "$cutoff" ]; then
+      n=$(( n + 1 ))
+    fi
+  done
+  echo "$n"
+}
+
+recent="$(posts_last_hour)"
+if [ "$recent" -ge "$ELMER_MAX_PER_HR" ]; then
+  echo "elmer-tick: hourly cap reached ($recent/$ELMER_MAX_PER_HR posts in the last hour); nothing posted."
+  exit 0
+fi
+
+echo "elmer-tick: lock acquired, cap ok ($recent/$ELMER_MAX_PER_HR this hour)"
 exit 0
