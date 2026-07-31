@@ -159,6 +159,30 @@ CASES = [
     # subcommand that does NOT accept --no-verify + token in an arg -> allow
     ("git log --grep with --no-verify in pattern allowed",
      'git log --grep="--no-verify"', False, "allow"),
+    # Tier-1 commit-signing bypass (#333): blocked ALWAYS, by the same argument that
+    # justifies the --no-verify deny - both are "silence a gate to keep moving". Verified
+    # ALLOWED by the live guard before this deny existed. Cost asymmetry drives it: caught
+    # at commit time the fix is `git commit --amend -S`; caught at a required_signatures
+    # merge gate it is a history rewrite + force-push on a reviewed PR, which orphans every
+    # cited fix SHA. Two spellings, since disabling the config is the same act as the flag.
+    ("git commit --no-gpg-sign", "git commit --no-gpg-sign -m x", False, "block"),
+    ("git commit -c gpgsign=false", "git -c commit.gpgsign=false commit -m x", False, "block"),
+    ("git merge --no-gpg-sign", "git merge --no-gpg-sign topic", False, "block"),
+    ("git rebase --no-gpg-sign", "git rebase --no-gpg-sign main", False, "block"),
+    ("git cherry-pick --no-gpg-sign", "git cherry-pick --no-gpg-sign abc123", False, "block"),
+    ("git -C dir commit --no-gpg-sign still blocks",
+     "git -C ../wt commit --no-gpg-sign -m x", False, "block"),
+    ("gpgsign=false with spaces around = still blocks",
+     "git -c commit.gpgsign = false commit -m x", False, "block"),
+    # scoped-negatives: the same false-positive classes the --no-verify deny documents.
+    ("sometool --no-gpg-sign (no git) allowed", "sometool --no-gpg-sign", False, "allow"),
+    ("gh issue title bans --no-gpg-sign mentioning git allowed",
+     'gh issue create --title "ban --no-gpg-sign in git workflows" --body x', False, "allow"),
+    ("git log --grep with --no-gpg-sign in pattern allowed",
+     'git log --grep="--no-gpg-sign"', False, "allow"),
+    ("gpgsign=true (ENABLING signing) allowed",
+     "git -c commit.gpgsign=true commit -m x", False, "allow"),
+    ("plain signed commit allowed", "git commit -S -m x", False, "allow"),
     # Tier-1 gh pr merge --admin (admin-bypass overriding branch protection): blocked ALWAYS.
     # SUBCOMMAND-anchored: `gh pr merge` is the ONLY gh subcommand that accepts --admin.
     ("gh pr merge --admin", "gh pr merge --admin 1868", False, "block"),

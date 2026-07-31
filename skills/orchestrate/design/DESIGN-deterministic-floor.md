@@ -533,8 +533,14 @@ implementer does not mistake them for bugs:
   in a non-push clause (`git checkout main && git push feat`) no longer trips a
   deny meant for the push clause. A perf pre-filter skips the split entirely when
   neither `push` nor a `gh` word is present (keeps ordinary pipelines O(1)).
-- **F30 - `--no-verify` / `--admin` token inside a commit message or quoted arg of
-  a flag-accepting (sub)command.** The two newer Tier-1 denies (`git <sub> --no-verify`
+- **F30 - `--no-verify` / `--admin` / `--no-gpg-sign` token inside a commit message or
+  quoted arg of a flag-accepting (sub)command.** (#333 added the commit-signing-bypass
+  deny, which INHERITS this residue EXACTLY - it reuses `has_noverify_subcmd`, so
+  `git commit -m "...--no-gpg-sign..."` hard-blocks for the identical reason and takes the
+  identical remedy: reword, or run it yourself via `!`. MEASURED, not assumed - the two
+  forms were probed side by side and behave identically. The config spelling
+  `-c commit.gpgsign=false` has the same shape. No new limitation class is introduced.)
+  The two older Tier-1 denies (`git <sub> --no-verify`
   skip-hooks, `gh pr merge --admin` protection-bypass) are now SUBCOMMAND-anchored
   (mirroring F13): the no-verify deny requires one of the git subcommands that actually
   accept the flag (commit/push/merge/rebase/cherry-pick/am/revert/pull), and the admin

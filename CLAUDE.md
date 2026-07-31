@@ -37,7 +37,13 @@ Runtime (`scripts/`; canonical source is this repo):
 - `scripts/orchestrate-guard.sh` - the single PreToolUse Bash deny authority (deterministic floor).
   Tier-1 = general bash-safety, MARKER-INDEPENDENT (every session): push-to-main/master, bare
   `--force`/`-f` (not `--force-with-lease`), `git ... --no-verify` (any accepting subcommand),
-  `gh ... --admin` (admin-bypass on `pr merge`). Tier-2 = orchestrate-MARKER-GATED merge: BOTH
+  `gh ... --admin` (admin-bypass on `pr merge`), and (#333) the COMMIT-SIGNING BYPASS -
+  `--no-gpg-sign` or `-c commit.gpgsign=<false|no|off|0|empty>` on any signing-bearing
+  subcommand. Same argument as `--no-verify` (silence a gate to keep moving) and the same
+  subcommand anchoring; the config leg matches ONLY the disabling values, so `gpgsign=true`
+  and `tag.gpgsign=false` correctly ALLOW. Cost asymmetry is what earns it: caught at commit
+  time the fix is `git commit --amend -S`, caught at a `required_signatures` merge gate it is
+  a history rewrite + force-push that orphans every cited fix SHA. Tier-2 = orchestrate-MARKER-GATED merge: BOTH
   the `gh pr merge` CLI (`is_pr_merge`, #105) AND merge-by-API (`gh api ... pulls/N/merge`);
   a SOLO/non-marker session is never Tier-2-gated. #263 PIECE B: the `gh pr merge` CLI leg is
   RELAXED to ALLOW in a marker session iff a fresh session-scoped merge-auth token
