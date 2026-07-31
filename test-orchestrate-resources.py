@@ -110,33 +110,59 @@ def main():
               rc != 0 and "no free port" in (out4 + err4).lower())
         s.close()
 
-        # --- #98: single-call lsof enumeration (not one lsof per port) ---
-        # A fake `lsof` on PATH records each invocation and reports ONE listener (n*:TARGET).
-        # allocate must (a) call lsof exactly ONCE for the whole scan (was ~101, one per port),
-        # and (b) still skip the reported listening port.
-        print("\n  [#98: single-call lsof scan]")
-        lsofdir = os.path.join(td, "lsofbin")
-        os.makedirs(lsofdir, exist_ok=True)
-        counter = os.path.join(td, "lsof-calls.log")
-        fake_lsof = os.path.join(lsofdir, "lsof")
-        with open(fake_lsof, "w") as f:
-            f.write('#!/bin/sh\n'
-                    'echo x >> "$LSOF_FAKE_COUNTER"\n'
-                    'printf "p1\\nn*:%s\\n" "$LSOF_FAKE_TARGET"\n')
-        os.chmod(fake_lsof, 0o755)
-        target = 2000
-        ov98 = dict(ov)
-        ov98["ORCHESTRATE_PORT_RANGE"] = f"{target}-{target + 1}"  # 2 ports; target is "listening"
-        ov98["PATH"] = lsofdir + os.pathsep + os.environ.get("PATH", "")
-        ov98["LSOF_FAKE_COUNTER"] = counter
-        ov98["LSOF_FAKE_TARGET"] = str(target)
-        rc, out98, err98 = run(["allocate", "--session", "S98", "--teammate", "t"], env_overrides=ov98)
-        check("#98: allocate exits 0 with fake single-call lsof", rc == 0)
+        # --- #352: the liveness probe asks the KERNEL, and depends on NO external tool ---
+        #
+        # These replace the #98 pair, which asserted on the MECHANISM (that `lsof` was invoked
+        # exactly once) rather than the BEHAVIOR (that a live port is skipped). #98 optimized
+        # a per-port lsof fan-out into one global lsof crawl; #352 found the whole approach
+        # wrong -- on a host where lsof does not complete, its timeout returns an EMPTY set,
+        # which is indistinguishable from "nothing is listening", so the allocator hands out a
+        # LIVE port silently. Measured: lsof rc=124 at both a 25s and a 60s ceiling, 0 lines,
+        # 6 consecutive attempts. A mechanism assertion could not have caught that; a behavior
+        # assertion driven by a REAL listener does, which is why these are written this way.
+        print("\n  [#352: kernel-authoritative liveness probe]")
+        real = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        real.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        real.bind(("127.0.0.1", 0)); real.listen(1)
+        live_port = real.getsockname()[1]
+        ov352 = dict(ov)
+        # A 2-port range whose FIRST port is genuinely LISTENing: allocate must skip to the second.
+        ov352["ORCHESTRATE_PORT_RANGE"] = f"{live_port}-{live_port + 1}"
+        # PATH without any lsof at all. The probe must not need it -- if the implementation ever
+        # regresses to shelling out, this case fails rather than silently failing open.
+        nobin = os.path.join(td, "empty-bin"); os.makedirs(nobin, exist_ok=True)
+        ov352["PATH"] = nobin
+        rc, out352, err352 = run(["allocate", "--session", "S352", "--teammate", "t"],
+                                 env_overrides=ov352)
+        check("#352: allocate exits 0 with NO lsof (or any tool) on PATH", rc == 0)
         if rc == 0:
-            check("#98: the lsof-reported LISTENing port is skipped",
-                  json.loads(out98)["resources"]["port"]["value"] == target + 1)
-        ncalls = sum(1 for _ in open(counter)) if os.path.exists(counter) else 0
-        check(f"#98: lsof invoked ONCE for the whole scan (not per-port); got {ncalls}", ncalls == 1)
+            check("#352: a genuinely LISTENing port is skipped",
+                  json.loads(out352)["resources"]["port"]["value"] == live_port + 1)
+        real.close()
+        # The SAME must hold for a listener bound to 0.0.0.0, not just 127.0.0.1. This is the
+        # SO_REUSEADDR trap: a probe that sets SO_REUSEADDR can bind 127.0.0.1 while a live
+        # listener holds 0.0.0.0, so it under-reports and the allocator hands out a live port.
+        # Verified both directions before choosing the no-REUSEADDR form; without this case a
+        # regression that adds the flag back passes every other assertion here.
+        wild = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        wild.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        wild.bind(("0.0.0.0", 0)); wild.listen(1)
+        wild_port = wild.getsockname()[1]
+        os.remove(state)
+        ovw = dict(ov352); ovw["ORCHESTRATE_PORT_RANGE"] = f"{wild_port}-{wild_port + 1}"
+        rc, outw, _ = run(["allocate", "--session", "S352w", "--teammate", "t"], env_overrides=ovw)
+        check("#352: a 0.0.0.0-bound LISTENer is also skipped (no SO_REUSEADDR under-report)",
+              rc == 0 and json.loads(outw)["resources"]["port"]["value"] == wild_port + 1)
+        wild.close()
+        # Once the listener is gone the same port must become allocatable again -- proves the
+        # probe reads LIVE state, not a cached or stale inventory.
+        os.remove(state)
+        ov352b = dict(ov352); ov352b["ORCHESTRATE_PORT_RANGE"] = f"{live_port}-{live_port}"
+        rc, out352b, _ = run(["allocate", "--session", "S352b", "--teammate", "t"],
+                             env_overrides=ov352b)
+        check("#352: the port is allocatable once its listener closes (live, not cached)",
+              rc == 0 and json.loads(out352b)["resources"]["port"]["value"] == live_port)
+        os.remove(state)
 
         # --- #98: lsof failure (or absence) does not block allocation ---
         # A fake lsof that exits non-zero with no output -> empty snapshot -> allocate proceeds.
