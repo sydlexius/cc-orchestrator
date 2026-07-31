@@ -88,9 +88,11 @@ Runtime (`scripts/`; canonical source is this repo):
   [--apply]` is the consent-based path that wires the floor hook + missing allow-list entries into
   settings.json, DEPLOYS the bundled guard to the stable `~/.claude/scripts/` path (so a fresh
   plugin install has a working floor; idempotent, refreshes a stale copy, warns on a missing source),
-  DEPLOYS the 16 bundled PR-lifecycle helpers (HELPER_NAMES) the same Option-A way (#133; #234 added
-  `gh-react.sh`, #303 added `run-paths.sh`; retiring any claude-kit
-  symlink, backed up to `<dest>.bak`), and (unless `--no-steer`) DEPLOYS + wires the advisory
+  DEPLOYS the 18 bundled PR-lifecycle helpers (HELPER_NAMES) the same Option-A way (#133; #234 added
+  `gh-react.sh`, #303 added `run-paths.sh`, and the elmer front half added `cr-quota-watch.sh` +
+  `elmer-enqueue.sh` - for those two the stable path is LOAD-BEARING, since it is what keeps the
+  unattended loop inside the existing wrapper grant instead of needing a broad `gh` one; retiring
+  any claude-kit symlink, backed up to `<dest>.bak`), and (unless `--no-steer`) DEPLOYS + wires the advisory
   steering hook `orchestrate-steer.sh` for Edit/Write/Bash/Read/Agent (#95/#226/#231; doctor only ever WARNs about it),
   DEPLOYS this script to the stable path + wires a read-only SessionStart `init` advisory hook (#162;
   the `init` subcommand reuses the single `_scan_merge_gate_shadows` matcher to surface a `gh pr *`
@@ -203,6 +205,44 @@ Runtime (`scripts/`; canonical source is this repo):
   operational path including a read failure, so it can never block cleanup; exit 2 ONLY on a malformed
   invocation. Needs the maintainer-granted `Bash(gh pr update-branch *)` allow-list entry; without it
   the report-only degradation is the normal path. No floor/guard change.
+- `scripts/cr-quota-watch.sh` - READ-ONLY surfacer for CodeRabbit's own quota announcements. It
+  POSTS NOTHING, so it can never spend a review slot and needs no trigger authority (triggering a
+  CR review stays the maintainer's exclusive purview). It exists because CR already reports its
+  remaining quota and a human never sees it: the better of the two signals rides the ack of a
+  review CR just performed, wrapped in a `<details>` block GitHub renders COLLAPSED, so the
+  visible summary is only "Action performed". TWO NOUN PHRASES carry it and a matcher tuned to one
+  silently misses the other ("your next review will be available in N" vs "your next INCLUDED
+  review will be available in N"); durations are always RELATIVE and real messages include a
+  SINGULAR "1 minute." and a different unit "4 seconds.", so a naive `(\d+) minutes` breaks. The
+  NEWEST signal wins outright and its deadline is computed from that comment's OWN timestamp,
+  because CR's limits are adaptive and the countdown is NON-MONOTONIC (53 minutes, then 51 minutes
+  an hour LATER) - counting down locally from an old reading is wrong by construction. A gh read
+  failure exits 2, NEVER 0: reporting "no limit" because the read failed is a false all-clear.
+  Only `coderabbitai[bot]` counts, and the matcher demands CR's exact relative-duration shape -
+  the retired Codoki used an ABSOLUTE UTC timestamp and transcripts are full of them. CEILING (a
+  product decision, not a parser gap): CR publishes a COUNTDOWN only once the limit is ALREADY
+  reached, never a remaining-slot count, so "no announced limit" means EITHER plenty of budget OR
+  one review from the wall.
+- `scripts/elmer-enqueue.sh` - the RECEIPT-GATED queue writer for the unattended review requester
+  ("elmer"). A TL files a request; a separate single writer is the only thing that ever posts.
+  THE POINT: a TL must not be able to queue a review for code that never passed `/prep-pr`, and
+  that is enforced MECHANICALLY - `/prep-pr` now runs `gate-runner.py --receipt` (a byproduct that
+  never changes the gate's verdict), and enqueue REFUSES unless the `gate-receipt/v1` exists,
+  validates, says `result=pass`, names `gate-runner` as producer, AND carries a `commit_sha` equal
+  to the PR's CURRENT head. That last check is load-bearing: a TL who gated then pushed twice
+  holds a receipt whose commit no longer matches HEAD, so the request is refused with a pointer
+  back to `/prep-pr`. Same VERIFY-DO-NOT-CLASSIFY shape as #337 - check the fact, never the claim.
+  Threat model matches the floor (an honest TL on the obvious path, NOT an adversary): the
+  producer/schema checks reject a wrong-tool or hand-rolled artifact, not a determined forger.
+  The receipt path is `$(git rev-parse --git-dir)`, NEVER a literal `.git/` - in a worktree `.git`
+  is a FILE pointing into `.git/worktrees/<name>`, so a literal path is unwritable exactly where
+  this workflow normally runs, and `--git-dir` is also naturally per-worktree. IDEMPOTENCY is
+  structural: an entry sits in `inbox/` until triggered then moves to `drained/`, and a PR+SHA in
+  EITHER is never queued again - asking GitHub "has a review happened" would be RACY, since CR
+  takes minutes to post and a tick 30s later would fire twice. `full` review is refused outright
+  regardless of what a caller asks (it re-surfaces resolved threads and owes a human decision); a
+  gh read failure exits 2 rather than enqueuing. Reads a PR + writes one LOCAL queue entry: no
+  posting, no gh mutation, no allow-list or floor change.
 - `scripts/run-paths.sh` - THE single producer of a worktree's run-artifact directory (#303),
   SOURCED (never executed). Exports `CC_RUN_ROOT`, `CC_RUN_DIR`
   (`<XDG_CACHE_HOME>/<repo-prefix>-run/<basename>-<sha12>`), and `GOLANGCI_LINT_CACHE`
@@ -293,8 +333,8 @@ clean-worktree check, so an unchanged committed tree skips re-running it
 `skills/orchestrate/templates/gates.toml.md`.
 
 ```sh
-shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/orchestrate-authorize-merge.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh scripts/base-freshness.sh scripts/open-pr-staleness-sweep.sh scripts/run-paths.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
-ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py
+shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/orchestrate-authorize-merge.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh scripts/base-freshness.sh scripts/open-pr-staleness-sweep.sh scripts/run-paths.sh scripts/cr-quota-watch.sh scripts/elmer-enqueue.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
+ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py test-cr-quota-watch.py test-elmer-enqueue.py
 ./scripts/orchestrate-guard.sh --self-test    # MUST use ./ - the self-test re-invokes "$0";
                                               # `bash scripts/orchestrate-guard.sh` makes $0 a bare name -> 127
 ./scripts/orchestrate-guard.sh --assert-coverage  # #324: no deny is unreachable behind the perf
@@ -333,6 +373,8 @@ python3 test-base-freshness.py
 python3 test-open-pr-staleness-sweep.py
 python3 test-run-paths.py
 python3 test-cleanup-worktree.py
+python3 test-cr-quota-watch.py
+python3 test-elmer-enqueue.py
 ```
 
 ## Versioning

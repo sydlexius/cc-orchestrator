@@ -438,8 +438,9 @@ def main():
     _osetup = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(_osetup)
     helper_names = list(_osetup.HELPER_NAMES)
+    # 18 = 16 + the two elmer front-half helpers (cr-quota-watch.sh, elmer-enqueue.sh).
     check("#284 lockstep: HELPER_NAMES imported (exact count -- a truncated parse must not pass)",
-          len(helper_names) == 16)
+          len(helper_names) == 18)
     for h in helper_names:
         p = os.path.join(repo, "scripts", h)
         rc, err = run_steer({"file_path": p}, channel="stdin", tool_name="Edit", marker_active=True)
