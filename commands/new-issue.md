@@ -43,6 +43,23 @@ Present the agent hint defaults for the issue type and ask if they are OK:
 Then for each content section in the template, ask the user to provide input.
 If the user gives a brief phrase, expand it into a well-structured section.
 
+Also ask here: **"Assign to a milestone? (enter milestone title or skip)"**. It is one more
+field, and asking BEFORE creation is load-bearing, not tidiness (#344): a repo may REQUIRE a
+milestone at creation time (stillwater enforces exactly this with a local hookify rule that
+blocks any issue-creation command not already carrying `--milestone`). Asking afterward means
+the create is DENIED and the skill's own prescribed command is the thing that gets rejected -
+hit twice while filing a real issue on 2026-07-27. Carry the answer into Step 5's `--milestone`
+flag; on "skip", omit the flag entirely.
+
+List the available milestones rather than making the user recall a title:
+
+```bash
+gh api "repos/{owner}/{repo}/milestones" --jq '.[].title' 2>/dev/null || true
+```
+
+The `|| true` matters: a repo with milestones DISABLED, or a token without the scope, must
+degrade to "no milestones offered" and continue, never abort the issue-filing flow.
+
 ---
 
 ## Step 4 -- Write body file
@@ -93,17 +110,21 @@ Map the type to its label:
 - bug: `bug`
 - task: `chore`
 
+Carry the milestone answer from Step 3 into the create itself - do NOT create first and edit
+after (#344), which is denied outright in a repo that requires a milestone at creation time:
+
 ```bash
+# With a milestone (the answer from Step 3):
+gh issue create --title "<title>" --body-file /tmp/gh-issue-body.md --label <label> \
+  --milestone "<title-from-step-3>"
+
+# On "skip", omit the flag entirely - do NOT pass an empty --milestone "":
 gh issue create --title "<title>" --body-file /tmp/gh-issue-body.md --label <label>
 ```
 
-After creation, ask: "Assign to a milestone? (enter milestone title or skip)"
-
-If yes:
-
-```bash
-gh issue edit <number> --milestone "<title>"
-```
+If the create is REJECTED for an unknown milestone (a title typo, or one closed since Step 3
+listed it), re-list and re-ask rather than dropping the flag - silently creating the issue
+without the milestone is what a required-milestone repo is trying to prevent.
 
 ---
 

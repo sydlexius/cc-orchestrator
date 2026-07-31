@@ -520,21 +520,28 @@ drives `/plugin marketplace` update-detection, so they must never diverge. The C
   - SELF-IMPOSED CARVE-OUT: a change that edits the deterministic floor / merge-policy / operating-model
     ITSELF routes for MAINTAINER MERGE even when it is "doc" (this file's operating-model + SKILL.md floor
     invariants qualify).
-  - MECHANICAL: autonomous merge works only in a SOLO / non-marker session; a marker-active TEAM session
-    has the floor hard-deny `gh pr merge` CLI (is_pr_merge, #105) and deny merge-by-API, so there the lead
-    SURFACES the merge to the human (who merges from a SEPARATE plain terminal). "Looks good"/"LGTM" is
-    NEVER a merge authorization for the human-gated tiers; commit locally freely regardless of tier.
+  - MECHANICAL: AUTONOMOUS (no per-PR go) merge works only in a SOLO / non-marker session. A marker-active
+    TEAM session denies merge-by-API outright and denies the `gh pr merge` CLI (is_pr_merge, #105) UNLESS
+    #263 Piece B's readiness-gated token authorizes it - so there the lead SURFACES the merge and, on the
+    human's explicit go, may execute it IN-SESSION via `orchestrate-authorize-merge.sh <pr>` (oracle-gated;
+    arms a token only on PASS) + `gh pr merge --match-head-commit <sha>`. A SEPARATE plain terminal / the
+    GitHub UI stays a valid FALLBACK, not the primary path (#319 retired the contradictory prose). What
+    Piece B changed is WHERE the merge runs, never WHO authorizes it. "Looks good"/"LGTM" is NEVER a merge
+    authorization for the human-gated tiers; commit locally freely regardless of tier.
 - The LEAD owns all privileged/outward steps and is the SOLE human-facing channel (the shared
   push/`gh pr create`/CR-replies/merge rule lives in the user-global CLAUDE.md; not restated here).
   Repo-specific delta: teammates implement + test + commit in their OWN worktree and message the lead
   rather than prompting the human (AskUserQuestion/permission prompts from teammates clobber the
   human's input box).
-- The merge (the one irreversible step) is human-executed IN A MARKER-ACTIVE (TEAM) SESSION ONLY -
-  in a SOLO/non-marker session the NON-CR tier merges autonomously per AUTONOMY TIERS above. In a
-  marker-active session the floor hard-denies the `gh pr merge` CLI (is_pr_merge, #105) and the
-  merge-by-API path, so the human runs it from a SEPARATE plain terminal (no marker there) or the GitHub UI. The allow-list now
-  carries an EXPLICIT merge-scoped entry (`Bash(gh pr merge *)`) - safe because the floor deny
-  outranks it in a marker session, and it enables prompt-free solo merge for the maintainer.
+- The merge (the one irreversible step) is HUMAN-AUTHORIZED in a MARKER-ACTIVE (TEAM) session - in a
+  SOLO/non-marker session the NON-CR tier merges autonomously per AUTONOMY TIERS above. Authorized,
+  not necessarily human-EXECUTED: #263 Piece B lets the lead run the merge in-session once the human
+  has said so, via the oracle-gated `orchestrate-authorize-merge.sh` + a `--match-head-commit` pin.
+  The floor denies merge-by-API outright and denies the `gh pr merge` CLI absent that fresh token; a
+  SEPARATE plain terminal (no marker there) or the GitHub UI remains a valid FALLBACK. NEVER route
+  around a FAILED readiness gate by using the fallback - that is the one move the design forbids.
+  The allow-list now carries an EXPLICIT merge-scoped entry (`Bash(gh pr merge *)`) - safe because
+  the floor deny outranks it in a marker session, and it enables prompt-free solo merge.
 - Default to PARALLEL subagents for independent work, but only when DISJOINT (different files / git
   index): split by the resource being mutated, not just by logical task. FOREGROUND for anything that
   writes/commits; BACKGROUND only for provably-zero-prompt read-only work (the standing background-agent
