@@ -251,21 +251,41 @@ Note (both paths): do NOT pass `--delete-branch`. When a worktree holds the bran
 server-side), leaving the workflow half-done and non-idempotent. Branch cleanup is
 handled explicitly in Step 4 so the sequence is safe to re-run.
 
-### Step 3a -- marker_active=1 (active orchestrate session): hand the merge to the human
+### Step 3a -- marker_active=1 (active orchestrate session): merge in-session on the human's go
 
-The merge is the one irreversible, unforgeable step, so in an orchestrate session it
-stays human-executed. Do NOT attempt the merge yourself: the global guard hard-DENIES
-the mutating merge-by-API path (`gh api ... pulls/N/merge`) whenever the marker is
-fresh, and `gh pr merge` is withheld by the allow-list (an auto-mode bot stalls; a
-default-mode lead is prompted). Instead PRINT the exact command for the human to run
-in a SEPARATE PLAIN TERMINAL (outside the IDE) or via the GitHub UI -- NOT as an
-in-session `!` bang, which fails outright in IDE-hosted sessions -- then STOP and wait:
+THE AUTHORIZATION IS ALWAYS THE HUMAN'S. What #263 Piece B changed is WHERE the merge
+runs, not who decides it. The merge is still the one irreversible step and still requires
+an explicit "merge" go; it no longer requires a second terminal to execute.
+
+The floor denies merge-by-API (`gh api ... pulls/N/merge`) OUTRIGHT while the marker is
+fresh, and denies the `gh pr merge` CLI UNLESS a fresh session-scoped merge-auth token
+authorizes it. So there are two paths, in this order:
+
+**PRIMARY -- in-session, token-authorized.** Only after the human has explicitly said to
+merge. `orchestrate-authorize-merge.sh` runs the readiness oracle itself and arms a token
+ONLY on PASS, so a not-ready PR cannot be merged this way:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/orchestrate-authorize-merge.sh" "$pr_number"
+# On PASS it prints the head SHA it pinned the token to. Merge with that EXACT sha:
+gh pr merge "$pr_number" --squash --match-head-commit <sha>
+```
+
+The `--match-head-commit` pin is load-bearing, not ceremony: the token binds to one head
+SHA, so a push landing between the arm and the merge invalidates it rather than merging
+un-vetted code. If the helper does not PASS, STOP and report why -- do not fall back to
+the second terminal to route around a failed readiness gate. That is the one move this
+design forbids.
+
+**FALLBACK -- separate plain terminal or the GitHub UI.** Still valid, and what the
+guard's own deny message offers, for when a token cannot be armed (the helper is
+unavailable, or the maintainer simply prefers to run it). PRINT the command and STOP;
+do NOT run it as an in-session `!` bang, which fails outright in IDE-hosted sessions:
 
 ```text
 All pre-merge checks passed for #<pr_number>.
-This is an active orchestrate session, so the merge itself is yours to run
-(the one irreversible step, unforgeable by a bot). Run it in a SEPARATE PLAIN
-TERMINAL outside the IDE, or use the GitHub UI "Squash and merge" button:
+Run it in a SEPARATE PLAIN TERMINAL outside the IDE, or use the GitHub UI
+"Squash and merge" button:
 
     gh pr merge <pr_number> --squash
 

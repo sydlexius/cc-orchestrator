@@ -64,6 +64,29 @@ bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-watch.sh $pr_number "" $timeout_secs
 
 (The empty second arg lets the script auto-detect the repo via `gh repo view`.)
 
+PASS THAT LINE DIRECTLY as the backgrounded command. NO `nohup`, NO trailing `&`, NO output
+redirect (#331):
+
+```bash
+# WRONG - the verdict is orphaned:
+nohup bash .../pr-watch.sh 123 "" 1800 > /tmp/watch.log 2>&1 &
+```
+
+Inside a `run_in_background: true` task, that wrapper RETURNS IMMEDIATELY, so the completion
+notification fires on the WRAPPER, not the watcher. The watch then runs correctly, writes its
+terminal line to the logfile, and exits with NOBODY READING IT. The failure is silent and
+plausible-looking: an exit-0 notification seconds after arming is indistinguishable from a
+healthy detached launch, and nothing surfaces the problem until a human asks why the watch is
+not working. Measured (stillwater 2026-07-18/19): two PR watches armed this way both wrote
+terminal verdicts nobody consumed, leaving a bot review unhandled ~14 minutes. It WAS working -
+the wiring was wrong.
+
+The task output file already IS the logfile and the completion notification already IS the
+signal; a wrapper only hides both. This applies to ANY long-running helper whose EXIT CODE is
+the signal - `issue-watch.sh`, a `gate-runner.py` run - not just this one. And when the
+notification arrives, READ THE OUTPUT FILE: a backgrounded command's reported "exit code 0" is
+the wrapper's, not the tool's, so confirm the tool's own terminal line before acting on it.
+
 ## Step 3 -- Dispatch on the terminal line
 
 When the Monitor reports the script's exit, branch off the single stdout line:
