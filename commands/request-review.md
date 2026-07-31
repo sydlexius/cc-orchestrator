@@ -43,7 +43,14 @@ literal path is unwritable exactly where this workflow normally runs.
 ## Step 2 -- Enqueue
 
 Resolve the helper in the SAME Bash call that uses it - each tool call is a fresh shell, so the
-variable does not survive across calls. Substitute the real PR number:
+variable does not survive across calls.
+
+Set `PR_TO_ENQUEUE` to the real PR number before running the block. It is written as a `:?`
+guard rather than a `<PR#>` placeholder deliberately: a bare `<PR#>` is a shell REDIRECTION, so
+the block is a `bash -n` parse error and the whole call fails before anything runs; and a
+hardcoded number would silently enqueue the wrong PR. The `:?` form fails LOUDLY with its own
+message if the value was never set. The receipt path must match the one `/orchestrate:prep-pr`
+writes (`<git-dir>/prep-pr-receipt.json`) - a mismatch makes enqueue refuse every request.
 
 ```bash
 EQ=""
@@ -54,7 +61,8 @@ elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/elm
 fi
 [ -n "$EQ" ] || { echo "elmer-enqueue.sh not found (repo-local, deployed, or plugin)" >&2; exit 2; }
 
-bash "$EQ" <PR#> --receipt "$(git rev-parse --git-dir)/orchestrate/gate-receipt.json"
+PR_TO_ENQUEUE="${PR_TO_ENQUEUE:?set to the PR number from the arguments above}"
+bash "$EQ" "$PR_TO_ENQUEUE" --receipt "$(git rev-parse --git-dir)/prep-pr-receipt.json"
 ```
 
 The deployed `~/.claude/scripts/` path is checked before the plugin path deliberately: that stable

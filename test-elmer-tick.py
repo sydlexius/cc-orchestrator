@@ -398,6 +398,14 @@ def _(env):
         rec = json.load(f)
     check("record carries triggered_at", bool(rec.get("triggered_at")))
     check("record carries the SHA", rec.get("commit_sha") == SHA)
+    # The trigger crosses into jq as an `--arg`, not spliced into the PROGRAM TEXT.
+    # Read the ACTUAL drained JSON rather than trusting the post: a splice that
+    # produced an invalid jq program would fail the drain AFTER a successful post,
+    # the one genuinely bad state (the next tick could re-post).
+    check("record carries the exact trigger string posted",
+          rec.get("trigger") == "@coderabbitai review"
+          and rec["trigger"] in env.posts[0])
+    check("record carries the post response", "response" in rec)
     r2 = env.run()
     check("re-tick posts nothing", len(env.posts) == 1)
     check("re-tick exit 0", r2.returncode == 0)
@@ -480,6 +488,229 @@ def _(env):
     check("posted nothing", env.posts == [])
     check("warns about the unreadable entry", "unreadable" in r.stderr.lower())
     check("names the file", "bad.json" in r.stderr)
+
+
+@case("a VALID entry missing .pr is refused by scan_queue, never posted for")
+def _(env):
+    # THE WORST OBSERVED SHAPE. scan_queue used to admit an entry on `.repo` +
+    # `.enqueued_at` alone, and the posting path then read `.pr` with no default, so
+    # jq handed back the literal STRING "null". The tick issued `gh pr comment null`,
+    # REPORTED IT AS A SUCCESSFUL POST, and drained the entry - a spent slot on a
+    # nonexistent PR, recorded in the audit trail as a real request. The entry is
+    # well-formed JSON, so the pre-existing unparseable-json case cannot catch it.
+    with open(os.path.join(env.inbox, "nopr.json"), "w") as f:
+        json.dump({"repo": "sydlexius/cc-orchestrator", "commit_sha": SHA,
+                   "form": "incremental", "enqueued_at": "2026-07-30T10:00:00Z"}, f)
+    r = env.run()
+    check("exit 0 (nothing pickable)", r.returncode == 0)
+    check("posted nothing", env.posts == [])
+    check("never posts to a PR named 'null'",
+          not any("null" in p for p in env.posts))
+    check("reported as unreadable, not silently invisible",
+          "unreadable" in r.stderr.lower() and "nopr.json" in r.stderr)
+    check("entry NOT drained", env.ls("drained") == [])
+
+
+@case("a VALID entry missing .commit_sha is refused by scan_queue, not wedged at exit 1")
+def _(env):
+    # Less destructive than a missing .pr but permanently wedging: the staleness gate
+    # compared the PR head against the string "null" forever, so the entry produced a
+    # 1 with "queued: null" on every tick and never drained. A 1 tells the operator an
+    # entry was REFUSED for a real reason, so this forged a refusal out of a malformed
+    # file that should have been reported as unreadable.
+    with open(os.path.join(env.inbox, "nosha.json"), "w") as f:
+        json.dump({"repo": "sydlexius/cc-orchestrator", "pr": 354,
+                   "form": "incremental", "enqueued_at": "2026-07-30T10:00:00Z"}, f)
+    r = env.run()
+    check("exit 0, not the wedged 1", r.returncode == 0)
+    check("posted nothing", env.posts == [])
+    check("never reports a SHA of 'null'", "queued: null" not in r.stderr)
+    check("reported as unreadable", "unreadable" in r.stderr.lower()
+          and "nosha.json" in r.stderr)
+
+
+@case("an explicit JSON null for .pr is refused too (jq renders both the same)")
+def _(env):
+    # `// ""` cannot distinguish an absent key from an explicit null, and neither can
+    # a bare read - both render as the string "null". The check rejects the literal.
+    with open(os.path.join(env.inbox, "nullpr.json"), "w") as f:
+        f.write(json.dumps({"repo": "sydlexius/cc-orchestrator", "pr": None,
+                            "commit_sha": SHA, "form": "incremental",
+                            "enqueued_at": "2026-07-30T10:00:00Z"}))
+    r = env.run()
+    check("exit 0", r.returncode == 0)
+    check("posted nothing", env.posts == [])
+    check("reported as unreadable", "nullpr.json" in r.stderr)
+
+
+@case("a GOOD entry alongside a malformed one is still posted for")
+def _(env):
+    # The narrowing must refuse the BAD entry only. If it accidentally rejected every
+    # entry the tick would go silently idle over a healthy queue, which is the same
+    # silent-wrong-answer class in the other direction.
+    with open(os.path.join(env.inbox, "nopr.json"), "w") as f:
+        json.dump({"repo": "sydlexius/cc-orchestrator",
+                   "enqueued_at": "2026-07-30T09:00:00Z"}, f)
+    env.queue(354, at="2026-07-30T10:00:00Z")
+    r = env.run()
+    check("exit 0", r.returncode == 0)
+    check("the good entry WAS posted", len(env.posts) == 1)
+    check("the bad entry is still reported", "nopr.json" in r.stderr)
+
+
+# --- Malformed integer env vars: a bound that reads FALSE is a DISABLED bound -------
+
+@case("ELMER_MAX_PER_HR non-integer -> exit 2, and the cap is NOT bypassed")
+def _(env):
+    # `[ "$recent" -ge "$ELMER_MAX_PER_HR" ]` with a non-integer returns 2, prints
+    # "integer expression expected", and as an `if` condition simply reads FALSE - so
+    # THE CAP WAS SILENTLY DISABLED AND THE TICK POSTED. Reproduced with
+    # ELMER_MAX_PER_HR=four and 10 drained records inside the hour: posted anyway.
+    # A typo in the environment is a SETUP ERROR, which is what 2 is for.
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for i in range(10):
+        env.drain_record(f"old-{i}.json", now)
+    env.queue(354)
+    r = env.run(ELMER_MAX_PER_HR="four")
+    check("exit 2 (setup error), never a silent post", r.returncode == 2)
+    check("POSTED NOTHING", env.posts == [])
+    check("names the variable", "ELMER_MAX_PER_HR" in r.stderr)
+    check("entry left queued", env.ls("inbox") == ["e-354.json"])
+
+
+@case("ELMER_MAX_PER_HR with surrounding whitespace is rejected, not coerced")
+def _(env):
+    # `case ''|*[!0-9]*` catches a leading/trailing space that a `[[ =~ ^[0-9]+$ ]]`
+    # would also catch but a naive `-eq` probe would silently accept.
+    env.queue(354)
+    r = env.run(ELMER_MAX_PER_HR=" 4 ")
+    check("exit 2", r.returncode == 2)
+    check("posted nothing", env.posts == [])
+
+
+@case("ELMER_MAX_PER_HR EMPTY falls back to the default cap, never to no cap")
+def _(env):
+    # An empty value is NOT a malformed one: `${ELMER_MAX_PER_HR:-4}` treats empty and
+    # unset alike, so the bound is the default 4 and the tick behaves normally. Asserted
+    # explicitly because the two hazardous readings of an empty string are "0" (posts
+    # never) and "unbounded" (posts always), and the `''` arm of the validating `case`
+    # exists only so a later change from `:-` to `-` cannot open the second one.
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for i in range(4):
+        env.drain_record(f"old-{i}.json", now)
+    env.queue(354)
+    r = env.run(ELMER_MAX_PER_HR="")
+    check("exit 0 (the default cap applied)", r.returncode == 0)
+    check("the DEFAULT cap of 4 held: posted nothing", env.posts == [])
+    check("says cap reached (not a setup error)", "hourly cap reached" in r.stdout)
+
+
+@case("ELMER_LOCK_STALE_SECS non-integer -> exit 2, never a lock that can never break")
+def _(env):
+    # Same shape at the lock: `[ "$age" -gt "$LOCK_STALE_SECS" ]` returns 2, reads
+    # FALSE, and NO lock is ever reclaimed - the loop wedges forever with only a stray
+    # stderr line to show for it.
+    lock = os.path.join(env.home, ".tick.lock")
+    os.makedirs(lock)
+    os.utime(lock, (1, 1))
+    env.queue(354)
+    r = env.run(ELMER_LOCK_STALE_SECS="nine")
+    check("exit 2, not a silent wedge", r.returncode == 2)
+    check("posted nothing", env.posts == [])
+    check("names the variable", "ELMER_LOCK_STALE_SECS" in r.stderr)
+
+
+@case("a VALID integer for both bounds still works (the check is not over-broad)")
+def _(env):
+    env.queue(354)
+    r = env.run(ELMER_MAX_PER_HR=9, ELMER_LOCK_STALE_SECS=60)
+    check("exit 0", r.returncode == 0)
+    check("posted once", len(env.posts) == 1)
+
+
+@case("the malformed-env exit 2 does not downgrade to 1 with stderr closed")
+def _(env):
+    # The new exit 2 goes through the `{ ...; } >&2 || true` template for exactly the
+    # reason the file-wide sweep exists: an unguarded message on a closed fd 2 would
+    # turn the deliberate 2 into a 1 (REFUSED), reintroducing the class the sweep
+    # eliminated at the very site added to fix another one.
+    env.queue(354)
+    r = env.run_stderr_closed(ELMER_MAX_PER_HR="four")
+    check("still exit 2", r.returncode == 2)
+    check("posted nothing", env.posts == [])
+    r = env.run_stderr_closed(ELMER_LOCK_STALE_SECS="nine")
+    check("lock var: still exit 2", r.returncode == 2)
+
+
+@case("over-hardening: the malformed-env message still lands when fd 2 works")
+def _(env):
+    env.queue(354)
+    r = env.run(ELMER_MAX_PER_HR="four")
+    check("names the variable and the bad value",
+          "ELMER_MAX_PER_HR" in r.stderr and "four" in r.stderr)
+    check("says setup error", "setup error" in r.stderr.lower())
+
+
+# --- The stat portability order: BSD-first is broken on GNU ------------------------
+
+@case("the stat probes are GNU-FIRST (a BSD-first order wedges every GNU host)")
+def _(env):
+    # NOT a source grep for its own sake: the failure is invisible on macOS, where
+    # BSD-first happens to work, so no behavioral case on this host can distinguish
+    # the two orders. GNU's `-f` is --file-system and SUCCEEDS-WITH-GARBAGE on stdout,
+    # so a BSD-first `stat -f %m || stat -c %Y` captures multi-line filesystem info
+    # PLUS the fallback's number, `[ -n ]` passes, and the arithmetic dies - stale-lock
+    # recovery never fires and the loop wedges permanently and silently. Verified
+    # empirically with GNU coreutils' gstat on this machine.
+    src = open(SCRIPT).read()
+    for probe in ("%m", "%i"):
+        gnu = "%Y" if probe == "%m" else "%i"
+        bsd_first = f'stat -f {probe} "$LOCK_DIR" 2>/dev/null || stat -c {gnu}'
+        check(f"stat -f {probe} is NOT the first probe", bsd_first not in src)
+    check("mtime probe is GNU-first",
+          'stat -c %Y "$LOCK_DIR" 2>/dev/null || stat -f %m "$LOCK_DIR"' in src)
+    check("inode probe is GNU-first",
+          'stat -c %i "$LOCK_DIR" 2>/dev/null || stat -f %i "$LOCK_DIR"' in src)
+
+
+@case("stale-lock recovery works when only a GNU-style stat is on PATH")
+def _(env):
+    # THE BEHAVIORAL PROOF the source grep above cannot give on macOS: a `stat` shim
+    # that behaves like GNU coreutils (accepts -c, treats -f as --file-system and
+    # prints filesystem info to STDOUT at rc=1). Under the BSD-first order the age
+    # read captures that garbage, the arithmetic dies, and the stale lock is never
+    # broken. Under GNU-first the first probe succeeds and recovery fires.
+    gnu_stat = (
+        "#!/usr/bin/env bash\n"
+        "# GNU-coreutils-shaped stat: -c works; -f is --file-system and prints to STDOUT.\n"
+        "if [ \"$1\" = \"-c\" ]; then\n"
+        "  fmt=\"$2\"; shift 2\n"
+        "  case \"$fmt\" in\n"
+        "    %Y) /usr/bin/stat -f %m \"$@\" ;;\n"
+        "    %i) /usr/bin/stat -f %i \"$@\" ;;\n"
+        "    *) exit 1 ;;\n"
+        "  esac\n"
+        "  exit $?\n"
+        "fi\n"
+        "if [ \"$1\" = \"-f\" ]; then\n"
+        "  echo \"stat: cannot read file system information for '$2'\" >&2\n"
+        "  printf '  File: \"x\"\\n    ID: 1 Namelen: ?  Type: apfs\\nBlock size: 4096\\n'\n"
+        "  exit 1\n"
+        "fi\n"
+        "exit 1\n"
+    )
+    Env._write(os.path.join(env.bin, "stat"), gnu_stat)
+    lock = os.path.join(env.home, ".tick.lock")
+    os.makedirs(lock)
+    os.utime(lock, (1, 1))
+    env.queue(354)
+    r = env.run()
+    check("stale lock was broken under a GNU-shaped stat",
+          "breaking a stale tick lock" in r.stderr)
+    check("posted once", len(env.posts) == 1)
+    check("exit 0", r.returncode == 0)
 
 
 @case("jq missing -> exit 2, never a false 'queue empty'")

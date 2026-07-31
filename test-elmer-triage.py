@@ -63,7 +63,7 @@ Actionable comments posted: 3
 
 def run(args, *, status_out=STATUS_LINE, status_rc=0, findings_out=FINDINGS,
         findings_rc=0, pr_json=None, home=None, repo_fail=False,
-        status_missing=False):
+        status_missing=False, close_fd=None, pr_view_fail=False):
     """Invoke triage with stubbed helpers + isolated ELMER_HOME."""
     td = tempfile.mkdtemp()
     bindir = os.path.join(td, "bin"); os.makedirs(bindir)
@@ -75,7 +75,15 @@ def run(args, *, status_out=STATUS_LINE, status_rc=0, findings_out=FINDINGS,
             "set -eu\n"
             "case \"${1:-}\" in\n"
             "  repo) [ -n \"${GH_REPO_FAIL:-}\" ] && exit 1; echo 'owner/repo'; exit 0;;\n"
-            "  pr)   printf '%s' \"${PR_JSON:-{}}\"; exit 0;;\n"
+            # The `pr` arm can be made to FAIL, which is the only way to exercise the
+            # script's documented read-failure path. The guard is the same shape the
+            # `repo` arm already uses, and it is safe under `set -eu`: the failing
+            # command is the `[`, which is not the command FOLLOWING the final `&&`,
+            # so errexit is exempt and an unset GH_PR_FAIL falls straight through.
+            # The `${PR_JSON:-{}}` default is left EXACTLY as-is: escaping the braces
+            # would emit `${PR_JSON:-\\{\\}}`, whose default expands to a literal `\{}`
+            # -- a backslash in the JSON that would break every other case.
+            "  pr)   [ -n \"${GH_PR_FAIL:-}\" ] && exit 1; printf '%s' \"${PR_JSON:-{}}\"; exit 0;;\n"
             "esac\n"
             "exit 0\n"
         )
@@ -107,8 +115,19 @@ def run(args, *, status_out=STATUS_LINE, status_rc=0, findings_out=FINDINGS,
         {"headRefOid": SHA1, "state": "OPEN", "number": 354, "title": "fix(#352): bind probe"})
     if repo_fail:
         env["GH_REPO_FAIL"] = "1"
+    if pr_view_fail:
+        env["GH_PR_FAIL"] = "1"
 
-    p = subprocess.run([SCRIPT] + args, env=env, capture_output=True, text=True, timeout=30)
+    full = [SCRIPT] + args
+    if close_fd == 1:
+        # `>&-` cannot be expressed through subprocess's stdout parameter (every value
+        # it accepts is an OPEN fd), so the closing is done by an exec'd bash wrapper --
+        # the same construct that reproduced the defect by hand. The other fd stays
+        # captured so the assertions can still see what the run reported.
+        full = ["bash", "-c", 'exec "$@" >&-', "sh"] + full
+    elif close_fd == 2:
+        full = ["bash", "-c", 'exec "$@" 2>&-', "sh"] + full
+    p = subprocess.run(full, env=env, capture_output=True, text=True, timeout=30)
     tdir = os.path.join(elmer_home, "triage")
     entries = sorted(os.listdir(tdir)) if os.path.isdir(tdir) else []
     return p.returncode, p.stdout, p.stderr, entries, elmer_home
@@ -150,6 +169,13 @@ def main():
     m = re.search(r"^triaged_sha:\s*([0-9a-f]{40})\s*$", body, re.M)
     check("triaged_sha appears on its own line, machine-greppable", bool(m))
     check("triaged_sha matches the head the oracle saw", bool(m) and m.group(1) == SHA1)
+    # `state` is FETCHED by the same `gh pr view --json` read as the sha and the title,
+    # so discarding it left the entry with no PR state at all on the degraded path,
+    # while the data to fill it had already been paid for. Same own-line convention as
+    # triaged_sha, so a consumer greps rather than parsing prose.
+    ms = re.search(r"^state:\s*(\S+)\s*$", body, re.M)
+    check("state appears on its own line, machine-greppable", bool(ms))
+    check("state carries what the read returned", bool(ms) and ms.group(1) == "OPEN")
 
     print("== a PR with NOTHING to report still succeeds ==")
     rc, out, err, entries, home = run(["354", "owner/repo"],
@@ -176,26 +202,66 @@ def main():
     rc, out, err, entries, home = run(["354", "owner/repo"], status_missing=True)
     check("status oracle ABSENT -> still exit 0, entry written (degraded, loud)",
           rc == 0 and len(entries) == 1)
+    # THE DEGRADED PATH is exactly where the discarded `state` hurt: with no status
+    # oracle the entry has no other source of PR state, and the `gh pr view` read that
+    # would supply it has already run.
+    check("degraded (no status oracle) -> state is STILL recorded",
+          bool(re.search(r"^state:\s*OPEN\s*$", read_entry(home, entries[0]), re.M)))
+
+    print("== a FAILED `gh pr view` read is RECORDED, never fatal ==")
+    # The script's header promises this path: a read failure is not fatal, the entry is
+    # still worth writing, and it says so rather than implying a pin it lacks. The stub
+    # always exited 0 for `pr`, so the path was never exercised -- a regression making
+    # the read fatal, or dropping the triaged_sha line, would have passed unnoticed.
+    rc, out, err, entries, home = run(["354", "owner/repo"], pr_view_fail=True)
+    check("gh pr view fails -> still exit 0", rc == 0)
+    check("gh pr view fails -> the entry IS still written", len(entries) == 1)
+    fbody = read_entry(home, entries[0]) if entries else ""
+    check("unpinnable entry records triaged_sha: unknown, on its own line",
+          bool(re.search(r"^triaged_sha:\s*unknown\s*$", fbody, re.M)))
+    check("unpinnable entry records state: unknown, on its own line",
+          bool(re.search(r"^state:\s*unknown\s*$", fbody, re.M)))
+    # `title` is the ONE field written conditionally -- an unread title is OMITTED
+    # rather than filled with a placeholder, because a fake title is worse than none.
+    check("no title was read -> the title line is ABSENT (not a placeholder)",
+          not re.search(r"^title:", fbody, re.M))
+    check("the composed helpers still ran (a gh failure is per-field, not per-entry)",
+          "checks:GREEN" in fbody and "Actionable comments posted" in fbody)
 
     print("== multi-PR sweep: one bad PR does not abort the rest ==")
     rc, out, err, entries, home = run(["354", "355", "owner/repo"])
     check("two PRs -> two entries", rc == 0 and len(entries) == 2)
 
-    # THE POINT OF THE SWEEP being fail-soft: an UNWRITABLE entry must cost that ONE
-    # PR's report, never the others. Simulated by making the triage dir read-only
-    # after the first PR would have been written -- so PR #355 cannot be written and
-    # the run must still succeed with #354's report intact. Without this case the
-    # `continue` on write failure is untested and could silently become `exit 1`.
-    rc, out, err, entries, home = run(["354", "owner/repo"])
+    # THE POINT OF THE SWEEP being fail-soft: an unwritable entry must cost that ONE
+    # PR's report, never the others.
+    #
+    # THE BLOCKED PR GOES FIRST, AND THAT ORDERING IS THE WHOLE TEST. In a SINGLE-PR
+    # invocation `continue` and a normal loop exit are INDISTINGUISHABLE -- both reach
+    # the summary line and exit 0 -- so a sweep that ran #354 to completion and then
+    # started a SEPARATE process for #355 proved nothing about the `continue`, and the
+    # documented failure mode (losing a good report because a LATER PR failed) went
+    # uncovered. One invocation, blocked PR first: the only way #354's entry can exist
+    # afterward is if the loop CONTINUED past #355's failure.
+    #
+    # The block is a mode-0500 DIRECTORY at #355's entry path, so `mv -f` cannot
+    # replace it. A plain WRITABLE directory there would not do: `mv -f file dir/`
+    # SUCCEEDS on one, moving the file inside, and the case would pass vacuously.
+    home = tempfile.mkdtemp()
     tdir = os.path.join(home, "triage")
-    os.chmod(tdir, 0o500)  # readable/executable, NOT writable
+    blocked = os.path.join(tdir, "owner-repo--355.md")
+    os.makedirs(blocked)
+    os.chmod(blocked, 0o500)
     try:
-        rc2, out2, err2, entries2, _ = run(["355", "owner/repo"], home=home)
-        check("unwritable triage dir -> still exit 0 (sweep survives)", rc2 == 0)
-        check("unwritable entry is reported, not silent", "WARN" in err2 or "could not write" in err2)
-        check("the earlier PR's report is untouched", any("354" in e for e in entries2))
+        rc2, out2, err2, entries2, _ = run(["355", "354", "owner/repo"], home=home)
+        check("blocked FIRST PR -> the sweep still exits 0", rc2 == 0)
+        check("the blocked PR is REPORTED by number, not silent",
+              "WARN" in err2 and "355" in err2)
+        check("the LATER PR was still triaged (the `continue` is live)",
+              "owner-repo--354.md" in entries2)
+        check("no .tmp file orphaned by the blocked PR",
+              not any(".tmp." in e for e in os.listdir(tdir)))
     finally:
-        os.chmod(tdir, 0o700)
+        os.chmod(blocked, 0o700)
 
     print("== re-triage OVERWRITES rather than accreting ==")
     # A triage entry is a current-state report, not an append-only log: a second
@@ -203,6 +269,82 @@ def main():
     rc, _, _, entries2, _ = run(["354", "owner/repo"], home=home)
     n354 = [e for e in entries2 if "354" in e]
     check("re-triage of the same PR leaves ONE entry for it", len(n354) == 1)
+
+    print("== a FAILED RENAME costs one PR's report, never the sweep ==")
+    # `set -e` is active and the `mv -f` that installs an entry was UNGUARDED, so a
+    # rename failure exited 1 - a code this script's header does not document at all
+    # (only 0 and 2) - and ABORTED THE WHOLE SWEEP, leaving every later PR untriaged
+    # and a `.tmp` file orphaned. Reproduced with a mode-0500 DIRECTORY at the entry
+    # path: the composing write into `$tmp` succeeds (the tmp file is a sibling, and
+    # the dir itself is still writable), so the pre-existing unwritable-dir case does
+    # not reach this failure. The sweep must survive it and still triage #355.
+    rc, out, err, entries, home = run(["354", "355", "owner/repo"])
+    tdir = os.path.join(home, "triage")
+    blocker = os.path.join(tdir, "owner-repo--354.md")
+    os.remove(blocker)
+    os.makedirs(blocker)            # a DIRECTORY where the entry file must go
+    os.chmod(blocker, 0o500)        # ... and non-empty-proof: mv cannot replace it
+    try:
+        rc2, out2, err2, entries2, _ = run(["354", "355", "owner/repo"], home=home)
+        check("failed rename -> sweep still exits 0", rc2 == 0)
+        check("failed rename is REPORTED, not silent",
+              "WARN" in err2 and "354" in err2)
+        check("the OTHER PR was still triaged", "355" in out2)
+        check("no .tmp file orphaned",
+              not any(e.startswith(".") and e.endswith(".tmp") for e in os.listdir(tdir))
+              and not any(".tmp." in e for e in os.listdir(tdir)))
+    finally:
+        os.chmod(blocker, 0o700)
+
+    print("== a CLOSED output fd must never change the exit code ==")
+    # THE CLASS: under `set -e` a bare `echo`/`printf`/`awk` onto a CLOSED or BROKEN fd
+    # (EBADF/EIO - an unattended loop redirecting into a rotated or closed log) FAILS,
+    # and that failure becomes the exit status, OVERRIDING the intended code. Every
+    # write site here was unguarded, so with stdout closed the SUCCESS path returned
+    # rc=1 - a code the header does not document - and every deliberate `exit 2`
+    # downgraded to 1. This is the whole-file sweep's proof, not a per-site patch's.
+    rc, _, _, entries, _ = run(["354", "owner/repo"], close_fd=1)
+    check("SUCCESS with stdout closed -> still exit 0", rc == 0)
+    check("SUCCESS with stdout closed -> the entry IS written", len(entries) == 1)
+    rc, _, _, _, _ = run(["notanumber"], close_fd=2)
+    check("non-numeric PR with stderr closed -> still exit 2", rc == 2)
+    rc, _, _, _, _ = run([], close_fd=2)
+    check("no args with stderr closed -> still exit 2", rc == 2)
+    rc, _, _, _, _ = run(["--badflag"], close_fd=2)
+    check("unknown flag with stderr closed -> still exit 2", rc == 2)
+    rc, _, _, _, _ = run(["354"], repo_fail=True, close_fd=2)
+    check("unresolvable repo with stderr closed -> still exit 2", rc == 2)
+    rc, _, _, _, _ = run(["--help"], close_fd=1)
+    check("--help with stdout closed -> still exit 0", rc == 0)
+    # The fail-soft paths write a WARN to stderr; a closed fd 2 must not turn a
+    # survivable per-PR failure into an abort.
+    rc, _, _, entries, home = run(["354", "owner/repo"])
+    os.chmod(os.path.join(home, "triage"), 0o500)
+    try:
+        rc2, _, _, _, _ = run(["355", "owner/repo"], home=home, close_fd=2)
+        check("unwritable entry + closed stderr -> still exit 0", rc2 == 0)
+    finally:
+        os.chmod(os.path.join(home, "triage"), 0o700)
+
+    print("== OVER-HARDENING: a guard must not become a mute ==")
+    # `{ ... } >&2 || true` is one careless edit from `{ ... } >/dev/null`, and BOTH
+    # satisfy every rc assertion above while the second silently discards the report.
+    rc, out, err, entries, home = run(["354", "owner/repo"])
+    check("the per-PR line still prints on stdout",
+          "triaged: owner/repo #354" in out)
+    check("the summary line still prints on stdout",
+          "elmer-triage: wrote 1 entry" in out)
+    rc, _, err, _, _ = run(["notanumber"])
+    check("the non-numeric setup error still names the value",
+          "setup error" in err and "notanumber" in err)
+    rc, _, err, _, _ = run(["--badflag"])
+    check("the unknown-flag error still names the flag", "--badflag" in err)
+    rc, _, err, _, _ = run([])
+    check("the usage line still prints", "usage: elmer-triage.sh" in err)
+    rc, _, err, _, _ = run(["354"], repo_fail=True)
+    check("the unresolvable-repo error still explains the fix", "owner/repo" in err)
+    rc, out, _, _, _ = run(["--help"])
+    check("--help still prints the header", "elmer-triage" in out and "Exit codes" in out)
 
     print("== READ-ONLY: triage never mutates and never posts ==")
     src = open(SCRIPT).read()

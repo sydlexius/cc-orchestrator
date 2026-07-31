@@ -51,8 +51,46 @@
 # harness so a test never touches the real queue.
 set -euo pipefail
 
+# EVERY WRITE IN THIS FILE IS GUARDED, AND THE GUARD IS THE POINT ------------------
+# The same class elmer-tick.sh documents at length, and it was live here on EVERY
+# write site: under `set -e` a bare `echo`/`printf`/`awk` onto a CLOSED or BROKEN fd
+# (EBADF/EIO - an unattended loop redirecting into a rotated or closed log) FAILS,
+# and that failure becomes the script's exit status, OVERRIDING the code the code
+# deliberately intended.
+#
+# Here the damage is worse than a wrong number. The SUCCESS path's three `echo`s sit
+# BELOW the `mv` that publishes the entry, so with stdout closed the entry was
+# PUBLISHED and the caller was told rc=1 - REFUSED - while the tick would go on to
+# post it. A caller acting on that "refusal" re-files, or reports the request lost,
+# about the one outcome that ends in a spent review slot. Symmetrically, every
+# deliberate `exit 2` (setup error) downgraded to 1 (REFUSED), which sends the
+# operator to fix a gate that never complained.
+#
+# THE TEMPLATE, applied at EVERY write site below without exception:
+#     { echo "..."; echo "..."; } >&2 || true
+#     exit 2
+# Group the writes, redirect ONCE, `|| true` so no write can change the exit status,
+# and put the `exit` on its own line AFTER the guard so it carries the intended code
+# whether or not the write landed. `set -e` is suspended inside a group that is the
+# left operand of `||`, which is what makes the guard cover every command in the body
+# and not just the last one.
+#
+# THE GUARD IS NOT A MUTE. `{ ... } >&2 || true` is one careless edit from
+# `{ ... } >/dev/null`, and BOTH satisfy every exit-code assertion while the second
+# silently discards the report. The output must still be WRITTEN when the fd is fine;
+# the harness asserts that separately (the over-hardening cases).
+#
+# ONE KIND OF WRITE IS DELIBERATELY NOT GUARDED, and guarding it would be a defect:
+# a write that is a RETURN CHANNEL into a `$( )` pipe the shell itself creates -
+# `printf '%s' "$pr_raw" | jq ...` and `printf '%s' "$repo" | tr ...`. No caller can
+# close that fd, so the EBADF class cannot reach them, and a `|| true` there would
+# convert a genuinely failed computation into a silent empty string that the gate
+# then acts on. The distinguishing question is always: can the CALLER have handed
+# this script a broken fd for this write? Only then does the guard belong.
+
 case "${1:-}" in
-  -h|--help) awk 'NR==1{next} /^#/{sub(/^#[[:space:]]?/,""); print; next} {exit}' "$0"; exit 0 ;;
+  -h|--help) awk 'NR==1{next} /^#/{sub(/^#[[:space:]]?/,""); print; next} {exit}' "$0" || true
+             exit 0 ;;
 esac
 
 pr=""; repo=""; receipt_path=""; form="incremental"
@@ -66,35 +104,49 @@ while [ "$#" -gt 0 ]; do
     # cause. Measured: rc=137 after a 4s SIGKILL on three separate arg shapes.
     # So the value is REQUIRED to exist before shifting past it.
     --receipt)
-      [ "$#" -ge 2 ] || { echo "setup error: --receipt requires a path" >&2; exit 2; }
+      if [ "$#" -lt 2 ]; then
+        { echo "setup error: --receipt requires a path"; } >&2 || true
+        exit 2
+      fi
       receipt_path="$2"; shift 2 ;;
     --form)
-      [ "$#" -ge 2 ] || { echo "setup error: --form requires a value" >&2; exit 2; }
+      if [ "$#" -lt 2 ]; then
+        { echo "setup error: --form requires a value"; } >&2 || true
+        exit 2
+      fi
       form="$2"; shift 2 ;;
-    -*) echo "setup error: unknown flag: $1" >&2; exit 2 ;;
+    -*) { echo "setup error: unknown flag: $1"; } >&2 || true
+        exit 2 ;;
     */*) repo="$1"; shift ;;
-    *) if [ -z "$pr" ]; then pr="$1"; else echo "setup error: unexpected argument: $1" >&2; exit 2; fi; shift ;;
+    *) if [ -z "$pr" ]; then
+         pr="$1"
+       else
+         { echo "setup error: unexpected argument: $1"; } >&2 || true
+         exit 2
+       fi
+       shift ;;
   esac
 done
 
 if [ -z "$pr" ]; then
-  echo "usage: elmer-enqueue.sh <PR#> [owner/repo] --receipt <path> [--form incremental]" >&2
+  { echo "usage: elmer-enqueue.sh <PR#> [owner/repo] --receipt <path> [--form incremental]"; } >&2 || true
   exit 2
 fi
 if ! [[ "$pr" =~ ^[0-9]+$ ]]; then
-  echo "setup error: PR# must be numeric, got: $pr" >&2
+  { echo "setup error: PR# must be numeric, got: $pr"; } >&2 || true
   exit 2
 fi
 if [ -z "$receipt_path" ]; then
-  echo "setup error: --receipt <path> is required (run /prep-pr to produce one)" >&2
+  { echo "setup error: --receipt <path> is required (run /prep-pr to produce one)"; } >&2 || true
   exit 2
 fi
 
 # `full` is refused BEFORE any other work: it is never enqueueable, so there is no
 # point resolving a repo or reading a receipt for it.
 if [ "$form" != "incremental" ]; then
-  echo "REFUSED: trigger form '$form' is not enqueueable. Only 'incremental' is allowed;" >&2
-  echo "         a full review re-surfaces resolved threads and is the maintainer's call." >&2
+  { echo "REFUSED: trigger form '$form' is not enqueueable. Only 'incremental' is allowed;"
+    echo "         a full review re-surfaces resolved threads and is the maintainer's call."
+  } >&2 || true
   exit 1
 fi
 
@@ -102,26 +154,30 @@ if [ -z "$repo" ]; then
   repo="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)"
 fi
 if [ -z "$repo" ]; then
-  echo "setup error: could not resolve repo (pass owner/repo, or run inside a gh-aware repo)" >&2
+  { echo "setup error: could not resolve repo (pass owner/repo, or run inside a gh-aware repo)"; } >&2 || true
   exit 2
 fi
 
-command -v jq >/dev/null 2>&1 || { echo "setup error: jq is required" >&2; exit 2; }
+if ! command -v jq >/dev/null 2>&1; then
+  { echo "setup error: jq is required"; } >&2 || true
+  exit 2
+fi
 
 # --- Read the receipt (local file; no network) ------------------------------
 if [ ! -f "$receipt_path" ]; then
-  echo "REFUSED: no gate receipt at $receipt_path." >&2
-  echo "         Run /prep-pr (which writes one) before enqueuing a review request." >&2
+  { echo "REFUSED: no gate receipt at $receipt_path."
+    echo "         Run /prep-pr (which writes one) before enqueuing a review request."
+  } >&2 || true
   exit 1
 fi
 
 r_schema="$(jq -r '.schema // ""' "$receipt_path" 2>/dev/null || true)"
 if [ -z "$r_schema" ]; then
-  echo "REFUSED: gate receipt at $receipt_path is not readable JSON." >&2
+  { echo "REFUSED: gate receipt at $receipt_path is not readable JSON."; } >&2 || true
   exit 1
 fi
 if [ "$r_schema" != "gate-receipt/v1" ]; then
-  echo "REFUSED: gate receipt schema is '$r_schema', expected 'gate-receipt/v1'." >&2
+  { echo "REFUSED: gate receipt schema is '$r_schema', expected 'gate-receipt/v1'."; } >&2 || true
   exit 1
 fi
 
@@ -130,46 +186,47 @@ r_result="$(jq -r '.result // ""' "$receipt_path" 2>/dev/null || true)"
 r_producer="$(jq -r '.producer // ""' "$receipt_path" 2>/dev/null || true)"
 
 if [ -z "$r_commit" ] || [ -z "$r_result" ]; then
-  echo "REFUSED: gate receipt is missing commit_sha and/or result." >&2
+  { echo "REFUSED: gate receipt is missing commit_sha and/or result."; } >&2 || true
   exit 1
 fi
 # The producer check rejects a hand-rolled or wrong-tool artifact. It is NOT an
 # anti-forgery control (see the threat model in the header).
 if [ "$r_producer" != "gate-runner" ]; then
-  echo "REFUSED: gate receipt producer is '$r_producer', expected 'gate-runner'." >&2
+  { echo "REFUSED: gate receipt producer is '$r_producer', expected 'gate-runner'."; } >&2 || true
   exit 1
 fi
 if [ "$r_result" != "pass" ]; then
-  echo "REFUSED: the gate did not pass (receipt result='$r_result'). Fix the gate, re-run /prep-pr." >&2
+  { echo "REFUSED: the gate did not pass (receipt result='$r_result'). Fix the gate, re-run /prep-pr."; } >&2 || true
   exit 1
 fi
 
 # --- Read the PR's CURRENT head (the fact the gate is checked against) -------
 # gh's status is captured BEFORE the jq pipe: piping a failed gh into jq would
 # yield empty fields that could read as a benign state. A read failure is exit 2.
-pr_raw="$(gh pr view "$pr" --repo "$repo" --json headRefOid,state,number 2>/dev/null)" || {
-  echo "setup error: could not read PR #$pr ($repo) (gh read failed)" >&2
+if ! pr_raw="$(gh pr view "$pr" --repo "$repo" --json headRefOid,state,number 2>/dev/null)"; then
+  { echo "setup error: could not read PR #$pr ($repo) (gh read failed)"; } >&2 || true
   exit 2
-}
+fi
 head_sha="$(printf '%s' "$pr_raw" | jq -r '.headRefOid // ""' 2>/dev/null || true)"
 pr_state="$(printf '%s' "$pr_raw" | jq -r '.state // ""' 2>/dev/null || true)"
 if [ -z "$head_sha" ] || [ -z "$pr_state" ]; then
-  echo "setup error: could not parse PR #$pr ($repo) head/state" >&2
+  { echo "setup error: could not parse PR #$pr ($repo) head/state"; } >&2 || true
   exit 2
 fi
 
 if [ "$pr_state" != "OPEN" ]; then
-  echo "REFUSED: PR #$pr ($repo) is $pr_state; a review request is only meaningful on an open PR." >&2
+  { echo "REFUSED: PR #$pr ($repo) is $pr_state; a review request is only meaningful on an open PR."; } >&2 || true
   exit 1
 fi
 
 # THE GATE. Everything above is preamble; this is the check that makes the
 # receipt load-bearing rather than decorative.
 if [ "$r_commit" != "$head_sha" ]; then
-  echo "REFUSED: STALE gate receipt for PR #$pr ($repo)." >&2
-  echo "         gated commit: $r_commit" >&2
-  echo "         PR head now:  $head_sha" >&2
-  echo "         The branch moved after the gate ran. Re-run /prep-pr on the current HEAD." >&2
+  { echo "REFUSED: STALE gate receipt for PR #$pr ($repo)."
+    echo "         gated commit: $r_commit"
+    echo "         PR head now:  $head_sha"
+    echo "         The branch moved after the gate ran. Re-run /prep-pr on the current HEAD."
+  } >&2 || true
   exit 1
 fi
 
@@ -183,12 +240,13 @@ slug="$(printf '%s' "$repo" | tr '/' '-')"
 entry="${slug}--${pr}--${r_commit:0:12}.json"
 
 if [ -e "$inbox/$entry" ]; then
-  echo "REFUSED: PR #$pr ($repo) at ${r_commit:0:12} is ALREADY QUEUED ($inbox/$entry)." >&2
+  { echo "REFUSED: PR #$pr ($repo) at ${r_commit:0:12} is ALREADY QUEUED ($inbox/$entry)."; } >&2 || true
   exit 1
 fi
 if [ -e "$drained/$entry" ]; then
-  echo "REFUSED: PR #$pr ($repo) at ${r_commit:0:12} was ALREADY TRIGGERED (see $drained/$entry)." >&2
-  echo "         A drained entry is never re-posted. Push a change and re-run /prep-pr for a new request." >&2
+  { echo "REFUSED: PR #$pr ($repo) at ${r_commit:0:12} was ALREADY TRIGGERED (see $drained/$entry)."
+    echo "         A drained entry is never re-posted. Push a change and re-run /prep-pr for a new request."
+  } >&2 || true
   exit 1
 fi
 
@@ -201,13 +259,19 @@ if ! jq -n \
     --arg by "${USER:-unknown}" \
     '{repo: $repo, pr: ($pr|tonumber), commit_sha: $sha, form: $form,
       receipt: $receipt, enqueued_at: $at, enqueued_by: $by}' > "$tmp" 2>/dev/null; then
-  rm -f "$tmp"
-  echo "setup error: could not write queue entry to $inbox" >&2
+  rm -f "$tmp" 2>/dev/null || true
+  { echo "setup error: could not write queue entry to $inbox"; } >&2 || true
   exit 2
 fi
 mv -f "$tmp" "$inbox/$entry"
 
-echo "ENQUEUED: PR #$pr ($repo) at ${r_commit:0:12} for an incremental CodeRabbit review."
-echo "          entry: $inbox/$entry"
-echo "          (this script posts nothing; elmer-tick.sh is the only writer)"
+# THE ENTRY IS NOW PUBLISHED. From here on no write may change the exit status: the
+# contract defines 1 as REFUSED, and a caller told "refused" about an entry the tick
+# will go on to post acts on a false premise about the one outcome that spends a
+# review slot. Reproduced with `elmer-enqueue.sh ... >&-`: rc=1 with the entry
+# sitting in inbox/. The exit is explicit and unconditional, below the guard.
+{ echo "ENQUEUED: PR #$pr ($repo) at ${r_commit:0:12} for an incremental CodeRabbit review."
+  echo "          entry: $inbox/$entry"
+  echo "          (this script posts nothing; elmer-tick.sh is the only writer)"
+} || true
 exit 0

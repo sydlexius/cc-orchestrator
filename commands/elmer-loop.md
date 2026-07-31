@@ -88,8 +88,15 @@ QW=""
 if [ -f scripts/cr-quota-watch.sh ]; then QW=scripts/cr-quota-watch.sh
 elif [ -f "$HOME/.claude/scripts/cr-quota-watch.sh" ]; then QW="$HOME/.claude/scripts/cr-quota-watch.sh"
 fi
-[ -n "$QW" ] && bash "$QW" <a-PR#-from-the-queue> || true
+PR_FOR_QUOTA="${PR_FOR_QUOTA:?set to a PR number from the queue (ls the inbox; entries are named <repo-slug>--<pr>--<sha12>.json)}"
+[ -n "$QW" ] && bash "$QW" "$PR_FOR_QUOTA"
 ```
+
+`PR_FOR_QUOTA` is a `:?` guard, not a `<a-PR#>` placeholder: a bare `<...>` is a shell
+REDIRECTION, so that form is a `bash -n` parse error and the whole call dies before the `|| true`
+could ever run. It is not hardcoded either - an unattended loop pinned to one PR number would poll
+a stale PR forever. The `|| true` is deliberately absent from the guard line so a missing value
+fails loudly instead of being swallowed.
 
 Exit 1 means limited, and the output carries the remaining time plus a Pacific-labeled deadline.
 Exit 0 means no announced limit.

@@ -70,7 +70,7 @@ def pr_json(head=SHA_A, state="OPEN"):
 
 def run(args, *, receipt_obj="__default__", pr=None, api_fail=False,
         repo_fail=False, home=None, write_receipt=True, raw_receipt=None,
-        timeout=30):
+        timeout=30, close_fd=None):
     """Invoke enqueue with a stubbed gh + isolated ELMER_HOME.
 
     Returns (rc, stdout, stderr, inbox_entries, home_dir_kept_alive)."""
@@ -111,6 +111,14 @@ def run(args, *, receipt_obj="__default__", pr=None, api_fail=False,
         env["GH_REPO_FAIL"] = "1"
 
     full = [SCRIPT] + [a.replace("__RECEIPT__", rpath) for a in args]
+    if close_fd == 1:
+        # `>&-` cannot be expressed through subprocess's stdout parameter (every value
+        # it accepts is an OPEN fd), so the closing is done by an exec'd bash wrapper --
+        # the same construct that reproduced the defect by hand. stderr stays captured
+        # so the assertion can still see what the run reported.
+        full = ["bash", "-c", 'exec "$@" >&-', "sh"] + full
+    elif close_fd == 2:
+        full = ["bash", "-c", 'exec "$@" 2>&-', "sh"] + full
     p = subprocess.run(full, env=env, capture_output=True, text=True, timeout=timeout)
 
     inbox = os.path.join(elmer_home, "inbox")
@@ -245,6 +253,79 @@ def main():
     check("entry records the trigger form as incremental", body.get("form") == "incremental")
     check("entry cites the receipt path it was gated on", "receipt" in body)
     check("entry is timestamped", bool(body.get("enqueued_at")))
+
+    print("== a CLOSED output fd must never change the exit code ==")
+    # THE CLASS: under `set -e` a bare `echo` onto a CLOSED or BROKEN fd (EBADF/EIO -
+    # an unattended loop redirecting into a rotated or closed log) FAILS, and that
+    # failure becomes the script's exit status, OVERRIDING the intended code. Every
+    # write site in this file was unguarded, so:
+    #   - the SUCCESS path's three echoes sit BELOW the `mv` that publishes the entry,
+    #     so the entry was PUBLISHED and the caller was told rc=1 (REFUSED) while the
+    #     tick would go on to post it - a false premise about the one outcome that
+    #     ends in a spent review slot;
+    #   - every deliberate `exit 2` (setup error) downgraded to 1 (REFUSED), sending
+    #     the operator to fix a gate that never complained.
+    # These cases are the reason the fix is a WHOLE-FILE sweep and not a per-site patch.
+    rc, _, _, entries, home = run(["42", "owner/repo", "--receipt", "__RECEIPT__"],
+                                  close_fd=1)
+    check("SUCCESS with stdout closed -> still exit 0", rc == 0)
+    check("SUCCESS with stdout closed -> the entry IS published", len(entries) == 1)
+
+    rc, _, _, entries, _ = run(["42", "owner/repo", "--receipt", "__RECEIPT__"],
+                               write_receipt=False, close_fd=2)
+    check("REFUSED with stderr closed -> still exit 1", rc == 1)
+    check("REFUSED with stderr closed -> nothing queued", entries == [])
+
+    rc, _, _, entries, _ = run(["42", "owner/repo", "--receipt", "__RECEIPT__"],
+                               api_fail=True, close_fd=2)
+    check("SETUP ERROR with stderr closed -> still exit 2, never a downgrade to 1",
+          rc == 2)
+    check("setup error with stderr closed -> nothing queued", entries == [])
+
+    rc, _, _, _, _ = run(["notanumber", "--receipt", "__RECEIPT__"], close_fd=2)
+    check("arg validation with stderr closed -> still exit 2", rc == 2)
+    rc, _, _, _, _ = run([], close_fd=2)
+    check("usage path with stderr closed -> still exit 2", rc == 2)
+    rc, _, _, _, _ = run(["42", "owner/repo", "--receipt"], timeout=10, close_fd=2)
+    check("trailing --receipt with stderr closed -> still exit 2", rc == 2)
+    rc, _, _, _, _ = run(["42", "--badflag", "--receipt", "__RECEIPT__"], close_fd=2)
+    check("unknown flag with stderr closed -> still exit 2", rc == 2)
+    rc, _, _, _, _ = run(["42", "owner/repo", "--receipt", "__RECEIPT__",
+                          "--form", "full"], close_fd=2)
+    check("form=full refusal with stderr closed -> still exit 1", rc == 1)
+    # No explicit owner/repo here on purpose: the resolution path is only reached when
+    # the slug is NOT given as an argument.
+    rc, _, _, _, _ = run(["42", "--receipt", "__RECEIPT__"], repo_fail=True, close_fd=2)
+    check("unresolvable repo with stderr closed -> still exit 2", rc == 2)
+    rc, _, _, _, _ = run(["42", "owner/repo", "--receipt", "__RECEIPT__"],
+                         receipt_obj=receipt(commit=SHA_A), pr=pr_json(head=SHA_B),
+                         close_fd=2)
+    check("stale receipt with stderr closed -> still exit 1", rc == 1)
+    rc, _, out_, _, _ = run(["--help"], close_fd=1)
+    check("--help with stdout closed -> still exit 0 (a help request is not an error)",
+          rc == 0)
+
+    print("== OVER-HARDENING: a guard must not become a mute ==")
+    # `{ ... } >&2 || true` is one careless edit from `{ ... } >/dev/null`, and BOTH
+    # satisfy every rc assertion above while the second silently discards the report.
+    # These assert the messages STILL LAND when the fd works, at both ends of the file.
+    rc, out, err, _, _ = run(["42", "owner/repo", "--receipt", "__RECEIPT__"])
+    check("success line still prints on stdout", "ENQUEUED" in out and "entry:" in out)
+    check("success line still names the no-post invariant",
+          "posts nothing" in out)
+    rc, _, err, _, _ = run(["42", "owner/repo", "--receipt", "__RECEIPT__"],
+                           receipt_obj=receipt(commit=SHA_A), pr=pr_json(head=SHA_B))
+    check("the STALE refusal still prints ALL FOUR lines",
+          "STALE" in err and SHA_A in err and SHA_B in err and "prep-pr" in err)
+    rc, _, err, _, _ = run(["42", "owner/repo", "--receipt", "__RECEIPT__",
+                            "--form", "full"])
+    check("the form=full refusal still prints BOTH lines",
+          "not enqueueable" in err and "resolved threads" in err)
+    rc, _, err, _, _ = run(["42", "owner/repo", "--receipt", "__RECEIPT__"],
+                           api_fail=True)
+    check("the gh-read setup error still names the PR", "#42" in err)
+    rc, out, _, _, _ = run(["--help"])
+    check("--help still prints the header", "elmer-enqueue" in out and "Exit codes" in out)
 
     print("== read-only toward GitHub: enqueue never posts ==")
     src = open(SCRIPT).read()

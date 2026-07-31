@@ -132,25 +132,52 @@ mkdir -p "$inbox" "$drained"
 # because breaking a LIVE tick's lock is far worse than waiting one extra cycle.
 LOCK_DIR="$ELMER_HOME/.tick.lock"
 LOCK_STALE_SECS="${ELMER_LOCK_STALE_SECS:-900}"
+# A MALFORMED INTEGER MUST NOT SILENTLY DISABLE THE BOUND IT CONFIGURES. `[ "$age"
+# -gt "$LOCK_STALE_SECS" ]` with a non-integer returns 2 and prints "integer
+# expression expected", and as an `if` condition a 2 simply reads FALSE - so
+# ELMER_LOCK_STALE_SECS=nine would mean NO lock is ever reclaimed and the loop
+# wedges forever, with only a stray stderr line to show for it. Validated at
+# assignment instead, as a SETUP ERROR (exit 2), because a typo in the environment
+# is exactly the "bad args / bad environment" class the contract reserves 2 for.
+# `case` rather than a regex so a leading/trailing space is rejected too: `[[ =~
+# ^[0-9]+$ ]]` would be fine here but the glob form matches the empty string and
+# any non-digit byte in ONE pattern, and is the file's plainest shape.
+case "$LOCK_STALE_SECS" in
+  ''|*[!0-9]*)
+    { echo "setup error: ELMER_LOCK_STALE_SECS must be a non-negative integer, got: '$LOCK_STALE_SECS'"; } >&2 || true
+    exit 2 ;;
+esac
 
 lock_age_secs() {
-  # Portable mtime read: BSD stat (macOS) then GNU stat (Linux). An unreadable
-  # mtime returns empty, and the caller treats that as NOT stale -- refusing to
-  # break a lock it cannot reason about.
+  # Portable mtime read: GNU stat (Linux) FIRST, BSD stat (macOS) as the fallback.
+  # THE ORDER IS LOAD-BEARING, and it is the house pattern (orchestrate-guard.sh
+  # marker_active, orchestrate-steer.sh). GNU's `-f` is --file-system, so on Linux
+  # `stat -f %m` SUCCEEDS-WITH-GARBAGE: it prints multi-line filesystem info to
+  # STDOUT before the fallback's number is appended, `$( )` captures both, the
+  # `[ -n ]` below passes, and the arithmetic dies on the garbage. BSD instead
+  # cleanly REJECTS `-c` ("illegal option") with NOTHING on stdout, so it is safe
+  # as the fallback and only GNU-first is correct on both platforms. Reproduced:
+  # a BSD-first order made stale-lock recovery never fire on a GNU host, wedging
+  # the loop permanently and silently. An unreadable mtime returns empty, and the
+  # caller treats that as NOT stale -- refusing to break a lock it cannot reason about.
   local t now
-  t="$(stat -f %m "$LOCK_DIR" 2>/dev/null || stat -c %Y "$LOCK_DIR" 2>/dev/null || true)"
+  t="$(stat -c %Y "$LOCK_DIR" 2>/dev/null || stat -f %m "$LOCK_DIR" 2>/dev/null || true)"
   [ -n "$t" ] || return 1
   now="$(date +%s)"
   echo $(( now - t ))
 }
 
 lock_inode() {
-  # The lock's IDENTITY, read the same portable way as its age: BSD stat (macOS)
-  # then GNU stat (Linux). An unreadable inode returns nonzero and the caller backs
-  # off rather than breaking a lock it cannot identify - the same deny-on-doubt
-  # posture lock_age_secs already takes with an unreadable mtime.
+  # The lock's IDENTITY, read the same portable way as its age: GNU stat (Linux)
+  # FIRST, BSD stat (macOS) as the fallback -- same reasoning as lock_age_secs
+  # above, and for the same reason it is not optional. GNU's `-f` is
+  # --file-system and succeeds-with-garbage on stdout, so it can never be the
+  # first probe; BSD cleanly REJECTS `-c` with nothing on stdout, so it can be the
+  # fallback. An unreadable inode returns nonzero and the caller backs off rather
+  # than breaking a lock it cannot identify - the same deny-on-doubt posture
+  # lock_age_secs already takes with an unreadable mtime.
   local i
-  i="$(stat -f %i "$LOCK_DIR" 2>/dev/null || stat -c %i "$LOCK_DIR" 2>/dev/null || true)"
+  i="$(stat -c %i "$LOCK_DIR" 2>/dev/null || stat -f %i "$LOCK_DIR" 2>/dev/null || true)"
   [ -n "$i" ] || return 1
   printf '%s\n' "$i"
 }
@@ -228,7 +255,7 @@ PICKED=""
 
 scan_queue() {
   SCANNED=1
-  local f base best="" best_at="" repo at
+  local f base best="" best_at="" repo at pr sha
   : > "$UNREADABLE_LOG"; : > "$STALE_LOG"
   for f in "$inbox"/*.json; do
     [ -e "$f" ] || continue
@@ -263,7 +290,25 @@ scan_queue() {
     # never guessed at, and never silently invisible either (an earlier comment
     # claimed the triage path surfaced these, which it does not - triage takes PR
     # numbers and never reads the queue).
-    if [ -z "$repo" ] || [ -z "$at" ]; then
+    # EVERY FIELD THE POSTING PATH LATER READS IS VALIDATED HERE, not just the two
+    # the selection ORDER needs. Admitting an entry on `.repo` + `.enqueued_at`
+    # alone let a well-formed JSON object missing `.pr` reach the read sites below,
+    # where a bare `jq -r '.pr'` yields the literal STRING "null" - and the tick
+    # then issued `gh pr comment null`, REPORTED IT AS A SUCCESSFUL POST, and
+    # drained the entry. A missing `.commit_sha` is less destructive but permanently
+    # wedging: the staleness gate compares against "null" forever, so the entry
+    # exits 1 with "queued: null" on every tick and never drains.
+    #
+    # Routed to UNREADABLE_LOG like every other malformed shape, so a bad entry is
+    # REPORTED rather than silently invisible. "null" is rejected explicitly because
+    # jq renders a missing key that way and the `// ""` default below cannot tell a
+    # JSON null from an absent key either. This is a strict NARROWING - it can only
+    # make the tick post LESS - so it cannot weaken the exit contract.
+    pr="$(jq -r '.pr // ""' "$f" 2>/dev/null || true)"
+    sha="$(jq -r '.commit_sha // ""' "$f" 2>/dev/null || true)"
+    if [ -z "$repo" ] || [ -z "$at" ] \
+       || [ -z "$pr" ]  || [ "$pr" = "null" ] \
+       || [ -z "$sha" ] || [ "$sha" = "null" ]; then
       printf '%s\n' "$f" >> "$UNREADABLE_LOG"
       continue
     fi
@@ -370,6 +415,17 @@ trap 'rmdir "$LOCK_DIR" 2>/dev/null || true; rm -f "$UNREADABLE_LOG" "$STALE_LOG
 # recent post (see the || echo below). That is deliberate: an unreadable record must
 # never buy an extra post, and the conservative direction here is to post less.
 ELMER_MAX_PER_HR="${ELMER_MAX_PER_HR:-4}"
+# VALIDATED FOR THE SAME REASON AS ELMER_LOCK_STALE_SECS ABOVE, and here the
+# consequence is worse: `[ "$recent" -ge "$ELMER_MAX_PER_HR" ]` with a non-integer
+# returns 2, which an `if` reads as FALSE, so the cap is SILENTLY DISABLED and the
+# tick POSTS. Reproduced with ELMER_MAX_PER_HR=four and 10 drained records inside
+# the hour: posted anyway. The cap is the one bound that is supposed to hold even
+# when every other guard's reasoning is wrong, so it must never fail open on a typo.
+case "$ELMER_MAX_PER_HR" in
+  ''|*[!0-9]*)
+    { echo "setup error: ELMER_MAX_PER_HR must be a non-negative integer, got: '$ELMER_MAX_PER_HR'"; } >&2 || true
+    exit 2 ;;
+esac
 
 posts_last_hour() {
   local cutoff n=0 f ts
@@ -424,9 +480,15 @@ if [ -z "$entry" ]; then
   exit 0
 fi
 
-e_repo="$(jq -r '.repo' "$entry")"
-e_pr="$(jq -r '.pr' "$entry")"
-e_sha="$(jq -r '.commit_sha' "$entry")"
+# The `// ""` defaults are BELT AND BRACES over scan_queue's validation, not the
+# primary control: a bare `jq -r '.pr'` on a missing key yields the literal string
+# "null", which composed straight into `gh pr comment null`. scan_queue now refuses
+# such an entry outright, so these defaults only ever matter if that check is later
+# weakened - in which case an empty string fails loudly downstream instead of
+# posting to a PR named "null".
+e_repo="$(jq -r '.repo // ""' "$entry")"
+e_pr="$(jq -r '.pr // ""' "$entry")"
+e_sha="$(jq -r '.commit_sha // ""' "$entry")"
 e_form="$(jq -r '.form // "incremental"' "$entry")"
 
 # --- Refuse `full` outright, whatever the entry says -------------------------------
@@ -563,8 +625,14 @@ fi
 now="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
 base="${entry##*/}"
 tmp="$drained/.$base.tmp.$$"
-if jq --arg t "$now" --arg out "$post_out" \
-     '. + {triggered_at: $t, trigger: "'"$TRIGGER"'", response: $out}' \
+# EVERY value crosses into jq as an `--arg`, INCLUDING the trigger. Splicing
+# "'"$TRIGGER"'" into the PROGRAM TEXT worked only because today's literal happens to
+# contain no quote or backslash; a future literal carrying either would produce an
+# INVALID JQ PROGRAM, and the drain would then fail AFTER a successful post - the one
+# genuinely bad state this section documents (the next tick could re-post). `--arg`
+# makes that failure class unrepresentable rather than merely unlikely.
+if jq --arg t "$now" --arg out "$post_out" --arg trig "$TRIGGER" \
+     '. + {triggered_at: $t, trigger: $trig, response: $out}' \
      "$entry" > "$tmp" 2>/dev/null && mv -f "$tmp" "$drained/$base"; then
   # THE POST HAS HAPPENED. From here on, no failure may exit 1: the contract defines
   # 1 as "POSTED NOTHING", and the loop runbook tells the operator to hand the entry

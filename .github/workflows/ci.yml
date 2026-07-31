@@ -163,3 +163,21 @@ jobs:
       # Host-independent, platform-independent.
       - name: harness - gate-runner
         run: python3 test-gate-runner.py
+
+      # The elmer harnesses (the unattended review requester): enqueue/triage/tick.
+      # PLATFORM-SENSITIVE and therefore on BOTH legs, which is the whole point of
+      # wiring them here - the tick reads a lock's mtime and inode via stat, and a
+      # BSD-first `stat -f` order silently succeeds-with-garbage on GNU coreutils, so
+      # stale-lock recovery never fired on Linux. That defect shipped CI-green purely
+      # because these three lived in .gates.toml only and the ubuntu leg never ran
+      # them. Every dependency (gh, the quota helper, the composed read-only helpers)
+      # is stubbed via PATH/$ELMER_* and the maildir is a temp dir, so nothing here
+      # touches the network or the real queue.
+      - name: harness - elmer-enqueue
+        run: python3 test-elmer-enqueue.py
+
+      - name: harness - elmer-triage
+        run: python3 test-elmer-triage.py
+
+      - name: harness - elmer-tick
+        run: python3 test-elmer-tick.py
