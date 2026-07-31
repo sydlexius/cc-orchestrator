@@ -124,13 +124,29 @@ class Env:
         with open(os.path.join(self.drained, name), "w") as f:
             json.dump({"triggered_at": triggered_at}, f)
 
-    def run(self, **env):
+    def _env(self, extra):
         e = dict(os.environ)
         e["PATH"] = self.bin + os.pathsep + e["PATH"]
         e["ELMER_HOME"] = self.home
         e["GH_POSTLOG"] = self.postlog
-        e.update({k: str(v) for k, v in env.items()})
-        return subprocess.run([self.script], capture_output=True, text=True, env=e)
+        e.update({k: str(v) for k, v in extra.items()})
+        return e
+
+    def run(self, **env):
+        return subprocess.run([self.script], capture_output=True, text=True,
+                              env=self._env(env), timeout=120)
+
+    def run_stdout_closed(self, **env):
+        """Run the tick with fd 1 CLOSED, the way a rotated/broken log redirect leaves it.
+
+        `>&-` cannot be expressed through subprocess's stdout parameter (every value it
+        accepts is an OPEN fd), so the closing is done by an exec'd bash wrapper -- the
+        same construct that reproduced the defect by hand. stderr stays captured so the
+        assertion can still see what the run reported.
+        """
+        return subprocess.run(["bash", "-c", 'exec "$1" >&-', "sh", self.script],
+                              capture_output=True, text=True, env=self._env(env),
+                              timeout=120)
 
     @property
     def posts(self):
@@ -516,6 +532,112 @@ def _(env):
         max_end = end if max_end is None else max(max_end, end)
     check(f"at least one post happened ({len(spans)} intervals)", len(spans) >= 1)
     check(f"zero overlapping post intervals (found {overlaps})", overlaps == 0)
+
+
+# --- The fix-scoped cases: the same silent-wrong-answer class, other dependencies ---
+
+@case("a stdout write failure after a SUCCESSFUL post never reports rc=1")
+def _(env):
+    # THE CONTRACT SAYS 1 MEANS "POSTED NOTHING", and the loop runbook hands the entry
+    # back to the TL on a 1. Two bare `echo`s sat below the `rm -f` under `set -e`, so a
+    # stdout write error (EBADF - a timer loop redirecting into a closed or rotated fd)
+    # exited 1 AFTER the post, the drain record and the inbox removal. Reproduced with
+    # `elmer-tick.sh >&-`: rc=1, posted=1. EPIPE is a different animal (141); it is this
+    # EBADF class that forges a refusal out of a spent review slot.
+    env.queue(354)
+    r = env.run_stdout_closed()
+    check("posted once", len(env.posts) == 1)
+    check(f"rc is NOT 1 (got {r.returncode})", r.returncode != 1)
+    check("rc is 0", r.returncode == 0)
+    check("inbox drained", env.ls("inbox") == [])
+    check("drain record written", env.ls("drained") == ["e-354.json"])
+
+
+@case("a broken basename does NOT turn a full queue into 'queue empty'")
+def _(env):
+    # The drained/ check was `[ -e "$drained/$(basename "$f")" ]`. A basename that fails
+    # or yields empty collapses that to `[ -e "$drained/" ]` - TRUE for the directory
+    # itself - so EVERY entry is skipped and the tick reports an empty queue over a full
+    # one. That is the jq-probe failure class exactly, reintroduced through a second,
+    # unprobed dependency; `${f##*/}` removes the dependency instead of probing it.
+    Env._write(os.path.join(env.bin, "basename"),
+               "#!/usr/bin/env bash\nexit 127\n")
+    env.queue(354)
+    r = env.run()
+    check("does NOT claim the queue is empty", "queue empty" not in r.stdout)
+    check("posted once", len(env.posts) == 1)
+    check("exit 0", r.returncode == 0)
+    check("inbox drained", env.ls("inbox") == [])
+
+
+@case("queue health is reported on the LOCK-CONTENDED path")
+def _(env):
+    # Lock contention is the DESIGNED outcome of a second loop window, so a report that
+    # sits below it is dead under exactly the condition a human creates routinely.
+    with open(os.path.join(env.inbox, "bad.json"), "w") as f:
+        f.write('{"broken":')
+    os.makedirs(os.path.join(env.home, ".tick.lock"))
+    r = env.run()
+    check("exit 0", r.returncode == 0)
+    check("still silent on stdout", r.stdout.strip() == "")
+    check("warns about the unreadable entry", "unreadable" in r.stderr.lower())
+    check("names the file", "bad.json" in r.stderr)
+    check("posted nothing", env.posts == [])
+
+
+@case("queue health is reported on the CAP-REACHED path")
+def _(env):
+    # The cap fires under any steady load, so this is the other routinely-taken exit
+    # the report used to sit below.
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for i in range(4):
+        env.drain_record(f"old-{i}.json", now)
+    with open(os.path.join(env.inbox, "bad.json"), "w") as f:
+        f.write('{"broken":')
+    r = env.run()
+    check("exit 0", r.returncode == 0)
+    check("says cap reached", "hourly cap reached" in r.stdout)
+    check("warns about the unreadable entry", "unreadable" in r.stderr.lower())
+    check("names the file", "bad.json" in r.stderr)
+    check("posted nothing", env.posts == [])
+
+
+@case("an inbox entry that is ALSO in drained/ is reported as stale, never posted")
+def _(env):
+    # The exit-2 rm-failure path strands a file in BOTH directories. The drained/ check
+    # `continue`s BEFORE the readability read, so such a file can never reach the
+    # unreadable report either: it was surfaced exactly once, by the tick that stranded
+    # it, and was then invisible forever while every later tick asserted "queue empty".
+    # Two individually-correct fixes jointly produced a silent wrong answer.
+    env.queue(354)
+    env.drain_record("e-354.json", "2020-01-01T00:00:00Z")
+    r = env.run()
+    check("exit 0", r.returncode == 0)
+    check("posted nothing", env.posts == [])
+    check("warns it is stale", "stale" in r.stderr.lower())
+    check("names the file", "e-354.json" in r.stderr)
+    check("tells the operator to remove it", "by hand" in r.stderr)
+    check("entry left in place", env.ls("inbox") == ["e-354.json"])
+
+
+@case("a coderabbitai LOOKALIKE login does not suppress a wanted review")
+def _(env):
+    # `test("^coderabbitai")` is unanchored at the end, so `coderabbitai-impostor` and
+    # `coderabbitai2` also suppressed. The check can only ever SUPPRESS, so the cost is
+    # a silently skipped review the maintainer wanted - cheap to fix, invisible to hit.
+    env.queue(354)
+    r = env.run(GH_REVIEWS=json.dumps([review(SHA, login="coderabbitai-impostor")]))
+    check("posted once", len(env.posts) == 1)
+    check("exit 0", r.returncode == 0)
+
+
+@case("a coderabbitai2 login does not suppress either")
+def _(env):
+    env.queue(354)
+    r = env.run(GH_REVIEWS=json.dumps([review(SHA, login="coderabbitai2")]))
+    check("posted once", len(env.posts) == 1)
+    check("exit 0", r.returncode == 0)
 
 
 print()

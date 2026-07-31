@@ -156,12 +156,118 @@ acquire_lock() {
   return 1
 }
 
+# --- The single queue pass: pick the head entry AND record what is wrong with it ----
+# Queue policy from the design. stillwater outranks everything because it is the repo
+# whose reviews the maintainer actually waits on; within a tier, oldest first, so
+# nothing starves behind a busy repo.
+#
+# Only ONE entry is selected per tick, and that is a correctness requirement rather
+# than throttling: CR publishes a countdown only once its limit is ALREADY reached,
+# never a remaining-slot count, so "no announced limit" means EITHER plenty of budget
+# OR one review from the wall. Posting a batch on a single all-clear reading would
+# blow past the wall unseen. Post one, then re-read the signal.
+#
+# ONE PASS, AT MOST ONCE PER RUN. Selection and health reporting read the same fields,
+# so they are the same loop: `report_queue_health` runs this scan only if the normal
+# path has not already run it, which is what lets the early exits report without
+# adding a second jq pass per entry to the posting path.
+#
+# It runs in the MAIN shell, not a command substitution: a subshell's variables die
+# with it, which is why the unreadable list was already being routed through a FILE.
+SCANNED=0
+PICKED=""
+
+scan_queue() {
+  SCANNED=1
+  local f base best="" best_at="" repo at
+  : > "$UNREADABLE_LOG"; : > "$STALE_LOG"
+  for f in "$inbox"/*.json; do
+    [ -e "$f" ] || continue
+    # `${f##*/}` NOT `$(basename "$f")`. A basename that fails or yields empty makes
+    # the test below read `[ -e "$drained/" ]`, TRUE for the directory itself, so
+    # EVERY entry is skipped and the tick prints "queue empty" over a full queue -
+    # the same silent wrong answer the jq probe exists to prevent, reintroduced
+    # through a second unprobed dependency. Parameter expansion cannot fail, needs no
+    # subprocess, and handles spaces/globs/newlines identically.
+    base="${f##*/}"
+    # ANYTHING ALREADY DRAINED IS NEVER RE-POSTED, and that is checked HERE rather
+    # than trusted. The header long claimed this invariant while nothing in the tick
+    # ever read `drained/` - the de-dup lived only in elmer-enqueue.sh, a different
+    # process at a different time. The invariant then rested entirely on the `rm -f`
+    # below always succeeding; an unwritable inbox (permissions drift, a restored
+    # backup) leaves the entry in BOTH directories and the next tick posts it again.
+    # A claimed invariant that no code enforces is worse than no claim at all.
+    #
+    # Suppressing the post is necessary but NOT sufficient: such a file is invisible
+    # to the unreadable report too (it never reaches the jq read), so it would be
+    # surfaced exactly once - by the exit-2 message of the tick that stranded it -
+    # and then never again, while every later tick asserted "queue empty". It is
+    # therefore RECORDED and reported as a stale inbox file the operator must remove.
+    if [ -e "$drained/$base" ]; then
+      printf '%s\n' "$f" >> "$STALE_LOG"
+      continue
+    fi
+
+    repo="$(jq -r '.repo // ""' "$f" 2>/dev/null || true)"
+    at="$(jq -r '.enqueued_at // ""' "$f" 2>/dev/null || true)"
+    # An entry we cannot read is SKIPPED here and reported by report_queue_health -
+    # never guessed at, and never silently invisible either (an earlier comment
+    # claimed the triage path surfaced these, which it does not - triage takes PR
+    # numbers and never reads the queue).
+    if [ -z "$repo" ] || [ -z "$at" ]; then
+      printf '%s\n' "$f" >> "$UNREADABLE_LOG"
+      continue
+    fi
+    # Sort key puts the priority repo ahead of everything, then orders by ISO
+    # timestamp, which sorts lexically because it is fixed-width UTC.
+    case "$repo" in
+      */stillwater) at="0 $at" ;;
+      *)            at="1 $at" ;;
+    esac
+    if [ -z "$best" ] || [[ "$at" < "$best_at" ]]; then
+      best="$f"; best_at="$at"
+    fi
+  done
+  PICKED="$best"
+}
+
+# A malformed or stranded entry is REPORTED, never silently invisible: a queue quietly
+# accumulating files while the tick prints "queue empty" is exactly the silent wrong
+# answer this script's contract forbids. Reported on EVERY path - empty queue, lock
+# contention, cap spent, and the posting path alike - and always on stderr, so the
+# contended path stays silent on stdout as its own contract requires.
+report_queue_health() {
+  [ "$SCANNED" = 1 ] || scan_queue
+  if [ -s "$UNREADABLE_LOG" ]; then
+    echo "elmer-tick: WARNING - $(wc -l < "$UNREADABLE_LOG" | tr -d ' ') unreadable queue entr(y/ies), skipped:" >&2
+    sed 's/^/  /' "$UNREADABLE_LOG" >&2
+  fi
+  if [ -s "$STALE_LOG" ]; then
+    echo "elmer-tick: WARNING - $(wc -l < "$STALE_LOG" | tr -d ' ') inbox entr(y/ies) already drained (stale, never re-posted):" >&2
+    sed 's/^/  /' "$STALE_LOG" >&2
+    echo "            Remove the stale inbox file(s) by hand." >&2
+  fi
+}
+
+# --- Queue-health reporting, armed BEFORE the first early exit ---------------------
+# The two health logs are created here, ABOVE the lock, because the report has to
+# survive every exit path below it. They used to be created after the lock and after
+# the cap, so the unreadable-entry report was DEAD on exactly the two exits that fire
+# routinely - lock contention is the DESIGNED outcome of a second loop window, and the
+# cap fires under any steady load - and a queue accumulating malformed files could
+# stay invisible indefinitely while the comment claimed "reported on every path".
+UNREADABLE_LOG="$(mktemp)"
+STALE_LOG="$(mktemp)"
+trap 'rm -f "$UNREADABLE_LOG" "$STALE_LOG" 2>/dev/null || true' EXIT
+
 if ! acquire_lock; then
-  # QUIET success: another tick is working, which is the designed outcome of a second
-  # loop window, not a fault.
+  # QUIET success on STDOUT: another tick is working, which is the designed outcome of
+  # a second loop window, not a fault. Queue health still goes to stderr - "someone
+  # else is busy" is not a reason to withhold a report about a broken queue.
+  report_queue_health
   exit 0
 fi
-trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+trap 'rmdir "$LOCK_DIR" 2>/dev/null || true; rm -f "$UNREADABLE_LOG" "$STALE_LOG" 2>/dev/null || true' EXIT
 
 # --- The hourly cap: a bound that does not consult the queue -----------------------
 # The carve-out requires a hard posts-per-hour cap INDEPENDENT of queue depth. That
@@ -203,73 +309,15 @@ posts_last_hour() {
 
 recent="$(posts_last_hour)"
 if [ "$recent" -ge "$ELMER_MAX_PER_HR" ]; then
+  report_queue_health
   echo "elmer-tick: hourly cap reached ($recent/$ELMER_MAX_PER_HR posts in the last hour); nothing posted."
   exit 0
 fi
 
 # --- Pick the head entry: stillwater first, then FIFO ------------------------------
-# Queue policy from the design. stillwater outranks everything because it is the
-# repo whose reviews the maintainer actually waits on; within a tier, oldest first,
-# so nothing starves behind a busy repo.
-#
-# Only ONE entry is selected per tick, and that is a correctness requirement rather
-# than throttling: CR publishes a countdown only once its limit is ALREADY reached,
-# never a remaining-slot count, so "no announced limit" means EITHER plenty of budget
-# OR one review from the wall. Posting a batch on a single all-clear reading would
-# blow past the wall unseen. Post one, then re-read the signal.
-UNREADABLE_LOG="$(mktemp)"
-trap 'rmdir "$LOCK_DIR" 2>/dev/null || true; rm -f "$UNREADABLE_LOG" 2>/dev/null || true' EXIT
-
-pick_entry() {
-  local f best="" best_at="" repo at
-  for f in "$inbox"/*.json; do
-    [ -e "$f" ] || continue
-    # ANYTHING ALREADY DRAINED IS NEVER RE-POSTED, and that is checked HERE rather
-    # than trusted. The header long claimed this invariant while nothing in the tick
-    # ever read `drained/` - the de-dup lived only in elmer-enqueue.sh, a different
-    # process at a different time. The invariant then rested entirely on the `rm -f`
-    # below always succeeding; an unwritable inbox (permissions drift, a restored
-    # backup) leaves the entry in BOTH directories and the next tick posts it again.
-    # A claimed invariant that no code enforces is worse than no claim at all.
-    [ -e "$drained/$(basename "$f")" ] && continue
-
-    repo="$(jq -r '.repo // ""' "$f" 2>/dev/null || true)"
-    at="$(jq -r '.enqueued_at // ""' "$f" 2>/dev/null || true)"
-    # An entry we cannot read is SKIPPED here and reported after the loop - never
-    # guessed at, and never silently invisible either (see the unreadable report
-    # below; an earlier comment claimed the triage path surfaced these, which it
-    # does not - triage takes PR numbers and never reads the queue).
-    # Recorded to a FILE, not a variable: pick_entry runs in a command substitution,
-    # so a shell variable set here dies with the subshell and the report would never
-    # reach the caller.
-    if [ -z "$repo" ] || [ -z "$at" ]; then
-      printf '%s\n' "$f" >> "$UNREADABLE_LOG"
-      continue
-    fi
-    # Sort key puts the priority repo ahead of everything, then orders by ISO
-    # timestamp, which sorts lexically because it is fixed-width UTC.
-    case "$repo" in
-      */stillwater) at="0 $at" ;;
-      *)            at="1 $at" ;;
-    esac
-    if [ -z "$best" ] || [[ "$at" < "$best_at" ]]; then
-      best="$f"; best_at="$at"
-    fi
-  done
-  [ -n "$best" ] || return 1
-  printf '%s\n' "$best"
-}
-
-entry="$(pick_entry)" || entry=""
-
-# An unreadable entry is REPORTED, never silently invisible. It cannot be posted for
-# (it was skipped above), but a queue quietly accumulating malformed files while the
-# tick prints "queue empty" is exactly the silent-wrong-answer this script's contract
-# forbids. Reported on every path, including the empty-queue one.
-if [ -s "$UNREADABLE_LOG" ]; then
-  echo "elmer-tick: WARNING - $(wc -l < "$UNREADABLE_LOG" | tr -d ' ') unreadable queue entr(y/ies), skipped:" >&2
-  sed 's/^/  /' "$UNREADABLE_LOG" >&2
-fi
+scan_queue
+entry="$PICKED"
+report_queue_health
 
 if [ -z "$entry" ]; then
   echo "elmer-tick: queue empty; nothing to do."
@@ -360,10 +408,15 @@ esac
 # Scoped to CodeRabbit's own login on purpose: a human approval or another bot's
 # review at this SHA must NOT suppress a wanted CR pass. Only a CR review at this
 # exact head means the slot would be spent on work already done.
+#
+# The login match is anchored at BOTH ends and admits exactly the two real forms,
+# `coderabbitai` and `coderabbitai[bot]`. Anchored only at the front, it also matched
+# `coderabbitai2` and `coderabbitai-impostor` - which can only ever SUPPRESS, so the
+# cost is a silently skipped review the maintainer wanted, not a stray post.
 if revs="$(gh pr view "$e_pr" --repo "$e_repo" --json reviews 2>/dev/null)"; then
   if [ "$(jq -r --arg s "$e_sha" \
         '[.reviews[]? | select((.commit.oid // "") == $s)
-                      | select((.author.login // "") | test("^coderabbitai"))] | length' \
+                      | select((.author.login // "") | test("^coderabbitai(\\[bot\\])?$"))] | length' \
         <<<"$revs" 2>/dev/null || echo 0)" -gt 0 ]; then
     echo "REFUSED: CodeRabbit has already reviewed ${e_sha:0:12}; not spending a slot." >&2
     exit 1
@@ -398,8 +451,13 @@ fi
 #
 # A drain failure after a SUCCESSFUL post is the one genuinely bad state here (the
 # next tick could re-post), so it is loud and exits 2 rather than pretending success.
-now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-base="$(basename "$entry")"
+# EVERY command below the successful post is failure-TOLERANT, because `set -e` turns
+# any of them into an exit 1 - the one code the contract reserves for "POSTED NOTHING".
+# `date` is guarded rather than trusted (an empty timestamp is COUNTED as a recent post
+# by the cap, the conservative direction), and the basename is parameter expansion so
+# there is no subprocess to fail at all.
+now="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
+base="${entry##*/}"
 tmp="$drained/.$base.tmp.$$"
 if jq --arg t "$now" --arg out "$post_out" \
      '. + {triggered_at: $t, trigger: "'"$TRIGGER"'", response: $out}' \
@@ -412,20 +470,32 @@ if jq --arg t "$now" --arg out "$post_out" \
   # `rm -f` does NOT succeed unconditionally - it fails on an unwritable inbox
   # (permissions drift, a restored backup), and under `set -e` that failure used to
   # kill the script at rc=1 right here, with the success lines below never printed.
-  # The drained/ check in pick_entry now prevents the resulting double-post, so this
-  # is reported loudly as exit 2 and never mistaken for a refusal.
+  # The drained/ check in scan_queue now prevents the resulting double-post (and
+  # reports the stranded file on every later tick), so this is reported loudly as
+  # exit 2 and never mistaken for a refusal. The reporting echoes are guarded for the
+  # same reason as the success ones below: a failed write must not turn a deliberate
+  # 2 into a 1.
   if ! rm -f "$entry" 2>/dev/null || [ -e "$entry" ]; then
-    echo "elmer-tick: POSTED $e_repo #$e_pr at ${e_sha:0:12}, drained to $drained/$base" >&2
-    echo "setup error: could not remove the inbox entry $entry after a SUCCESSFUL post." >&2
-    echo "             The drain record exists, so the next tick will NOT re-post it." >&2
-    echo "             Remove the stale inbox file by hand." >&2
+    { echo "elmer-tick: POSTED $e_repo #$e_pr at ${e_sha:0:12}, drained to $drained/$base"
+      echo "setup error: could not remove the inbox entry $entry after a SUCCESSFUL post."
+      echo "             The drain record exists, so the next tick will NOT re-post it."
+      echo "             Remove the stale inbox file by hand."
+    } >&2 || true
     exit 2
   fi
-  echo "elmer-tick: POSTED an incremental review request -- $e_repo #$e_pr at ${e_sha:0:12}"
-  echo "            drained: $drained/$base"
+  # EVERY command from here to the exit is failure-TOLERANT, and the exit is an
+  # explicit unconditional 0. A bare `echo` is not safe under `set -e`: a stdout write
+  # error (EBADF/EIO - a timer loop redirecting into a closed or rotated fd) fails, and
+  # the script would exit 1 AFTER a successful post, a written drain record, and a
+  # removed inbox entry. Reproduced with `elmer-tick.sh >&-`: rc=1 with posted=1.
+  # EPIPE is a different animal (SIGPIPE gives 141, which no caller reads as a refusal);
+  # it is the EBADF class that produces the forbidden 1.
+  echo "elmer-tick: POSTED an incremental review request -- $e_repo #$e_pr at ${e_sha:0:12}" || true
+  echo "            drained: $drained/$base" || true
   exit 0
 fi
-rm -f "$tmp"
-echo "setup error: POSTED but could not write the drain record for $entry." >&2
-echo "             Move or delete it by hand before the next tick, or it may re-post." >&2
+rm -f "$tmp" 2>/dev/null || true
+{ echo "setup error: POSTED but could not write the drain record for $entry."
+  echo "             Move or delete it by hand before the next tick, or it may re-post."
+} >&2 || true
 exit 2
