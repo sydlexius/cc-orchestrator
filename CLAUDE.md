@@ -37,7 +37,13 @@ Runtime (`scripts/`; canonical source is this repo):
 - `scripts/orchestrate-guard.sh` - the single PreToolUse Bash deny authority (deterministic floor).
   Tier-1 = general bash-safety, MARKER-INDEPENDENT (every session): push-to-main/master, bare
   `--force`/`-f` (not `--force-with-lease`), `git ... --no-verify` (any accepting subcommand),
-  `gh ... --admin` (admin-bypass on `pr merge`). Tier-2 = orchestrate-MARKER-GATED merge: BOTH
+  `gh ... --admin` (admin-bypass on `pr merge`), and (#333) the COMMIT-SIGNING BYPASS -
+  `--no-gpg-sign` or `-c commit.gpgsign=<false|no|off|0|empty>` on any signing-bearing
+  subcommand. Same argument as `--no-verify` (silence a gate to keep moving) and the same
+  subcommand anchoring; the config leg matches ONLY the disabling values, so `gpgsign=true`
+  and `tag.gpgsign=false` correctly ALLOW. Cost asymmetry is what earns it: caught at commit
+  time the fix is `git commit --amend -S`, caught at a `required_signatures` merge gate it is
+  a history rewrite + force-push that orphans every cited fix SHA. Tier-2 = orchestrate-MARKER-GATED merge: BOTH
   the `gh pr merge` CLI (`is_pr_merge`, #105) AND merge-by-API (`gh api ... pulls/N/merge`);
   a SOLO/non-marker session is never Tier-2-gated. #263 PIECE B: the `gh pr merge` CLI leg is
   RELAXED to ALLOW in a marker session iff a fresh session-scoped merge-auth token
@@ -106,7 +112,19 @@ Runtime (`scripts/`; canonical source is this repo):
   helper accepts an explicit merge-scoped rule as NOT a shadow (the floor backstops it); it
   shows the diff, writes only with --apply + a y/N, backs up, never clobbers an unparseable
   file, and reuses doctor's single shadow matcher.
-  doctor stays read-only (it WARNs on a stale deployed guard) so "permissions are the user's to grant" holds.
+  doctor stays read-only (it WARNs on a DIFFERING deployed guard) so "permissions are the user's to grant" holds.
+  #292/#327: the deployed-vs-bundled comparison is a BYTE-COMPARE and therefore DIRECTION-BLIND -
+  it cannot tell which copy is newer, so it now reports DIFFER (not "STALE", which asserts a
+  direction it never established) and names the deployed-is-newer case explicitly, where a blind
+  refresh REVERTS a correct script. That case is real, not theoretical: an older plugin cache
+  running configure, or an emergency deny applied straight to the deployed guard (#327) which a
+  refresh would silently drop from the floor. The check is still not direction-AWARE (mtime is
+  preserved by copy2 and so cannot order them; a real fix needs version/provenance), so the
+  mitigation is RECOVERABILITY - `_deploy_helper` now backs the overwritten regular file up to
+  `<dest>.bak` before replacing it, and REFUSES the overwrite if that backup cannot be made.
+  The backup is VERIFIED to exist rather than inferred from the call succeeding: `shutil.copy2`
+  onto a DIRECTORY does not raise, it copies INTO it, so a bare try/except reports a backup that
+  is not there and then clobbers the original.
 - `uat-autobuild.sh` - repo-agnostic UAT auto-rebuild watcher: polls a branch HEAD, runs a
   parameterized `--build-cmd` on a new commit, and swaps only that port's LISTEN-pid (lease-safe)
   to the fresh binary. Keeps the leased UAT binary current (the SKILL.md "UAT EVERGREEN" mandate).

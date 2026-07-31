@@ -159,6 +159,53 @@ CASES = [
     # subcommand that does NOT accept --no-verify + token in an arg -> allow
     ("git log --grep with --no-verify in pattern allowed",
      'git log --grep="--no-verify"', False, "allow"),
+    # Tier-1 commit-signing bypass (#333): blocked ALWAYS, by the same argument that
+    # justifies the --no-verify deny - both are "silence a gate to keep moving". Verified
+    # ALLOWED by the live guard before this deny existed. Cost asymmetry drives it: caught
+    # at commit time the fix is `git commit --amend -S`; caught at a required_signatures
+    # merge gate it is a history rewrite + force-push on a reviewed PR, which orphans every
+    # cited fix SHA. Two spellings, since disabling the config is the same act as the flag.
+    ("git commit --no-gpg-sign", "git commit --no-gpg-sign -m x", False, "block"),
+    ("git commit -c gpgsign=false", "git -c commit.gpgsign=false commit -m x", False, "block"),
+    ("git merge --no-gpg-sign", "git merge --no-gpg-sign topic", False, "block"),
+    ("git rebase --no-gpg-sign", "git rebase --no-gpg-sign main", False, "block"),
+    ("git cherry-pick --no-gpg-sign", "git cherry-pick --no-gpg-sign abc123", False, "block"),
+    ("git -C dir commit --no-gpg-sign still blocks",
+     "git -C ../wt commit --no-gpg-sign -m x", False, "block"),
+    # QUOTED spellings (CR Critical, #359). A shell-quoted flag is the SAME command once the
+    # shell strips the quotes, but a whitespace-only boundary did not match it - so the deny was
+    # escapable with two characters. Both the flag and the config leg, both quote styles.
+    ('git commit "--no-gpg-sign" (double-quoted)',
+     'git commit "--no-gpg-sign" -m x', False, "block"),
+    ("git commit '--no-gpg-sign' (single-quoted)",
+     "git commit '--no-gpg-sign' -m x", False, "block"),
+    ('git -c "commit.gpgsign=false" (double-quoted config)',
+     'git -c "commit.gpgsign=false" commit -m x', False, "block"),
+    ("git -c 'commit.gpgsign=false' (single-quoted config)",
+     "git -c 'commit.gpgsign=false' commit -m x", False, "block"),
+    # The SAME hole existed in the PRE-EXISTING --no-verify deny and is fixed with it, so the
+    # older deny does not keep a known bypass the newer one closed.
+    ('git commit "--no-verify" (quoted; pre-existing hole)',
+     'git commit "--no-verify" -m x', False, "block"),
+    ("git commit '--no-verify' (single-quoted)",
+     "git commit '--no-verify' -m x", False, "block"),
+    # Quote tolerance must not cost the false-positive guards: an ENABLING config and a
+    # quoted mention in a non-signing subcommand still ALLOW.
+    ('git -c "commit.gpgsign=true" (quoted, ENABLING) allowed',
+     'git -c "commit.gpgsign=true" commit -m x', False, "allow"),
+    ('quoted flag in a log --grep pattern allowed',
+     'git log --grep="--no-gpg-sign"', False, "allow"),
+    ("gpgsign=false with spaces around = still blocks",
+     "git -c commit.gpgsign = false commit -m x", False, "block"),
+    # scoped-negatives: the same false-positive classes the --no-verify deny documents.
+    ("sometool --no-gpg-sign (no git) allowed", "sometool --no-gpg-sign", False, "allow"),
+    ("gh issue title bans --no-gpg-sign mentioning git allowed",
+     'gh issue create --title "ban --no-gpg-sign in git workflows" --body x', False, "allow"),
+    ("git log --grep with --no-gpg-sign in pattern allowed",
+     'git log --grep="--no-gpg-sign"', False, "allow"),
+    ("gpgsign=true (ENABLING signing) allowed",
+     "git -c commit.gpgsign=true commit -m x", False, "allow"),
+    ("plain signed commit allowed", "git commit -S -m x", False, "allow"),
     # Tier-1 gh pr merge --admin (admin-bypass overriding branch protection): blocked ALWAYS.
     # SUBCOMMAND-anchored: `gh pr merge` is the ONLY gh subcommand that accepts --admin.
     ("gh pr merge --admin", "gh pr merge --admin 1868", False, "block"),
