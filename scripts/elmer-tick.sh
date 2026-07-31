@@ -143,5 +143,88 @@ if [ "$recent" -ge "$ELMER_MAX_PER_HR" ]; then
   exit 0
 fi
 
-echo "elmer-tick: lock acquired, cap ok ($recent/$ELMER_MAX_PER_HR this hour)"
+# --- Pick the head entry: stillwater first, then FIFO ------------------------------
+# Queue policy from the design. stillwater outranks everything because it is the
+# repo whose reviews the maintainer actually waits on; within a tier, oldest first,
+# so nothing starves behind a busy repo.
+#
+# Only ONE entry is selected per tick, and that is a correctness requirement rather
+# than throttling: CR publishes a countdown only once its limit is ALREADY reached,
+# never a remaining-slot count, so "no announced limit" means EITHER plenty of budget
+# OR one review from the wall. Posting a batch on a single all-clear reading would
+# blow past the wall unseen. Post one, then re-read the signal.
+pick_entry() {
+  local f best="" best_at="" repo at
+  for f in "$inbox"/*.json; do
+    [ -e "$f" ] || continue
+    repo="$(jq -r '.repo // ""' "$f" 2>/dev/null || true)"
+    at="$(jq -r '.enqueued_at // ""' "$f" 2>/dev/null || true)"
+    # An entry we cannot read is left alone rather than guessed at: it will be
+    # surfaced by the triage/audit path, not silently posted for.
+    [ -n "$repo" ] && [ -n "$at" ] || continue
+    # Sort key puts the priority repo ahead of everything, then orders by ISO
+    # timestamp, which sorts lexically because it is fixed-width UTC.
+    case "$repo" in
+      */stillwater) at="0 $at" ;;
+      *)            at="1 $at" ;;
+    esac
+    if [ -z "$best" ] || [[ "$at" < "$best_at" ]]; then
+      best="$f"; best_at="$at"
+    fi
+  done
+  [ -n "$best" ] || return 1
+  printf '%s\n' "$best"
+}
+
+if ! entry="$(pick_entry)"; then
+  echo "elmer-tick: queue empty; nothing to do."
+  exit 0
+fi
+
+e_repo="$(jq -r '.repo' "$entry")"
+e_pr="$(jq -r '.pr' "$entry")"
+e_sha="$(jq -r '.commit_sha' "$entry")"
+e_form="$(jq -r '.form // "incremental"' "$entry")"
+
+# --- Refuse `full` outright, whatever the entry says -------------------------------
+# The carve-out permits the incremental form ONLY. This is checked HERE, at the
+# posting site, and not merely at enqueue: a hand-edited queue entry is exactly the
+# path that would otherwise smuggle a `full review` past the gate, and a full review
+# re-surfaces resolved threads and owes a human decision.
+if [ "$e_form" != "incremental" ]; then
+  echo "REFUSED: entry requests form '$e_form'; only 'incremental' is permitted." >&2
+  echo "         $entry" >&2
+  exit 1
+fi
+
+# --- The PR must still be open, and still at the gated SHA -------------------------
+# A gh read failure is a SETUP ERROR (exit 2), never a refusal and never a silent
+# skip: an unattended loop that treats an unreadable PR as "nothing to do" goes wrong
+# quietly, which is the failure mode this whole design is built to avoid.
+if ! pr_json="$(gh pr view "$e_pr" --repo "$e_repo" --json headRefOid,state 2>/dev/null)"; then
+  echo "setup error: could not read PR #$e_pr ($e_repo). Not posting; entry stays queued." >&2
+  exit 2
+fi
+pr_state="$(jq -r '.state' <<<"$pr_json")"
+pr_head="$(jq -r '.headRefOid' <<<"$pr_json")"
+
+if [ "$pr_state" != "OPEN" ]; then
+  echo "REFUSED: PR #$e_pr ($e_repo) is $pr_state; a closed PR is never reviewed." >&2
+  exit 1
+fi
+
+# THE STALENESS GATE. The entry was admitted because a gate receipt matched the head
+# at enqueue time; if the head has moved since, that receipt no longer describes what
+# a review would read. Posting anyway would review code that never passed the gate --
+# precisely what the receipt exists to prevent. Refuse and surface; the TL re-runs
+# /prep-pr on the new head. This is verify-do-not-classify (#337): compare the fact,
+# do not infer intent.
+if [ "$pr_head" != "$e_sha" ]; then
+  echo "REFUSED: PR #$e_pr ($e_repo) has moved since it was gated." >&2
+  echo "         queued: ${e_sha:0:12}   current: ${pr_head:0:12}" >&2
+  echo "         Re-run /prep-pr on the new head to re-queue. Entry left in place." >&2
+  exit 1
+fi
+
+echo "elmer-tick: entry ok -- $e_repo #$e_pr at ${e_sha:0:12} ($recent/$ELMER_MAX_PER_HR this hour)"
 exit 0
