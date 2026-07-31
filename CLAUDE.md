@@ -88,9 +88,9 @@ Runtime (`scripts/`; canonical source is this repo):
   [--apply]` is the consent-based path that wires the floor hook + missing allow-list entries into
   settings.json, DEPLOYS the bundled guard to the stable `~/.claude/scripts/` path (so a fresh
   plugin install has a working floor; idempotent, refreshes a stale copy, warns on a missing source),
-  DEPLOYS the 18 bundled PR-lifecycle helpers (HELPER_NAMES) the same Option-A way (#133; #234 added
-  `gh-react.sh`, #303 added `run-paths.sh`, and the elmer front half added `cr-quota-watch.sh` +
-  `elmer-enqueue.sh` - for those two the stable path is LOAD-BEARING, since it is what keeps the
+  DEPLOYS the 19 bundled PR-lifecycle helpers (HELPER_NAMES) the same Option-A way (#133; #234 added
+  `gh-react.sh`, #303 added `run-paths.sh`, and the elmer front half added `cr-quota-watch.sh`,
+  `elmer-enqueue.sh` + `elmer-triage.sh` - for those two the stable path is LOAD-BEARING, since it is what keeps the
   unattended loop inside the existing wrapper grant instead of needing a broad `gh` one; retiring
   any claude-kit symlink, backed up to `<dest>.bak`), and (unless `--no-steer`) DEPLOYS + wires the advisory
   steering hook `orchestrate-steer.sh` for Edit/Write/Bash/Read/Agent (#95/#226/#231; doctor only ever WARNs about it),
@@ -243,6 +243,20 @@ Runtime (`scripts/`; canonical source is this repo):
   regardless of what a caller asks (it re-surfaces resolved threads and owes a human decision); a
   gh read failure exits 2 rather than enqueuing. Reads a PR + writes one LOCAL queue entry: no
   posting, no gh mutation, no allow-list or floor change.
+- `scripts/elmer-triage.sh` - the MECHANICAL triage drop: one maildir entry per PR, composed from
+  EXISTING read-only helpers (`orchestrate-status.sh` for state/checks/review/merge/unreplied,
+  `pr-read-comments.sh` for the finding bodies), so a TL wakes to a digest instead of a raw comment
+  dump. NO MODEL IS INVOLVED - that is deliberate, and is what keeps the loop a DUMB PIPE: the
+  deterministic parts of triage cost nothing, never go stale, and cannot stall on a permission
+  prompt. THE ONE NON-OBVIOUS FIELD is `triaged_sha`, written on its OWN LINE so a consumer greps
+  it rather than parsing prose: a report is only valid for the code it was computed against, so a
+  reader compares it to HEAD (equal -> live, different -> re-derive). That check is what would make
+  an OPTIONAL model-driven triage safe to layer on later - it makes staleness DETECTABLE rather
+  than assumed. FAIL-SOFT BY CONTRACT: every composed read may fail and a failure is RECORDED IN
+  THE ENTRY, never omitted - an entry quietly missing its findings section reads as "no findings",
+  the dangerous direction. A per-PR failure is reported and skipped (one 404 must not cost the
+  other four reports), and a re-run REPLACES an entry rather than leaving two rival reports for one
+  PR. Read-only: composes read-only helpers + one `gh pr view`; never posts, never mutates.
 - `scripts/run-paths.sh` - THE single producer of a worktree's run-artifact directory (#303),
   SOURCED (never executed). Exports `CC_RUN_ROOT`, `CC_RUN_DIR`
   (`<XDG_CACHE_HOME>/<repo-prefix>-run/<basename>-<sha12>`), and `GOLANGCI_LINT_CACHE`
@@ -333,8 +347,8 @@ clean-worktree check, so an unchanged committed tree skips re-running it
 `skills/orchestrate/templates/gates.toml.md`.
 
 ```sh
-shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/orchestrate-authorize-merge.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh scripts/base-freshness.sh scripts/open-pr-staleness-sweep.sh scripts/run-paths.sh scripts/cr-quota-watch.sh scripts/elmer-enqueue.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
-ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py test-cr-quota-watch.py test-elmer-enqueue.py
+shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/orchestrate-authorize-merge.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh scripts/base-freshness.sh scripts/open-pr-staleness-sweep.sh scripts/run-paths.sh scripts/cr-quota-watch.sh scripts/elmer-enqueue.sh scripts/elmer-triage.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
+ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py test-cr-quota-watch.py test-elmer-enqueue.py test-elmer-triage.py
 ./scripts/orchestrate-guard.sh --self-test    # MUST use ./ - the self-test re-invokes "$0";
                                               # `bash scripts/orchestrate-guard.sh` makes $0 a bare name -> 127
 ./scripts/orchestrate-guard.sh --assert-coverage  # #324: no deny is unreachable behind the perf
@@ -375,6 +389,7 @@ python3 test-run-paths.py
 python3 test-cleanup-worktree.py
 python3 test-cr-quota-watch.py
 python3 test-elmer-enqueue.py
+python3 test-elmer-triage.py
 ```
 
 ## Versioning
