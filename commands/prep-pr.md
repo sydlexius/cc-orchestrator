@@ -104,13 +104,37 @@ to it:
 # copy at the stable path. The runner finds the repo root itself and reads
 # .gates.toml or falls back; it exits non-zero on the first required-gate
 # failure, 0 when everything passed/skipped/fell open.
+#
+# --receipt writes a schema-validated `gate-receipt/v1` as a BYPRODUCT of the real
+# gate run (it never changes the gate's verdict or exit code; a receipt failure
+# only WARNs). The receipt binds this gate result to the exact commit it ran on,
+# which is what lets a later consumer verify a gate-pass instead of trusting a
+# claim -- see "What the receipt is for" below.
+# NOTE: `$(git rev-parse --git-dir)`, never a literal `.git/`. In a WORKTREE `.git`
+# is a FILE (it points at .git/worktrees/<name>), so a literal path is unwritable
+# there -- and worktrees are the normal case for this workflow. --git-dir resolves
+# correctly in both, and is per-worktree, so receipts never leak between them.
+RECEIPT_PATH="$(git rev-parse --git-dir)/prep-pr-receipt.json"
 if [ -f scripts/gate-runner.py ]; then
-  python3 scripts/gate-runner.py
+  python3 scripts/gate-runner.py --receipt "$RECEIPT_PATH"
 else
-  python3 ~/.claude/scripts/gate-runner.py
+  python3 ~/.claude/scripts/gate-runner.py --receipt "$RECEIPT_PATH"
 fi
 gate_rc=$?
 ```
+
+**What the receipt is for.** `.git/prep-pr-receipt.json` records
+`{commit_sha, tree_sha, result, steps[], producer}` for this run. It lives under
+`.git/` deliberately: never committed, never in the diff, and naturally per-worktree.
+It costs one flag and changes nothing about the gate itself -- a consumer that
+ignores it sees identical behavior.
+
+Its point is that a gate-pass becomes **verifiable rather than assertable**. A
+consumer checks `commit_sha` against the PR's current head, so a receipt from before
+a later push is detectably stale rather than silently trusted. `elmer-enqueue.sh` is
+the first such consumer (it refuses to queue an unattended review request without a
+passing receipt matching HEAD); the mechanism is general, and this is the same
+"verify, do not classify" shape as #337's branch delete.
 
 `gate-runner.py` reads `.gates.toml` (`[prep_pr]` with either a `gate`
 delegate or an ordered `steps` list; see

@@ -110,6 +110,15 @@ HELPER_NAMES = (
     # consumer WARNs and skips run-dir cleanup rather than reconstructing the path (that
     # second derivation is the drift #303 exists to eliminate).
     "run-paths.sh",
+    # The "elmer" review-requester front half. Deployment is LOAD-BEARING here, not a
+    # convenience: the whole permission story is that a script under the stable path is
+    # already covered by the existing `Bash(bash ~/.claude/scripts/*.sh *)` grant, so an
+    # unattended loop needs NO new grant and can never stall on a permission prompt. A
+    # repo-local-only copy would force a broader `gh` grant instead - the documented
+    # "recurring ditch" that shadows the merge gate. Both are READ-ONLY toward GitHub
+    # (cr-quota-watch.sh reads comments; elmer-enqueue.sh reads a PR + writes one local
+    # queue entry); neither posts, and neither is a reason to widen any allow-list.
+    "cr-quota-watch.sh", "elmer-enqueue.sh", "elmer-triage.sh", "elmer-tick.sh",
 )
 # The _helper_deploy_action results that warrant an actual deploy write (vs. None / informational).
 HELPER_DEPLOY_ACTIONS = ("deploy", "refresh", "replace-symlink", "replace-broken-symlink")
