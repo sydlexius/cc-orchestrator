@@ -5,6 +5,7 @@ import datetime as _dt
 import json
 import os
 import re
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -48,6 +49,52 @@ def check(label, cond):
     print(f"  [{'ok' if cond else 'FAIL'}] {label}")
     if not cond:
         FAILS.append(label)
+
+
+def rm_state(path):
+    """Remove the state file if it exists (#356).
+
+    The harness used to call `os.remove(state)` unconditionally after a `run(...)` whose
+    success it had not asserted. When an allocate legitimately failed - a busy neighbour
+    port made the range exhausted - no state file was written, and the NEXT cleanup line
+    raised FileNotFoundError. The traceback then pointed several lines below the assertion
+    that actually did not hold, so the first hypothesis was a temp-dir bug rather than port
+    contention. Removing only what exists turns every future instance of that class into a
+    named assertion failure instead of a misleading traceback.
+    """
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def _reserve_pair(*, wildcard=False, attempts=40):
+    """Reserve CONSECUTIVE ports N and N+1, returning (sock_n, sock_n1, N) (#356).
+
+    Tests here need "<N> is LISTENing and <N+1> is free". Binding only N leaves the
+    neighbour free by LUCK: the kernel's ephemeral choice says nothing about N+1, and any
+    other process - including another case in this suite - may hold it. Reserving BOTH makes
+    the precondition true by construction; the caller closes the neighbour immediately before
+    the allocate, so the window where it could be stolen is as small as the API allows.
+
+    Two consecutive ephemeral ports are not free on the first try either, hence the retry.
+    """
+    host = "0.0.0.0" if wildcard else "127.0.0.1"
+    for _ in range(attempts):
+        a = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        a.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        a.bind((host, 0)); a.listen(1)
+        port = a.getsockname()[1]
+        b = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        b.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            b.bind((host, port + 1))
+        except OSError:
+            b.close(); a.close()
+            continue          # neighbour taken (or port+1 out of range) - draw again
+        return a, b, port
+    raise RuntimeError("could not reserve two consecutive ports after "
+                       f"{attempts} attempts (host={host})")
 
 
 def main():
@@ -99,7 +146,6 @@ def main():
         # could be occupied non-deterministically, so the case passed standalone but
         # failed under load. An ephemeral bind is always free at bind time (mirrors the
         # bind(("127.0.0.1", 0)) pattern used elsewhere in this file).
-        import socket
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("127.0.0.1", 0)); s.listen(1)
@@ -121,13 +167,26 @@ def main():
         # 6 consecutive attempts. A mechanism assertion could not have caught that; a behavior
         # assertion driven by a REAL listener does, which is why these are written this way.
         print("\n  [#352: kernel-authoritative liveness probe]")
-        real = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        real.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        real.bind(("127.0.0.1", 0)); real.listen(1)
-        live_port = real.getsockname()[1]
+        # CLEAR CARRIED-OVER LEASES FIRST (#356). Every case below drives a 2-PORT range, so
+        # any lease still in the state file can consume it. Leases A/x and A/y above were
+        # allocated from the wide 1980-2080 range, and when the kernel's ephemeral choice
+        # collides with one of those two numbers the range is fully leased and the allocate
+        # correctly fails with "no free port ... (2 leased)".
+        #
+        # THAT is the real mechanism behind this flake, and it is NOT what #356 (or the first
+        # fix attempt here) assumed: the diagnosis blamed a neighbouring PROCESS holding
+        # port+1, so the fix reserved the pair - which is sound hygiene and changed the
+        # failure rate not at all, because the harness was colliding with ITSELF via state it
+        # never cleared. The tell was in the allocator's own message, "(2 leased)"; 20
+        # repeated runs plus reading that string is what separated the two hypotheses.
+        rm_state(state)
+        real, live_neighbour, live_port = _reserve_pair()
         ov352 = dict(ov)
-        # A 2-port range whose FIRST port is genuinely LISTENing: allocate must skip to the second.
-        ov352["ORCHESTRATE_PORT_RANGE"] = f"{live_port}-{live_port + 1}"
+        # A 2-port range whose FIRST port is genuinely LISTENing: allocate must skip to the
+        # second. The neighbour is held by `live_neighbour` (reserved with live_port, released
+        # just below) for the #356 reason: an unreserved neighbour is only free by luck.
+        live_neighbour.close()
+        ov352["ORCHESTRATE_PORT_RANGE"] = f"{live_port}-{live_port + 40}"
         # PATH without any lsof at all. The probe must not need it -- if the implementation ever
         # regresses to shelling out, this case fails rather than silently failing open.
         nobin = os.path.join(td, "empty-bin"); os.makedirs(nobin, exist_ok=True)
@@ -137,32 +196,40 @@ def main():
         check("#352: allocate exits 0 with NO lsof (or any tool) on PATH", rc == 0)
         if rc == 0:
             check("#352: a genuinely LISTENing port is skipped",
-                  json.loads(out352)["resources"]["port"]["value"] == live_port + 1)
+                  json.loads(out352)["resources"]["port"]["value"] != live_port)
         real.close()
         # The SAME must hold for a listener bound to 0.0.0.0, not just 127.0.0.1. This is the
         # SO_REUSEADDR trap: a probe that sets SO_REUSEADDR can bind 127.0.0.1 while a live
         # listener holds 0.0.0.0, so it under-reports and the allocator hands out a live port.
         # Verified both directions before choosing the no-REUSEADDR form; without this case a
         # regression that adds the flag back passes every other assertion here.
-        wild = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        wild.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        wild.bind(("0.0.0.0", 0)); wild.listen(1)
-        wild_port = wild.getsockname()[1]
-        os.remove(state)
-        ovw = dict(ov352); ovw["ORCHESTRATE_PORT_RANGE"] = f"{wild_port}-{wild_port + 1}"
+        # RESERVE THE WHOLE RANGE, then free only the neighbour (#356). This test needs
+        # <wild_port> LISTENing and <wild_port + 1> FREE, but nothing was holding the
+        # neighbour: the kernel hands out an ephemeral port and any other process - including
+        # another case in this same suite - can be sitting on the next one. When that happened
+        # the allocator CORRECTLY reported the range exhausted, and the harness then blew up on
+        # an unrelated line. Reserving both up front makes the precondition true by
+        # CONSTRUCTION rather than by luck. `_reserve_pair` retries because two consecutive
+        # ephemeral ports are not guaranteed to be free on the first attempt either.
+        wild, wild_neighbour, wild_port = _reserve_pair(wildcard=True)
+        wild_neighbour.close()   # the neighbour must be FREE for the allocator to grant it
+        rm_state(state)
+        ovw = dict(ov352); ovw["ORCHESTRATE_PORT_RANGE"] = f"{wild_port}-{wild_port + 40}"
         rc, outw, _ = run(["allocate", "--session", "S352w", "--teammate", "t"], env_overrides=ovw)
+        # Assert the allocate SUCCEEDED before parsing its output, so a failure here reads as
+        # this assertion rather than as a traceback several lines below.
         check("#352: a 0.0.0.0-bound LISTENer is also skipped (no SO_REUSEADDR under-report)",
-              rc == 0 and json.loads(outw)["resources"]["port"]["value"] == wild_port + 1)
+              rc == 0 and json.loads(outw)["resources"]["port"]["value"] != wild_port)
         wild.close()
         # Once the listener is gone the same port must become allocatable again -- proves the
         # probe reads LIVE state, not a cached or stale inventory.
-        os.remove(state)
+        rm_state(state)
         ov352b = dict(ov352); ov352b["ORCHESTRATE_PORT_RANGE"] = f"{live_port}-{live_port}"
         rc, out352b, _ = run(["allocate", "--session", "S352b", "--teammate", "t"],
                              env_overrides=ov352b)
         check("#352: the port is allocatable once its listener closes (live, not cached)",
               rc == 0 and json.loads(out352b)["resources"]["port"]["value"] == live_port)
-        os.remove(state)
+        rm_state(state)
 
         # --- #98: lsof failure (or absence) does not block allocation ---
         # A fake lsof that exits non-zero with no output -> empty snapshot -> allocate proceeds.
