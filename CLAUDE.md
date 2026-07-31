@@ -396,6 +396,18 @@ Runtime (`scripts/`; canonical source is this repo):
   `[[pref]]` it greps the directly-changed governed surfaces for the pref's `verify` regex; a governed,
   changed surface that misses the mechanism is a hard failure unless an `[[exempt]]` block covers it.
   Executes `git` ONLY - a repo-declared `list_cmd` drift-check was dropped for RCE safety (#201).
+- `test-ci-gates-lockstep.py` - the CI/`.gates.toml` lint LOCKSTEP guard (#364). The two lint
+  enumerations are HAND-MAINTAINED and nothing compared them, so they drifted until CI
+  shellchecked 28 of the 37 scripts the local gate covered - `orchestrate-authorize-merge.sh`
+  (which arms the merge-auth token the FLOOR reads) among the nine CI never linted, plus 19
+  ruff targets. A re-sync alone would have fixed today's drift and guaranteed tomorrow's, so
+  this asserts the invariant instead, same shape as `test-version-lockstep.py` and the #284
+  exact-count check. THREE checks, because two of them pass while the invariant is broken:
+  set equality in BOTH directions (a CI-only entry is a stale path that lints nothing yet
+  reads as coverage); a PARSE-SANITY FLOOR before any verdict (an empty parse compares {} to
+  {} and passes - exactly how a drift guard becomes decorative, and the #330 lesson about a
+  wrong pattern reading as a real defect); and a FILESYSTEM CROSS-CHECK, since the two lists
+  can AGREE and both omit a script that exists. Stdlib only, no network.
 - `test-orchestrate-{guard,resources,setup}.py`, `test-planner-classify.py`, `test-gh-wrappers.py` -
   the proof harnesses (kept at repo root; dev tooling, not shipped in the skill).
 
@@ -431,7 +443,7 @@ clean-worktree check, so an unchanged committed tree skips re-running it
 
 ```sh
 shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/orchestrate-authorize-merge.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh scripts/base-freshness.sh scripts/open-pr-staleness-sweep.sh scripts/run-paths.sh scripts/cr-quota-watch.sh scripts/elmer-enqueue.sh scripts/elmer-triage.sh scripts/elmer-tick.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
-ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-safe-push-freshness.py test-prep-pr-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py test-cr-quota-watch.py test-elmer-enqueue.py test-elmer-triage.py test-elmer-tick.py
+ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-ci-gates-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-safe-push-freshness.py test-prep-pr-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py test-cr-quota-watch.py test-elmer-enqueue.py test-elmer-triage.py test-elmer-tick.py
 ./scripts/orchestrate-guard.sh --self-test    # MUST use ./ - the self-test re-invokes "$0";
                                               # `bash scripts/orchestrate-guard.sh` makes $0 a bare name -> 127
 ./scripts/orchestrate-guard.sh --assert-coverage  # #324: no deny is unreachable behind the perf
@@ -459,6 +471,7 @@ python3 test-safe-push.py
 python3 test-pr-watch.py
 python3 test-issue-watch.py
 python3 test-version-lockstep.py
+python3 test-ci-gates-lockstep.py
 python3 test-stale-branch-sweep.py
 python3 test-codoki-quota-watch.py
 python3 test-gate-runner.py
