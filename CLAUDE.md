@@ -160,6 +160,17 @@ Runtime (`scripts/`; canonical source is this repo):
   in `reviewThreads`); `ship-gate-preflight.sh` FULL mode BLOCKs when a Codoki summary exists
   with no NON-BOT ack, PASSES on no-summary, and
   `pr-unreplied-comments.sh --audit` surfaces the summary's ACKED/UNACKED state (informational).
+  #334: the FULL-mode gating path now reads `mergeStateStatus` from the SAME snapshot as the
+  checks and BLOCKS unless it is CLEAN/UNSTABLE/HAS_HOOKS/BEHIND. It previously fetched that
+  field ONLY in DIAGNOSE mode, so the oracle could return PASS on a PR GitHub was actively
+  BLOCKING (measured: an unsigned commit tripping a `required_signatures` rule the oracle does
+  not evaluate rule-by-rule). The fix deliberately does NOT enumerate more rule types - that is
+  the defect class, since a hand-picked subset silently treats the remainder as absent - it asks
+  GitHub for its AGGREGATE verdict instead. BEHIND still PASSES by design (base-freshness is
+  `base-freshness.sh`'s scope) but is REPORTED; UNKNOWN BLOCKS, because "still computing" must
+  never read as "fine" in a fail-closed gate. #315: a null `reviewDecision` is now QUALIFIED in
+  the PASS line (approved-on-head / nobody-reviewed / unreadable) instead of a bare `<none>`
+  that read as "review state is fine" - REPORTING only, fail-soft, never changes the verdict.
   CODOKI IS NOT IN SERVICE (subscription lapsed 2026-07-12; no free tier). No trigger is ever posted
   and no check ever appears, so every Codoki gate ON A LIVE PR PATH is INERT BY DESIGN and PASSes on
   absence: `--codoki-gate` (what `pr-watch.sh` calls) and the FULL-mode root-ack gate. The STRICT

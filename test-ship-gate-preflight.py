@@ -46,7 +46,8 @@ def check(label, ok):
 DEFAULT_SHA = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
 
 
-def rollup(*contexts, review_decision="__OMIT__", head_ref_oid=DEFAULT_SHA):
+def rollup(*contexts, review_decision="__OMIT__", head_ref_oid=DEFAULT_SHA,
+           merge_state="CLEAN"):
     """Build a statusCheckRollup JSON document from context dicts.
 
     review_decision: when supplied, add a top-level `reviewDecision` field (the
@@ -64,6 +65,11 @@ def rollup(*contexts, review_decision="__OMIT__", head_ref_oid=DEFAULT_SHA):
         doc["reviewDecision"] = review_decision
     if head_ref_oid != "__OMIT__":
         doc["headRefOid"] = head_ref_oid
+    # merge_state (#334): GitHub's AGGREGATE verdict, now on the GATING path. Defaults to
+    # CLEAN so every pre-existing PASS fixture keeps passing; pass "__OMIT__" to drop the
+    # field (unreadable -> BLOCK) or any other value to exercise the new gate.
+    if merge_state != "__OMIT__":
+        doc["mergeStateStatus"] = merge_state
     return json.dumps(doc)
 
 
@@ -651,6 +657,71 @@ def main():
                       fixture_json=rollup(checkrun("Codoki PR Review", "COMPLETED", "SUCCESS")),
                       threads_json=threads_doc(unresolved=9))
     check("--codoki-only ignores the thread gate (9 unresolved) -> exit 0", rc == 0)
+
+    print("== #334: GitHub's aggregate verdict gates the PASS ==")
+    # THE DEFECT: the oracle returned PASS on a PR sitting at mergeStateStatus=BLOCKED,
+    # because mergeStateStatus was fetched ONLY in DIAGNOSE mode (an after-the-fact
+    # explainer) and never on the gating path. Measured with an unsigned commit tripping a
+    # required_signatures rule this oracle does not evaluate rule-by-rule. For a check whose
+    # whole contract is fail-CLOSED, a false PASS is the worst defect it can have.
+    ALL_GREEN_CTX = checkrun("ci", "COMPLETED", "SUCCESS")
+    rc, out, err, _ = run(["1", "owner/repo"],
+                          fixture_json=rollup(ALL_GREEN_CTX, merge_state="BLOCKED"),
+                          unreplied_findings=0)
+    check("#334: all checks green but mergeStateStatus=BLOCKED -> exit 2 (was a false PASS)",
+          rc == 2 and "RESULT: PASS" not in out)
+    check("#334: the BLOCK names the aggregate verdict, not a guess",
+          "mergeStateStatus=BLOCKED" in err)
+    check("#334: the BLOCK points at --diagnose for the specific unmet rule",
+          "--diagnose" in err)
+    # DIRTY (conflicts) is the other everyday blocking state.
+    rc, out, _, _ = run(["1", "owner/repo"],
+                        fixture_json=rollup(ALL_GREEN_CTX, merge_state="DIRTY"),
+                        unreplied_findings=0)
+    check("#334: mergeStateStatus=DIRTY (conflicts) -> exit 2", rc == 2 and "RESULT: PASS" not in out)
+    # UNKNOWN means GitHub has not finished computing. "Not yet known" must never read as
+    # "fine" in a fail-closed gate - re-running resolves it in seconds.
+    rc, out, err, _ = run(["1", "owner/repo"],
+                          fixture_json=rollup(ALL_GREEN_CTX, merge_state="UNKNOWN"),
+                          unreplied_findings=0)
+    check("#334: mergeStateStatus=UNKNOWN -> exit 2 (still computing is not 'fine')",
+          rc == 2 and "re-run" in err)
+    # An unreadable/absent field must BLOCK, not default to mergeable.
+    rc, out, _, _ = run(["1", "owner/repo"],
+                        fixture_json=rollup(ALL_GREEN_CTX, merge_state="__OMIT__"),
+                        unreplied_findings=0)
+    check("#334: absent mergeStateStatus -> exit 2 (fail closed, never assume mergeable)",
+          rc == 2 and "RESULT: PASS" not in out)
+    # THE MERGEABLE SET still passes - a gate that blocks everything is not a fix.
+    for ms in ("CLEAN", "UNSTABLE", "HAS_HOOKS"):
+        rc, out, _, _ = run(["1", "owner/repo"],
+                            fixture_json=rollup(ALL_GREEN_CTX, merge_state=ms),
+                            unreplied_findings=0)
+        check(f"#334: mergeStateStatus={ms} still PASSes", rc == 0 and "RESULT: PASS" in out)
+    # BEHIND passes DELIBERATELY (base-freshness is out of this oracle's scope, owned by
+    # base-freshness.sh) but must be REPORTED rather than silently swallowed.
+    rc, out, _, _ = run(["1", "owner/repo"],
+                        fixture_json=rollup(ALL_GREEN_CTX, merge_state="BEHIND"),
+                        unreplied_findings=0)
+    check("#334: BEHIND still PASSes (base-freshness is out of scope)", rc == 0)
+    check("#334: BEHIND is REPORTED in the PASS line, not silent",
+          "BEHIND" in out and "out of this oracle's scope" in out)
+
+    print("== #315: reviewDecision=<none> is disambiguated, not bare ==")
+    # A bare `<none>` inside a RESULT: PASS line reads as "review state is fine" while
+    # meaning only "not an active CHANGES_REQUESTED". reviewDecision is a branch-protection
+    # artifact, so null covers three different states: approved, never-reviewed, or
+    # dismissed-by-push. Measured on a real PR that had an APPROVED on HEAD.
+    rc, out, _, _ = run(["1", "owner/repo"],
+                        fixture_json=rollup(ALL_GREEN_CTX, review_decision=None),
+                        unreplied_findings=0)
+    check("#315: a null reviewDecision PASS still says <none>", rc == 0 and "reviewDecision=<none>" in out)
+    check("#315: ...but is qualified, not left bare",
+          "no decision required" in out)
+    # REPORTING, not gating: the qualifier must never turn a PASS into a BLOCK, because
+    # requiring an approval would impose a policy the repo has not set (auto-review is off
+    # org-wide, so plenty of legitimately-mergeable PRs carry no approval).
+    check("#315: the disambiguation NEVER changes the verdict (still exit 0)", rc == 0)
 
     print("== #263 Piece A: emit validated headRefOid on PASS ==")
     # PASS prints a parseable headRefOid=<sha> line, and it is the validated SHA.
