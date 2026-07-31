@@ -157,7 +157,7 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         unreplied_fail_until=0, codoki_ack_verdict="no-summary",
         codoki_ack_fail=False, codoki_ack_missing=False,
         threads_json="__DEFAULT__", threads_fail=False, protection=None, comments=None,
-        comments_fail=False):
+        comments_fail=False, reviews=None, reviews_fail=False):
     """Invoke the oracle with stubbed gh + pr-unreplied-comments.sh + gh-react.sh.
     Returns (exit_code, stdout, stderr, argv) where argv is the recorded helper
     argv content (one line per invocation, read back from the log) -- used to
@@ -197,6 +197,13 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
                 "    # trigger detector's fail-toward-not-triggered posture in isolation (#277 CR).\n"
                 "    if [ -n \"${COMMENTS_FAIL:-}\" ]; then echo 'gh: simulated comments-API failure' >&2; exit 1; fi\n"
                 "    printf '%s' \"${FIXTURE_COMMENTS:-[]}\"; exit 0;;\n"
+                "  *reviews)\n"
+                "    # `gh api repos/.../pulls/<pr>/reviews` (#315 disambiguation + #301 Part 2\n"
+                "    # coverage advisory). REVIEWS_FAIL fails ONLY this route, so the fail-OPEN\n"
+                "    # posture can be proved in isolation: an unreadable reviews API must leave\n"
+                "    # the exit code identical, never flip a PASS to a BLOCK.\n"
+                "    if [ -n \"${REVIEWS_FAIL:-}\" ]; then echo 'gh: simulated reviews-API failure' >&2; exit 1; fi\n"
+                "    printf '%s' \"${FIXTURE_REVIEWS:-[]}\"; exit 0;;\n"
                 "  *protection)\n"
                 "    # `gh api repos/.../branches/<base>/protection` (#275 --diagnose). Empty\n"
                 "    # FIXTURE_PROTECTION simulates a 403 (no admin scope) so the degradation\n"
@@ -277,6 +284,12 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         env.pop("COMMENTS_FAIL", None)
         if comments_fail:
             env["COMMENTS_FAIL"] = "1"
+        env.pop("FIXTURE_REVIEWS", None)
+        if reviews is not None:
+            env["FIXTURE_REVIEWS"] = reviews
+        env.pop("REVIEWS_FAIL", None)
+        if reviews_fail:
+            env["REVIEWS_FAIL"] = "1"
         env.pop("THREADS_FAIL", None)
         if threads_fail:
             env["THREADS_FAIL"] = "1"
@@ -807,6 +820,45 @@ def main():
     # requiring an approval would impose a policy the repo has not set (auto-review is off
     # org-wide, so plenty of legitimately-mergeable PRs carry no approval).
     check("#315: the disambiguation NEVER changes the verdict (still exit 0)", rc == 0)
+
+    print("== #301 Part 2: review-coverage advisory (WARN only, fail-OPEN) ==")
+    # The gate measured thread state and CI state but never asked whether anyone reviewed
+    # the code about to merge, so fix-round commits pushed after the last review merged
+    # UNREVIEWED with every gate green.
+    def review(commit, login="coderabbitai[bot]", state="APPROVED", at="2026-01-01T00:00:00Z"):
+        return {"commit_id": commit, "state": state, "submitted_at": at,
+                "user": {"login": login}}
+    OTHER_SHA = "b" * 40
+    GREEN = checkrun("ci", "COMPLETED", "SUCCESS")
+    # head IS among the reviewed oids -> silent. Membership, NOT recency: a reviewer who
+    # re-reviews an EARLIER commit must not trip a WARN (that is the false-WARN the AC names).
+    rc, out, _, _ = run(["1", "owner/repo"], fixture_json=rollup(GREEN), unreplied_findings=0,
+                        reviews=json.dumps([review(DEFAULT_SHA),
+                                            review(OTHER_SHA, at="2026-01-02T00:00:00Z")]))
+    check("#301p2: head among reviewed oids -> PASS with NO coverage WARN",
+          rc == 0 and "WARN: no review covers" not in out)
+    # head NOT reviewed -> WARN naming the range, verdict UNCHANGED.
+    rc, out, _, _ = run(["1", "owner/repo"], fixture_json=rollup(GREEN), unreplied_findings=0,
+                        reviews=json.dumps([review(OTHER_SHA)]))
+    check("#301p2: head NOT reviewed -> WARN, exit UNCHANGED (still 0)", rc == 0)
+    check("#301p2: the WARN names the unreviewed range",
+          f"{OTHER_SHA[:8]}..{DEFAULT_SHA[:8]}" in out)
+    check("#301p2: the WARN says the LEAD decides (it is not a policy)", "LEAD decides" in out)
+    # Zero reviews -> WARN, verdict unchanged.
+    rc, out, _, _ = run(["1", "owner/repo"], fixture_json=rollup(GREEN), unreplied_findings=0,
+                        reviews="[]")
+    check("#301p2: zero reviews -> WARN, exit UNCHANGED", rc == 0 and "entirely unreviewed" in out)
+    # FAIL-OPEN, the property that makes an advisory safe: an unreadable reviews API must
+    # leave the exit code IDENTICAL to a normal run. An advisory that can flip a verdict
+    # is not an advisory.
+    rc_fail, out_fail, _, _ = run(["1", "owner/repo"], fixture_json=rollup(GREEN),
+                                  unreplied_findings=0, reviews_fail=True)
+    rc_base, _, _, _ = run(["1", "owner/repo"], fixture_json=rollup(GREEN),
+                           unreplied_findings=0, reviews=json.dumps([review(DEFAULT_SHA)]))
+    check("#301p2: reviews-API failure -> exit IDENTICAL to a healthy run (fail-OPEN)",
+          rc_fail == rc_base == 0)
+    check("#301p2: ...and says so as a NOTE rather than failing silently",
+          "unverifiable" in out_fail or "unreadable" in out_fail)
 
     print("== #263 Piece A: emit validated headRefOid on PASS ==")
     # PASS prints a parseable headRefOid=<sha> line, and it is the validated SHA.

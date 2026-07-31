@@ -796,9 +796,16 @@ fi
 #
 # Fail SOFT: an unreadable reviews API degrades to the old bare token rather than blocking
 # a PR that passed every real gate. A reporting nicety must never become a merge blocker.
+# ONE reviews read, shared by the #315 disambiguation and the #301 coverage advisory.
+# Hoisted out of the `-z "$review_decision"` branch deliberately: nested there, an
+# APPROVED PR left $rv empty and the coverage check below silently took its
+# "unverifiable" path - a check that reports nothing on exactly the PRs that HAVE been
+# reviewed. Both consumers are fail-soft, so one unreadable read degrades both to a NOTE
+# rather than blocking.
+rv="$(gh api --paginate "repos/$repo/pulls/$pr/reviews" 2>/dev/null | jq -s 'add // []' 2>/dev/null)" || rv=""
+
 review_note=""
 if [ -z "$review_decision" ]; then
-  rv="$(gh api --paginate "repos/$repo/pulls/$pr/reviews" 2>/dev/null | jq -s 'add // []' 2>/dev/null)" || rv=""
   if [ -n "$rv" ] && jq -e . >/dev/null 2>&1 <<<"$rv"; then
     # Latest review PER REVIEWER on the CURRENT head, so a stale CHANGES_REQUESTED that a
     # later APPROVED superseded does not misreport (that exact sequence is what #315 saw).
@@ -820,9 +827,46 @@ if [ -z "$review_decision" ]; then
   fi
 fi
 
+# --- REVIEW COVERAGE (#301 Part 2; ADVISORY, fail-OPEN, NEVER gates) -------
+# The gate measures thread state and CI state but never asks whether anyone reviewed the
+# code that is actually about to merge. Fix-round commits pushed after the last review
+# merge UNREVIEWED with every gate green - measured elsewhere at 3 unreviewed commits,
+# including the fix for a bot's own MAJOR finding.
+#
+# WARN ONLY, by design. A docs-only fix round needs no re-review, and blocking every fix
+# round would deadlock the push-first loop (push, then reply citing the SHA). So this
+# surfaces the range and says explicitly that the LEAD decides.
+#
+# THE PREDICATE IS MEMBERSHIP, not recency: "is head among the reviewed commit oids". The
+# tempting `newest_review.commit == head` false-WARNs whenever a reviewer re-reviews an
+# EARLIER commit, which is ordinary when a bot revisits a thread.
+#
+# Reuses the reviews payload already fetched above for #315 rather than issuing a second
+# read - and because that read is fail-SOFT, an unreadable API degrades to a NOTE here
+# instead of flipping a PASS to a BLOCK. An advisory that can change the verdict is not
+# advisory.
+coverage_note=""
+if [ -n "${rv:-}" ] && jq -e . >/dev/null 2>&1 <<<"$rv"; then
+  reviewed_head="$(jq -r --arg h "$head_sha" '[.[] | select(.commit_id == $h)] | length' <<<"$rv" 2>/dev/null)" || reviewed_head=""
+  rv_count="$(jq -r 'length' <<<"$rv" 2>/dev/null)" || rv_count=""
+  case "$reviewed_head" in
+    ''|*[!0-9]*) coverage_note=" NOTE: review coverage unreadable (advisory only; verdict unchanged)." ;;
+    0)
+      if [ "${rv_count:-0}" = "0" ]; then
+        coverage_note=" WARN: NO review covers any commit on this PR - the head is entirely unreviewed. The LEAD decides whether that is acceptable (a docs-only change often is)."
+      else
+        last_reviewed="$(jq -r 'sort_by(.submitted_at) | last | (.commit_id // "")' <<<"$rv" 2>/dev/null)" || last_reviewed=""
+        coverage_note=" WARN: no review covers the CURRENT head - commits ${last_reviewed:0:8}..${head_sha:0:8} are unreviewed. The LEAD decides whether they need a pass (a docs/comment-only fix round often does not)."
+      fi ;;
+    *) : ;;   # head IS among the reviewed oids - silent, nothing to say
+  esac
+else
+  coverage_note=" NOTE: review coverage unverifiable (reviews read failed; advisory only, verdict unchanged)."
+fi
+
 # BEHIND is a PASS here (base-freshness is out of scope) but must be VISIBLE, not silent.
 merge_note=""
 [ "$merge_state" = "BEHIND" ] && merge_note=" (BEHIND base - out of this oracle's scope; refresh before merging)"
 
-echo "RESULT: PASS -- all checks green, 0 actionable review-body findings, reviewDecision=${review_decision:-<none>}${review_note}, 0 unresolved review threads, mergeStateStatus=${merge_state}${merge_note}, Codoki root ack ${ack_verdict}, headRefOid=${head_sha}. [#$pr $repo]"
+echo "RESULT: PASS -- all checks green, 0 actionable review-body findings, reviewDecision=${review_decision:-<none>}${review_note}, 0 unresolved review threads, mergeStateStatus=${merge_state}${merge_note}, Codoki root ack ${ack_verdict}, headRefOid=${head_sha}.${coverage_note} [#$pr $repo]"
 exit 0
