@@ -50,6 +50,12 @@ bash ${CLAUDE_PLUGIN_ROOT}/scripts/issue-watch.sh $ARGUMENTS
 
 (Pass the repo explicitly as the positional after the issue number to target a repo other than the current one; otherwise the script auto-detects it via `gh repo view`.)
 
+Pass that line DIRECTLY as the backgrounded command - no `nohup`, no trailing `&`, no output
+redirect. Wrapping a watcher that way inside a `run_in_background: true` task fires the
+completion notification on the WRAPPER and orphans the watcher's verdict in a logfile nobody
+reads, silently (#331). Same reasoning and the same measured incident as `/orchestrate:pr-watch`
+Step 2, which carries the full explanation.
+
 ## Step 2 -- Dispatch on the terminal line
 
 - **`plan-ready ...`** + Exit 0 -> vet + steer the CR Coding Plan (a consolidated `@coderabbitai <feedback>` reply on the issue), per the BINDING GATE.
