@@ -88,9 +88,9 @@ Runtime (`scripts/`; canonical source is this repo):
   [--apply]` is the consent-based path that wires the floor hook + missing allow-list entries into
   settings.json, DEPLOYS the bundled guard to the stable `~/.claude/scripts/` path (so a fresh
   plugin install has a working floor; idempotent, refreshes a stale copy, warns on a missing source),
-  DEPLOYS the 19 bundled PR-lifecycle helpers (HELPER_NAMES) the same Option-A way (#133; #234 added
+  DEPLOYS the 20 bundled PR-lifecycle helpers (HELPER_NAMES) the same Option-A way (#133; #234 added
   `gh-react.sh`, #303 added `run-paths.sh`, and the elmer front half added `cr-quota-watch.sh`,
-  `elmer-enqueue.sh` + `elmer-triage.sh` - for those two the stable path is LOAD-BEARING, since it is what keeps the
+  `elmer-enqueue.sh`, `elmer-triage.sh` + `elmer-tick.sh` - for those the stable path is LOAD-BEARING, since it is what keeps the
   unattended loop inside the existing wrapper grant instead of needing a broad `gh` one; retiring
   any claude-kit symlink, backed up to `<dest>.bak`), and (unless `--no-steer`) DEPLOYS + wires the advisory
   steering hook `orchestrate-steer.sh` for Edit/Write/Bash/Read/Agent (#95/#226/#231; doctor only ever WARNs about it),
@@ -257,6 +257,31 @@ Runtime (`scripts/`; canonical source is this repo):
   the dangerous direction. A per-PR failure is reported and skipped (one 404 must not cost the
   other four reports), and a re-run REPLACES an entry rather than leaving two rival reports for one
   PR. Read-only: composes read-only helpers + one `gh pr view`; never posts, never mutates.
+- `scripts/elmer-tick.sh` - THE ONE WRITER of the elmer loop, and the ONLY thing in the repo that
+  posts a CodeRabbit review trigger. It exists under a NARROW user-global CLAUDE.md carve-out
+  (approved 2026-07-30) which does NOT grant an agent trigger authority: it records that the
+  maintainer MECHANIZED HIS OWN trigger, delegating the TIMING to a script whose behavior is fixed
+  in reviewable code instead of per-invocation judgment. Every bound is enforced HERE, so widening
+  any of them means amending CLAUDE.md FIRST: one writer, queue-derived only, `@coderabbitai review`
+  (incremental) ONLY with `full` REFUSED at the posting site (not merely at enqueue - a hand-edited
+  entry is exactly the smuggling path), a hard posts-per-hour cap, and silence on any unrecognized
+  state. THE LOCK is a `mkdir` not an `flock` (absent from stock macOS): atomic everywhere that
+  matters and correct without a liveness probe, with a stale-age break so a tick killed before its
+  EXIT trap cannot wedge the loop forever; contention exits 0 and SILENT, because a second
+  `/elmer-loop` window is a normal thing for a human to open, not a fault. THE CAP counts
+  `drained/` records rather than a counter file (which could drift while looking authoritative) and
+  fails toward FEWER posts - an unreadable record COUNTS as a recent post, never discounted.
+  ONE entry per tick is CORRECTNESS, not throttling: CR publishes a countdown only once its limit
+  is already reached and never a remaining-slot count, so an all-clear reading means EITHER plenty
+  of budget OR one review from the wall, and batching on it would blow past that wall unseen.
+  Quota is queried BEFORE posting (whether a trigger during a limit burns the slot is UNMEASURED,
+  so the conservative order is the one that cannot be wrong) and a quota READ FAILURE never falls
+  through to a post. THE DRAIN RECORD is the idempotency mechanism, written the instant the post
+  succeeds: asking GitHub "has a review happened" would be RACY the dangerous way, since CR takes
+  minutes to post and a tick 30s later would fire again. The trigger is a FIXED literal, never
+  composed from entry data. Exit 0 for every no-op (empty queue, throttled, cap spent, lock held -
+  a timer-driven loop must not read those as failure), 1 for a refused entry (left queued), 2 for
+  any setup error including a gh/quota read failure or a drain that failed AFTER a successful post.
 - `scripts/run-paths.sh` - THE single producer of a worktree's run-artifact directory (#303),
   SOURCED (never executed). Exports `CC_RUN_ROOT`, `CC_RUN_DIR`
   (`<XDG_CACHE_HOME>/<repo-prefix>-run/<basename>-<sha12>`), and `GOLANGCI_LINT_CACHE`
@@ -347,8 +372,8 @@ clean-worktree check, so an unchanged committed tree skips re-running it
 `skills/orchestrate/templates/gates.toml.md`.
 
 ```sh
-shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/orchestrate-authorize-merge.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh scripts/base-freshness.sh scripts/open-pr-staleness-sweep.sh scripts/run-paths.sh scripts/cr-quota-watch.sh scripts/elmer-enqueue.sh scripts/elmer-triage.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
-ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py test-cr-quota-watch.py test-elmer-enqueue.py test-elmer-triage.py
+shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/orchestrate-authorize-merge.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh scripts/base-freshness.sh scripts/open-pr-staleness-sweep.sh scripts/run-paths.sh scripts/cr-quota-watch.sh scripts/elmer-enqueue.sh scripts/elmer-triage.sh scripts/elmer-tick.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
+ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py test-cr-quota-watch.py test-elmer-enqueue.py test-elmer-triage.py test-elmer-tick.py
 ./scripts/orchestrate-guard.sh --self-test    # MUST use ./ - the self-test re-invokes "$0";
                                               # `bash scripts/orchestrate-guard.sh` makes $0 a bare name -> 127
 ./scripts/orchestrate-guard.sh --assert-coverage  # #324: no deny is unreachable behind the perf
@@ -390,6 +415,7 @@ python3 test-cleanup-worktree.py
 python3 test-cr-quota-watch.py
 python3 test-elmer-enqueue.py
 python3 test-elmer-triage.py
+python3 test-elmer-tick.py
 ```
 
 ## Versioning

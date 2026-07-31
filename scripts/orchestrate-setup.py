@@ -118,7 +118,7 @@ HELPER_NAMES = (
     # "recurring ditch" that shadows the merge gate. Both are READ-ONLY toward GitHub
     # (cr-quota-watch.sh reads comments; elmer-enqueue.sh reads a PR + writes one local
     # queue entry); neither posts, and neither is a reason to widen any allow-list.
-    "cr-quota-watch.sh", "elmer-enqueue.sh", "elmer-triage.sh",
+    "cr-quota-watch.sh", "elmer-enqueue.sh", "elmer-triage.sh", "elmer-tick.sh",
 )
 # The _helper_deploy_action results that warrant an actual deploy write (vs. None / informational).
 HELPER_DEPLOY_ACTIONS = ("deploy", "refresh", "replace-symlink", "replace-broken-symlink")

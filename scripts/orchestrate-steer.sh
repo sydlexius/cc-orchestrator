@@ -207,7 +207,7 @@ is_canonical_path() {
       */scripts/pre-push-hook.sh|*/scripts/prefs-coverage.py|*/scripts/issue-watch.sh|\
       */scripts/ship-gate-preflight.sh|*/scripts/orchestrate-context-meter.sh|\
       */scripts/orchestrate-setup.py|*/scripts/orchestrate-authorize-merge.sh|\
-      */scripts/run-paths.sh|*/scripts/cr-quota-watch.sh|*/scripts/elmer-enqueue.sh|*/scripts/elmer-triage.sh)
+      */scripts/run-paths.sh|*/scripts/cr-quota-watch.sh|*/scripts/elmer-enqueue.sh|*/scripts/elmer-triage.sh|*/scripts/elmer-tick.sh)
         return 0 ;;
       */scripts/pr-*.sh|*/scripts/gh-*.sh) return 0 ;;
       */commands/*.md) return 0 ;;
