@@ -52,6 +52,16 @@ case "$TTL_HOURS" in ''|*[!0-9]*) TTL_HOURS=72 ;; esac
 # clause split), but it must NEVER reject a command the matcher would block. That direction
 # is the whole safety property, and `--assert-coverage` proves it per-vector.
 #
+# DO NOT ADD A CREDENTIAL-IN-ARGV DENY HERE (or to orchestrate-steer.sh). Three attempts
+# have failed BY MEASUREMENT against a real 5,358-rule corpus holding 14 real secrets:
+# value-detection reached 14/14 recall only with 18 false positives (including flagging the
+# very remedy it recommends), and blessed-absence caught 4/14 and 0/10 on the DOMINANT
+# carrier. Both directions are unbounded for the same reason - the dominant carrier hands a
+# secret to an ARBITRARY program (`ENV=value nohup ./svc`), so neither "is this a secret"
+# nor "which tools take credentials" is a closed set. Do not build a third; see #350 and
+# DESIGN-deterministic-floor.md. Detection (#349) and storage-side redaction (#326) are the
+# live directions.
+#
 # ADDING A DENY: declare its fragment here, add it to _PREFILTER_PARTS below, and add a
 # BLOCK vector to `--assert-coverage` plus `test-orchestrate-guard.py`. assert-coverage fails
 # loudly if a BLOCK vector cannot clear the short-circuit, so a forgotten fragment can no
@@ -59,6 +69,11 @@ case "$TTL_HOURS" in ''|*[!0-9]*) TTL_HOURS=72 ;; esac
 _PF_PUSH='push'                     # is_push (git push + safe-push, incl. main/force denies)
 _PF_NO_VERIFY='--no-verify'         # has_no_verify (git hook-skip)
 _PF_ADMIN='--admin'                 # is_gh_admin (branch-protection bypass)
+# has_signing_bypass (#333). TWO spellings, so the fragment is an alternation: the flag,
+# and the config knob that disables signing for one call. Deliberately WEAKER than the
+# matcher (it admits `gpgsign=true`, which the matcher then rejects) - weaker is the safe
+# direction, since over-admitting only costs a wasted clause split.
+_PF_SIGN_BYPASS='(--no-gpg-sign|commit\.gpgsign)'
 _PF_GH_GIT='(^|[^[:alnum:]_-])(gh|git)([[:space:]]|$)'   # is_git / is_merge_api / is_pr_merge
 
 # The derived union. One `grep -Eq` at run time, exactly as before: these are concatenated
@@ -66,6 +81,7 @@ _PF_GH_GIT='(^|[^[:alnum:]_-])(gh|git)([[:space:]]|$)'   # is_git / is_merge_api
 _PREFILTER_PARTS="$_PF_PUSH"
 _PREFILTER_PARTS="$_PREFILTER_PARTS|$_PF_NO_VERIFY"
 _PREFILTER_PARTS="$_PREFILTER_PARTS|$_PF_ADMIN"
+_PREFILTER_PARTS="$_PREFILTER_PARTS|$_PF_SIGN_BYPASS"
 _PREFILTER_PARTS="$_PREFILTER_PARTS|$_PF_GH_GIT"
 
 # --- self-test: `orchestrate-guard.sh --self-test` feeds a known Tier-1 block
@@ -115,6 +131,8 @@ if [ "${1:-}" = "--assert-coverage" ]; then
 push-force|git push --force origin feat
 safe-push-main|scripts/safe-push.sh main
 git-no-verify|git commit --no-verify -m x
+git-sign-bypass-flag|git commit --no-gpg-sign -m x
+git-sign-bypass-config|git -c commit.gpgsign=false commit -m x
 gh-admin|gh pr merge 1 --admin
 merge-by-api|gh api -X PUT repos/o/r/pulls/1/merge
 pr-merge-cli|gh pr merge 1 --squash"
@@ -182,6 +200,7 @@ AC_EOF
   ac_frags="_PF_PUSH|$_PF_PUSH
 _PF_NO_VERIFY|$_PF_NO_VERIFY
 _PF_ADMIN|$_PF_ADMIN
+_PF_SIGN_BYPASS|$_PF_SIGN_BYPASS
 _PF_GH_GIT|$_PF_GH_GIT"
   while IFS='|' read -r ac_frag_name ac_frag; do
     [ -n "$ac_frag_name" ] || continue
@@ -193,12 +212,15 @@ _PF_GH_GIT|$_PF_GH_GIT"
     #                   by _PF_GH_GIT.
     #   _PF_ADMIN     - `is_gh_admin` is anchored on `gh ... pr ... merge`, so a blockable
     #                   command ALWAYS carries the `gh` word, likewise already admitted.
+    #   _PF_SIGN_BYPASS - same shape as _PF_NO_VERIFY: its deny is
+    #                   `is_git && has_signing_bypass && has_noverify_subcmd`, so a blockable
+    #                   command ALWAYS carries the `git` word (#333).
     # They are kept because they are free (one alternation branch, no extra process) and they
     # keep each deny's trigger self-documenting at its declaration site. If either matcher is
     # ever loosened to fire WITHOUT a gh/git word, its fragment stops being redundant and must
     # move out of this list and gain an isolating vector.
     case "$ac_frag_name" in
-      _PF_NO_VERIFY|_PF_ADMIN) continue ;;
+      _PF_NO_VERIFY|_PF_ADMIN|_PF_SIGN_BYPASS) continue ;;
     esac
     ac_sole=0
     while IFS='|' read -r ac_label ac_cmd; do
@@ -380,8 +402,20 @@ has_main_dest() {
 has_bare_force() {
   printf '%s' "$cmd" | grep -Eq '(^|[[:space:]])(--force([[:space:]]|$)|-f([[:space:]]|$))'
 }
+# QUOTE-TOLERANT BOUNDARIES. A shell-quoted flag (`git commit "--no-verify"`) is the
+# SAME command once the shell strips the quotes, but a whitespace-only boundary does not
+# match it, so the deny was escapable by adding two characters. Found by CodeRabbit on
+# #359 against the new signing-bypass deny, and verified to affect this PRE-EXISTING
+# --no-verify deny identically - so both are fixed together rather than leaving a known
+# hole in the older one. The `'"` in the class is the same technique has_main_dest above
+# already uses for the same reason; it is not new machinery.
+#
+# This does NOT claim to defeat quoting generally - `--no''-verify` and `$(printf ...)`
+# still evade, and adversarial evasion remains explicitly out of the threat model (F30 /
+# DESIGN). It closes the ACCIDENTAL and one-keystroke-deliberate spellings an honest
+# operator actually types, which is what this floor is for.
 has_no_verify() {
-  printf '%s' "$cmd" | grep -Eq '(^|[[:space:]])--no-verify([[:space:]]|$)'
+  printf '%s' "$cmd" | grep -Eq '(^|[[:space:]'\''"])--no-verify([[:space:]'\''"]|$)'
 }
 # A git subcommand that ACTUALLY accepts `--no-verify` (the flag is a real hook-skip
 # only on these: commit/push/merge/rebase/cherry-pick/am/revert; pull forwards to
@@ -395,6 +429,30 @@ has_no_verify() {
 # between `git` and the subcommand (`git -C <dir> commit ...`) via the loose word match.
 has_noverify_subcmd() {
   printf '%s' "$cmd" | grep -Eq '(^|[[:space:]])(commit|push|merge|rebase|cherry-pick|am|revert|pull)([[:space:]]|$)'
+}
+# Commit-signing bypass (#333): `--no-gpg-sign`, or `-c commit.gpgsign=<false-ish>`.
+# SAME argument as the --no-verify deny - both silence a gate to keep moving - and the
+# same SUBCOMMAND anchoring, so `gh issue create --title "ban --no-gpg-sign in git ..."`
+# carries both words yet runs no signing-bearing subcommand and is ALLOWED.
+#
+# THE CONFIG LEG MATCHES ONLY THE DISABLING VALUE. `gpgsign=true` must pass: a command
+# that ENABLES signing is the opposite of the act being denied, and denying it would be
+# both wrong and a training signal that the override means "dismiss". git's boolean
+# parser accepts false/no/off/0 (case-insensitively) and an EMPTY value as false, so all
+# are matched; `[[:space:]]*=[[:space:]]*` tolerates spacing around the `=`.
+#
+# Deny-on-doubt does NOT apply to the enabling form: this is a POSITIVE match on a
+# disabling spelling, not an inference from absence, so an unrecognized value simply
+# does not match and the command is allowed. That is the correct direction - a novel
+# spelling of "disable" is a gap to close with a case, never a reason to block signing.
+# Boundaries are QUOTE-TOLERANT for the reason documented on has_no_verify above:
+# `git commit "--no-gpg-sign"` and `git -c 'commit.gpgsign=false' commit` are the same
+# commands after the shell strips the quotes, and a whitespace-only boundary let both
+# through (CR, #359). The config leg needs the quote on BOTH sides - the opening quote
+# may precede `commit.gpgsign` and the closing one may follow the value.
+has_signing_bypass() {
+  printf '%s' "$cmd" | grep -Eq -e '(^|[[:space:]'\''"])--no-gpg-sign([[:space:]'\''"]|$)' \
+    -e '(^|[[:space:]'\''"])commit\.gpgsign[[:space:]]*=[[:space:]]*([Ff][Aa][Ll][Ss][Ee]|[Nn][Oo]|[Oo][Ff][Ff]|0)?([[:space:]'\''"]|$)'
 }
 # A `git` INVOCATION anywhere in the clause: the bare word `git` at a word boundary
 # (start, or preceded by a non-[alnum_-] char) followed by whitespace or end-of-clause.
@@ -767,6 +825,10 @@ if [ "$_pf_rc" -ne 1 ]; then
     fi
     if is_git && has_no_verify && has_noverify_subcmd; then
       echo "BLOCKED: refusing 'git ... --no-verify'. It skips git hooks (pre-commit/commit-msg/pre-push); fix the hook failure rather than bypassing it." >&2
+      exit 2
+    fi
+    if is_git && has_signing_bypass && has_noverify_subcmd; then
+      echo "BLOCKED: refusing to disable commit signing. An unsigned commit passes locally and then blocks the PR at a required_signatures gate, where the only fix is a history rewrite + force-push that orphans every cited fix SHA. Commit signed (the default); if signing is genuinely broken, fix the signer rather than bypassing it." >&2
       exit 2
     fi
     if is_gh_admin; then
