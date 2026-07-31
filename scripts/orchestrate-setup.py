@@ -313,11 +313,50 @@ def _guard_deploy_action():
     return None
 
 
+def _backup_before_overwrite(dest):
+    """Preserve `dest` at <dest>.bak before it is overwritten (#292). Returns (ok, err_or_None).
+
+    ONE implementation for every deploy path. The guard and the helpers previously would have
+    needed the same eight lines twice, and two copies of a safety net drift - which is the exact
+    defect class #292 is about, so duplicating it here would be self-defeating.
+
+    VERIFY, DO NOT CLASSIFY (the #337 pattern). `shutil.copy2(src, dir)` does NOT raise when the
+    destination is a DIRECTORY - it copies INTO it, so the bytes land at <dest>.bak/<name> while
+    the caller believes <dest>.bak holds them and proceeds to overwrite the original. A bare
+    try/except therefore reports a backup that does not exist. So: reject a directory up front,
+    and confirm a regular file is actually there afterward."""
+    bak = dest + ".bak"
+    try:
+        if os.path.isdir(bak):
+            return False, f"{bak} is a directory"
+        shutil.copy2(dest, bak)
+        if not os.path.isfile(bak):
+            return False, f"{bak} missing after copy"
+    except OSError as e:
+        return False, str(e)
+    return True, None
+
+
 def _deploy_guard():
     """Copy the bundled guard to the stable GUARD path and ensure it is executable. The caller has
     already gated on --apply + consent. Returns (ok: bool, message: str)."""
     try:
         os.makedirs(os.path.dirname(GUARD), exist_ok=True)
+        # BACK UP AN EXISTING DEPLOYED GUARD FIRST (#292; CR flagged the omission on #359). The
+        # staleness check is direction-blind, so a refresh can overwrite a deployed guard that is
+        # AHEAD of the bundle - and for the guard specifically that means silently deleting a
+        # floor DENY that is actively protecting this machine (#327 is exactly that case). The
+        # doctor WARN tells operators this can happen; leaving the deploy path itself unbacked
+        # would make that warning the only mitigation, which is not one.
+        # islink, not exists: a symlink dest is MOVED aside (never followed), matching
+        # _deploy_helper's claude-kit retirement, so the backup preserves the link itself.
+        if os.path.islink(GUARD):
+            os.replace(GUARD, GUARD + ".bak")
+        elif os.path.isfile(GUARD):
+            ok, err = _backup_before_overwrite(GUARD)
+            if not ok:
+                return False, (f"could not back up the deployed guard at {GUARD} ({err}); "
+                               f"refusing to replace it unbacked")
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(GUARD), prefix=".orch-guard-")
         os.close(fd)
         try:
@@ -646,17 +685,11 @@ def _deploy_helper(name):
             # code believes <dest>.bak holds them. A bare try/except therefore reports a backup
             # that does not exist and proceeds to overwrite the original. Caught by the harness
             # only after the assertion was tightened; the earlier `A or B` form could not fail.
-            bak = dest + ".bak"
-            try:
-                if os.path.isdir(bak):
-                    raise IsADirectoryError(f"{bak} is a directory")
-                shutil.copy2(dest, bak)
-                if not os.path.isfile(bak):
-                    raise OSError(f"{bak} missing after copy")
-            except OSError as e:
+            ok, err = _backup_before_overwrite(dest)
+            if not ok:
                 # A backup that cannot be written must not silently proceed to the overwrite.
                 return False, (f"helper {name}: could not back up {dest} before overwriting it "
-                               f"({e}); refusing to replace it unbacked")
+                               f"({err}); refusing to replace it unbacked")
         fd, tmp = tempfile.mkstemp(dir=SCRIPTS_DIR, prefix=".orch-helper-")
         os.close(fd)
         try:

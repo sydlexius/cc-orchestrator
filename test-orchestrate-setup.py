@@ -989,6 +989,25 @@ def main():
         rc, out = run(["configure", "--apply", "--yes"], env_overrides=cov)
         check("#30: configure --apply REFRESHES a stale deployed guard back to the bundle",
               open(cdest, "rb").read() == open(cbundle, "rb").read())
+        # #292 (CR finding on #359): the OVERWRITTEN guard must survive at <dest>.bak. This is the
+        # highest-stakes instance of the direction-blind refresh - the deployed guard can carry a
+        # floor DENY the bundle lacks (#327), so a blind refresh silently DELETES active protection.
+        # Without this, the doctor WARN about that risk is the only mitigation, and a warning is not
+        # a mitigation.
+        _gbak = cdest + ".bak"
+        check("#292: refreshing the deployed guard BACKS IT UP (a deployed-only deny stays recoverable)",
+              os.path.isfile(_gbak) and "drifted" in open(_gbak).read())
+        # And a backup that cannot be written must ABORT the refresh, leaving the deployed guard
+        # intact. Forced with a DIRECTORY at <dest>.bak: shutil.copy2 does not raise there, it
+        # copies INTO it - so this also proves the verify-don't-classify check is load-bearing.
+        open(cdest, "w").write("#!/bin/sh\nexit 1\n# drifted a third time\n")
+        os.remove(_gbak); os.makedirs(_gbak)
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=cov)
+        check("#292: a failed guard backup REFUSES the refresh (deployed guard intact)",
+              "drifted a third time" in open(cdest).read())
+        check("#292: the guard-backup refusal is REPORTED, not silent",
+              "refusing to replace it unbacked" in out or "could not back up" in out)
+        shutil.rmtree(_gbak)
         # #30: a MISSING bundled source warns (does not crash); the rest of configure still runs.
         covms = dict(cov); covms["ORCHESTRATE_BUNDLED_GUARD"] = os.path.join(td, "does-not-exist.sh")
         rc, out = run(["configure", "--apply", "--yes"], env_overrides=covms)

@@ -392,8 +392,20 @@ has_main_dest() {
 has_bare_force() {
   printf '%s' "$cmd" | grep -Eq '(^|[[:space:]])(--force([[:space:]]|$)|-f([[:space:]]|$))'
 }
+# QUOTE-TOLERANT BOUNDARIES. A shell-quoted flag (`git commit "--no-verify"`) is the
+# SAME command once the shell strips the quotes, but a whitespace-only boundary does not
+# match it, so the deny was escapable by adding two characters. Found by CodeRabbit on
+# #359 against the new signing-bypass deny, and verified to affect this PRE-EXISTING
+# --no-verify deny identically - so both are fixed together rather than leaving a known
+# hole in the older one. The `'"` in the class is the same technique has_main_dest above
+# already uses for the same reason; it is not new machinery.
+#
+# This does NOT claim to defeat quoting generally - `--no''-verify` and `$(printf ...)`
+# still evade, and adversarial evasion remains explicitly out of the threat model (F30 /
+# DESIGN). It closes the ACCIDENTAL and one-keystroke-deliberate spellings an honest
+# operator actually types, which is what this floor is for.
 has_no_verify() {
-  printf '%s' "$cmd" | grep -Eq '(^|[[:space:]])--no-verify([[:space:]]|$)'
+  printf '%s' "$cmd" | grep -Eq '(^|[[:space:]'\''"])--no-verify([[:space:]'\''"]|$)'
 }
 # A git subcommand that ACTUALLY accepts `--no-verify` (the flag is a real hook-skip
 # only on these: commit/push/merge/rebase/cherry-pick/am/revert; pull forwards to
@@ -423,9 +435,14 @@ has_noverify_subcmd() {
 # disabling spelling, not an inference from absence, so an unrecognized value simply
 # does not match and the command is allowed. That is the correct direction - a novel
 # spelling of "disable" is a gap to close with a case, never a reason to block signing.
+# Boundaries are QUOTE-TOLERANT for the reason documented on has_no_verify above:
+# `git commit "--no-gpg-sign"` and `git -c 'commit.gpgsign=false' commit` are the same
+# commands after the shell strips the quotes, and a whitespace-only boundary let both
+# through (CR, #359). The config leg needs the quote on BOTH sides - the opening quote
+# may precede `commit.gpgsign` and the closing one may follow the value.
 has_signing_bypass() {
-  printf '%s' "$cmd" | grep -Eq -e '(^|[[:space:]])--no-gpg-sign([[:space:]]|$)' \
-    -e '(^|[[:space:]])commit\.gpgsign[[:space:]]*=[[:space:]]*([Ff][Aa][Ll][Ss][Ee]|[Nn][Oo]|[Oo][Ff][Ff]|0)?([[:space:]]|$)'
+  printf '%s' "$cmd" | grep -Eq -e '(^|[[:space:]'\''"])--no-gpg-sign([[:space:]'\''"]|$)' \
+    -e '(^|[[:space:]'\''"])commit\.gpgsign[[:space:]]*=[[:space:]]*([Ff][Aa][Ll][Ss][Ee]|[Nn][Oo]|[Oo][Ff][Ff]|0)?([[:space:]'\''"]|$)'
 }
 # A `git` INVOCATION anywhere in the clause: the bare word `git` at a word boundary
 # (start, or preceded by a non-[alnum_-] char) followed by whitespace or end-of-clause.
