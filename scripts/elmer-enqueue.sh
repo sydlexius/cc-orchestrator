@@ -234,7 +234,15 @@ fi
 ELMER_HOME="${ELMER_HOME:-$HOME/.claude/elmer}"
 inbox="$ELMER_HOME/inbox"
 drained="$ELMER_HOME/drained"
-mkdir -p "$inbox" "$drained"
+# EXPLICIT, not left to `set -e`. An unwritable ELMER_HOME (a read-only $HOME, a
+# stale symlink, a full disk) is a SETUP ERROR and owes the caller the same labeled
+# refusal every other failure here prints. Bare `set -e` would exit 1 - the code the
+# contract reserves for "REFUSED, entry left queued" - silently, sending the operator
+# to look for a refusal reason that does not exist.
+mkdir -p "$inbox" "$drained" || {
+  { echo "setup error: cannot create the elmer maildir under $ELMER_HOME"; } >&2 || true
+  exit 2
+}
 
 slug="$(printf '%s' "$repo" | tr '/' '-')"
 entry="${slug}--${pr}--${r_commit:0:12}.json"

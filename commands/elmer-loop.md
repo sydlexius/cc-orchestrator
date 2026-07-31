@@ -89,14 +89,21 @@ if [ -f scripts/cr-quota-watch.sh ]; then QW=scripts/cr-quota-watch.sh
 elif [ -f "$HOME/.claude/scripts/cr-quota-watch.sh" ]; then QW="$HOME/.claude/scripts/cr-quota-watch.sh"
 fi
 PR_FOR_QUOTA="${PR_FOR_QUOTA:?set to a PR number from the queue (ls the inbox; entries are named <repo-slug>--<pr>--<sha12>.json)}"
-[ -n "$QW" ] && bash "$QW" "$PR_FOR_QUOTA"
+QUOTA_RC=0
+if [ -n "$QW" ]; then bash "$QW" "$PR_FOR_QUOTA" || QUOTA_RC=$?; fi
+echo "quota rc=$QUOTA_RC"
 ```
 
 `PR_FOR_QUOTA` is a `:?` guard, not a `<a-PR#>` placeholder: a bare `<...>` is a shell
-REDIRECTION, so that form is a `bash -n` parse error and the whole call dies before the `|| true`
-could ever run. It is not hardcoded either - an unattended loop pinned to one PR number would poll
-a stale PR forever. The `|| true` is deliberately absent from the guard line so a missing value
-fails loudly instead of being swallowed.
+REDIRECTION, so that form is a `bash -n` parse error and the whole block dies before anything
+below it could run. It is not hardcoded either - an unattended loop pinned to one PR number would
+poll a stale PR forever. Nothing swallows the guard, so a missing value fails loudly.
+
+The quota call's status is CAPTURED into `QUOTA_RC` rather than left as the block's own status.
+Exit 1 here is the EXPECTED "limited" reading and the whole reason to call the oracle, so letting
+it become the block's failure status would make the normal path look like a fault (and abort it
+under a caller running `set -e`). The missing-PR guard still fails loudly - the capture is scoped
+to the helper call alone.
 
 Exit 1 means limited, and the output carries the remaining time plus a Pacific-labeled deadline.
 Exit 0 means no announced limit.

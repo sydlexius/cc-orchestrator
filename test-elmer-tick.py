@@ -665,14 +665,13 @@ def _(env):
     # recovery never fires and the loop wedges permanently and silently. Verified
     # empirically with GNU coreutils' gstat on this machine.
     src = open(SCRIPT).read()
-    for probe in ("%m", "%i"):
-        gnu = "%Y" if probe == "%m" else "%i"
-        bsd_first = f'stat -f {probe} "$LOCK_DIR" 2>/dev/null || stat -c {gnu}'
-        check(f"stat -f {probe} is NOT the first probe", bsd_first not in src)
+    for target in ('"$LOCK_DIR"', '"$d"'):
+        bsd_first = f'stat -f %m {target} 2>/dev/null || stat -c %Y'
+        check(f"stat -f %m is NOT the first probe for {target}", bsd_first not in src)
     check("mtime probe is GNU-first",
           'stat -c %Y "$LOCK_DIR" 2>/dev/null || stat -f %m "$LOCK_DIR"' in src)
-    check("inode probe is GNU-first",
-          'stat -c %i "$LOCK_DIR" 2>/dev/null || stat -f %i "$LOCK_DIR"' in src)
+    check("breaker-lock age probe is GNU-first",
+          'stat -c %Y "$d" 2>/dev/null || stat -f %m "$d"' in src)
 
 
 @case("stale-lock recovery works when only a GNU-style stat is on PATH")
@@ -682,14 +681,20 @@ def _(env):
     # prints filesystem info to STDOUT at rc=1). Under the BSD-first order the age
     # read captures that garbage, the arithmetic dies, and the stale lock is never
     # broken. Under GNU-first the first probe succeeds and recovery fires.
+    # THE METADATA COMES FROM PYTHON's os.stat, NOT from any system `stat`. The shim
+    # previously delegated `-c %Y`/`-c %i` to `/usr/bin/stat -f %m`/`-f %i`, which is a
+    # BSD-ONLY idiom: on Linux the system stat is ALREADY GNU, `-f` is --file-system, and
+    # those branches returned filesystem info instead of an mtime/inode. The shim broke
+    # itself on the one platform it exists to simulate, so this case failed on ubuntu and
+    # passed on macOS - the exact inversion of what it is for. os.stat is correct on both.
     gnu_stat = (
         "#!/usr/bin/env bash\n"
         "# GNU-coreutils-shaped stat: -c works; -f is --file-system and prints to STDOUT.\n"
         "if [ \"$1\" = \"-c\" ]; then\n"
         "  fmt=\"$2\"; shift 2\n"
         "  case \"$fmt\" in\n"
-        "    %Y) /usr/bin/stat -f %m \"$@\" ;;\n"
-        "    %i) /usr/bin/stat -f %i \"$@\" ;;\n"
+        "    %Y) exec python3 -c 'import os,sys; print(int(os.stat(sys.argv[1]).st_mtime))' \"$1\" ;;\n"
+        "    %i) exec python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_ino)' \"$1\" ;;\n"
         "    *) exit 1 ;;\n"
         "  esac\n"
         "  exit $?\n"
@@ -747,11 +752,16 @@ def _(env):
     # START/END timestamp and holds the critical section for a real interval; the
     # assertion is that no two of those intervals overlap.
     #
-    # This case is what separates the identity-checked break from a merely ATOMIC
-    # one. `mv` succeeds for one racer at a time but does not verify WHICH directory
-    # it moved, so a tick that read the old lock's age can break a FRESH lock the
-    # winner already installed. Reverting the inode check (or going back to
-    # rmdir+mkdir) makes overlaps appear here.
+    # This case is what separates the SERIALIZED break from a merely atomic one, and
+    # from the identity-checked break that preceded it. `mv` succeeds for one racer at
+    # a time but does not verify WHICH directory it moved, so a tick that read the old
+    # lock's age can break a FRESH lock the winner already installed. An inode check
+    # BEFORE the mv does not fix that - the swap happens in the gap between the check
+    # and the mv - which is why the break is now serialized by its own breaker lock.
+    # MEASURED, not assumed: the identity-checked form failed 3 of 8 trials on Linux
+    # (and passed on macOS, whose window is narrower); the serialized form passed 8 of
+    # 8; and disabling the breaker lock puts the failures back, 5 of 6. Reverting to
+    # either earlier form makes overlaps appear here.
     ilog = os.path.join(env.tmp, "intervals")
     open(ilog, "w").close()
 

@@ -69,6 +69,8 @@ jobs:
             scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh
             scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh
             scripts/safe-push.sh scripts/pre-push-hook.sh
+            scripts/cr-quota-watch.sh scripts/elmer-enqueue.sh scripts/elmer-triage.sh
+            scripts/elmer-tick.sh
           )
           docker run --rm -v "$GITHUB_WORKSPACE:/mnt" -w /mnt \
             koalaman/shellcheck@sha256:b9389b73c8f26f710a7171cb7d8848a34a9c1e07a7865e727c9ec4ce99f9a83f \
@@ -76,7 +78,7 @@ jobs:
 
       - name: ruff (F,E741)
         if: runner.os == 'Linux'
-        run: ruff check --select F,E741 scripts/orchestrate-resources.py scripts/orchestrate-setup.py scripts/planner_classify.py scripts/gate-runner.py test-orchestrate-guard.py test-orchestrate-steer.py test-orchestrate-resources.py test-orchestrate-setup.py test-orchestrate-feedback.py test-planner-classify.py test-gh-wrappers.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py
+        run: ruff check --select F,E741 scripts/orchestrate-resources.py scripts/orchestrate-setup.py scripts/planner_classify.py scripts/gate-runner.py test-orchestrate-guard.py test-orchestrate-steer.py test-orchestrate-resources.py test-orchestrate-setup.py test-orchestrate-feedback.py test-planner-classify.py test-gh-wrappers.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-version-lockstep.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-cr-quota-watch.py test-elmer-enqueue.py test-elmer-triage.py test-elmer-tick.py
 
       # Platform-sensitive: run on BOTH macOS (BSD stat) and Linux (GNU stat).
       # Must invoke via ./ so the self-test's "$0" re-invocation resolves
@@ -173,6 +175,9 @@ jobs:
       # them. Every dependency (gh, the quota helper, the composed read-only helpers)
       # is stubbed via PATH/$ELMER_* and the maildir is a temp dir, so nothing here
       # touches the network or the real queue.
+      - name: harness - cr-quota-watch
+        run: python3 test-cr-quota-watch.py
+
       - name: harness - elmer-enqueue
         run: python3 test-elmer-enqueue.py
 
