@@ -148,6 +148,22 @@ class Env:
                               capture_output=True, text=True, env=self._env(env),
                               timeout=120)
 
+    def run_args_stdout_closed(self, *args, **env):
+        """run_stdout_closed, but with ARGUMENTS -- for the `-h` and bad-arg paths.
+
+        Those two exit before the queue is ever read, so they need their own runner
+        rather than a flag on the standard one.
+        """
+        return subprocess.run(["bash", "-c", 'exec "$@" >&-', "sh", self.script, *args],
+                              capture_output=True, text=True, env=self._env(env),
+                              timeout=120)
+
+    def run_args_stderr_closed(self, *args, **env):
+        """The stderr twin of run_args_stdout_closed."""
+        return subprocess.run(["bash", "-c", 'exec "$@" 2>&-', "sh", self.script, *args],
+                              capture_output=True, text=True, env=self._env(env),
+                              timeout=120)
+
     def run_stderr_closed(self, **env):
         """Run the tick with fd 2 CLOSED -- the STDERR twin of run_stdout_closed.
 
@@ -797,6 +813,314 @@ def _(env):
     check("exit 0", r.returncode == 0)
     check("still says queue empty", "queue empty" in r.stdout)
     check("posted nothing", env.posts == [])
+
+
+# --- THE WHOLE-FILE SWEEP: no write anywhere may change the exit status -------------
+#
+# The three rounds before this one each guarded ONE write site and each left another
+# unguarded, because the file was being fixed instance-by-instance. The cases below
+# assert the CLASS instead: every contractually-0 no-op keeps its 0 with stdout
+# closed, and every deliberate exit 2 keeps its 2 with stderr closed. A future write
+# added without the `{ ... } || true` template fails here regardless of which path it
+# sits on.
+#
+# WHY EACH FD PAIRS WITH ITS OWN SET: the no-op lines are STDOUT writes (the tick's
+# normal report), so only a closed fd 1 can break them; the setup-error messages are
+# STDERR writes, so only a closed fd 2 can. Testing a path against the wrong fd
+# exercises a write that cannot fail and proves nothing - which is exactly how the
+# earlier suite passed while `report_queue_health` sat unguarded.
+
+@case("stdout closed: an EMPTY QUEUE still exits 0, never a phantom refusal")
+def _(env):
+    # `echo "elmer-tick: queue empty..."` was bare on a contractually-0 path, so a
+    # timer loop with a rotated log turned the most common outcome in the whole system
+    # into rc=1 - "an entry was refused" for a queue with nothing in it at all.
+    r = env.run_stdout_closed()
+    check(f"rc is NOT 1 (got {r.returncode})", r.returncode != 1)
+    check("rc is 0", r.returncode == 0)
+    check("posted nothing", env.posts == [])
+
+
+@case("stdout closed: the CAP-REACHED no-op still exits 0")
+def _(env):
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for i in range(4):
+        env.drain_record(f"old-{i}.json", now)
+    env.queue(354)
+    r = env.run_stdout_closed()
+    check(f"rc is NOT 1 (got {r.returncode})", r.returncode != 1)
+    check("rc is 0", r.returncode == 0)
+    check("posted nothing", env.posts == [])
+    check("entry left queued", env.ls("inbox") == ["e-354.json"])
+
+
+@case("stdout closed: the THROTTLED no-op still exits 0")
+def _(env):
+    env.queue(354)
+    r = env.run_stdout_closed(GH_QUOTA=1)
+    check(f"rc is NOT 1 (got {r.returncode})", r.returncode != 1)
+    check("rc is 0", r.returncode == 0)
+    check("posted nothing", env.posts == [])
+    check("entry left queued", env.ls("inbox") == ["e-354.json"])
+
+
+@case("stdout closed: the DRY RUN still exits 0")
+def _(env):
+    env.queue(354)
+    r = env.run_stdout_closed(ELMER_DRY_RUN=1)
+    check(f"rc is NOT 1 (got {r.returncode})", r.returncode != 1)
+    check("rc is 0", r.returncode == 0)
+    check("posted nothing", env.posts == [])
+    check("entry left queued", env.ls("inbox") == ["e-354.json"])
+
+
+@case("stdout closed: the ALL-STALE no-op still exits 0")
+def _(env):
+    # The other arm of the same `if`: a guard applied to only one branch would pass
+    # the empty-queue case above and still fail here.
+    env.queue(354)
+    env.drain_record("e-354.json", "2020-01-01T00:00:00Z")
+    r = env.run_stdout_closed()
+    check(f"rc is NOT 1 (got {r.returncode})", r.returncode != 1)
+    check("rc is 0", r.returncode == 0)
+    check("posted nothing", env.posts == [])
+
+
+@case("stdout closed: `-h` still exits 0 (help is not a setup error)")
+def _(env):
+    # The awk that prints the header block exits 2 on a write error, so an unguarded
+    # `-h` with stdout closed reported a SETUP ERROR for a request it serviced fine.
+    r = env.run_args_stdout_closed("-h")
+    check(f"rc is 0 (got {r.returncode})", r.returncode == 0)
+
+
+@case("stderr closed: a gh READ FAILURE still exits 2, never a downgrade to 1")
+def _(env):
+    # THE WORST DIRECTION IN THE WHOLE CONTRACT. 2 means "setup error, the loop is
+    # broken"; 1 means "an entry was refused, hand it back to the TL". With fd 2
+    # closed, `set -e` on the bare `echo` ahead of the `exit 2` made every genuine
+    # setup error indistinguishable from a refusal, so the operator re-queues an entry
+    # while the actual fault - an unreadable GitHub - goes unreported.
+    env.queue(354)
+    r = env.run_stderr_closed(GH_FAIL=1)
+    check(f"rc is NOT 1 (got {r.returncode})", r.returncode != 1)
+    check("rc is 2", r.returncode == 2)
+    check("posted nothing", env.posts == [])
+    check("entry left queued", env.ls("inbox") == ["e-354.json"])
+
+
+@case("stderr closed: a QUOTA read failure still exits 2")
+def _(env):
+    env.queue(354)
+    r = env.run_stderr_closed(GH_QUOTA=2)
+    check(f"rc is NOT 1 (got {r.returncode})", r.returncode != 1)
+    check("rc is 2", r.returncode == 2)
+    check("posted nothing", env.posts == [])
+
+
+@case("stderr closed: a POST failure still exits 2")
+def _(env):
+    env.queue(354)
+    r = env.run_stderr_closed(GH_POST_FAIL=1)
+    check(f"rc is NOT 1 (got {r.returncode})", r.returncode != 1)
+    check("rc is 2", r.returncode == 2)
+    check("nothing drained", env.ls("drained") == [])
+    check("entry left queued", env.ls("inbox") == ["e-354.json"])
+
+
+@case("stderr closed: a broken jq still exits 2 (the earliest exit-2 site)")
+def _(env):
+    # The jq probe fires before ANYTHING else, so it is the one exit-2 site no other
+    # case can reach; a sweep that missed it would be invisible to every test above.
+    env.queue(354)
+    Env._write(os.path.join(env.bin, "jq"), "#!/usr/bin/env bash\nexit 127\n")
+    r = env.run_stderr_closed()
+    check(f"rc is NOT 1 (got {r.returncode})", r.returncode != 1)
+    check("rc is 2", r.returncode == 2)
+    check("posted nothing", env.posts == [])
+
+
+@case("stderr closed: a failing mktemp still exits 2")
+def _(env):
+    Env._write(os.path.join(env.bin, "mktemp"), "#!/usr/bin/env bash\nexit 1\n")
+    env.queue(354)
+    r = env.run_stderr_closed()
+    check(f"rc is NOT 1 (got {r.returncode})", r.returncode != 1)
+    check("rc is 2", r.returncode == 2)
+    check("posted nothing", env.posts == [])
+
+
+@case("stderr closed: a bad ARGUMENT still exits 2")
+def _(env):
+    r = env.run_args_stderr_closed("354")
+    check(f"rc is NOT 1 (got {r.returncode})", r.returncode != 1)
+    check("rc is 2", r.returncode == 2)
+
+
+@case("stderr closed: the REFUSALS keep their 1 (guarding must not move them either)")
+def _(env):
+    # The sweep guards refusal sites too, and a guard that changed a 1 into something
+    # else would be as much a defect as the 2-to-1 downgrade. Asserted on all three
+    # stderr-reporting refusal paths.
+    env.queue(354)
+    r = env.run_stderr_closed(GH_HEAD=OTHER_SHA)
+    check(f"stale head still rc=1 (got {r.returncode})", r.returncode == 1)
+    check("posted nothing", env.posts == [])
+
+
+@case("stderr closed: a CLOSED PR and a FULL form keep their 1")
+def _(env):
+    env.queue(354)
+    r = env.run_stderr_closed(GH_STATE="MERGED")
+    check(f"closed PR still rc=1 (got {r.returncode})", r.returncode == 1)
+    check("posted nothing", env.posts == [])
+
+
+@case("stderr closed: form=full keeps its 1")
+def _(env):
+    env.queue(354, form="full")
+    r = env.run_stderr_closed()
+    check(f"full form still rc=1 (got {r.returncode})", r.returncode == 1)
+    check("posted nothing", env.posts == [])
+
+
+@case("stderr closed: an already-reviewed head keeps its 1")
+def _(env):
+    env.queue(354)
+    r = env.run_stderr_closed(GH_REVIEWS=json.dumps([review(SHA)]))
+    check(f"already reviewed still rc=1 (got {r.returncode})", r.returncode == 1)
+    check("posted nothing", env.posts == [])
+
+
+# --- OVER-HARDENING: the guard must not be a mute -----------------------------------
+#
+# `{ ... } >&2 || true` is one careless edit from `{ ... } >/dev/null`, and BOTH make
+# every rc assertion above pass while the second silently discards the report. Losing
+# the output would be a worse defect than the rc=1 being fixed, so every guarded group
+# gets a matching case asserting the message STILL LANDS on a working fd. These are
+# the counterweight to the closed-fd cases and must be read as a pair with them.
+
+@case("over-hardening: the no-op stdout lines are still PRINTED on a working fd")
+def _(env):
+    r = env.run()
+    check("empty-queue line printed", "queue empty" in r.stdout)
+    check("exit 0", r.returncode == 0)
+
+
+@case("over-hardening: the CAP line is still printed")
+def _(env):
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for i in range(4):
+        env.drain_record(f"old-{i}.json", now)
+    env.queue(354)
+    r = env.run()
+    check("cap line printed", "hourly cap reached" in r.stdout)
+    check("names the counts", "4/4" in r.stdout)
+    check("exit 0", r.returncode == 0)
+
+
+@case("over-hardening: the THROTTLED line is still printed")
+def _(env):
+    env.queue(354)
+    r = env.run(GH_QUOTA=1)
+    check("throttle line printed", "throttled" in r.stdout)
+    check("exit 0", r.returncode == 0)
+
+
+@case("over-hardening: the DRY RUN still shows the exact command")
+def _(env):
+    env.queue(354)
+    r = env.run(ELMER_DRY_RUN=1)
+    check("shows the target", "#354" in r.stdout)
+    check("shows the trigger", "@coderabbitai review" in r.stdout)
+    check("exit 0", r.returncode == 0)
+
+
+@case("over-hardening: `-h` still prints the usage block")
+def _(env):
+    r = subprocess.run([env.script, "-h"], capture_output=True, text=True,
+                       env=env._env({}), timeout=120)
+    check("exit 0", r.returncode == 0)
+    check("printed the header block", "Exit codes:" in r.stdout)
+
+
+@case("over-hardening: the SETUP-ERROR messages still reach a working stderr")
+def _(env):
+    env.queue(354)
+    r = env.run(GH_FAIL=1)
+    check("exit 2", r.returncode == 2)
+    check("gh read failure names the PR", "#354" in r.stderr)
+    check("says setup error", "setup error" in r.stderr.lower())
+
+
+@case("over-hardening: the quota and post failures still report")
+def _(env):
+    env.queue(354)
+    r = env.run(GH_QUOTA=2)
+    check("exit 2", r.returncode == 2)
+    check("quota failure reports", "quota read failed" in r.stderr)
+
+
+@case("over-hardening: a failed post still surfaces gh's own stderr")
+def _(env):
+    # The `printf '%s\n' "$post_out"` inside the guarded group is what carries gh's
+    # message; a group redirected to /dev/null would lose the only clue why it failed.
+    env.queue(354)
+    r = env.run(GH_POST_FAIL=1)
+    check("exit 2", r.returncode == 2)
+    check("says the post failed", "the post failed" in r.stderr)
+    check("relays gh's own message", "post rejected" in r.stderr)
+
+
+@case("over-hardening: the bad-argument usage line still prints")
+def _(env):
+    r = subprocess.run([env.script, "354"], capture_output=True, text=True,
+                       env=env._env({}), timeout=120)
+    check("exit 2", r.returncode == 2)
+    check("prints usage", "usage: elmer-tick.sh" in r.stderr)
+
+
+@case("over-hardening: the REFUSAL messages still print in full")
+def _(env):
+    # The stale-head refusal is a THREE-line group; a mute would drop the two detail
+    # lines the operator needs to act, while the rc assertion passed either way.
+    env.queue(354)
+    r = env.run(GH_HEAD=OTHER_SHA)
+    check("exit 1", r.returncode == 1)
+    check("line 1: says refused", "REFUSED" in r.stderr)
+    check("line 2: names both SHAs", SHA[:12] in r.stderr and OTHER_SHA[:12] in r.stderr)
+    check("line 3: tells them to re-run prep-pr", "/prep-pr" in r.stderr)
+
+
+@case("over-hardening: the form=full refusal still names the entry file")
+def _(env):
+    env.queue(354, form="full")
+    r = env.run()
+    check("exit 1", r.returncode == 1)
+    check("names the form", "'full'" in r.stderr)
+    check("names the entry path", "e-354.json" in r.stderr)
+
+
+@case("over-hardening: the stale-lock note still prints")
+def _(env):
+    lock = os.path.join(env.home, ".tick.lock")
+    os.makedirs(lock)
+    os.utime(lock, (1, 1))
+    env.queue(354)
+    r = env.run()
+    check("note printed", "breaking a stale tick lock" in r.stderr)
+    check("posted once", len(env.posts) == 1)
+
+
+@case("over-hardening: the POST-SUCCESS lines still print")
+def _(env):
+    env.queue(354)
+    r = env.run()
+    check("exit 0", r.returncode == 0)
+    check("says POSTED", "POSTED an incremental review request" in r.stdout)
+    check("names the drain record", "drained: " in r.stdout)
 
 
 print()

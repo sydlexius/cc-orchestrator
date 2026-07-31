@@ -38,13 +38,62 @@
 #   ELMER_DRY_RUN=1  do everything except the post; print the exact command instead.
 set -euo pipefail
 
+# EVERY WRITE IN THIS FILE IS GUARDED, AND THE GUARD IS THE POINT ------------------
+# The class, stated once here so no future write site has to rediscover it: under
+# `set -e` a bare `echo`/`printf`/`sed`/`awk` onto a CLOSED or BROKEN fd (EBADF/EIO -
+# a timer loop redirecting into a rotated or closed log) FAILS, and that failure
+# becomes the script's exit status, OVERRIDING the code the code below deliberately
+# intended. The damage is directional and always bad: a contractually-0 no-op and a
+# deliberate exit 2 both DOWNGRADE to 1, and 1 is the one code the contract reserves
+# for "POSTED NOTHING because an entry was REFUSED" - so the runbook sends the
+# operator to hand an entry back to the TL that nothing ever refused.
+#
+# THE TEMPLATE, applied at EVERY write site below without exception:
+#     { echo "..."; echo "..."; } >&2 || true
+#     exit 2
+# Group the writes, redirect ONCE, `|| true` so no write can change the exit status,
+# and put the `exit` on its own line AFTER the guard so it carries the intended code
+# whether or not the write landed. `set -e` is suspended inside a group that is the
+# left operand of `||`, which is what makes the guard cover every command in the body
+# and not just the last one.
+#
+# THE GUARD IS NOT A MUTE. `{ ... } >&2 || true` is one careless edit away from
+# `{ ... } >/dev/null`, and BOTH satisfy every exit-code assertion while the second
+# silently discards the report. The output must still be WRITTEN when the fd is fine;
+# the harness asserts that separately at both ends (see the over-hardening cases).
+#
+# Three successive fix rounds each guarded ONE site and each left another unguarded,
+# because the file was being fixed instance-by-instance. This is the whole-file sweep:
+# the property to preserve is not "these lines are guarded" but "NO write anywhere in
+# this file can change the exit status".
+#
+# TWO KINDS OF WRITE ARE DELIBERATELY NOT GUARDED, and guarding them would be a
+# defect, not a completion of the sweep:
+#
+# 1. A write that is a function's RETURN CHANNEL - `echo $(( now - t ))` in
+#    lock_age_secs, `printf '%s\n' "$i"` in lock_inode, `echo "$n"` in
+#    posts_last_hour. Those go into a pipe the shell itself creates for `$(...)`;
+#    no caller can close that fd, so the EBADF class cannot reach them, and a
+#    `|| true` there would convert a genuinely failed computation into a silent
+#    empty string that the cap and the lock then act on.
+# 2. A write to a file THIS SCRIPT opened - the `>> "$UNREADABLE_LOG"` /
+#    `>> "$STALE_LOG"` appends in scan_queue. A failure there is a real fault (a
+#    TMPDIR that filled after mktemp succeeded) and must surface, not be swallowed.
+#
+# The distinguishing question is always the same: can the CALLER have handed this
+# script a broken fd for this write? Only then does the guard belong.
+
 # -h / --help: print this script's header comment block as usage, then exit.
+# The awk write is guarded like every other: awk exits 2 on a write error, so with
+# stdout closed an unguarded `-h` returned 2 - a SETUP ERROR reported for a help
+# request that did exactly what it was asked to do.
 case "${1:-}" in
-  -h|--help) awk 'NR==1{next} /^#/{sub(/^#[[:space:]]?/,""); print; next} {exit}' "$0"; exit 0 ;;
+  -h|--help) awk 'NR==1{next} /^#/{sub(/^#[[:space:]]?/,""); print; next} {exit}' "$0" || true
+             exit 0 ;;
 esac
 
 if [ "$#" -gt 0 ]; then
-  echo "usage: elmer-tick.sh   (no arguments; it services the queue)" >&2
+  { echo "usage: elmer-tick.sh   (no arguments; it services the queue)"; } >&2 || true
   exit 2
 fi
 
@@ -61,7 +110,7 @@ SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # install, a wrapper that exits 127) passes a presence check and then fails every
 # read. Both failure modes produce the same silent wrong answer, so both are caught.
 echo '{}' | jq -e . >/dev/null 2>&1 || {
-  echo "setup error: jq is required and must be working (probe failed)." >&2
+  { echo "setup error: jq is required and must be working (probe failed)."; } >&2 || true
   exit 2
 }
 
@@ -146,7 +195,7 @@ acquire_lock() {
     [ "$now_ino" = "$ino" ] || return 1
     local dead="$LOCK_DIR.dead.$$"
     if mv "$LOCK_DIR" "$dead" 2>/dev/null; then
-      echo "note: breaking a stale tick lock (${age}s old, threshold ${LOCK_STALE_SECS}s)" >&2
+      { echo "note: breaking a stale tick lock (${age}s old, threshold ${LOCK_STALE_SECS}s)"; } >&2 || true
       rmdir "$dead" 2>/dev/null || true
       mkdir "$LOCK_DIR" 2>/dev/null || return 1
       return 0
@@ -288,12 +337,12 @@ report_queue_health() {
 #    failed stranded the first file in TMPDIR forever. Arming after the first closes
 #    that window: whichever call fails, everything already created is cleaned up.
 UNREADABLE_LOG="$(mktemp)" || {
-  echo "setup error: mktemp failed (TMPDIR unwritable or full); cannot arm queue-health reporting." >&2
+  { echo "setup error: mktemp failed (TMPDIR unwritable or full); cannot arm queue-health reporting."; } >&2 || true
   exit 2
 }
 trap 'rm -f "$UNREADABLE_LOG" 2>/dev/null || true' EXIT
 STALE_LOG="$(mktemp)" || {
-  echo "setup error: mktemp failed (TMPDIR unwritable or full); cannot arm queue-health reporting." >&2
+  { echo "setup error: mktemp failed (TMPDIR unwritable or full); cannot arm queue-health reporting."; } >&2 || true
   exit 2
 }
 trap 'rm -f "$UNREADABLE_LOG" "$STALE_LOG" 2>/dev/null || true' EXIT
@@ -348,7 +397,7 @@ posts_last_hour() {
 recent="$(posts_last_hour)"
 if [ "$recent" -ge "$ELMER_MAX_PER_HR" ]; then
   report_queue_health
-  echo "elmer-tick: hourly cap reached ($recent/$ELMER_MAX_PER_HR posts in the last hour); nothing posted."
+  { echo "elmer-tick: hourly cap reached ($recent/$ELMER_MAX_PER_HR posts in the last hour); nothing posted."; } || true
   exit 0
 fi
 
@@ -365,11 +414,13 @@ if [ -z "$entry" ]; then
   # false assertion about a directory with files in it - the operator reads it as "the
   # queue drained normally" and never looks. The stderr warning already names each
   # stale file; this makes the STDOUT line agree with it instead of contradicting it.
-  if [ -s "$STALE_LOG" ]; then
-    echo "elmer-tick: no postable entries (see the stale-inbox warning above); nothing to do."
-  else
-    echo "elmer-tick: queue empty; nothing to do."
-  fi
+  {
+    if [ -s "$STALE_LOG" ]; then
+      echo "elmer-tick: no postable entries (see the stale-inbox warning above); nothing to do."
+    else
+      echo "elmer-tick: queue empty; nothing to do."
+    fi
+  } || true
   exit 0
 fi
 
@@ -384,8 +435,9 @@ e_form="$(jq -r '.form // "incremental"' "$entry")"
 # path that would otherwise smuggle a `full review` past the gate, and a full review
 # re-surfaces resolved threads and owes a human decision.
 if [ "$e_form" != "incremental" ]; then
-  echo "REFUSED: entry requests form '$e_form'; only 'incremental' is permitted." >&2
-  echo "         $entry" >&2
+  { echo "REFUSED: entry requests form '$e_form'; only 'incremental' is permitted."
+    echo "         $entry"
+  } >&2 || true
   exit 1
 fi
 
@@ -394,14 +446,14 @@ fi
 # skip: an unattended loop that treats an unreadable PR as "nothing to do" goes wrong
 # quietly, which is the failure mode this whole design is built to avoid.
 if ! pr_json="$(gh pr view "$e_pr" --repo "$e_repo" --json headRefOid,state 2>/dev/null)"; then
-  echo "setup error: could not read PR #$e_pr ($e_repo). Not posting; entry stays queued." >&2
+  { echo "setup error: could not read PR #$e_pr ($e_repo). Not posting; entry stays queued."; } >&2 || true
   exit 2
 fi
 pr_state="$(jq -r '.state' <<<"$pr_json")"
 pr_head="$(jq -r '.headRefOid' <<<"$pr_json")"
 
 if [ "$pr_state" != "OPEN" ]; then
-  echo "REFUSED: PR #$e_pr ($e_repo) is $pr_state; a closed PR is never reviewed." >&2
+  { echo "REFUSED: PR #$e_pr ($e_repo) is $pr_state; a closed PR is never reviewed."; } >&2 || true
   exit 1
 fi
 
@@ -412,9 +464,10 @@ fi
 # /prep-pr on the new head. This is verify-do-not-classify (#337): compare the fact,
 # do not infer intent.
 if [ "$pr_head" != "$e_sha" ]; then
-  echo "REFUSED: PR #$e_pr ($e_repo) has moved since it was gated." >&2
-  echo "         queued: ${e_sha:0:12}   current: ${pr_head:0:12}" >&2
-  echo "         Re-run /prep-pr on the new head to re-queue. Entry left in place." >&2
+  { echo "REFUSED: PR #$e_pr ($e_repo) has moved since it was gated."
+    echo "         queued: ${e_sha:0:12}   current: ${pr_head:0:12}"
+    echo "         Re-run /prep-pr on the new head to re-queue. Entry left in place."
+  } >&2 || true
   exit 1
 fi
 
@@ -429,14 +482,14 @@ quota_rc=0
 if [ -x "$SELF_DIR/cr-quota-watch.sh" ]; then
   "$SELF_DIR/cr-quota-watch.sh" "$e_pr" "$e_repo" >/dev/null 2>&1 || quota_rc=$?
 else
-  echo "setup error: cr-quota-watch.sh not found beside $0; refusing to post blind." >&2
+  { echo "setup error: cr-quota-watch.sh not found beside $0; refusing to post blind."; } >&2 || true
   exit 2
 fi
 case "$quota_rc" in
   0) : ;;
-  1) echo "elmer-tick: CodeRabbit is throttled; nothing posted. Entry stays queued."
+  1) { echo "elmer-tick: CodeRabbit is throttled; nothing posted. Entry stays queued."; } || true
      exit 0 ;;
-  *) echo "setup error: quota read failed (rc=$quota_rc). Not posting." >&2
+  *) { echo "setup error: quota read failed (rc=$quota_rc). Not posting."; } >&2 || true
      exit 2 ;;
 esac
 
@@ -467,7 +520,7 @@ if revs="$(gh pr view "$e_pr" --repo "$e_repo" --json reviews 2>/dev/null)"; the
         '[.reviews[]? | select((.commit.oid // "") == $s)
                       | select((.author.login // "") | test("^coderabbitai(\\[bot\\])?$"))] | length' \
         <<<"$revs" 2>/dev/null || echo 0)" -gt 0 ]; then
-    echo "REFUSED: CodeRabbit has already reviewed ${e_sha:0:12}; not spending a slot." >&2
+    { echo "REFUSED: CodeRabbit has already reviewed ${e_sha:0:12}; not spending a slot."; } >&2 || true
     exit 1
   fi
 fi
@@ -480,14 +533,16 @@ fi
 TRIGGER='@coderabbitai review'
 
 if [ "${ELMER_DRY_RUN:-0}" = "1" ]; then
-  echo "DRY RUN: would post to $e_repo #$e_pr at ${e_sha:0:12}:"
-  echo "         $TRIGGER"
+  { echo "DRY RUN: would post to $e_repo #$e_pr at ${e_sha:0:12}:"
+    echo "         $TRIGGER"
+  } || true
   exit 0
 fi
 
 if ! post_out="$(gh pr comment "$e_pr" --repo "$e_repo" --body "$TRIGGER" 2>&1)"; then
-  echo "setup error: the post failed; entry stays queued for the next tick." >&2
-  printf '%s\n' "$post_out" >&2
+  { echo "setup error: the post failed; entry stays queued for the next tick."
+    printf '%s\n' "$post_out"
+  } >&2 || true
   exit 2
 fi
 
@@ -539,8 +594,9 @@ if jq --arg t "$now" --arg out "$post_out" \
   # removed inbox entry. Reproduced with `elmer-tick.sh >&-`: rc=1 with posted=1.
   # EPIPE is a different animal (SIGPIPE gives 141, which no caller reads as a refusal);
   # it is the EBADF class that produces the forbidden 1.
-  echo "elmer-tick: POSTED an incremental review request -- $e_repo #$e_pr at ${e_sha:0:12}" || true
-  echo "            drained: $drained/$base" || true
+  { echo "elmer-tick: POSTED an incremental review request -- $e_repo #$e_pr at ${e_sha:0:12}"
+    echo "            drained: $drained/$base"
+  } || true
   exit 0
 fi
 rm -f "$tmp" 2>/dev/null || true
