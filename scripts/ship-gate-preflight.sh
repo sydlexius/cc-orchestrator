@@ -305,7 +305,19 @@ fi
 # FAIL CLOSED: any gh failure -> BLOCK. headRefOid is fetched in the SAME snapshot
 # as the checks (#263 Piece A) so the SHA the oracle emits on PASS is exactly the
 # commit whose statusCheckRollup it validated - no second read to drift off.
-json="$(gh pr view "$pr" --repo "$repo" --json statusCheckRollup,reviewDecision,headRefOid 2>/dev/null)" || {
+# mergeStateStatus joins the SAME snapshot (#334). It was previously fetched only in
+# DIAGNOSE mode - a WHY-is-it-blocked explainer invoked AFTER the fact - so the GATING
+# path never read it and could return PASS on a PR GitHub was actively BLOCKING. Measured:
+# a PASS emitted against mergeStateStatus=BLOCKED, where an unsigned commit had tripped a
+# required_signatures rule this oracle does not evaluate rule-by-rule. For a check whose
+# entire contract is fail-CLOSED, a false PASS is the worst defect it can have.
+#
+# THE POINT IS NOT TO ENUMERATE MORE RULES. The old DIAGNOSE jq selected a hand-picked set
+# of rule types and silently skipped the rest, which is how required_signatures became
+# invisible; adding a fourth type would leave a fifth. Instead ASK GITHUB FOR ITS VERDICT -
+# mergeStateStatus already aggregates every rule, including ones this script has never
+# heard of. Evaluate the aggregate, do not re-derive it.
+json="$(gh pr view "$pr" --repo "$repo" --json statusCheckRollup,reviewDecision,headRefOid,mergeStateStatus 2>/dev/null)" || {
   echo "BLOCK: 'gh pr view' failed for #$pr in $repo" >&2
   exit 2
 }
@@ -422,7 +434,34 @@ fi
 # StatusContext is never wrongly treated as a (possibly-conclusion-bearing)
 # CheckRun. Anything not matching the per-shape PASS rule blocks (fail closed).
 bad="$(jq -r --argjson ok "$ACCEPTABLE_CONCLUSIONS" '
-  (.statusCheckRollup // [])[]
+  # LATEST-PER-NAME REDUCTION for CheckRuns (#301 Part 1). GitHub CANCELS in-flight
+  # duplicates on every new push, so a superseded CANCELLED run sits in the rollup
+  # alongside the LATER same-name run that SUCCEEDED - and evaluating the list flat
+  # blocked on the corpse. That is normal push behavior, not an edge case.
+  #
+  # THIS MOVES IN THE RELAXING DIRECTION (it makes the gate block LESS), which for a
+  # fail-closed oracle is the dangerous one, so the sort is specified defensively:
+  #
+  #   PRIMARY KEY = startedAt, NOT completedAt. Sorting by completedAt is a FALSE-GREEN:
+  #   a newer IN_PROGRESS run has completedAt = null, so a stale SUCCESS would sort
+  #   above it and win. startedAt is monotonic per run and always set for a started run.
+  #
+  #   NULL TIMESTAMPS SORT AS NEWEST, never oldest. A QUEUED re-run has startedAt = null
+  #   and MUST beat an old SUCCESS, so the gate blocks on the pending re-run rather than
+  #   the stale pass. Ordering nulls last would invert exactly this case.
+  #
+  # ONLY CheckRuns are reduced. StatusContexts have no re-run/name-collision semantics,
+  # and the unknown-__typename entries must keep their fail-closed path untouched - so
+  # both bypass the grouping entirely.
+  ( (.statusCheckRollup // [])
+    | map(select((.__typename // "") == "CheckRun"))
+    | group_by(.name // .context // "unknown")
+    | map( sort_by( [ (if .startedAt   == null then "9999" else .startedAt   end),
+                      (if .completedAt == null then "9999" else .completedAt end) ] )
+           | last )
+  ) as $latest_runs
+  | ( (.statusCheckRollup // []) | map(select((.__typename // "") != "CheckRun")) ) as $others
+  | ($latest_runs + $others)[]
   | (.__typename // "") as $t
   | if $t == "StatusContext" then
       { name: (.context // "unknown"),
@@ -688,6 +727,43 @@ case "$ack_verdict" in
     exit 2 ;;
 esac
 
+# --- GITHUB'S OWN AGGREGATE VERDICT (#334; FULL mode only) -----------------
+# Ask GitHub whether it would merge this, instead of re-deriving that from a subset of
+# rules. mergeStateStatus aggregates EVERY branch-protection and ruleset rule, including
+# ones this script has never heard of, so it closes the whole "evaluated a hand-picked
+# subset, treated the remainder as absent" class rather than one instance of it.
+#
+# THE MERGEABLE SET, and why each member is a PASS:
+#   CLEAN     - mergeable, nothing outstanding.
+#   UNSTABLE  - a NON-REQUIRED check is failing or pending. GitHub still merges this, and
+#               the required checks were already validated above via statusCheckRollup.
+#   HAS_HOOKS - mergeable; a repo pre-receive hook will run. Same set pr-watch.sh treats
+#               as merge-ready, so the two agree by construction.
+#   BEHIND    - PASSES DELIBERATELY. Base-freshness is explicitly out of this oracle's
+#               scope (base-freshness.sh owns it, and /prep-pr + the staleness sweep act
+#               on it), so blocking here would move a documented boundary as a side effect
+#               of a false-PASS fix. It is REPORTED in the PASS line instead.
+# Everything else BLOCKS - notably BLOCKED (a rule is unmet) and DIRTY (conflicts).
+# UNKNOWN is GitHub still computing: BLOCK, because "not yet known" must never read as
+# "fine" in a fail-closed gate. Re-running resolves it in seconds.
+merge_state="$(jq -r '(.mergeStateStatus // "") | ascii_upcase' <<<"$json" 2>/dev/null)" || merge_state=""
+case "$merge_state" in
+  CLEAN|UNSTABLE|HAS_HOOKS|BEHIND) : ;;
+  "")
+    echo "BLOCK: mergeStateStatus unreadable on #$pr; cannot confirm GitHub would merge this." >&2
+    echo "RESULT: BLOCK -- merge state unverifiable. [#$pr $repo]" >&2
+    exit 2 ;;
+  UNKNOWN)
+    echo "BLOCK: mergeStateStatus=UNKNOWN on #$pr (GitHub is still computing the merge state); re-run in a few seconds." >&2
+    echo "RESULT: BLOCK -- merge state not yet computed. [#$pr $repo]" >&2
+    exit 2 ;;
+  *)
+    echo "BLOCK: GitHub reports mergeStateStatus=${merge_state} on #$pr - it would NOT merge this, whatever the other gates say." >&2
+    echo "       Run '$0 --diagnose $pr $repo' for the specific unmet rule (e.g. required_signatures, which this oracle does not evaluate rule-by-rule)." >&2
+    echo "RESULT: BLOCK -- GitHub is blocking the merge (mergeStateStatus=${merge_state}). [#$pr $repo]" >&2
+    exit 2 ;;
+esac
+
 # --- HEAD-SHA ATTESTATION (#263 Piece A; FULL mode only) -------------------
 # Every other gate passed. Emit the validated head SHA so authorize-merge can pin
 # --match-head-commit to it. FAIL CLOSED if the SHA is unreadable (empty/null/
@@ -703,5 +779,94 @@ if [[ ! "$head_sha" =~ ^[0-9a-f]{40,}$ ]]; then
   exit 2
 fi
 
-echo "RESULT: PASS -- all checks green, 0 actionable review-body findings, reviewDecision=${review_decision:-<none>} (not an active CHANGES_REQUESTED), 0 unresolved review threads, Codoki root ack ${ack_verdict}, headRefOid=${head_sha}. [#$pr $repo]"
+# --- REVIEW-DECISION DISAMBIGUATION (#315) ---------------------------------
+# A bare `reviewDecision=<none>` inside a line beginning `RESULT: PASS` is ambiguous in
+# the DANGEROUS direction: it reads as "review state is fine" while meaning only "not an
+# active CHANGES_REQUESTED". reviewDecision is a BRANCH-PROTECTION artifact - GitHub
+# populates it only when a review is REQUIRED - so null covers three very different
+# states: someone approved HEAD, nobody has reviewed at all, or a push dismissed a review.
+# Measured on a real PR whose reviews API showed an APPROVED on HEAD while the oracle
+# printed the same `<none>` it prints for a never-reviewed PR.
+#
+# So when it is null, SAY WHICH by reading the reviews API - the record of what humans and
+# bots actually did, as opposed to what branch protection requires. This is REPORTING
+# only: it does not gate, because requiring an approval here would impose a review policy
+# the repo has not set (auto-review is off org-wide, so plenty of legitimately-mergeable
+# PRs carry no approval at all). It removes the ambiguity without inventing a rule.
+#
+# Fail SOFT: an unreadable reviews API degrades to the old bare token rather than blocking
+# a PR that passed every real gate. A reporting nicety must never become a merge blocker.
+# ONE reviews read, shared by the #315 disambiguation and the #301 coverage advisory.
+# Hoisted out of the `-z "$review_decision"` branch deliberately: nested there, an
+# APPROVED PR left $rv empty and the coverage check below silently took its
+# "unverifiable" path - a check that reports nothing on exactly the PRs that HAVE been
+# reviewed. Both consumers are fail-soft, so one unreadable read degrades both to a NOTE
+# rather than blocking.
+rv="$(gh api --paginate "repos/$repo/pulls/$pr/reviews" 2>/dev/null | jq -s 'add // []' 2>/dev/null)" || rv=""
+
+review_note=""
+if [ -z "$review_decision" ]; then
+  if [ -n "$rv" ] && jq -e . >/dev/null 2>&1 <<<"$rv"; then
+    # Latest review PER REVIEWER on the CURRENT head, so a stale CHANGES_REQUESTED that a
+    # later APPROVED superseded does not misreport (that exact sequence is what #315 saw).
+    appr="$(jq -r --arg h "$head_sha" '[.[] | select(.commit_id == $h)]
+              | group_by(.user.login) | map(sort_by(.submitted_at) | last)
+              | map(select(.state == "APPROVED")) | length' <<<"$rv" 2>/dev/null)" || appr=""
+    total="$(jq -r 'length' <<<"$rv" 2>/dev/null)" || total=""
+    case "$appr" in
+      ''|*[!0-9]*) review_note=" (no decision required; approval state unreadable)" ;;
+      0) if [ "${total:-0}" = "0" ]; then
+           review_note=" (no decision required; NOBODY has reviewed this PR)"
+         else
+           review_note=" (no decision required; no APPROVED review on the current head)"
+         fi ;;
+      *) review_note=" (no decision required; ${appr} APPROVED review(s) on the current head)" ;;
+    esac
+  else
+    review_note=" (no decision required; approval state unreadable)"
+  fi
+fi
+
+# --- REVIEW COVERAGE (#301 Part 2; ADVISORY, fail-OPEN, NEVER gates) -------
+# The gate measures thread state and CI state but never asks whether anyone reviewed the
+# code that is actually about to merge. Fix-round commits pushed after the last review
+# merge UNREVIEWED with every gate green - measured elsewhere at 3 unreviewed commits,
+# including the fix for a bot's own MAJOR finding.
+#
+# WARN ONLY, by design. A docs-only fix round needs no re-review, and blocking every fix
+# round would deadlock the push-first loop (push, then reply citing the SHA). So this
+# surfaces the range and says explicitly that the LEAD decides.
+#
+# THE PREDICATE IS MEMBERSHIP, not recency: "is head among the reviewed commit oids". The
+# tempting `newest_review.commit == head` false-WARNs whenever a reviewer re-reviews an
+# EARLIER commit, which is ordinary when a bot revisits a thread.
+#
+# Reuses the reviews payload already fetched above for #315 rather than issuing a second
+# read - and because that read is fail-SOFT, an unreadable API degrades to a NOTE here
+# instead of flipping a PASS to a BLOCK. An advisory that can change the verdict is not
+# advisory.
+coverage_note=""
+if [ -n "${rv:-}" ] && jq -e . >/dev/null 2>&1 <<<"$rv"; then
+  reviewed_head="$(jq -r --arg h "$head_sha" '[.[] | select(.commit_id == $h)] | length' <<<"$rv" 2>/dev/null)" || reviewed_head=""
+  rv_count="$(jq -r 'length' <<<"$rv" 2>/dev/null)" || rv_count=""
+  case "$reviewed_head" in
+    ''|*[!0-9]*) coverage_note=" NOTE: review coverage unreadable (advisory only; verdict unchanged)." ;;
+    0)
+      if [ "${rv_count:-0}" = "0" ]; then
+        coverage_note=" WARN: NO review covers any commit on this PR - the head is entirely unreviewed. The LEAD decides whether that is acceptable (a docs-only change often is)."
+      else
+        last_reviewed="$(jq -r 'sort_by(.submitted_at) | last | (.commit_id // "")' <<<"$rv" 2>/dev/null)" || last_reviewed=""
+        coverage_note=" WARN: no review covers the CURRENT head - commits ${last_reviewed:0:8}..${head_sha:0:8} are unreviewed. The LEAD decides whether they need a pass (a docs/comment-only fix round often does not)."
+      fi ;;
+    *) : ;;   # head IS among the reviewed oids - silent, nothing to say
+  esac
+else
+  coverage_note=" NOTE: review coverage unverifiable (reviews read failed; advisory only, verdict unchanged)."
+fi
+
+# BEHIND is a PASS here (base-freshness is out of scope) but must be VISIBLE, not silent.
+merge_note=""
+[ "$merge_state" = "BEHIND" ] && merge_note=" (BEHIND base - out of this oracle's scope; refresh before merging)"
+
+echo "RESULT: PASS -- all checks green, 0 actionable review-body findings, reviewDecision=${review_decision:-<none>}${review_note}, 0 unresolved review threads, mergeStateStatus=${merge_state}${merge_note}, Codoki root ack ${ack_verdict}, headRefOid=${head_sha}.${coverage_note} [#$pr $repo]"
 exit 0

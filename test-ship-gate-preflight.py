@@ -46,7 +46,8 @@ def check(label, ok):
 DEFAULT_SHA = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
 
 
-def rollup(*contexts, review_decision="__OMIT__", head_ref_oid=DEFAULT_SHA):
+def rollup(*contexts, review_decision="__OMIT__", head_ref_oid=DEFAULT_SHA,
+           merge_state="CLEAN"):
     """Build a statusCheckRollup JSON document from context dicts.
 
     review_decision: when supplied, add a top-level `reviewDecision` field (the
@@ -64,6 +65,11 @@ def rollup(*contexts, review_decision="__OMIT__", head_ref_oid=DEFAULT_SHA):
         doc["reviewDecision"] = review_decision
     if head_ref_oid != "__OMIT__":
         doc["headRefOid"] = head_ref_oid
+    # merge_state (#334): GitHub's AGGREGATE verdict, now on the GATING path. Defaults to
+    # CLEAN so every pre-existing PASS fixture keeps passing; pass "__OMIT__" to drop the
+    # field (unreadable -> BLOCK) or any other value to exercise the new gate.
+    if merge_state != "__OMIT__":
+        doc["mergeStateStatus"] = merge_state
     return json.dumps(doc)
 
 
@@ -90,8 +96,20 @@ def threads_doc(unresolved=0, resolved=0, total=None, raw_nodes=None):
 DEFAULT_THREADS = threads_doc(unresolved=0, resolved=0)
 
 
-def checkrun(name, status, conclusion):
-    return {"__typename": "CheckRun", "name": name, "status": status, "conclusion": conclusion}
+def checkrun(name, status, conclusion, started_at="__OMIT__", completed_at="__OMIT__"):
+    """A CheckRun rollup entry.
+
+    started_at / completed_at (#301 Part 1) drive the latest-per-name reduction. Both
+    default to OMITTED so every pre-existing fixture is unchanged - and note that an
+    omitted timestamp reads as NULL, which the reduction sorts as NEWEST (fail-closed:
+    a QUEUED re-run with no startedAt must beat a stale SUCCESS). Pass an ISO string to
+    order runs explicitly, or None to emit an explicit JSON null."""
+    d = {"__typename": "CheckRun", "name": name, "status": status, "conclusion": conclusion}
+    if started_at != "__OMIT__":
+        d["startedAt"] = started_at
+    if completed_at != "__OMIT__":
+        d["completedAt"] = completed_at
+    return d
 
 
 def statusctx(context, state):
@@ -139,7 +157,7 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         unreplied_fail_until=0, codoki_ack_verdict="no-summary",
         codoki_ack_fail=False, codoki_ack_missing=False,
         threads_json="__DEFAULT__", threads_fail=False, protection=None, comments=None,
-        comments_fail=False):
+        comments_fail=False, reviews=None, reviews_fail=False):
     """Invoke the oracle with stubbed gh + pr-unreplied-comments.sh + gh-react.sh.
     Returns (exit_code, stdout, stderr, argv) where argv is the recorded helper
     argv content (one line per invocation, read back from the log) -- used to
@@ -179,6 +197,13 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
                 "    # trigger detector's fail-toward-not-triggered posture in isolation (#277 CR).\n"
                 "    if [ -n \"${COMMENTS_FAIL:-}\" ]; then echo 'gh: simulated comments-API failure' >&2; exit 1; fi\n"
                 "    printf '%s' \"${FIXTURE_COMMENTS:-[]}\"; exit 0;;\n"
+                "  *reviews)\n"
+                "    # `gh api repos/.../pulls/<pr>/reviews` (#315 disambiguation + #301 Part 2\n"
+                "    # coverage advisory). REVIEWS_FAIL fails ONLY this route, so the fail-OPEN\n"
+                "    # posture can be proved in isolation: an unreadable reviews API must leave\n"
+                "    # the exit code identical, never flip a PASS to a BLOCK.\n"
+                "    if [ -n \"${REVIEWS_FAIL:-}\" ]; then echo 'gh: simulated reviews-API failure' >&2; exit 1; fi\n"
+                "    printf '%s' \"${FIXTURE_REVIEWS:-[]}\"; exit 0;;\n"
                 "  *protection)\n"
                 "    # `gh api repos/.../branches/<base>/protection` (#275 --diagnose). Empty\n"
                 "    # FIXTURE_PROTECTION simulates a 403 (no admin scope) so the degradation\n"
@@ -259,6 +284,12 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         env.pop("COMMENTS_FAIL", None)
         if comments_fail:
             env["COMMENTS_FAIL"] = "1"
+        env.pop("FIXTURE_REVIEWS", None)
+        if reviews is not None:
+            env["FIXTURE_REVIEWS"] = reviews
+        env.pop("REVIEWS_FAIL", None)
+        if reviews_fail:
+            env["REVIEWS_FAIL"] = "1"
         env.pop("THREADS_FAIL", None)
         if threads_fail:
             env["THREADS_FAIL"] = "1"
@@ -651,6 +682,183 @@ def main():
                       fixture_json=rollup(checkrun("Codoki PR Review", "COMPLETED", "SUCCESS")),
                       threads_json=threads_doc(unresolved=9))
     check("--codoki-only ignores the thread gate (9 unresolved) -> exit 0", rc == 0)
+
+    print("== #301 Part 1: latest-per-name CheckRun reduction ==")
+    # GitHub CANCELS in-flight duplicates on every push, so a superseded CANCELLED run
+    # sits in the rollup beside the LATER same-name run that SUCCEEDED. Evaluating the
+    # list flat blocked on the corpse - normal push behavior, not an edge case.
+    #
+    # This RELAXES the gate, which for a fail-closed oracle is the dangerous direction,
+    # so cases (c)(d)(e) below are the mandatory false-green traps: each one must still
+    # BLOCK, and each fails if the sort keys are reverted.
+    T1, T2 = "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"
+    # (a) earlier CANCELLED + later SUCCESS, same name -> PASS (the defect being fixed).
+    rc, out, _, _ = run(["1", "owner/repo"],
+                        fixture_json=rollup(checkrun("ci", "COMPLETED", "CANCELLED", started_at=T1),
+                                            checkrun("ci", "COMPLETED", "SUCCESS", started_at=T2)),
+                        unreplied_findings=0)
+    check("#301a: superseded CANCELLED + later SUCCESS (same name) -> PASS", rc == 0)
+    # (b) a LONE CANCELLED with no later same-name run must still BLOCK - the reduction
+    # must not swallow a genuine failure just because it dedupes.
+    rc, _, _, _ = run(["1", "owner/repo"],
+                      fixture_json=rollup(checkrun("ci", "COMPLETED", "CANCELLED", started_at=T1)),
+                      unreplied_findings=0)
+    check("#301b: lone CANCELLED (no later same-name) -> BLOCK", rc == 2)
+    # (c) A newer IN_PROGRESS run (completedAt=null) must beat a stale SUCCESS.
+    rc, _, _, _ = run(["1", "owner/repo"],
+                      fixture_json=rollup(
+                          checkrun("ci", "COMPLETED", "SUCCESS", started_at=T1, completed_at=T1),
+                          checkrun("ci", "IN_PROGRESS", "", started_at=T2, completed_at=None)),
+                      unreplied_findings=0)
+    check("#301c: stale SUCCESS + newer IN_PROGRESS(null completedAt) -> BLOCK", rc == 2)
+    # (c2) THE CASE THAT ACTUALLY PROVES THE KEY *ORDER*. Cases (c) and (d) are both
+    # carried by the null-sorts-newest rule, so they pass under EITHER key ordering -
+    # verified by mutation: swapping startedAt/completedAt broke nothing until this case
+    # existed. Here BOTH timestamps are present and they DISAGREE: a run STARTED later
+    # FINISHED earlier (a fast re-run overtaking a slow original, which is ordinary when
+    # a re-run skips cached steps). startedAt-primary correctly picks the later-started
+    # FAILURE; completedAt-primary picks the SUCCESS that finished last and false-greens.
+    rc, _, _, _ = run(["1", "owner/repo"],
+                      fixture_json=rollup(
+                          checkrun("ci", "COMPLETED", "SUCCESS", started_at=T1,
+                                   completed_at="2026-01-03T00:00:00Z"),
+                          checkrun("ci", "COMPLETED", "FAILURE", started_at=T2,
+                                   completed_at="2026-01-02T12:00:00Z")),
+                      unreplied_findings=0)
+    check("#301c2: later-STARTED FAILURE that finished FIRST -> BLOCK (startedAt is primary)",
+          rc == 2)
+    # (d) FALSE-GREEN TRAP: a QUEUED re-run has startedAt=null. Nulls must sort NEWEST,
+    # not oldest, or the old SUCCESS wins and the pending re-run is invisible.
+    rc, _, _, _ = run(["1", "owner/repo"],
+                      fixture_json=rollup(
+                          checkrun("ci", "COMPLETED", "SUCCESS", started_at=T1, completed_at=T1),
+                          checkrun("ci", "QUEUED", "", started_at=None, completed_at=None)),
+                      unreplied_findings=0)
+    check("#301d: old SUCCESS + newer QUEUED(null startedAt) -> BLOCK (nulls sort newest)", rc == 2)
+    # (e) the reduction must not be a blanket "any SUCCESS wins": a LATER FAILURE over an
+    # earlier SUCCESS still blocks.
+    rc, _, _, _ = run(["1", "owner/repo"],
+                      fixture_json=rollup(
+                          checkrun("ci", "COMPLETED", "SUCCESS", started_at=T1),
+                          checkrun("ci", "COMPLETED", "FAILURE", started_at=T2)),
+                      unreplied_findings=0)
+    check("#301e: latest same-name is FAILURE over earlier SUCCESS -> BLOCK", rc == 2)
+    # StatusContexts have no re-run semantics and must bypass the grouping untouched.
+    rc, _, _, _ = run(["1", "owner/repo"],
+                      fixture_json=rollup(checkrun("ci", "COMPLETED", "SUCCESS", started_at=T2),
+                                          statusctx("legacy", "FAILURE")),
+                      unreplied_findings=0)
+    check("#301: a failing StatusContext still BLOCKS (not swallowed by the reduction)", rc == 2)
+    # The unknown-__typename fail-closed path must survive the restructure.
+    rc, _, _, _ = run(["1", "owner/repo"],
+                      fixture_json=rollup(checkrun("ci", "COMPLETED", "SUCCESS", started_at=T2),
+                                          unknowntype("mystery")),
+                      unreplied_findings=0)
+    check("#301: unknown __typename still BLOCKS (fail-closed path intact)", rc == 2)
+
+    print("== #334: GitHub's aggregate verdict gates the PASS ==")
+    # THE DEFECT: the oracle returned PASS on a PR sitting at mergeStateStatus=BLOCKED,
+    # because mergeStateStatus was fetched ONLY in DIAGNOSE mode (an after-the-fact
+    # explainer) and never on the gating path. Measured with an unsigned commit tripping a
+    # required_signatures rule this oracle does not evaluate rule-by-rule. For a check whose
+    # whole contract is fail-CLOSED, a false PASS is the worst defect it can have.
+    ALL_GREEN_CTX = checkrun("ci", "COMPLETED", "SUCCESS")
+    rc, out, err, _ = run(["1", "owner/repo"],
+                          fixture_json=rollup(ALL_GREEN_CTX, merge_state="BLOCKED"),
+                          unreplied_findings=0)
+    check("#334: all checks green but mergeStateStatus=BLOCKED -> exit 2 (was a false PASS)",
+          rc == 2 and "RESULT: PASS" not in out)
+    check("#334: the BLOCK names the aggregate verdict, not a guess",
+          "mergeStateStatus=BLOCKED" in err)
+    check("#334: the BLOCK points at --diagnose for the specific unmet rule",
+          "--diagnose" in err)
+    # DIRTY (conflicts) is the other everyday blocking state.
+    rc, out, _, _ = run(["1", "owner/repo"],
+                        fixture_json=rollup(ALL_GREEN_CTX, merge_state="DIRTY"),
+                        unreplied_findings=0)
+    check("#334: mergeStateStatus=DIRTY (conflicts) -> exit 2", rc == 2 and "RESULT: PASS" not in out)
+    # UNKNOWN means GitHub has not finished computing. "Not yet known" must never read as
+    # "fine" in a fail-closed gate - re-running resolves it in seconds.
+    rc, out, err, _ = run(["1", "owner/repo"],
+                          fixture_json=rollup(ALL_GREEN_CTX, merge_state="UNKNOWN"),
+                          unreplied_findings=0)
+    check("#334: mergeStateStatus=UNKNOWN -> exit 2 (still computing is not 'fine')",
+          rc == 2 and "re-run" in err)
+    # An unreadable/absent field must BLOCK, not default to mergeable.
+    rc, out, _, _ = run(["1", "owner/repo"],
+                        fixture_json=rollup(ALL_GREEN_CTX, merge_state="__OMIT__"),
+                        unreplied_findings=0)
+    check("#334: absent mergeStateStatus -> exit 2 (fail closed, never assume mergeable)",
+          rc == 2 and "RESULT: PASS" not in out)
+    # THE MERGEABLE SET still passes - a gate that blocks everything is not a fix.
+    for ms in ("CLEAN", "UNSTABLE", "HAS_HOOKS"):
+        rc, out, _, _ = run(["1", "owner/repo"],
+                            fixture_json=rollup(ALL_GREEN_CTX, merge_state=ms),
+                            unreplied_findings=0)
+        check(f"#334: mergeStateStatus={ms} still PASSes", rc == 0 and "RESULT: PASS" in out)
+    # BEHIND passes DELIBERATELY (base-freshness is out of this oracle's scope, owned by
+    # base-freshness.sh) but must be REPORTED rather than silently swallowed.
+    rc, out, _, _ = run(["1", "owner/repo"],
+                        fixture_json=rollup(ALL_GREEN_CTX, merge_state="BEHIND"),
+                        unreplied_findings=0)
+    check("#334: BEHIND still PASSes (base-freshness is out of scope)", rc == 0)
+    check("#334: BEHIND is REPORTED in the PASS line, not silent",
+          "BEHIND" in out and "out of this oracle's scope" in out)
+
+    print("== #315: reviewDecision=<none> is disambiguated, not bare ==")
+    # A bare `<none>` inside a RESULT: PASS line reads as "review state is fine" while
+    # meaning only "not an active CHANGES_REQUESTED". reviewDecision is a branch-protection
+    # artifact, so null covers three different states: approved, never-reviewed, or
+    # dismissed-by-push. Measured on a real PR that had an APPROVED on HEAD.
+    rc, out, _, _ = run(["1", "owner/repo"],
+                        fixture_json=rollup(ALL_GREEN_CTX, review_decision=None),
+                        unreplied_findings=0)
+    check("#315: a null reviewDecision PASS still says <none>", rc == 0 and "reviewDecision=<none>" in out)
+    check("#315: ...but is qualified, not left bare",
+          "no decision required" in out)
+    # REPORTING, not gating: the qualifier must never turn a PASS into a BLOCK, because
+    # requiring an approval would impose a policy the repo has not set (auto-review is off
+    # org-wide, so plenty of legitimately-mergeable PRs carry no approval).
+    check("#315: the disambiguation NEVER changes the verdict (still exit 0)", rc == 0)
+
+    print("== #301 Part 2: review-coverage advisory (WARN only, fail-OPEN) ==")
+    # The gate measured thread state and CI state but never asked whether anyone reviewed
+    # the code about to merge, so fix-round commits pushed after the last review merged
+    # UNREVIEWED with every gate green.
+    def review(commit, login="coderabbitai[bot]", state="APPROVED", at="2026-01-01T00:00:00Z"):
+        return {"commit_id": commit, "state": state, "submitted_at": at,
+                "user": {"login": login}}
+    OTHER_SHA = "b" * 40
+    GREEN = checkrun("ci", "COMPLETED", "SUCCESS")
+    # head IS among the reviewed oids -> silent. Membership, NOT recency: a reviewer who
+    # re-reviews an EARLIER commit must not trip a WARN (that is the false-WARN the AC names).
+    rc, out, _, _ = run(["1", "owner/repo"], fixture_json=rollup(GREEN), unreplied_findings=0,
+                        reviews=json.dumps([review(DEFAULT_SHA),
+                                            review(OTHER_SHA, at="2026-01-02T00:00:00Z")]))
+    check("#301p2: head among reviewed oids -> PASS with NO coverage WARN",
+          rc == 0 and "WARN: no review covers" not in out)
+    # head NOT reviewed -> WARN naming the range, verdict UNCHANGED.
+    rc, out, _, _ = run(["1", "owner/repo"], fixture_json=rollup(GREEN), unreplied_findings=0,
+                        reviews=json.dumps([review(OTHER_SHA)]))
+    check("#301p2: head NOT reviewed -> WARN, exit UNCHANGED (still 0)", rc == 0)
+    check("#301p2: the WARN names the unreviewed range",
+          f"{OTHER_SHA[:8]}..{DEFAULT_SHA[:8]}" in out)
+    check("#301p2: the WARN says the LEAD decides (it is not a policy)", "LEAD decides" in out)
+    # Zero reviews -> WARN, verdict unchanged.
+    rc, out, _, _ = run(["1", "owner/repo"], fixture_json=rollup(GREEN), unreplied_findings=0,
+                        reviews="[]")
+    check("#301p2: zero reviews -> WARN, exit UNCHANGED", rc == 0 and "entirely unreviewed" in out)
+    # FAIL-OPEN, the property that makes an advisory safe: an unreadable reviews API must
+    # leave the exit code IDENTICAL to a normal run. An advisory that can flip a verdict
+    # is not an advisory.
+    rc_fail, out_fail, _, _ = run(["1", "owner/repo"], fixture_json=rollup(GREEN),
+                                  unreplied_findings=0, reviews_fail=True)
+    rc_base, _, _, _ = run(["1", "owner/repo"], fixture_json=rollup(GREEN),
+                           unreplied_findings=0, reviews=json.dumps([review(DEFAULT_SHA)]))
+    check("#301p2: reviews-API failure -> exit IDENTICAL to a healthy run (fail-OPEN)",
+          rc_fail == rc_base == 0)
+    check("#301p2: ...and says so as a NOTE rather than failing silently",
+          "unverifiable" in out_fail or "unreadable" in out_fail)
 
     print("== #263 Piece A: emit validated headRefOid on PASS ==")
     # PASS prints a parseable headRefOid=<sha> line, and it is the validated SHA.
