@@ -152,6 +152,12 @@ def check_compound_shadow_matcher():
         "* && " + MERGE,                        # merge as the trailing clause
         MERGE + " 5 && echo done",              # merge then something else (chained, not an ARG)
         "cd /x; *", "cd /x || *", "bash -c *; " + MERGE,   # other shell separators
+        # CR round 2: every clause is inspected, not just the head, and separators need no
+        # surrounding whitespace. Round 1 kept only `split(sep)[0]` and matched spaced forms.
+        "cd /tmp && echo ready && *",       # merge reachable via a THIRD clause
+        "a && b && c && " + MERGE,          # arbitrarily deep chain
+        "echo ok;" + MERGE,                 # UNSPACED separator
+        MERGE + " 5 || echo done", MERGE + " 5 | tee x",
     ]
     # MUST NOT shadow: the sanctioned forms + genuinely unrelated compounds.
     must_not_shadow = [
@@ -167,6 +173,10 @@ def check_compound_shadow_matcher():
         # that needs interpreter-awareness, not separator analysis. Documented limitation,
         # consistent with the floor's threat model (an honest operator on the obvious path,
         # not adversarial evasion); a shell-wrapped merge is still floor-denied at run time.
+        # CR round 2: a separator inside a QUOTED ARGUMENT is not a chain. Raw matching
+        # rejected the merge-scoped exemption here and reported a SANCTIONED rule as a
+        # shadow - a false positive on the one form the doctor must never flag.
+        MERGE + " --body 'a && b'", MERGE + ' --body "x ; y"',
         "bash -c *",
         MERGE,                                  # sanctioned bare
         MERGE + " *",                           # sanctioned boundary-star
@@ -2232,16 +2242,16 @@ def main():
     else:
         check("#107 real required-permissions.md: file accessible for regression check", False)
 
+    # #369: the compound-shadow matcher cases. CALLED HERE, before the single summary -
+    # an earlier edit removed a duplicated FAILS block and lost this call, leaving the whole
+    # block DEAD CODE that reported nothing while reading as covered. The mutation check is
+    # what surfaced it: the new cases "passed" against the KNOWN-BROKEN round-1 matcher,
+    # which is only possible if they never ran.
+    check_compound_shadow_matcher()
+
     print()
     if FAILS:
         print(f"{len(FAILS)} FAILED:")
-        for f in FAILS:
-            print(f"  - {f}")
-        sys.exit(1)
-    check_compound_shadow_matcher()
-
-    if FAILS:
-        print(f"\n{len(FAILS)} FAILED:")
         for f in FAILS:
             print(f"  - {f}")
         sys.exit(1)
