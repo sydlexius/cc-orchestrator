@@ -1200,8 +1200,15 @@ def _is_merge_scoped(pattern):
         return True
     if pattern.endswith(" *") or pattern.endswith(":*"):
         return pattern[:-2] == MERGE_TARGET
-    # wildcard-free specifier longer than the bare target: merge-specific args are fine
+    # wildcard-free specifier longer than the bare target: merge-specific ARGS are fine.
+    # But only ARGS - a rule that CHAINS a second command (`gh pr merge 5 && echo done`) is
+    # not "merge and nothing beyond merge's own args", so it must not take this exemption and
+    # be reported merge-scoped. Pre-existing hole, upstream of the compound-reach fix below:
+    # the exemption ran first, so such a rule short-circuited to "not a shadow" before any
+    # compound analysis could see it.
     if "*" not in pattern:
+        if any(sep in pattern for sep in ("&&", "||", ";", "|", "\n")):
+            return False
         return pattern.startswith(MERGE_TARGET + " ")
     # any other wildcard form (plain-glob, infix, leading) - not merge-scoped
     return False
@@ -1232,6 +1239,46 @@ def _merge_rule_shadows(pattern):
     rule_re = re.compile("^" + _rule_to_regex(pattern) + "$", re.DOTALL)
     if rule_re.match(MERGE_TARGET) or rule_re.match(MERGE_TARGET + " x"):
         return True
+    # COMPOUND REACH (#369). The two tests above anchor the rule's regex against the merge
+    # command ALONE, so a rule that reaches merge through a COMPOUND PREFIX escaped both:
+    # `cd <path> && *` cannot match the string "gh pr merge", yet the glob it defines grants
+    # exactly that command. The scan then reported SAFE and doctor printed its PASS line over
+    # a cascade that re-granted merge - a false all-clear on a HARD-FAIL check, which is worse
+    # than no check because the PASS is what a reviewer cites when waving the rule through.
+    # (Measured: a TL proposed `Bash(cd /Users/jesse/Developer/stillwater-* && *)`, its own
+    # "does NOT grant" note claimed the merge gate was untouched, and the matcher agreed.)
+    #
+    # A shell command line runs MANY commands - separated by && || ; | and newlines - and a
+    # grant covers EVERY clause, not just the first. So ask the question the allow-list
+    # actually answers: does this rule's language admit ANY command line containing a merge
+    # clause? Probe with representative separators rather than parsing shell grammar (this is
+    # a guardrail, not a sandbox - the threat model is an honest operator on the obvious path).
+    # THE PROBE MUST NOT OVER-REACH, and the naive form does. Probing whether the rule matches
+    # "<anything><sep>gh pr merge" flags `Bash(x *)` as a shadow: its trailing `*` swallows
+    # " && gh pr merge" and the string matches - but that rule grants the command `x`, not a
+    # route to merge. That false positive broke 16 unrelated harness assertions whose fixture
+    # allows exactly `Bash(x *)`, and it is the same over-reach this fix exists to correct,
+    # pointed the other way. So the probe fires ONLY for a rule that itself contains a shell
+    # SEPARATOR - i.e. one whose author wrote a compound grant - and never for a plain
+    # trailing-glob rule, where the glob is an argument wildcard rather than a command chain.
+    if any(sep in pattern for sep in ("&&", "||", ";", "|", "\n")):
+        # Build the probe from the RULE'S OWN PREFIX, not a placeholder. `cd /tmp && *`
+        # matches "cd /tmp && gh pr merge" - merge as the continuation of that literal prefix -
+        # and matches nothing of the form "<placeholder> && gh pr merge". An earlier probe used
+        # a stand-in there and missed 4 of 5 real shadows while flagging `Bash(x *)`, which is
+        # both failure directions from one wrong assumption about what the rule matches.
+        for sep in ("&&", "||", ";", "|", "\n"):
+            if sep not in pattern:
+                continue
+            head = pattern.split(sep)[0].rstrip()        # e.g. "cd /tmp"
+            for joiner in (f" {sep} ", f"{sep} ", f" {sep}"):
+                for tail in (MERGE_TARGET, MERGE_TARGET + " --squash"):
+                    if rule_re.match(head + joiner + tail):
+                        return True
+        # Merge in a LEADING clause: the rule itself starts with the merge command and chains
+        # something after it (`gh pr merge 5 && echo done`), which grants merge outright.
+        if _MERGE_FAMILY_RE.match(pattern.replace("*", "").split("&&")[0].split(";")[0].strip()):
+            return True
     # Reverse direction: is the rule itself a (more specific) merge invocation? Empty the
     # globs to get a concrete command the rule grants, and test family membership.
     rule_stem = pattern.replace("*", "")
