@@ -121,6 +121,77 @@ def check(label, cond):
     print(f"  [{status}] {label}")
 
 
+
+def check_compound_shadow_matcher():
+    """#369: a rule reaching `gh pr merge` through a COMPOUND PREFIX must be a SHADOW.
+
+    `_merge_rule_shadows` anchored the rule's regex against the WHOLE target command, so a
+    rule like `cd <path> && *` could not match `gh pr merge` and was reported SAFE - while
+    the glob it defines grants exactly that command. The doctor then printed its PASS line
+    over a cascade that re-granted merge, which is a false all-clear on a HARD-FAIL check.
+
+    Measured 2026-07-31: a TL proposed `Bash(cd /Users/jesse/Developer/stillwater-* && *)`
+    to unblock stalled agents, its own "does NOT grant" section asserted the merge gate was
+    untouched, and the matcher CONFIRMED that. Both were wrong.
+
+    The payload strings live in THIS file (never on a Bash command line) per the isolation
+    rule - the live guard greps command lines and would deny the harness itself.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_osetup_369", SCRIPT)
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+
+    MERGE = m.MERGE_TARGET                      # "gh pr merge"
+    CD = "cd /Users/jesse/Developer/stillwater-* && "
+
+    # MUST shadow: every one of these grants a command containing the merge target.
+    must_shadow = [
+        CD + "*",                               # the measured proposal
+        "cd /tmp && *",                         # any compound prefix
+        "cd /tmp && " + MERGE + " *",           # explicit merge behind a prefix
+        "* && " + MERGE,                        # merge as the trailing clause
+        MERGE + " 5 && echo done",              # merge then something else (chained, not an ARG)
+        "cd /x; *", "cd /x || *", "bash -c *; " + MERGE,   # other shell separators
+        # CR round 2: every clause is inspected, not just the head, and separators need no
+        # surrounding whitespace. Round 1 kept only `split(sep)[0]` and matched spaced forms.
+        "cd /tmp && echo ready && *",       # merge reachable via a THIRD clause
+        "a && b && c && " + MERGE,          # arbitrarily deep chain
+        "echo ok;" + MERGE,                 # UNSPACED separator
+        MERGE + " 5 || echo done", MERGE + " 5 | tee x",
+    ]
+    # MUST NOT shadow: the sanctioned forms + genuinely unrelated compounds.
+    must_not_shadow = [
+        # REGRESSION (this fix's own first attempt): a plain trailing-glob rule whose `*` can
+        # swallow " && gh pr merge" is NOT a route to merge - the glob is an ARGUMENT wildcard.
+        # The naive probe flagged this and broke 16 unrelated assertions whose fixture allows
+        # exactly `Bash(x *)`; it is the same over-reach this fix corrects, pointed backwards.
+        "x *", "x", "bash *", "bash ~/.claude/scripts/*.sh *",
+        # `bash -c *` was in the SHADOW list on the first draft of this test, and that was
+        # wrong for the same reason: it carries no separator, so its `*` is an argument
+        # wildcard indistinguishable from `x *`. Flagging it re-breaks the fixture above.
+        # It genuinely CAN run a merge - as can `bash *`, `sh *`, `xargs *` - but catching
+        # that needs interpreter-awareness, not separator analysis. Documented limitation,
+        # consistent with the floor's threat model (an honest operator on the obvious path,
+        # not adversarial evasion); a shell-wrapped merge is still floor-denied at run time.
+        # CR round 2: a separator inside a QUOTED ARGUMENT is not a chain. Raw matching
+        # rejected the merge-scoped exemption here and reported a SANCTIONED rule as a
+        # shadow - a false positive on the one form the doctor must never flag.
+        MERGE + " --body 'a && b'", MERGE + ' --body "x ; y"',
+        "bash -c *",
+        MERGE,                                  # sanctioned bare
+        MERGE + " *",                           # sanctioned boundary-star
+        MERGE + ":*",                           # sanctioned colon-star
+        MERGE + " --squash",                    # sanctioned specific invocation
+        "gh pr view *",                         # non-merge subcommand
+        "cd /tmp && go test *",                 # compound, no merge reachable
+        "cd /tmp && git diff *",
+    ]
+    for pat in must_shadow:
+        check(f"#369: SHADOWS - Bash({pat[:52]})", m._merge_rule_shadows(pat) is True)
+    for pat in must_not_shadow:
+        check(f"#369: not a shadow - Bash({pat[:52]})", m._merge_rule_shadows(pat) is False)
+
+
 def main():
     global _CLEAN_CASCADE
     with tempfile.TemporaryDirectory() as td:
@@ -2170,6 +2241,13 @@ def main():
               _writes == [])
     else:
         check("#107 real required-permissions.md: file accessible for regression check", False)
+
+    # #369: the compound-shadow matcher cases. CALLED HERE, before the single summary -
+    # an earlier edit removed a duplicated FAILS block and lost this call, leaving the whole
+    # block DEAD CODE that reported nothing while reading as covered. The mutation check is
+    # what surfaced it: the new cases "passed" against the KNOWN-BROKEN round-1 matcher,
+    # which is only possible if they never ran.
+    check_compound_shadow_matcher()
 
     print()
     if FAILS:

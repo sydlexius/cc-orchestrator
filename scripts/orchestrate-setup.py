@@ -1183,6 +1183,61 @@ def _rule_to_regex(pattern):
     return re.escape(pattern) + r"(\s.*)?"
 
 
+def _shell_clauses(pattern):
+    """Split a rule body into shell CLAUSES on unquoted, unescaped separators (#369 round 2).
+
+    Returns the list of clause strings (always at least one). A raw `split("&&")` was wrong in
+    BOTH directions, and CodeRabbit caught both on the first version of this fix:
+
+      FALSE NEGATIVE - `cd /tmp && echo ready && *` kept only the FIRST clause, so the probe
+      never saw that the trailing `*` grants `gh pr merge` as a third clause. Multi-clause
+      rules were simply not inspected past their head.
+
+      FALSE POSITIVE - `gh pr merge --body 'a && b'` carries a separator inside a QUOTED
+      argument. That is ONE command, but raw matching read it as chained, rejected the
+      merge-scoped exemption, and reported a sanctioned rule as a shadow.
+
+    Also handles UNSPACED separators (`echo ok;gh pr merge`), which the previous joiner-based
+    probe could not match because it only tried spaced forms.
+
+    Deliberately NOT a shell parser: it tracks single/double quotes and backslash escapes,
+    which covers how these rules are actually written. On anything it cannot tokenize it
+    returns the whole pattern as ONE clause, which routes the rule to the ordinary
+    intersection tests rather than silently exempting it - degrade toward INSPECTION, never
+    toward a free pass."""
+    clauses, buf = [], []
+    i, n = 0, len(pattern)
+    quote = None          # active quote char, or None
+    while i < n:
+        c = pattern[i]
+        if quote:
+            buf.append(c)
+            if c == "\\" and quote == '"' and i + 1 < n:      # escape inside double quotes
+                i += 1; buf.append(pattern[i])
+            elif c == quote:
+                quote = None
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:                            # escaped char outside quotes
+            buf.append(c); i += 1; buf.append(pattern[i]); i += 1
+            continue
+        if c in ("'", '"'):
+            quote = c; buf.append(c); i += 1
+            continue
+        two = pattern[i:i + 2]
+        if two in ("&&", "||"):
+            clauses.append("".join(buf).strip()); buf = []; i += 2
+            continue
+        if c in (";", "|", "\n"):
+            clauses.append("".join(buf).strip()); buf = []; i += 1
+            continue
+        buf.append(c); i += 1
+    if quote:                       # unterminated quote: cannot tokenize -> ONE clause
+        return [pattern]
+    clauses.append("".join(buf).strip())
+    return [c for c in clauses if c] or [pattern]
+
+
 def _is_merge_scoped(pattern):
     """True iff the specifier's language is a SUBSET of the merge family - i.e. it grants
     only `gh pr merge` and its own args/flags, nothing broader.
@@ -1200,8 +1255,20 @@ def _is_merge_scoped(pattern):
         return True
     if pattern.endswith(" *") or pattern.endswith(":*"):
         return pattern[:-2] == MERGE_TARGET
-    # wildcard-free specifier longer than the bare target: merge-specific args are fine
+    # wildcard-free specifier longer than the bare target: merge-specific ARGS are fine.
+    # But only ARGS - a rule that CHAINS a second command (`gh pr merge 5 && echo done`) is
+    # not "merge and nothing beyond merge's own args", so it must not take this exemption and
+    # be reported merge-scoped. Pre-existing hole, upstream of the compound-reach fix below:
+    # the exemption ran first, so such a rule short-circuited to "not a shadow" before any
+    # compound analysis could see it.
+    #
+    # QUOTE-AWARE, because a RAW separator scan is wrong in the expensive direction here:
+    # `gh pr merge --body 'a && b'` carries `&&` inside a QUOTED ARGUMENT, which is one
+    # command, not a chain. Treating it as chained rejected the exemption and then reported a
+    # genuine merge-scoped rule as a SHADOW - a false positive on the sanctioned form.
     if "*" not in pattern:
+        if len(_shell_clauses(pattern)) > 1:
+            return False
         return pattern.startswith(MERGE_TARGET + " ")
     # any other wildcard form (plain-glob, infix, leading) - not merge-scoped
     return False
@@ -1232,6 +1299,50 @@ def _merge_rule_shadows(pattern):
     rule_re = re.compile("^" + _rule_to_regex(pattern) + "$", re.DOTALL)
     if rule_re.match(MERGE_TARGET) or rule_re.match(MERGE_TARGET + " x"):
         return True
+    # COMPOUND REACH (#369). The two tests above anchor the rule's regex against the merge
+    # command ALONE, so a rule that reaches merge through a COMPOUND PREFIX escaped both:
+    # `cd <path> && *` cannot match the string "gh pr merge", yet the glob it defines grants
+    # exactly that command. The scan then reported SAFE and doctor printed its PASS line over
+    # a cascade that re-granted merge - a false all-clear on a HARD-FAIL check, which is worse
+    # than no check because the PASS is what a reviewer cites when waving the rule through.
+    # (Measured: a TL proposed `Bash(cd /Users/jesse/Developer/stillwater-* && *)`, its own
+    # "does NOT grant" note claimed the merge gate was untouched, and the matcher agreed.)
+    #
+    # A shell command line runs MANY commands - separated by && || ; | and newlines - and a
+    # grant covers EVERY clause, not just the first. So ask the question the allow-list
+    # actually answers: does this rule's language admit ANY command line containing a merge
+    # clause? Probe with representative separators rather than parsing shell grammar (this is
+    # a guardrail, not a sandbox - the threat model is an honest operator on the obvious path).
+    # THE PROBE MUST NOT OVER-REACH, and the naive form does. Probing whether the rule matches
+    # "<anything><sep>gh pr merge" flags `Bash(x *)` as a shadow: its trailing `*` swallows
+    # " && gh pr merge" and the string matches - but that rule grants the command `x`, not a
+    # route to merge. That false positive broke 16 unrelated harness assertions whose fixture
+    # allows exactly `Bash(x *)`, and it is the same over-reach this fix exists to correct,
+    # pointed the other way. So the probe fires ONLY for a rule that itself contains a shell
+    # SEPARATOR - i.e. one whose author wrote a compound grant - and never for a plain
+    # trailing-glob rule, where the glob is an argument wildcard rather than a command chain.
+    clauses = _shell_clauses(pattern)
+    if len(clauses) > 1:
+        # INSPECT EVERY CLAUSE, not just the head. A grant covers each command in the chain,
+        # so a merge anywhere in it is a merge grant. Round 1 of this fix examined only
+        # `split(sep)[0]`, which missed `cd /tmp && echo ready && *` entirely (CR caught it).
+        for idx, clause in enumerate(clauses):
+            # (a) the clause IS a merge invocation, literally or by glob.
+            if _MERGE_FAMILY_RE.match(clause.replace("*", "").strip()):
+                return True
+            # (b) the clause is a bare glob (or glob-tailed) that can expand to one. Only a
+            # clause whose OWN text is a wildcard counts: `x *` in isolation grants the
+            # command `x`, not merge - the over-reach that broke 16 assertions in round 1.
+            if clause == "*" or clause.endswith(" *"):
+                clause_re = re.compile("^" + _rule_to_regex(clause) + "$", re.DOTALL)
+                if clause_re.match(MERGE_TARGET) or clause_re.match(MERGE_TARGET + " --squash"):
+                    return True
+            # (c) a NON-leading clause reached through the rule's own prefix: rebuild the
+            # command line the rule grants, with merge substituted at this position.
+            if idx > 0:
+                probe = " && ".join(clauses[:idx] + [MERGE_TARGET])
+                if rule_re.match(probe) or rule_re.match(probe + " --squash"):
+                    return True
     # Reverse direction: is the rule itself a (more specific) merge invocation? Empty the
     # globs to get a concrete command the rule grants, and test family membership.
     rule_stem = pattern.replace("*", "")
