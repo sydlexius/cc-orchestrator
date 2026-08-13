@@ -345,16 +345,25 @@ description. An explicit env var always wins over the `codecov.yml` value.
     profile (the repo has no coverage tooling -- e.g. a stdlib-only shell/Python
     repo): treat exit 2 as a SKIP. Print "Patch-coverage gate skipped (no
     coverage profile / no coverage service)." and continue to Step 3.
-- `3` -- **REFUSED (#335): never a skip, on any repo.** The tree has uncommitted
-  Go changes (or `git status` could not be read), so the diff scope comes from
-  committed HEAD while the profile compiles the working tree -- the two halves
-  describe different versions of the same file, which yields either a silent
-  skip or a number that measures neither. It is a SEPARATE code from 2 for
+- `3` -- **REFUSED (#335): never a skip, on any repo.** The validity precondition
+  failed, so the diff scope (committed HEAD) and the profile (working tree) would
+  describe different versions of the same file. It is a SEPARATE code from 2 for
   exactly this reason: 2 legitimately routes to "skip, this repo has no coverage
-  tooling", and a refusal routed there would be swallowed. STOP and say:
-  > "patch-coverage REFUSED to measure -- uncommitted Go changes are present.
-  > Commit them, then re-run prep-pr. (`PATCH_COVERAGE_ALLOW_DIRTY=1` measures
-  > anyway and labels the figure UNRELIABLE; prefer committing.)"
+  tooling", and a refusal routed there would be swallowed. STOP -- and read the
+  script's stderr, because there are **two causes with different remedies**:
+  - **Dirty Go source** (stderr says "uncommitted Go changes are present"):
+    > "patch-coverage REFUSED to measure -- uncommitted Go changes are present.
+    > Commit them, then re-run prep-pr. (`PATCH_COVERAGE_ALLOW_DIRTY=1` measures
+    > anyway and labels the figure UNRELIABLE; prefer committing.)"
+  - **`git status` unreadable** (stderr says "could not read git status"): a
+    REPO-ACCESS fault, not a dirty tree -- the tree is UNDETERMINED. Committing
+    fixes nothing, and **`PATCH_COVERAGE_ALLOW_DIRTY=1` does not apply**: that
+    branch exits before the override is consulted, and there is no established
+    dirty tree for it to override. Say:
+    > "patch-coverage REFUSED -- `git status` could not be read, so the tree
+    > state is undetermined. Check this is a git repository, that `.git` is
+    > readable, and that no other git process holds a lock. Repair git access,
+    > then re-run prep-pr."
 
 **If the script is missing** (`${CLAUDE_PLUGIN_ROOT}/scripts/patch-coverage.sh` not found),
 treat as a `2` configuration error: stop and tell the user to reinstall or update

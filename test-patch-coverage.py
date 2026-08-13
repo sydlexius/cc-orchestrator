@@ -51,7 +51,8 @@ def _git(repo, *args):
 
 def run_case(profile_lines, *, go_src, added_src, threshold="70",
              commit_patch=True, dirty_extra=None, extra_files=None, env_extra=None,
-             break_index=False, committed_extra=None, run_from=None, git_config=None):
+             break_index=False, committed_extra=None, run_from=None, git_config=None,
+             empty_profile=False):
     """Build a throwaway Go repo with a BASE commit and a HEAD commit that ADDS `added_src`
     to lib.go, write `profile_lines` as the coverage profile, and run patch-coverage.sh
     against it. Returns (exit_code, stdout+stderr).
@@ -102,7 +103,11 @@ def run_case(profile_lines, *, go_src, added_src, threshold="70",
 
     prof = os.path.join(repo, "cover.out")
     with open(prof, "w") as fh:
-        fh.write("mode: set\n" + "".join(ln if ln.endswith("\n") else ln + "\n"
+        # empty_profile writes a ZERO-BYTE file, which is what the script's `[ -s ]` check
+        # rejects -- a repo with no coverage tooling. A "mode: set" header alone would be
+        # non-empty and sail past it.
+        fh.write("" if empty_profile else
+                 "mode: set\n" + "".join(ln if ln.endswith("\n") else ln + "\n"
                                          for ln in profile_lines))
     env = dict(os.environ, COVER_OUT=prof, BASE=base,
                PATCH_COVERAGE_THRESHOLD=threshold, **(env_extra or {}))
@@ -262,6 +267,22 @@ def main():
     check("#335: an untracked .go trips the guard even under status.showUntrackedFiles=no",
           rc_ut == 3)
 
+    # THE TWO EXIT-3 CAUSES HAVE DIFFERENT REMEDIES, and the message must say which applies
+    # (CR, PR #388). The status-fault branch exits BEFORE the ALLOW_DIRTY check, so the
+    # override is genuinely inapplicable there -- documenting "commit, or set ALLOW_DIRTY=1"
+    # for both sent a reader with a broken .git down a path that cannot work, which reads as
+    # a broken gate rather than a broken repo. Asserted here so the distinction cannot rot
+    # back into one generic message.
+    if os.geteuid() != 0:
+        rc_sf, out_sf = run_case([f"{BLOCK} 2 1"], go_src=GO_BASE, added_src=GO_ADDED,
+                                 break_index=True,
+                                 env_extra={"PATCH_COVERAGE_ALLOW_DIRTY": "1"})
+        check("#335: ALLOW_DIRTY does NOT override the status-fault branch (still exit 3)",
+              rc_sf == 3 and "Total patch coverage:" not in out_sf)
+        check("#335: the status-fault message names a repo-access fault and disclaims ALLOW_DIRTY",
+              "REPO-ACCESS fault" in out_sf and "does NOT apply" in out_sf
+              and "uncommitted Go changes are present" not in out_sf)
+
     # The escape hatch must exist and must be explicit, so a caller that genuinely wants
     # the old behavior declares it rather than learning to ignore a broken gate.
     rc_ov, out_ov = run_case([f"{BLOCK} 2 1"], go_src=GO_BASE, added_src=GO_ADDED,
@@ -276,6 +297,19 @@ def main():
                        if ln.startswith("Total patch coverage:")), "")
     check("#335: PATCH_COVERAGE_ALLOW_DIRTY=1 proceeds but LABELS the TOTAL LINE unreliable",
           rc_ov == 0 and "UNRELIABLE" in total_line)
+
+    # EXIT 2 OUTRANKS EXIT 3, and the ordering is load-bearing rather than incidental.
+    # The config checks (BASE, COVER_OUT, go.mod) all run BEFORE the dirty guard, so a repo
+    # with no coverage tooling gets the exit-2 self-skip even when its tree is dirty. Move
+    # the guard above them and every such repo would start REFUSING instead of skipping --
+    # converting a self-skip into a hard stop for every consumer. Nothing pinned that, so
+    # the reorder would have been silent. (CR raised this as "Trivial"; the severity label
+    # is input, not a verdict -- this guards exactly what makes exit 3 safe to introduce.)
+    rc_pre, out_pre = run_case([], go_src=GO_BASE, added_src=GO_ADDED,
+                               dirty_extra="\nfunc More() int {\n\treturn 3\n}\n",
+                               empty_profile=True)
+    check("#335: a config error OUTRANKS the dirty guard (empty profile + dirty tree -> 2, not 3)",
+          rc_pre == 2 and "profile not found or empty" in out_pre)
 
     # The label must ride EVERY stdout terminal path, not just the total line. Under
     # ALLOW_DIRTY with all changes uncommitted (the original face-1 shape) the script takes

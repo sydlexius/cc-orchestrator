@@ -91,8 +91,15 @@
 #   0  patch coverage meets or exceeds the threshold (or nothing to check)
 #   1  patch coverage below threshold
 #   2  configuration error (missing profile, unreadable go.mod, etc.)
-#   3  REFUSED: the validity precondition is not satisfied (dirty Go source, or
-#      an unreadable `git status` that leaves it undetermined). Distinct from 2
+#   3  REFUSED: the validity precondition is not satisfied. TWO causes, with
+#      DIFFERENT remedies, and the script's stderr names which one applies:
+#        (a) dirty Go source -- commit, then re-run. PATCH_COVERAGE_ALLOW_DIRTY=1
+#            measures anyway and labels the output UNRELIABLE.
+#        (b) `git status` unreadable -- a REPO-ACCESS fault, so the tree is
+#            UNDETERMINED rather than known-dirty. Repair git access; the
+#            ALLOW_DIRTY override does NOT apply (this branch exits before it is
+#            consulted, and there is no established dirty tree for it to override).
+#      Distinct from 2
 #      ON PURPOSE. Consumers legitimately treat 2 as "this repo has no coverage
 #      tooling -- skip", so reusing it would let a refusal be swallowed as
 #      "nothing to measure": exactly the silent skip this guard exists to end,
@@ -241,8 +248,16 @@ DIRTY_NOTE=""
 # Both are the same defect as the one this guard exists to fix: ambient context silently
 # turning "I did not look everywhere" into "there is nothing there", which routes to PASS.
 if ! dirty_go=$(git status --porcelain --untracked-files=normal -- ':(top)*.go' 2>/dev/null); then
-  echo "patch-coverage: REFUSED -- could not read git status to verify the tree is clean." >&2
+  # NOTE the remedy differs from the dirty-tree branch below, and this branch exits BEFORE
+  # the ALLOW_DIRTY check, so that override is genuinely INAPPLICABLE here: nothing is known
+  # to be dirty -- git access is broken. Saying "commit, or set ALLOW_DIRTY=1" would send a
+  # reader down a path that cannot work and reads as a broken gate rather than a broken repo.
+  echo "patch-coverage: REFUSED (exit 3) -- could not read git status to verify the tree is clean." >&2
   echo "  Undetermined is not clean: a figure computed here could be a chimera." >&2
+  echo "  This is a REPO-ACCESS fault, not a dirty tree: check that this is a git" >&2
+  echo "  repository, that .git is readable, and that no other git process holds a lock." >&2
+  echo "  PATCH_COVERAGE_ALLOW_DIRTY does NOT apply here -- it overrides a KNOWN-dirty" >&2
+  echo "  tree, and this branch never established one. Repair git access, then re-run." >&2
   exit 3
 fi
 if [ -n "$dirty_go" ]; then
