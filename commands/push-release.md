@@ -39,14 +39,33 @@ The user may provide:
 4. **Run pre-checks.** Execute each command in `build.pre_checks` sequentially from
    `build.working_dir`. If any fails, stop and show the error. Do NOT skip pre-checks.
 
-5. **Gather merged PRs.** Find the last tag: `git tag --sort=-creatordate | head -1`.
-   If no tags exist, get the first commit: `git rev-list --max-parents=0 HEAD`.
-   Then list merged PRs since that point, **including each PR's closing issues**:
-   `gh pr list --state merged --base main --search "merged:>={date}" --limit 200 --json number,title,labels,closingIssuesReferences`
-   where `{date}` is the tag's date trimmed to `YYYY-MM-DD` (`git log -1 --format=%aI {tag} | cut -d'T' -f1`);
-   GitHub's `merged:>={date}` search requires the bare date, not the full ISO 8601 timestamp with offset. The
-   `closingIssuesReferences` field is what makes step 6's issue-preferred
-   linking possible without parsing PR bodies.
+5. **Gather merged PRs.** Derive the set from the COMMIT RANGE, not from a date.
+
+   ```sh
+   last_tag=$(git tag --sort=-creatordate | head -1)   # empty on a first release
+   range="${last_tag:+$last_tag..}origin/main"          # first release -> whole history
+   # The PR number is the "(#N)" trailer GitHub appends on squash-merge.
+   prs=$(git log "$range" --oneline | grep -oE '\(#[0-9]+\)$' | tr -d '(#)')
+   for n in $prs; do
+     gh pr view "$n" --json number,title,labels,closingIssuesReferences
+   done
+   ```
+
+   **Why not a date search.** The obvious form -- `gh pr list --search "merged:>={tag date}"`
+   -- OVER-COLLECTS, and it does so silently. `merged:>=` takes a bare `YYYY-MM-DD`, so it
+   returns everything merged on the tag date INCLUDING what the previous tag already
+   shipped. Measured on v0.94.2: the date search returned 2 PRs where the range contained
+   1, because the other had shipped in v0.94.1 earlier the same day. An earlier run of the
+   same bug returned 15 PRs for a 4-PR release. A tag is a COMMIT, so ask git for the
+   commits; only the range knows where the last release actually stopped.
+
+   **Sanity-check the result** before writing notes: `git log "$range" --oneline | wc -l`
+   should be within one or two of the PR count (merge commits and direct pushes explain
+   any gap). A PR count far above the commit count means the range is wrong -- stop and
+   re-derive rather than shipping notes that credit another release's work.
+
+   The `closingIssuesReferences` field is what makes step 6's issue-preferred linking
+   possible without parsing PR bodies.
 
 6. **Generate release notes.** Group PRs by label using `release_notes.group_labels`.
    PRs without a matching label go under `release_notes.default_group`. Rewrite each
