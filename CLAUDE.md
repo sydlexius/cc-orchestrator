@@ -171,6 +171,34 @@ Runtime (`scripts/`; canonical source is this repo):
   never read as "fine" in a fail-closed gate. #315: a null `reviewDecision` is now QUALIFIED in
   the PASS line (approved-on-head / nobody-reviewed / unreadable) instead of a bare `<none>`
   that read as "review state is fine" - REPORTING only, fail-soft, never changes the verdict.
+  #375: FULL mode now also RECONCILES the rollup against an EXPECTED CONTEXT SET and BLOCKS
+  naming any required check ABSENT from it. The prior guards were a COUNT plus a purely
+  NEGATIVE scan, so a check that NEVER RAN was invisible: off a non-default base the ruleset
+  targets `~DEFAULT_BRANCH`, nothing is violated, and #334's aggregate reads CLEAN correctly -
+  which is why #334 does not cover this. The set is the UNION of the rulesets API
+  (`rules/branches/<ref>`, needs no admin scope, fail-CLOSED) and legacy branch protection
+  (best-effort: it 404s wherever it is simply unconfigured); they DISAGREE on this repo, 4
+  contexts vs 1, so either alone under-reports. When the BASE requires no checks the DEFAULT
+  branch's set is used, and the fallback is REPORTED, never applied silently. THE PREDICATE IS
+  `has required_status_checks`, NEVER `has rules`: a ref can carry an auto-review-only ruleset
+  with ZERO required checks, and a presence-keyed predicate would call that base governed,
+  reconcile against an empty set, and pass the identical false green through a longer path.
+  Every unreadable input BLOCKS, per the #334 UNKNOWN precedent. FULL mode only - `--diagnose`
+  keeps its own narrower legacy-protection read.
+  THE DEFECT CLASS IT KEEPS RE-GROWING is worth more than the feature: a status or a type
+  that goes UNCHECKED turns "I could not read this" into "there was nothing to read", which
+  routes to PASS, which arms the merge-auth token. It shipped SIX times across two rounds -
+  `|| echo ""` on a lookup whose failure writes its BODY TO STDOUT (twice, the second time in
+  the round that documented the first three comment blocks above the call site it missed);
+  `jq -e .` proving a body is JSON but not that it is the ARRAY OF RULES contracted; an
+  extraction jq whose status was discarded by plain assignment (pipefail never sees one); a
+  `--jq` exit of 1 conflating "endpoint 404'd" with "filter failed on the body"; and a
+  `select(. != null)` DROPPING a malformed context, which under-reports the required set.
+  The structural lesson, now encoded: the type/newline invariant is asserted ONCE ON THE
+  UNION rather than per-leg, because a rule applied at one call site and not its sibling
+  reads as enforced while the other half sails through - which is exactly how the newline
+  guard passed its own harness while the legacy leg still produced a live false PASS.
+  Design of record: `skills/orchestrate/design/DESIGN-expected-check-set.md`.
   #301 PART 1 is the one change here that RELAXES the gate: CheckRuns are reduced LATEST-PER-NAME
   before evaluation, because GitHub CANCELS in-flight duplicates on every push and the flat
   evaluation blocked on the superseded corpse beside the later same-name SUCCESS. The sort contract

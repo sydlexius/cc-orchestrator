@@ -317,7 +317,7 @@ fi
 # invisible; adding a fourth type would leave a fifth. Instead ASK GITHUB FOR ITS VERDICT -
 # mergeStateStatus already aggregates every rule, including ones this script has never
 # heard of. Evaluate the aggregate, do not re-derive it.
-json="$(gh pr view "$pr" --repo "$repo" --json statusCheckRollup,reviewDecision,headRefOid,mergeStateStatus 2>/dev/null)" || {
+json="$(gh pr view "$pr" --repo "$repo" --json statusCheckRollup,reviewDecision,headRefOid,mergeStateStatus,baseRefName 2>/dev/null)" || {
   echo "BLOCK: 'gh pr view' failed for #$pr in $repo" >&2
   exit 2
 }
@@ -425,6 +425,250 @@ if [ "$count" -eq 0 ]; then
   echo "BLOCK: no checks on #$pr (empty statusCheckRollup). An unverified PR is not merge-ready." >&2
   echo "RESULT: BLOCK -- no checks. [#$pr $repo]" >&2
   exit 2
+fi
+
+# --- EXPECTED-SET RECONCILIATION (#375) ------------------------------------
+# The guard above is a COUNT, not a coverage check: one green irrelevant check
+# satisfies it, and everything below is a purely NEGATIVE test hunting for entries
+# that are BAD. A check that never ran is not bad, it is ABSENT -- so on a PR based
+# off a non-default branch the oracle passed while Build, Test, Lint and both CodeQL
+# analyses had never been scheduled. Measured live on stillwater#3021: 1 of 18
+# required contexts present, and mergeStateStatus=CLEAN agreeing, because the ruleset
+# targets ~DEFAULT_BRANCH and off that branch there is no rule to violate.
+#
+# That is why #334's fix does not cover this. It adopted GitHub's aggregate verdict
+# precisely to stop hand-picking rule subsets, and the aggregate is genuinely clean
+# here. Silence is not consent.
+#
+# Design of record: skills/orchestrate/design/DESIGN-expected-check-set.md (Option C).
+# Deliberately reconciles the required-CONTEXT set only and leaves every other rule
+# type to GitHub's aggregate -- enumerating rule types is the #334 defect class.
+base_ref="$(jq -r '.baseRefName // ""' <<<"$json")" || base_ref=""
+# NOT guarded into a silent skip. An earlier draft treated an unreadable default
+# branch as "no fallback available" and fell through to a PASS emitting nothing --
+# byte-identical to a PR that legitimately had no expected set. A single transient
+# `gh repo view` failure therefore restored the exact #3021 false PASS, silently, on
+# the oracle that arms the floor merge-auth token. The emptiness is now a BLOCK at
+# the one place it can matter (below), so all three unreadable inputs -- base ref,
+# base rules, default branch -- fail the same way.
+# CAPTURE, THEN DECIDE -- never `|| echo ""`. `gh --jq` writes its ERROR BODY to
+# STDOUT and exits nonzero (the same contract the legacy leg below documents at
+# length), so the substitution did NOT yield an empty string on failure: it yielded
+# the payload. The `[ -z ]` guard was therefore skipped, the payload was used as a
+# BRANCH NAME, `rules/branches/<error text>` answered `[]`, and the gate PASSed --
+# the very fail-open the guard below was written to close, still reachable on the
+# transport failure it names. Reject anything that is not a plausible single ref:
+# a `null` (which --jq prints for an absent field), whitespace, or JSON punctuation.
+if default_branch="$(gh repo view "$repo" --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null)"; then
+  case "$default_branch" in
+    null|*[[:space:]]*|*'{'*|*'}'*|*'"'*) default_branch="" ;;
+  esac
+else
+  default_branch=""
+fi
+
+# Required contexts for a ref, from `rules/branches/<ref>`. That endpoint is the
+# authority AND needs no admin scope -- branches/<ref>/protection 404s without it,
+# which would make the common case indistinguishable from "unreadable".
+# Echoes one context per line; returns 1 when the ref cannot be read at all.
+_required_contexts_for() {
+  local _ref="$1" _doc _rules _legacy _union
+  _doc="$(gh api "repos/$repo/rules/branches/$_ref" 2>/dev/null)" || return 1
+  # An EMPTY body is not malformed and must not read as unreadable: `jq -e .` exits 4 on
+  # empty input, which would turn a benign empty response into a BLOCK on every merge.
+  # Normalize it to the empty rule array it means, then insist the rest parses.
+  [ -n "$_doc" ] || _doc='[]'
+  # TYPE, not merely parseability. `jq -e .` proves only that the body IS JSON, never
+  # that it is the ARRAY OF RULES this endpoint contracts -- and the extraction below
+  # ran as a plain assignment with `2>/dev/null`, so its status was DISCARDED and
+  # pipefail never saw it. Any jq runtime error therefore yielded an EMPTY set, which
+  # routes to "this ref requires nothing" and PASSes. Measured false PASSes: an
+  # enveloped `{"rules":[...]}` (the shape a paginated response would take, `.[]` over
+  # an object exits 5), one non-object element poisoning the array, and
+  # `{"message":"Not Found"}` served with HTTP 200 -- all with a genuinely missing
+  # required check. This is the same defect class as the two fixed below, at the one
+  # call site the fix did not reach: an unreadable set must never render as an absent one.
+  # EVERY element must be an object, not just the document an array. Tolerating a junk
+  # element and extracting from the rest is the wrong direction here: the junk could BE
+  # the malformed required_status_checks rule, and skipping it would drop a required
+  # context while reporting a clean read -- a false PASS dressed as resilience.
+  jq -e 'type == "array" and all(type == "object")' >/dev/null 2>&1 <<<"$_doc" || return 1
+  # As a JSON ARRAY, not lines: the union below is validated ONCE, and a value cannot be
+  # validated after it has been flattened into a newline-delimited stream (which is the
+  # very representation the newline defect exploits).
+  _rules="$(jq -c '[.[] | select(.type == "required_status_checks")
+          | .parameters.required_status_checks[]?.context]' <<<"$_doc" 2>/dev/null)" || return 1
+
+  # UNION with legacy branch protection. The two authorities are evaluated together by
+  # GitHub and they DISAGREE on this repo -- rulesets require 4 contexts, legacy
+  # requires 1 -- so reading either alone under-reports. Legacy happens to be a strict
+  # SUBSET today, which makes the union a no-op and is exactly why shipping without it
+  # would have looked correct until the first legacy-only required context appeared.
+  #
+  # BEST-EFFORT, deliberately asymmetric to the rules read above: this endpoint needs
+  # admin scope and 404s with "Branch not protected" wherever legacy protection simply
+  # is not configured (measured: 200 on cc-orchestrator, 404 on stillwater). Treating
+  # that absence as unreadable would block every merge on a rulesets-only repo, so a
+  # failure here contributes nothing rather than failing the gate. The union can only
+  # ADD contexts, so degrading it errs toward the pre-existing behavior, never toward
+  # passing something the rules endpoint already requires.
+  # DISCARD STDOUT ON A NONZERO EXIT. `--jq` does NOT suppress gh's error body: on a
+  # 404 it writes the raw error JSON to STDOUT and exits 1. A bare `|| true` swallows
+  # the status while KEEPING that payload, so
+  #   {"message":"Branch not protected",...}
+  # was unioned in as a required CONTEXT NAME and every PR on a repo without legacy
+  # protection blocked on a fabricated check that can never appear in a rollup.
+  # Measured live on stillwater before this fix. Capture first, then decide.
+  # FETCH RAW, THEN PARSE SEPARATELY. `gh --jq` exits 1 for TWO unrelated reasons --
+  # the endpoint 404'd, or the FILTER failed on the body -- and keying on exit status
+  # alone conflated them. A 200 whose body was HTML, truncated, or `null` therefore
+  # degraded the union to rulesets-only EMITTING NOTHING, which is exactly the
+  # "a legacy-only required context silently vanishes" failure the union exists to
+  # prevent. Splitting the fetch from the parse makes the two distinguishable:
+  # ABSENT contributes nothing SILENTLY (a rulesets-only repo must not be nagged on
+  # every merge), PRESENT-BUT-UNPARSEABLE contributes nothing LOUDLY.
+  _legacy="[]"
+  if _lraw="$(gh api "repos/$repo/branches/$_ref/protection" 2>/dev/null)"; then
+    # `type == "object"` first: this endpoint contracts an object, and a degenerate 200
+    # carrying `null` (or an array, or a scalar) would otherwise filter to nothing and
+    # read as "legacy requires no checks" -- indistinguishable from a real empty answer.
+    # NOT `jq -e`: it exits 4 on NO OUTPUT, and a branch that legitimately requires no
+    # legacy contexts produces exactly that -- the same empty-vs-unreadable conflation
+    # this whole change exists to close, and the trap the rules read above already
+    # documents. `error()` exits 5 for the shape failure; empty output exits 0.
+    if _lparsed="$(jq -c 'if type == "object" then . else error("not an object") end
+                          | [.required_status_checks.contexts[]?, (.required_status_checks.checks[]?.context)]' \
+                     <<<"$_lraw" 2>/dev/null)"; then
+      # An EMPTY 200 body is benign, not malformed -- `jq -c` over empty stdin exits 0
+      # with NO OUTPUT, and the rules leg twelve lines above normalizes exactly this
+      # case for exactly this reason. Without the guard the empty string reaches
+      # `--argjson`, which rejects it (exit 2) and turns a best-effort leg into a
+      # SILENT BLOCK: control never reaches the `else`, so the unparseable NOTE below
+      # does not fire either. That is the "an unread authority looks identical to an
+      # absent one" defect this block exists to prevent, inverted.
+      # An `[ -n ] && assign` here would be the LAST command of this branch, so an empty
+      # body would make the branch exit 1 and `set -e` would kill the whole oracle.
+      if [ -n "$_lparsed" ]; then _legacy="$_lparsed"; fi
+    else
+      # NOT a BLOCK: this leg is best-effort by design and the rules leg above already
+      # carries the authority. But never silent -- an unread authority that looks
+      # identical to an absent one is the defect, whichever way the verdict falls.
+      echo "NOTE: legacy branch protection for '$_ref' is present but unparseable; the expected set uses the rulesets API alone (#375)." >&2
+    fi
+  fi
+
+  # VALIDATE THE UNION, ONCE, WHILE IT IS STILL STRUCTURED. Both legs are checked here
+  # rather than at each source, because a per-leg guard is exactly what the first round
+  # got wrong twice: a rule applied at one call site and not its sibling reads as
+  # enforced while the other half sails through. Two invariants, both fail-CLOSED:
+  #
+  #   EVERY context is a STRING. A non-string (42, null, an object) would otherwise be
+  #   rendered by `-r` into the required-set as a name -- a pretty-printed JSON fragment
+  #   spanning several LINES, which is the fabricated-check-name defect this change was
+  #   opened to fix, arriving from the payload instead of from an error body.
+  #
+  #   NO CONTEXT CONTAINS A NEWLINE. The set is carried newline-delimited from here on,
+  #   so a context named "alpha\nbeta" split into two independent requirements and two
+  #   unrelated checks named `alpha` and `beta` satisfied a required check that never
+  #   ran (measured, both legs). Such a name is pathological rather than adversarial, so
+  #   reject it rather than moving three pipelines to NUL-delimited for a case that
+  #   should not exist. It must be rejected BEFORE the flattening: a value cannot be
+  #   validated after it has been flattened into the representation that loses it.
+  #
+  # A failure here is a nonzero exit the caller already turns into a BLOCK.
+  # NO `select(. != null)`. Discarding a null would DROP a required context while
+  # reporting a clean read -- the under-reporting direction, which is the one that
+  # PASSes. Both legs use `?` operators, so an ABSENT field yields nothing at all; a
+  # null can only arrive by being genuinely present as null, i.e. malformed. Malformed
+  # is unreadable, not empty. That distinction is the entire subject of this change.
+  _union="$(jq -rn --argjson a "$_rules" --argjson b "$_legacy" \
+              '($a + $b)
+               | if all(type == "string" and (test("\n") | not)) then unique | .[]
+                 else error("unusable context name") end' 2>/dev/null)" || return 1
+  # `|| true` because `grep -v` exits 1 when it filters EVERYTHING out, and under the
+  # caller's `pipefail` that status becomes this function's return value -- which the
+  # caller reads as "unreadable" and turns into a BLOCK. An EMPTY union is a valid
+  # result (a ref that requires no checks); it is the input the fallback exists to
+  # handle, so it must not be reported as a failure to read.
+  # `LC_ALL=C` because `sort -u` dedupes on COLLATION equality, not byte equality, and
+  # collation is locale-dependent, while the comparison downstream is byte-exact
+  # (`grep -Fxq`) and GitHub check names are case-SENSITIVE -- `CI` and `ci` can both be
+  # required. No locale was found locally that actually collapses a byte-distinct pair,
+  # so this is a structural guarantee rather than a fix for a measured failure: it makes
+  # the dedupe agree with the comparison by construction instead of by ambient setting.
+  printf '%s\n' "$_union" | grep -v '^$' | LC_ALL=C sort -u || true
+}
+
+expected=""; expected_src=""
+if [ -n "$base_ref" ]; then
+  if expected="$(_required_contexts_for "$base_ref")"; then
+    expected_src="base '$base_ref'"
+  else
+    echo "BLOCK: cannot read the rules for base '$base_ref' on #$pr. An unverifiable gate is not a passed gate (#375)." >&2
+    echo "RESULT: BLOCK -- expected check set unreadable. [#$pr $repo]" >&2
+    exit 2
+  fi
+else
+  echo "BLOCK: cannot determine the base branch of #$pr; the expected check set is unknowable." >&2
+  echo "RESULT: BLOCK -- base branch unreadable. [#$pr $repo]" >&2
+  exit 2
+fi
+
+# THE FALLBACK PREDICATE IS ON REQUIRED CHECKS, NEVER ON RULE PRESENCE (design F4).
+# stillwater returns exactly one rule for a non-default ref -- copilot_code_review,
+# from an auto-review ruleset, carrying ZERO required checks. A predicate keyed on
+# "does this ref have rules" would call that base governed, reconcile against an
+# empty set, and pass the identical false green through a longer path.
+if [ -z "$expected" ]; then
+  # Only the FALLBACK needs the default branch, and the fallback only applies when the
+  # base is a DIFFERENT ref. Demanding it unconditionally turned a flaky `gh repo view`
+  # into a false BLOCK for any repo whose default branch simply requires no checks --
+  # fail-closed, so not a safety hole, but wrong.
+  if [ -n "$default_branch" ] && [ "$base_ref" = "$default_branch" ]; then
+    : # base IS the default branch and it requires nothing; nothing to fall back to.
+  elif [ -z "$default_branch" ]; then
+    # Only fatal HERE, where the fallback is actually needed: a repo whose base
+    # already carries its own required set never reaches this branch, so a flaky
+    # default-branch lookup cannot block it.
+    echo "BLOCK: base '$base_ref' requires no checks and the default branch is unreadable (#$pr); the expected check set cannot be determined." >&2
+    echo "RESULT: BLOCK -- expected check set unreadable. [#$pr $repo]" >&2
+    exit 2
+  fi
+  if [ "$base_ref" != "$default_branch" ]; then
+    if expected="$(_required_contexts_for "$default_branch")"; then
+      expected_src="default branch '$default_branch' (fallback: base '$base_ref' requires no checks)"
+    else
+      echo "BLOCK: base '$base_ref' requires no checks and the default branch's rules are unreadable (#$pr)." >&2
+      echo "RESULT: BLOCK -- expected check set unreadable. [#$pr $repo]" >&2
+      exit 2
+    fi
+  fi
+fi
+
+if [ -n "$expected" ]; then
+  present="$(jq -r '[.statusCheckRollup[]? | (.name // .context)] | map(select(. != null)) | unique | .[]' <<<"$json" 2>/dev/null || echo "")"
+  missing=""
+  while IFS= read -r _ctx; do
+    [ -n "$_ctx" ] || continue
+    printf '%s\n' "$present" | grep -Fxq -- "$_ctx" || missing="${missing}${missing:+, }${_ctx}"
+  done <<<"$expected"
+  if [ -n "$missing" ]; then
+    # "did not run (absent from the rollup)", never "NEVER RAN": GitHub populates the
+    # rollup incrementally, so a required check not yet SCHEDULED is absent rather than
+    # never-run. The verdict is the same either way (block), but the message must not
+    # assert more than was observed.
+    echo "BLOCK: required check(s) did not run on #$pr (absent from the rollup): $missing" >&2
+    echo "  expected set from $expected_src; an absent check is not a passing check (#375)." >&2
+    echo "  If a push just landed, re-run once the checks have been scheduled." >&2
+    echo "RESULT: BLOCK -- required checks missing. [#$pr $repo]" >&2
+    exit 2
+  fi
+  echo "NOTE: required check set reconciled against $expected_src -- all present."
+else
+  # NEVER silent (M4). A skipped reconciliation and a clean one used to produce
+  # identical output, so a PASS could not be audited for whether the check even ran --
+  # which is the same class of defect this whole change exists to close.
+  echo "NOTE: no required check set applies to base '$base_ref'; reconciliation skipped."
 fi
 
 # A context is BAD if it is not terminal-and-acceptable. CheckRun: status must be

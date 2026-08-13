@@ -47,7 +47,7 @@ DEFAULT_SHA = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
 
 
 def rollup(*contexts, review_decision="__OMIT__", head_ref_oid=DEFAULT_SHA,
-           merge_state="CLEAN"):
+           merge_state="CLEAN", base_ref="main"):
     """Build a statusCheckRollup JSON document from context dicts.
 
     review_decision: when supplied, add a top-level `reviewDecision` field (the
@@ -70,7 +70,39 @@ def rollup(*contexts, review_decision="__OMIT__", head_ref_oid=DEFAULT_SHA,
     # field (unreadable -> BLOCK) or any other value to exercise the new gate.
     if merge_state != "__OMIT__":
         doc["mergeStateStatus"] = merge_state
+    # base_ref (#375): FULL mode needs the PR's base to ask GitHub what that ref
+    # actually requires. Defaults to "main" so every pre-existing fixture keeps its
+    # behavior; pass a feature-branch name to exercise the non-default-base case, or
+    # "__OMIT__" to drop the field (unreadable base -> BLOCK).
+    if base_ref != "__OMIT__":
+        doc["baseRefName"] = base_ref
     return json.dumps(doc)
+
+
+def rules_doc(*, contexts=None, extra_types=None):
+    """A `rules/branches/<ref>` response.
+
+    contexts: required status-check contexts, emitted as a `required_status_checks`
+    rule. Pass None for a ref that requires NO checks.
+
+    extra_types: other rule types present on the ref. This exists for the F4 case in
+    DESIGN-expected-check-set.md, and it is the whole reason the fallback predicate
+    cannot be "does the base have rules": stillwater returns exactly one rule for a
+    non-default ref -- `copilot_code_review`, from an auto-review ruleset, with ZERO
+    required checks. A predicate keyed on rule PRESENCE would call that base governed,
+    reconcile against an empty required set, and pass the identical false green.
+    """
+    out = []
+    for t in (extra_types or []):
+        out.append({"type": t, "ruleset_id": 1})
+    if contexts is not None:
+        out.append({
+            "type": "required_status_checks",
+            "ruleset_id": 2,
+            "parameters": {"required_status_checks":
+                           [{"context": c} for c in contexts]},
+        })
+    return json.dumps(out)
 
 
 def threads_doc(unresolved=0, resolved=0, total=None, raw_nodes=None):
@@ -157,7 +189,9 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         unreplied_fail_until=0, codoki_ack_verdict="no-summary",
         codoki_ack_fail=False, codoki_ack_missing=False,
         threads_json="__DEFAULT__", threads_fail=False, protection=None, comments=None,
-        comments_fail=False, reviews=None, reviews_fail=False):
+        comments_fail=False, reviews=None, reviews_fail=False,
+        rules_main=None, rules_base=None, rules_fail=False, default_branch_fail=False,
+        rules_main_fail=False, default_branch=None):
     """Invoke the oracle with stubbed gh + pr-unreplied-comments.sh + gh-react.sh.
     Returns (exit_code, stdout, stderr, argv) where argv is the recorded helper
     argv content (one line per invocation, read back from the log) -- used to
@@ -190,7 +224,30 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
                 "  graphql)\n"
                 "    if [ -n \"${THREADS_FAIL:-}\" ]; then echo 'gh api graphql: simulated failure' >&2; exit 1; fi\n"
                 "    printf '%s' \"${FIXTURE_THREADS:-}\"; exit 0;;\n"
-                "  repo) echo 'owner/repo'; exit 0;;\n"
+                "  repo)\n"
+                "    # `gh repo view` serves TWO callers now: the repo-slug resolution that\n"
+                "    # predates this stub, and (#375) the default-branch lookup the\n"
+                "    # expected-set fallback needs. Discriminate on the --json field, or the\n"
+                "    # slug answer is handed to a caller parsing a branch name.\n"
+                "    case \"$*\" in\n"
+                "      *defaultBranchRef*)\n"
+                "        # DEFAULT_BRANCH_FAIL fails ONLY this route. Without a knob here the\n"
+                "        # fail-open in the fallback path was untestable, and it shipped: an\n"
+                "        # unreadable default branch skipped reconciliation entirely and PASSed\n"
+                "        # with no output at all.\n"
+                "        #\n"
+                "        # THE ERROR BODY GOES TO STDOUT, not stderr. Real `gh ... --jq` writes\n"
+                "        # its error payload to STDOUT and exits nonzero (the same contract the\n"
+                "        # protection route models below). An earlier stub wrote this failure to\n"
+                "        # STDERR -- kinder than reality in the one direction that mattered, so a\n"
+                "        # caller using `|| echo \"\"` captured the payload as a BRANCH NAME and the\n"
+                "        # harness could not see it. Fidelity here is what gives the case teeth.\n"
+                "        if [ -n \"${DEFAULT_BRANCH_FAIL:-}\" ]; then\n"
+                "          printf '%s' '{\"message\":\"Not Found\",\"status\":\"404\"}'; exit 1\n"
+                "        fi\n"
+                "        echo \"${FIXTURE_DEFAULT_BRANCH:-main}\"; exit 0;;\n"
+                "    esac\n"
+                "    echo 'owner/repo'; exit 0;;\n"
                 "  *comments)\n"
                 "    # `gh api repos/.../issues/<pr>/comments` (#237 @codoki-trigger detector).\n"
                 "    # COMMENTS_FAIL fails ONLY this route (gh pr view still succeeds) to test the\n"
@@ -204,12 +261,57 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
                 "    # the exit code identical, never flip a PASS to a BLOCK.\n"
                 "    if [ -n \"${REVIEWS_FAIL:-}\" ]; then echo 'gh: simulated reviews-API failure' >&2; exit 1; fi\n"
                 "    printf '%s' \"${FIXTURE_REVIEWS:-[]}\"; exit 0;;\n"
+                "  */rules/branches/*)\n"
+                "    # `gh api repos/.../rules/branches/<ref>` (#375). THE authority for the\n"
+                "    # expected check set, and unlike branches/<ref>/protection it needs no\n"
+                "    # admin scope (measured: the legacy route 404s on this repo while this one\n"
+                "    # answers). FIXTURE_RULES_MAIN serves the default branch; FIXTURE_RULES_BASE\n"
+                "    # serves any other ref, so the stacked case (base has no required checks,\n"
+                "    # main does) is expressible. RULES_FAIL fails the route to prove the\n"
+                "    # unreadable path BLOCKS rather than degrading to a pass.\n"
+                "    if [ -n \"${RULES_FAIL:-}\" ]; then echo 'gh: simulated rules-API failure' >&2; exit 1; fi\n"
+                "    case \"$a\" in\n"
+                "      *\"/rules/branches/${FIXTURE_DEFAULT_BRANCH:-main}\")\n"
+                "        # RULES_MAIN_FAIL fails ONLY the DEFAULT branch's route. RULES_FAIL kills\n"
+                "        # every rules read at once and so exits at the BASE read, leaving the\n"
+                "        # default-branch unreadable BLOCK unreachable by any fixture -- neutering\n"
+                "        # that exit into a silent skip failed ZERO tests. Per-route is what\n"
+                "        # separates the four unreadable paths from each other.\n"
+                "        if [ -n \"${RULES_MAIN_FAIL:-}\" ]; then echo 'gh: simulated rules-API failure (default branch)' >&2; exit 1; fi\n"
+                "        printf '%s' \"${FIXTURE_RULES_MAIN:-[]}\"; exit 0;;\n"
+                "      *) printf '%s' \"${FIXTURE_RULES_BASE:-[]}\"; exit 0;;\n"
+                "    esac;;\n"
                 "  *protection)\n"
-                "    # `gh api repos/.../branches/<base>/protection` (#275 --diagnose). Empty\n"
-                "    # FIXTURE_PROTECTION simulates a 403 (no admin scope) so the degradation\n"
-                "    # path is exercised; the main oracle never calls this route.\n"
-                "    if [ -n \"${FIXTURE_PROTECTION:-}\" ]; then printf '%s' \"$FIXTURE_PROTECTION\"; exit 0; fi\n"
-                "    echo 'gh: HTTP 403 (branch protection needs admin)' >&2; exit 1;;\n"
+                "    # `gh api repos/.../branches/<base>/protection`. TWO callers: --diagnose\n"
+                "    # (#275, no --jq: it wants the raw document) and the #375 expected-set union\n"
+                "    # (--jq: it wants extracted context names). Empty FIXTURE_PROTECTION\n"
+                "    # simulates a 403 (no admin scope) so the degradation path is exercised.\n"
+                "    #\n"
+                "    # THE SUCCESS PATH MUST APPLY --jq. A stub that printed the fixture VERBATIM\n"
+                "    # regardless of the filter made the entire LEGACY half of the union\n"
+                "    # untestable: deleting either half of the filter, or pointing it at the wrong\n"
+                "    # ref, failed ZERO tests, and the case that looked like coverage passed only\n"
+                "    # because the context name appeared as a SUBSTRING of the dumped JSON blob.\n"
+                "    # That is the same 'JSON document as a check name' defect the 404 path below\n"
+                "    # models, reached through the success path. Shell out to real jq so the\n"
+                "    # filter under test is the filter that runs -- and so a BROKEN filter exits\n"
+                "    # nonzero here exactly as `gh --jq` does, which is what makes the\n"
+                "    # unparseable-body cases constructible at all.\n"
+                "    if [ -n \"${FIXTURE_PROTECTION:-}\" ]; then\n"
+                "      _f=''; _next=0\n"
+                "      for _a in \"$@\"; do\n"
+                "        if [ \"$_next\" = 1 ]; then _f=\"$_a\"; break; fi\n"
+                "        case \"$_a\" in --jq|-q) _next=1;; --jq=*) _f=\"${_a#--jq=}\"; break;; esac\n"
+                "      done\n"
+                "      if [ -n \"$_f\" ]; then printf '%s' \"$FIXTURE_PROTECTION\" | jq -r \"$_f\"; exit $?; fi\n"
+                "      printf '%s' \"$FIXTURE_PROTECTION\"; exit 0\n"
+                "    fi\n"
+                "    # MODELS REAL GH, which the earlier empty-stdout stub did not: on a 404\n"
+                "    # `gh api --jq` writes the ERROR BODY to STDOUT and exits 1. The stub used\n"
+                "    # to emit nothing, so a caller keeping stdout past a nonzero exit looked\n"
+                "    # correct here and unioned a 404 payload in as a required context name live.\n"
+                "    printf '%s' '{\"message\":\"Branch not protected\",\"status\":\"404\"}'\n"
+                "    exit 1;;\n"
                 "esac; done\n"
                 "# `gh pr view <pr> --repo <repo> --json statusCheckRollup,...,headRefOid`\n"
                 "printf '%s' \"${FIXTURE_JSON:-}\"\n"
@@ -278,6 +380,23 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         env.pop("FIXTURE_PROTECTION", None)
         if protection is not None:
             env["FIXTURE_PROTECTION"] = protection
+        if rules_main is not None:
+            env["FIXTURE_RULES_MAIN"] = rules_main
+        if rules_base is not None:
+            env["FIXTURE_RULES_BASE"] = rules_base
+        if rules_fail:
+            env["RULES_FAIL"] = "1"
+        if rules_main_fail:
+            env["RULES_MAIN_FAIL"] = "1"
+        if default_branch_fail:
+            env["DEFAULT_BRANCH_FAIL"] = "1"
+        # The default branch is a FIXTURE, not a constant. Every case defaulting to
+        # "main" meant hard-coding default_branch="main" and never calling gh at all
+        # passed the whole suite: the value was proven to FAIL correctly and never
+        # proven to be READ.
+        env.pop("FIXTURE_DEFAULT_BRANCH", None)
+        if default_branch is not None:
+            env["FIXTURE_DEFAULT_BRANCH"] = default_branch
         env.pop("FIXTURE_COMMENTS", None)
         if comments is not None:
             env["FIXTURE_COMMENTS"] = comments
@@ -1029,6 +1148,381 @@ def main():
     check("#277: --codoki-only + --codoki-gate -> exit 1 (mutually exclusive)", rc == 1)
     rc, _, _, _ = run(["1", "owner/repo", "--codoki-gate", "--diagnose"], fixture_json=ALL_GREEN)
     check("#277: --codoki-gate + --diagnose -> exit 1 (mutually exclusive)", rc == 1)
+
+    print()
+    print("== #375: reconcile the rollup against an EXPECTED check set ==")
+    # THE CANONICAL FIXTURE, from the live false PASS on sydlexius/stillwater#3021:
+    # a PR based off a non-trunk branch, mergeStateStatus=CLEAN, carrying ONE of the
+    # required contexts. Build/Test/Lint/Coverage/CodeQL never ran. Nothing red,
+    # nothing pending, nothing reported missing -- and GitHub's own aggregate verdict
+    # agrees, because the ruleset targets ~DEFAULT_BRANCH and off that branch there is
+    # no rule to violate. Silence is not consent.
+    MAIN_REQUIRES = rules_doc(contexts=["Build", "Test", "Lint", "Signed Commits"])
+    STACKED = rollup(
+        checkrun("Signed Commits", "COMPLETED", "SUCCESS"),
+        base_ref="fix/parent-branch",
+    )
+    rc, out, err, _ = run(["3021", "owner/repo"], fixture_json=STACKED,
+                          rules_main=MAIN_REQUIRES, rules_base=rules_doc())
+    blob = out + err
+    check("#375: a non-default-base PR missing 3 of 4 required checks BLOCKS "
+          "(the live #3021 false PASS)", rc == 2)
+    check("#375: the BLOCK NAMES the missing contexts (a gate that will not say what "
+          "is missing cannot be acted on)",
+          "Build" in blob and "Test" in blob and "Lint" in blob)
+
+    # F4 -- THE PREDICATE THAT MUST NOT REGRESS. stillwater returns exactly one rule for
+    # a non-default ref: copilot_code_review, with ZERO required checks. If the fallback
+    # keys on "has rules" instead of "has required_status_checks", this base reads as
+    # governed, the expected set is empty, and the same false green passes through a
+    # longer path. This case is the difference between the fix and the appearance of one.
+    rc, out, err, _ = run(["3021", "owner/repo"], fixture_json=STACKED,
+                          rules_main=MAIN_REQUIRES,
+                          rules_base=rules_doc(extra_types=["copilot_code_review"]))
+    check("#375 F4: a base carrying rules but NO required_status_checks still falls "
+          "back to the default branch (predicate is on required checks, not on rules)",
+          rc == 2)
+
+    # The fallback invents policy in exactly one place, so it must announce it.
+    check("#375: the fallback to the default branch is REPORTED, never silent",
+          "default branch" in blob.lower() or "fallback" in blob.lower())
+
+    # A base with its OWN required checks wins -- the release-base case that is the
+    # whole reason for choosing Option C over "always measure against main".
+    RELEASE_BASE = rollup(
+        checkrun("Build", "COMPLETED", "SUCCESS"),
+        base_ref="release/1.2",
+    )
+    # DISCRIMINATING SHAPE. An earlier version gave the base ["Build"] while main
+    # required 4 and the PR had Build -- which passes whether the base's set wins OR no
+    # reconciliation happens at all, so the assertion did not test its own name. The
+    # base now requires a context main does NOT (`OnlyBase`), so a PASS is only possible
+    # if the base's set genuinely won, and a BLOCK naming OnlyBase proves it was used.
+    rc, out, err, _ = run(["500", "owner/repo"], fixture_json=RELEASE_BASE,
+                          rules_main=MAIN_REQUIRES,
+                          rules_base=rules_doc(contexts=["Build", "OnlyBase"]))
+    blob500 = out + err
+    check("#375: a base with its OWN required set is measured against THAT, not main "
+          "(BLOCKs on the base-only context, proving the base set was the one used)",
+          rc == 2 and "OnlyBase" in blob500)
+    check("#375: ...and it does NOT block on main-only contexts that do not apply to "
+          "that base (a protected release base is not measured against main)",
+          "Test" not in blob500.split("did not run")[-1].split("\n")[0])
+
+    RELEASE_OK = rollup(
+        checkrun("Build", "COMPLETED", "SUCCESS"),
+        checkrun("OnlyBase", "COMPLETED", "SUCCESS"),
+        base_ref="release/1.2",
+    )
+    rc, out, err, _ = run(["501", "owner/repo"], fixture_json=RELEASE_OK,
+                          rules_main=MAIN_REQUIRES,
+                          rules_base=rules_doc(contexts=["Build", "OnlyBase"]))
+    check("#375: a release base with ITS OWN set satisfied PASSES (not blocked by "
+          "main's extra contexts)", rc == 0)
+
+    # C1 -- THE FAIL-OPEN THAT SHIPPED IN THE FIRST DRAFT. When the fallback is needed
+    # (base requires nothing) and `gh repo view` fails, an earlier version skipped
+    # reconciliation entirely and PASSed emitting NOTHING -- byte-identical to a PR that
+    # legitimately had no expected set. One transient API failure restored the exact
+    # #3021 false PASS, on the oracle that arms the floor merge-auth token.
+    rc, out, err, _ = run(["3021", "owner/repo"], fixture_json=STACKED,
+                          rules_main=MAIN_REQUIRES, rules_base=rules_doc(),
+                          default_branch_fail=True)
+    check("#375 C1: an unreadable DEFAULT BRANCH blocks when the fallback is needed "
+          "(never a silent PASS)", rc == 2)
+
+    # ...but it must not block when the fallback is NOT needed: a base carrying its own
+    # required set never consults the default branch, so a flaky lookup is irrelevant there.
+    rc, out, err, _ = run(["502", "owner/repo"], fixture_json=RELEASE_OK,
+                          rules_main=MAIN_REQUIRES,
+                          rules_base=rules_doc(contexts=["Build", "OnlyBase"]),
+                          default_branch_fail=True)
+    check("#375 C1: an unreadable default branch does NOT block a base that carries "
+          "its own required set (the guard fires only where it matters)", rc == 0)
+
+    # M4: a skipped reconciliation and a clean one must be distinguishable in the output.
+    NO_RULES = rollup(checkrun("ci", "COMPLETED", "SUCCESS"), base_ref="main")
+    rc, out, err, _ = run(["800", "owner/repo"], fixture_json=NO_RULES,
+                          rules_main=rules_doc(), rules_base=rules_doc())
+    check("#375 M4: a repo with NO required checks says so, rather than passing "
+          "silently (a PASS must be auditable)",
+          rc == 0 and "reconciliation skipped" in (out + err))
+
+    # I2: the expected set is the UNION of both authorities. They disagree on this repo
+    # (rulesets 4, legacy 1) and legacy is a strict SUBSET today, so the union is a
+    # no-op -- which is precisely why shipping without it would have looked correct
+    # until the first legacy-only required context appeared. `protection` supplies a
+    # context the rules endpoint does not; it must be enforced.
+    UNION_PR = rollup(checkrun("Build", "COMPLETED", "SUCCESS"), base_ref="main")
+    rc, out, err, _ = run(["900", "owner/repo"], fixture_json=UNION_PR,
+                          rules_main=rules_doc(contexts=["Build"]),
+                          rules_base=rules_doc(contexts=["Build"]),
+                          protection=prot_fixture(required_contexts=["LegacyOnly"]))
+    check("#375 I2: a LEGACY-only required context is enforced (expected set is the "
+          "UNION of rulesets and branch protection, not either alone)",
+          rc == 2 and "LegacyOnly" in (out + err))
+
+    # ...and legacy being unreadable must NOT block: it needs admin scope and 404s
+    # ("Branch not protected") wherever legacy protection is simply not configured, so
+    # treating absence as unreadable would block every merge on a rulesets-only repo.
+    rc, out, err, _ = run(["901", "owner/repo"], fixture_json=UNION_PR,
+                          rules_main=rules_doc(contexts=["Build"]),
+                          rules_base=rules_doc(contexts=["Build"]))
+    check("#375 I2: an unreadable/absent legacy protection degrades to the rulesets "
+          "set rather than blocking (asymmetric on purpose)", rc == 0)
+
+    # NO REGRESSION on the normal path. This criterion is load-bearing, not ceremony:
+    # the oracle gates orchestrate-authorize-merge.sh, so a defect that made the
+    # reconciliation wrong would block every merge.
+    NORMAL = rollup(
+        checkrun("Build", "COMPLETED", "SUCCESS"),
+        checkrun("Test", "COMPLETED", "SUCCESS"),
+        checkrun("Lint", "COMPLETED", "SUCCESS"),
+        checkrun("Signed Commits", "COMPLETED", "SUCCESS"),
+    )
+    rc, out, err, _ = run(["600", "owner/repo"], fixture_json=NORMAL,
+                          rules_main=MAIN_REQUIRES, rules_base=MAIN_REQUIRES)
+    check("#375 NO REGRESSION: a main-based PR with every required check green "
+          "still PASSES", rc == 0)
+
+    # UNREADABLE -> BLOCK, per the #334 UNKNOWN precedent. A gate that cannot verify
+    # has not passed; "still computing" must never read as "fine".
+    rc, out, err, _ = run(["700", "owner/repo"], fixture_json=NORMAL, rules_fail=True)
+    check("#375: an UNREADABLE expected set BLOCKS (fail closed, per #334)", rc == 2)
+
+    # ------------------------------------------------------------------ #375 round 2.
+    # Every case below is one shape of a SINGLE defect: a status or a type that goes
+    # unchecked, turning "I could not read this" into "there was nothing to read" --
+    # which routes to PASS, which arms the floor merge-auth token. The first round fixed
+    # that shape at three call sites and left its siblings; these pin the siblings.
+
+    # C1: `jq -e .` proves the body is JSON, NOT that it is the array-of-rules the
+    # endpoint contracts. The extraction jq then ran with its status DISCARDED (a plain
+    # assignment, which pipefail never sees), so any jq runtime error yielded an empty
+    # set and a PASS. Each body below is valid JSON that the extraction cannot process.
+    MISSING_BUILD = rollup(checkrun("Other", "COMPLETED", "SUCCESS"), base_ref="main")
+    for label, body in [
+        # The shape a paginated/enveloped response would take. REST list endpoints grow
+        # envelopes; `.[]` over an object exits 5.
+        ("an ENVELOPED object", '{"rules":[{"type":"required_status_checks",'
+                                '"parameters":{"required_status_checks":[{"context":"Build"}]}}]}'),
+        # One non-object element poisons the whole extraction, silently.
+        ("a poisoned array", '["a string", {"type":"required_status_checks",'
+                             '"parameters":{"required_status_checks":[{"context":"Build"}]}}]'),
+        # GitHub returns {"message":...} with HTTP 200 on some paths, so gh exits 0.
+        ("an error object served 200", '{"message":"Not Found","status":"404"}'),
+        ("a JSON scalar", '42'),
+        ("a JSON string", '"required_status_checks"'),
+    ]:
+        rc, out, err, _ = run(["1001", "owner/repo"], fixture_json=MISSING_BUILD,
+                              rules_main=body, rules_base=body)
+        check(f"#375 C1: {label} is UNREADABLE, never an empty expected set "
+              f"(a shape error must not read as 'requires nothing')",
+              rc == 2 and "unreadable" in (out + err))
+
+    # ...and the control: the SAME rollup with a well-formed doc must still block on the
+    # real missing context, not on unreadability. Without this the cases above would
+    # pass under a blanket "always BLOCK" and prove nothing.
+    rc, out, err, _ = run(["1002", "owner/repo"], fixture_json=MISSING_BUILD,
+                          rules_main=rules_doc(contexts=["Build"]),
+                          rules_base=rules_doc(contexts=["Build"]))
+    check("#375 C1 control: a WELL-FORMED doc still blocks on the genuinely missing "
+          "context (the shape check did not swallow the real verdict)",
+          rc == 2 and "Build" in (out + err) and "unreadable" not in (out + err))
+
+    # C2: `gh --jq` exits 1 BOTH when the endpoint 404s and when the FILTER fails, and
+    # the legacy leg keyed only on exit status. A 200 whose body is unparseable
+    # therefore degraded the union to rulesets-only with NO output saying so -- exactly
+    # the "legacy-only context vanishes" case the union exists to prevent.
+    LEGACY_OK = rollup(checkrun("Build", "COMPLETED", "SUCCESS"), base_ref="main")
+    for label, body in [("HTML", "<html>502 Bad Gateway</html>"),
+                        ("truncated JSON", '{"required_status_checks": {"cont'),
+                        ("null", "null")]:
+        rc, out, err, _ = run(["1003", "owner/repo"], fixture_json=LEGACY_OK,
+                              rules_main=rules_doc(contexts=["Build"]),
+                              rules_base=rules_doc(contexts=["Build"]),
+                              protection=body)
+        check(f"#375 C2: an UNPARSEABLE legacy body ({label}) is SURFACED, not silently "
+              f"degraded to rulesets-only", "legacy" in (out + err).lower())
+
+    # ...while a genuine 404/403 stays silent. The asymmetry is the whole design: legacy
+    # protection is simply absent on a rulesets-only repo, and announcing that on every
+    # merge would train the reader to ignore the line that matters above.
+    rc, out, err, _ = run(["1004", "owner/repo"], fixture_json=LEGACY_OK,
+                          rules_main=rules_doc(contexts=["Build"]),
+                          rules_base=rules_doc(contexts=["Build"]))
+    check("#375 C2: an ABSENT legacy protection (404) stays silent -- only an "
+          "unparseable PRESENT one is surfaced",
+          rc == 0 and "legacy" not in (out + err).lower())
+
+    # C3: the fix documented three comment blocks above the default-branch lookup was
+    # never applied TO it. Real `gh ... --jq` writes its error body to STDOUT and exits
+    # 1, so `|| echo ""` captured the PAYLOAD, the [ -z ] guard was skipped, and the
+    # script fetched rules/branches/<error text>, got [], and PASSed. The C1 guard the
+    # harness certified as closed was still reachable on the transport failure it names.
+    rc, out, err, _ = run(["1005", "owner/repo"], fixture_json=STACKED,
+                          rules_main=MAIN_REQUIRES, rules_base=rules_doc(),
+                          default_branch_fail=True)
+    check("#375 C3: a default-branch lookup that fails WITH A BODY ON STDOUT blocks "
+          "(the error payload is not usable as a branch name)",
+          rc == 2 and "unreadable" in (out + err))
+
+    # ...and the same guard must reject a `null` branch name. `--jq .a.b` prints the
+    # literal `null` when the field is absent, which is non-empty and so passed the
+    # [ -z ] test, then resolved as a ref named "null" -> [] -> PASS.
+    rc, out, err, _ = run(["1006", "owner/repo"], fixture_json=STACKED,
+                          rules_main=MAIN_REQUIRES, rules_base=rules_doc(),
+                          default_branch="null")
+    check("#375 C3: a literal 'null' default-branch name is rejected, not used as a ref",
+          rc == 2)
+
+    # m1: the default branch must be READ, not assumed. Hard-coding it to "main" and
+    # never calling gh passed the entire suite, because every fixture defaulted to main.
+    STACKED_TRUNK = rollup(checkrun("Build", "COMPLETED", "SUCCESS"), base_ref="feature/x")
+    rc, out, err, _ = run(["1007", "owner/repo"], fixture_json=STACKED_TRUNK,
+                          rules_main=MAIN_REQUIRES, rules_base=rules_doc(),
+                          default_branch="trunk")
+    check("#375: the fallback uses the REPO'S default branch, whatever it is named "
+          "(a non-'main' trunk is honored, proving the value is read not assumed)",
+          rc == 2 and "trunk" in (out + err))
+
+    # I2 (real): with the stub now applying --jq, a legacy-only context is enforced by
+    # NAME rather than by appearing as a substring of a dumped JSON blob -- and the PASS
+    # side, which had no case at all, is now covered.
+    LEGACY_PRESENT = rollup(checkrun("Build", "COMPLETED", "SUCCESS"),
+                            checkrun("LegacyOnly", "COMPLETED", "SUCCESS"), base_ref="main")
+    rc, out, err, _ = run(["1008", "owner/repo"], fixture_json=LEGACY_PRESENT,
+                          rules_main=rules_doc(contexts=["Build"]),
+                          rules_base=rules_doc(contexts=["Build"]),
+                          protection=prot_fixture(required_contexts=["LegacyOnly"]))
+    check("#375 I2: a legacy-only context that IS present PASSES (the legacy leg "
+          "contributes a real name, not a JSON document)",
+          rc == 0 and "reconciled" in (out + err))
+
+    # ...and the BLOCK side names exactly that context on its own, with no JSON blob.
+    rc, out, err, _ = run(["1009", "owner/repo"], fixture_json=LEGACY_OK,
+                          rules_main=rules_doc(contexts=["Build"]),
+                          rules_base=rules_doc(contexts=["Build"]),
+                          protection=prot_fixture(required_contexts=["LegacyOnly"]))
+    blob_i2 = out + err
+    check("#375 I2: the missing legacy context is named EXACTLY, with no JSON payload "
+          "leaking into the required-check list",
+          rc == 2 and "LegacyOnly" in blob_i2 and "required_status_checks" not in blob_i2)
+
+    # I1: a context name containing a NEWLINE split into two independent requirements,
+    # so two unrelated decoy checks satisfied a required check that never ran. Such a
+    # name is pathological; rejecting it fail-closed is the correct handling.
+    NEWLINE_DECOYS = rollup(checkrun("alpha", "COMPLETED", "SUCCESS"),
+                            checkrun("beta", "COMPLETED", "SUCCESS"), base_ref="main")
+    rc, out, err, _ = run(["1010", "owner/repo"], fixture_json=NEWLINE_DECOYS,
+                          rules_main=rules_doc(contexts=["alpha\nbeta"]),
+                          rules_base=rules_doc(contexts=["alpha\nbeta"]))
+    check("#375 I1: a required context containing a NEWLINE is not satisfied by two "
+          "decoy checks named after its halves", rc == 2)
+
+    # ...AND FROM THE LEGACY LEG. The first fix guarded only the rulesets doc, so the
+    # identical false PASS survived one call site over -- the same "patched at one site,
+    # not swept" shape the round was opened to end. Both legs are now validated at the
+    # UNION, so a per-leg omission is not expressible.
+    rc, out, err, _ = run(["1014", "owner/repo"],
+                          fixture_json=rollup(checkrun("gamma", "COMPLETED", "SUCCESS"),
+                                              checkrun("delta", "COMPLETED", "SUCCESS"),
+                                              base_ref="main"),
+                          rules_main=rules_doc(), rules_base=rules_doc(),
+                          protection=prot_fixture(required_contexts=["gamma\ndelta"]))
+    check("#375 I1: a NEWLINE-bearing context from the LEGACY leg is rejected too "
+          "(the invariant is on the union, not on one source)", rc == 2)
+
+    # An EMPTY 200 legacy body is BENIGN, not malformed: the rules leg normalizes exactly
+    # this case, and losing that on the legacy leg turned its documented best-effort
+    # degradation into a SILENT BLOCK (silent because control never reached the
+    # unparseable NOTE). Fail-closed, so not a false PASS -- but a leg that "contributes
+    # nothing rather than failing the gate" must actually not fail the gate.
+    for label, body in [("empty", ""), ("whitespace-only", "   ")]:
+        rc, out, err, _ = run(["1020", "owner/repo"], fixture_json=LEGACY_OK,
+                              rules_main=rules_doc(contexts=["Build"]),
+                              rules_base=rules_doc(contexts=["Build"]),
+                              protection=body)
+        check(f"#375: a {label} 200 legacy body degrades benignly (best-effort leg, "
+              f"never a silent BLOCK)", rc == 0)
+
+    # The modern `checks[].context` shape -- what GitHub returns today -- had no case at
+    # all: deleting that half of the legacy filter failed zero tests.
+    rc, out, err, _ = run(["1015", "owner/repo"], fixture_json=LEGACY_OK,
+                          rules_main=rules_doc(contexts=["Build"]),
+                          rules_base=rules_doc(contexts=["Build"]),
+                          protection=json.dumps({"required_status_checks": {
+                              "strict": False, "contexts": [],
+                              "checks": [{"context": "ModernOnly"}]}}))
+    check("#375: the modern legacy `checks[].context` shape contributes to the expected "
+          "set (not only the deprecated `contexts[]`)",
+          rc == 2 and "ModernOnly" in (out + err))
+
+    # A non-STRING context would be rendered as a name -- an object pretty-prints across
+    # several LINES, fabricating multiple required checks out of one malformed entry.
+    # Fail-closed, and it keeps JSON punctuation out of the operator-facing list.
+    for label, ctx in [("a number", 42), ("null", None), ("an object", {"a": 1})]:
+        doc = json.dumps([{"type": "required_status_checks", "ruleset_id": 2,
+                           "parameters": {"required_status_checks": [{"context": ctx}]}}])
+        rc, out, err, _ = run(["1016", "owner/repo"], fixture_json=LEGACY_OK,
+                              rules_main=doc, rules_base=doc)
+        check(f"#375: a non-string required context ({label}) is UNREADABLE, never "
+              f"rendered into the expected set as a name",
+              rc == 2 and "unreadable" in (out + err))
+
+    # Each C1 defense proven INDEPENDENTLY. Mutating them only together let a partial
+    # regression of either land silently, which is how a defense-in-depth pair decays
+    # into one defense plus a comment.
+    rc, out, err, _ = run(["1017", "owner/repo"], fixture_json=MISSING_BUILD,
+                          rules_main="[null]", rules_base="[null]")
+    check("#375 C1a: a null ELEMENT is caught by the array-of-objects type check "
+          "(independent of the extraction status check)",
+          rc == 2 and "unreadable" in (out + err))
+
+    BAD_PARAMS = json.dumps([{"type": "required_status_checks", "parameters": "oops"}])
+    rc, out, err, _ = run(["1018", "owner/repo"], fixture_json=MISSING_BUILD,
+                          rules_main=BAD_PARAMS, rules_base=BAD_PARAMS)
+    check("#375 C1b: a jq RUNTIME error during extraction is caught by the status check "
+          "(independent of the type check, which this document passes)",
+          rc == 2 and "unreadable" in (out + err))
+
+    # C3's value REJECTION proven independently of its capture: reverting only the case
+    # arm (keeping capture-then-decide) let the literal 'null' through to a false PASS.
+    # The legitimate-name direction is asserted by the 'trunk' case above.
+    for good in ["release/1.2", "feature/foo.bar"]:
+        rc, out, err, _ = run(["1019", "owner/repo"], fixture_json=STACKED_TRUNK,
+                              rules_main=MAIN_REQUIRES, rules_base=rules_doc(),
+                              default_branch=good)
+        check(f"#375 C3: a legitimate default-branch name ({good}) is still USED for "
+              f"the fallback (the rejection is narrow)",
+              rc == 2 and good in (out + err))
+
+    # I3: the unreadable-default-branch-RULES exit was unreachable by any fixture
+    # (RULES_FAIL killed the base read first and exited above it), so neutering it into
+    # a silent skip failed zero tests. Per-route failure separates the two.
+    rc, out, err, _ = run(["1011", "owner/repo"], fixture_json=STACKED,
+                          rules_main=MAIN_REQUIRES, rules_base=rules_doc(),
+                          rules_main_fail=True)
+    check("#375: unreadable DEFAULT-BRANCH rules block too (all four unreadable inputs "
+          "fail the same way, each proven separately)",
+          rc == 2 and "unreadable" in (out + err))
+
+    # An absent baseRefName was documented as BLOCKing but no fixture ever omitted it,
+    # so replacing that whole branch with expected="" failed zero tests.
+    NO_BASE = rollup(checkrun("Build", "COMPLETED", "SUCCESS"), base_ref="__OMIT__")
+    rc, out, err, _ = run(["1012", "owner/repo"], fixture_json=NO_BASE,
+                          rules_main=MAIN_REQUIRES, rules_base=MAIN_REQUIRES)
+    check("#375: an ABSENT baseRefName blocks (the expected set is unknowable)",
+          rc == 2 and "base branch" in (out + err))
+
+    # M5c: the PASS-side reconciliation NOTE was unmutated -- deleting it failed zero
+    # tests, which would make a reconciled PASS indistinguishable from a pre-#375 PASS.
+    # That audit trail IS the deliverable; the skipped side already had a case.
+    rc, out, err, _ = run(["1013", "owner/repo"], fixture_json=NORMAL,
+                          rules_main=MAIN_REQUIRES, rules_base=MAIN_REQUIRES)
+    check("#375 M5c: a CLEAN reconciliation says so on the PASS path (a reconciled "
+          "PASS must be distinguishable from a pre-#375 one)",
+          rc == 0 and "reconciled against" in (out + err))
 
     print()
     if FAILS:
