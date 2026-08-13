@@ -42,10 +42,17 @@ The user may provide:
 5. **Gather merged PRs.** Derive the set from the COMMIT RANGE, not from a date.
 
    ```sh
-   last_tag=$(git tag --sort=-creatordate | head -1)   # empty on a first release
+   # --merged origin/main: a tag NOT reachable from the release branch (an
+   # experimental or backport tag, which sorts by date like any other) would otherwise
+   # be picked as the range start and silently yield the wrong PR set.
+   last_tag=$(git tag --sort=-creatordate --merged origin/main | head -1)  # empty on a first release
    range="${last_tag:+$last_tag..}origin/main"          # first release -> whole history
    # The PR number is the "(#N)" trailer GitHub appends on squash-merge.
-   prs=$(git log "$range" --oneline | grep -oE '\(#[0-9]+\)$' | tr -d '(#)')
+   # `|| true`: grep exits 1 on NO MATCH, and an empty PR set is a VALID outcome (a
+   # first release, direct pushes, non-squash history). Without it a caller running
+   # `set -o pipefail` aborts on exactly the case this line is meant to handle --
+   # verified: the assignment fails rc=1 under pipefail and never reaches the next line.
+   prs=$(git log "$range" --oneline | grep -oE '\(#[0-9]+\)$' | tr -d '(#)' || true)
    for n in $prs; do
      gh pr view "$n" --json number,title,labels,closingIssuesReferences
    done
