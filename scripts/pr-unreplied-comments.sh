@@ -782,8 +782,10 @@ fi
 # 2. Review-body comments with actionable findings
 # CodeRabbit embeds "Outside diff range" findings in review bodies that cannot
 # be posted as inline comments. These appear in CHANGES_REQUESTED or COMMENTED
-# reviews. Copilot's "Pull request overview" reviews are summaries only and
-# are excluded.
+# reviews. Copilot does the same in a "Suppressed comments (N)" block inside its
+# "Pull request overview" body (#374), so such a body is admitted when -- and only
+# when -- it carries that block; an overview with no findings is still a pure
+# summary and stays excluded.
 all_reviews=$(gh api "repos/$repo/pulls/$pr_number/reviews" --paginate)
 
 if [ "$full_mode" = true ]; then
@@ -823,7 +825,7 @@ review_bodies_raw=$(echo "$all_reviews" | jq '[.[] | select(
       (.body | test("^## Pull request overview"; "") | not)
     )
     or
-    (.body | test("<summary>Suppressed comments \\([0-9]+\\)</summary>"; ""))
+    (.body | test("<summary>Suppressed comments \\(([1-9][0-9]*)\\)</summary>"; ""))
   )
 )]')
 
@@ -902,7 +904,7 @@ outside_diff_sum=$(echo "$review_bodies" | jq '
 # individually unclearable and WEDGE the merge gate, since a suppressed item has no
 # thread to resolve. Count them; do not split them.
 suppressed_sum=$(echo "$review_bodies" | jq '
-  [ .[] | (.body // "") | scan("<summary>Suppressed comments \\(([0-9]+)\\)</summary>") ]
+  [ .[] | (.body // "") | scan("<summary>Suppressed comments \\(([1-9][0-9]*)\\)</summary>") ]
   | flatten | map(tonumber) | add // 0')
 
 if [ "$latest_per_reviewer" = true ]; then
@@ -1079,7 +1081,19 @@ if [ "$itemized" = true ]; then
     # the Copilot "Suppressed comments (N)" block. BOTH are annotated onto the line so
     # the header count == the visible accounting (#252 core).
     #
-    # NOTE, and this bit is load-bearing: NO APOSTROPHES anywhere in this jq program.
+    # The count is matched as [1-9][0-9]* rather than [0-9]+ so a "(0)" block does not
+# admit a body and then contribute nothing -- that would count the body itself as 1
+# finding when it holds none, the cries-wolf direction (#376 review).
+#
+# NOT scoped to a Copilot login, deliberately, though the same review asked for it:
+# the login is NOT stable across installations. The reviewer on this repo posts as
+# "Copilot" while stillwater sees "copilot-pull-request-reviewer[bot]", so a login
+# allowlist would silently drop findings wherever a third spelling appears -- the
+# exact silent-zero this change exists to end. BOT_LOGIN_FILTER already bounds the
+# set to reviewer bots; a non-Copilot bot emitting this literal element is admitted,
+# which errs toward surfacing a finding rather than hiding one.
+#
+# NOTE, and this bit is load-bearing: NO APOSTROPHES anywhere in this jq program.
     # It is a single-quoted shell string, so one apostrophe closes the quote and the
     # whole script dies with a syntax error at the next paren. Caught pre-push on #374.
     #
@@ -1090,7 +1104,7 @@ if [ "$itemized" = true ]; then
     ( $reviewbody | .[]
       | (.user | sub("\\[bot\\]$"; "")) as $u
       | ([.body | scan("Outside diff range comments \\(([0-9]+)\\)")] | flatten | map(tonumber) | add // 0) as $od
-      | ([.body | scan("<summary>Suppressed comments \\(([0-9]+)\\)</summary>")] | flatten | map(tonumber) | add // 0) as $sup
+      | ([.body | scan("<summary>Suppressed comments \\(([1-9][0-9]*)\\)</summary>")] | flatten | map(tonumber) | add // 0) as $sup
       | "review-body | \($u) | (body) | \(excerpt(.body))\(if $od > 0 then " [+\($od) outside-diff]" else "" end)\(if $sup > 0 then " [+\($sup) suppressed]" else "" end) | replied:no resolved:n/a" ),
     ( $issue | .[]
       | (.user | sub("\\[bot\\]$"; "")) as $u

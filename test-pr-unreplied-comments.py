@@ -938,6 +938,32 @@ def main():
     check("#374: a boilerplate Copilot body (no suppressed block) stays FILTERED (expect 0)",
           n in (0, None))
 
+    # A "(0)" block must NOT admit the body. Admitting it would count the body itself as
+    # 1 finding while it holds none -- the cries-wolf direction that ends in an override.
+    COPILOT_SUPPRESSED_ZERO = (
+        '[{"id":666,"user":{"login":"copilot-pull-request-reviewer[bot]"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T02:00:00Z",'
+        '"body":"## Pull request overview\\n<details><summary>Suppressed comments (0)</summary></details>"}]'
+    )
+    rc, out, err = run(["--allow-stale"], reviews=COPILOT_SUPPRESSED_ZERO)
+    n = findings_count(out)
+    check("#376 review: 'Suppressed comments (0)' does NOT admit the body (expect 0, not 1)",
+          n in (0, None))
+
+    # The Copilot login is NOT stable across installations: this repo's reviewer posts as
+    # "Copilot" while stillwater sees "copilot-pull-request-reviewer[bot]". The matcher is
+    # therefore keyed on the BODY element, not the login -- a login allowlist would silently
+    # drop findings under a third spelling, which is the exact silent-zero #374 fixed.
+    COPILOT_ALT_LOGIN = (
+        '[{"id":777,"user":{"login":"Copilot"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T02:00:00Z",'
+        '"body":"## Pull request overview\\n<details><summary>Suppressed comments (2)</summary>x</details>"}]'
+    )
+    rc, out, err = run(["--allow-stale"], reviews=COPILOT_ALT_LOGIN)
+    n = findings_count(out)
+    check("#376 review: the OTHER real Copilot login ('Copilot', as seen on this repo) is "
+          "surfaced too -- the matcher keys on the body element, not an unstable login", n == 3)
+
     # The ack channel already exists and must still clear a suppressed body: N items share
     # ONE review id, so one reply-comment.sh --review <id> ack clears all N together.
     # Verified in production on stillwater#3018. This is why per-ITEM itemization would
