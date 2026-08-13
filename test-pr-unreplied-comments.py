@@ -1042,7 +1042,7 @@ def main():
     n = findings_count(out)
     check("#378: inline REPLIED but 3 suppressed body findings unacked -> still reported "
           "(the body findings do not ride out on the inline reply)",
-          n is not None and n >= 3)
+          n == 4)  # 1 body + 3 suppressed, exact
 
     MIXED_CR = (
         '[{"id":889,"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED",'
@@ -1061,7 +1061,7 @@ def main():
     rc, out, err = run(["--allow-stale"], reviews=MIXED_CR, inline=INLINE_REPLIED_CR)
     n = findings_count(out)
     check("#378: the SHARED hole is fixed for CodeRabbit outside-diff too, not just "
-          "Copilot (same branch, same defect)", n is not None and n >= 2)
+          "Copilot (same branch, same defect)", n == 3)  # 1 body + 2 outside-diff, exact
 
     # NO WEDGE, and NO over-blocking: once the review id is acked, the body findings
     # clear even though the inline comment was replied to separately. Both channels
@@ -1163,7 +1163,32 @@ def main():
     rc, out, err = run(["--allow-stale"], reviews=CR_REAL_SHAPE, inline=INLINE_REPLIED_REAL)
     n = findings_count(out)
     check("#378: the REAL CR shape (emoji between <summary> and the phrase) is still "
-          "detected -- the anchor tolerates intervening characters", n is not None and n >= 1)
+          "detected -- the anchor tolerates intervening characters", n == 2)  # 1 body + 1, exact
+
+    # THE SUMS AND THE CLEARING PREDICATE MUST AGREE. The predicate anchors on the
+    # <summary> element with a positive count; if the SUMS stay unanchored they add
+    # findings for prose mentions and (0) blocks that the predicate refuses to gate on,
+    # so ship-gate-preflight parses a total larger than the accounting a maintainer can
+    # clear. A count nobody can drive to zero is the wedge shape. (CodeRabbit, PR #380)
+    PROSE_ONLY = (
+        '[{"id":894,"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T02:00:00Z",'
+        '"body":"<summary>Suppressed comments (1)</summary>\\nAlso: Outside diff range comments (7) is the format we use."}]'
+    )
+    rc, out, err = run(["--allow-stale"], reviews=PROSE_ONLY)
+    n = findings_count(out)
+    check("#380 review: a PROSE mention does not inflate outside_diff_sum "
+          "(1 body + 1 suppressed = 2, not 9)", n == 2)
+
+    CR_ZERO_SUM = (
+        '[{"id":895,"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T02:00:00Z",'
+        '"body":"<summary>Suppressed comments (1)</summary>\\n<summary>Outside diff range comments (0)</summary>"}]'
+    )
+    rc, out, err = run(["--allow-stale"], reviews=CR_ZERO_SUM)
+    n = findings_count(out)
+    check("#380 review: an outside-diff '(0)' adds nothing to the sum "
+          "(1 body + 1 suppressed = 2)", n == 2)
 
     # The ack channel already exists and must still clear a suppressed body: N items share
     # ONE review id, so one reply-comment.sh --review <id> ack clears all N together.

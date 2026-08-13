@@ -933,7 +933,7 @@ review_bodies=$(jq -n \
 # The clamp lives in jq, not in bash, so the unbounded value never reaches the shell.
 CLAMP_MAX=100000
 outside_diff_sum=$(echo "$review_bodies" | jq --argjson cap "$CLAMP_MAX" '
-  [ .[] | (.body // "") | scan("Outside diff range comments \\(([0-9]+)\\)") ]
+  [ .[] | (.body // "") | scan("<summary>[^<]*Outside diff range comments \\(([1-9][0-9]*)\\)</summary>") ]
   | flatten | map(tonumber) | add // 0 | if . > $cap then $cap else . end')
 
 # Suppressed-finding count (#374): the exact same argument as outside_diff_sum above,
@@ -1162,7 +1162,7 @@ if [ "$itemized" = true ]; then
     # same "the oracle cries wolf" path that ends in a merge override.
     ( $reviewbody | .[]
       | (.user | sub("\\[bot\\]$"; "")) as $u
-      | ([.body | scan("Outside diff range comments \\(([0-9]+)\\)")] | flatten | map(tonumber) | add // 0 | if . > $cap then $cap else . end) as $od
+      | ([.body | scan("<summary>[^<]*Outside diff range comments \\(([1-9][0-9]*)\\)</summary>")] | flatten | map(tonumber) | add // 0 | if . > $cap then $cap else . end) as $od
       | ([.body | scan("<summary>Suppressed comments \\(([1-9][0-9]*)\\)</summary>")] | flatten | map(tonumber) | add // 0 | if . > $cap then $cap else . end) as $sup
       | "review-body | \($u) | (body) | \(excerpt(.body))\(if $od > 0 then " [+\($od) outside-diff]" else "" end)\(if $sup > 0 then " [+\($sup) suppressed]" else "" end) | replied:no resolved:n/a" ),
     ( $issue | .[]

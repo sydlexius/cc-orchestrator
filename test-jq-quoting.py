@@ -46,6 +46,9 @@ limits are written down. This catches the observed shape; it is not a proof.
   MISSED  a paired apostrophe in a SINGLE-LINE jq program (the newline requirement).
   MISSED  a jq program supplied via `-f file` or composed in a heredoc: the program is
           not a single-quoted argument at all, so this scanner never sees it.
+  CLOSED  a complete single-quoted OPTION VALUE between `jq` and the program
+          (`jq --arg label 'safe' '<program>'`) used to hide the whole program from the
+          command-word test. Complete quoted values are now collapsed before that test.
   MISSED  `commands/*.md` - scope is `scripts/*.sh`, yet 7 command files carry
           single-quoted jq programs that agents run verbatim.
   N/A     an apostrophe inside a DOUBLE-quoted jq program or an `--argjson` value is
@@ -69,7 +72,13 @@ FAILS = []
 
 
 def scan(text):
-    """Yield (line_no, col, context) for each apostrophe inside a jq single-quoted region.
+    """Yield (end_line, start_line, tail) per apostrophe inside a jq single-quoted region.
+
+    `end_line` is where the quote actually closed mid-word - the useful location for a
+    reader, since that is where the corruption is. `start_line` is where the program
+    opened, and `tail` is the surrounding text. (Docstring corrected on the PR #380
+    review, which caught it claiming a `(line_no, col, context)` triple this never
+    returned.)
 
     A hand-rolled scanner rather than a regex: quote state is a property of the whole
     preceding file, and a regex cannot carry that state. Double-quoted regions are
@@ -152,6 +161,13 @@ def scan(text):
                     break
                 scan_start = prev_end
             prefix = text[scan_start:i]
+            # COLLAPSE COMPLETE single-quoted option values before looking for the
+            # command word. `jq --arg label 'safe' '<program>'` puts a closed quote
+            # between `jq` and the program, and a `[^']*$` tail test therefore decided
+            # the program was not a jq program at all -- so the corrupted filter in
+            # `jq --arg label 'safe' '... CR's ...'` sailed through while bash -n also
+            # passed it. Reproduced before fixing (CodeRabbit, PR #380).
+            prefix = re.sub(r"'[^']*'", " ", prefix)
             is_jq = re.search(r"(^|[|(;\s])jq\b[^']*$", prefix, re.S) is not None
             start_line = line_no
             i += 1
@@ -230,6 +246,17 @@ def main():
     # pitfall in an English file-header comment. bash -n calls that file clean; the
     # first version of this scanner called it a defect. Pinned so the comment-skip
     # cannot silently regress.
+    # A COMPLETE single-quoted option value between `jq` and the program. This evaded
+    # the gate entirely: the tail test saw a closed quote and decided the program was
+    # not a jq program, so a corrupted filter passed both bash -n and this check.
+    # (CodeRabbit, PR #380 -- reproduced before fixing.)
+    optval = ("x=$(echo '{}' | jq --arg label 'safe' '\n"
+              "  .users | map(CR's) | map(Copilot's)\n"
+              "  ')\n")
+    check("self-test: a quoted OPTION VALUE before the program does not hide the "
+          "corrupted filter (jq --arg label 'safe' '...')",
+          len(list(scan(optval))) > 0)
+
     prose = ("# jq's `// alternative` operator only falls back on null/false, so a\n"
              "# hand-rolled `(.conclusion // \"\")` misreports GitHub's mid-flight state.\n"
              "x=$(jq '\n  .a\n  ')\n")
@@ -249,7 +276,11 @@ def main():
             violations.append((path, 0, str(exc)))  # never a silent skip
             continue
         for end_line, start_line, tail in scan(text):
-            violations.append((path, start_line, tail))
+            # Report END_LINE: that is where the quote closed mid-word, i.e. where the
+            # apostrophe actually is. start_line points at the top of the jq program,
+            # which can be dozens of lines above the defect and sends the reader to the
+            # wrong place (Copilot, PR #380).
+            violations.append((path, end_line, tail))
 
     for path, line, tail in violations:
         print(f"    {path.relative_to(REPO)}:{line}: apostrophe inside a jq program near: ...{tail}")
