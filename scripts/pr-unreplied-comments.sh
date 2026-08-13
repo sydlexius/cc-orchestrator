@@ -782,8 +782,10 @@ fi
 # 2. Review-body comments with actionable findings
 # CodeRabbit embeds "Outside diff range" findings in review bodies that cannot
 # be posted as inline comments. These appear in CHANGES_REQUESTED or COMMENTED
-# reviews. Copilot's "Pull request overview" reviews are summaries only and
-# are excluded.
+# reviews. Copilot does the same in a "Suppressed comments (N)" block inside its
+# "Pull request overview" body (#374), so such a body is admitted when -- and only
+# when -- it carries that block; an overview with no findings is still a pure
+# summary and stays excluded.
 all_reviews=$(gh api "repos/$repo/pulls/$pr_number/reviews" --paginate)
 
 if [ "$full_mode" = true ]; then
@@ -795,11 +797,36 @@ else
   rb_body_expr='((.body | split("\n") | map(select(test("^[[:space:]>]*$") | not)) | (.[0] // ""))[:120])'
 fi
 
+# The actionable-body test is a DISJUNCTION of two reviewer-shaped clauses. Keeping
+# them separate is deliberate: the first is CodeRabbit's prose vocabulary, the second
+# anchors on a literal Copilot HTML element, and collapsing them would let CR phrasing
+# admit a Copilot boilerplate body (and vice versa) on a wording coincidence.
+#
+# #374: the CR clause's keyword allowlist matches NONE of Copilot's vocabulary --
+# measured at 0 of 99 real Copilot review bodies -- so before this OR-branch existed,
+# every Copilot body was dropped here, taking its "Suppressed comments (N)" block with
+# it. That block is where Copilot parks findings it declined to post inline, so
+# --itemized reported 0 findings on a PR that had real ones, and 0 is precisely what
+# /handle-review and ship-gate-preflight.sh read as "this review is clean".
+#
+# The "^## Pull request overview" exclusion stays on the CR clause ONLY. It was never
+# the mechanism that dropped Copilot (the allowlist already had, independently), and
+# removing it would let a CR body that happens to open with that heading through.
+# Anchoring the Copilot clause on the literal <summary> element rather than on prose
+# is the "demand the exact shape" technique the floor matchers use: a boilerplate
+# "generated no new comments" body carries no such element and stays filtered, which
+# keeps the 58-of-99 pure-boilerplate majority out of the checklist.
 review_bodies_raw=$(echo "$all_reviews" | jq '[.[] | select(
   .body != "" and .body != null and
   '"$BOT_LOGIN_FILTER"' and
-  (.body | test("Outside diff range|Potential issue|Refactor suggestion|Actionable comments posted|Nitpick|CAUTION|Duplicate comments"; "i")) and
-  (.body | test("^## Pull request overview"; "") | not)
+  (
+    (
+      (.body | test("Outside diff range|Potential issue|Refactor suggestion|Actionable comments posted|Nitpick|CAUTION|Duplicate comments"; "i")) and
+      (.body | test("^## Pull request overview"; "") | not)
+    )
+    or
+    (.body | test("<summary>Suppressed comments \\(([1-9][0-9]*)\\)</summary>"; ""))
+  )
 )]')
 
 # A review body is "addressed" when every inline comment belonging to it has
@@ -864,6 +891,22 @@ outside_diff_sum=$(echo "$review_bodies" | jq '
   [ .[] | (.body // "") | scan("Outside diff range comments \\(([0-9]+)\\)") ]
   | flatten | map(tonumber) | add // 0')
 
+# Suppressed-finding count (#374): the exact same argument as outside_diff_sum above,
+# for Copilot's equivalent surface. Copilot's "Suppressed comments (N)" collapsible
+# holds N real findings with no inline thread, so the gating count must ADD N rather
+# than counting the body as 1. Summed across ALL surviving bodies, never
+# latest-per-reviewer: a later APPROVED Copilot review does not clear an earlier
+# submission's suppressed findings (the stillwater#1931 argument, same shape).
+#
+# NOTE for anyone tempted to itemize these individually: the N items share ONE review
+# id, so the existing ack channel (reply-comment.sh --review <id>) clears all N
+# together. Splitting them into separately-ackable findings would make them
+# individually unclearable and WEDGE the merge gate, since a suppressed item has no
+# thread to resolve. Count them; do not split them.
+suppressed_sum=$(echo "$review_bodies" | jq '
+  [ .[] | (.body // "") | scan("<summary>Suppressed comments \\(([1-9][0-9]*)\\)</summary>") ]
+  | flatten | map(tonumber) | add // 0')
+
 if [ "$latest_per_reviewer" = true ]; then
   review_bodies=$(echo "$review_bodies" | jq 'group_by(.user.login) | map(max_by(.id)) | flatten |
     map({id, type: "review-body", reply_type: "top-level", user: .user.login, state, body: '"$rb_body_expr"'})')
@@ -872,15 +915,17 @@ else
 fi
 
 review_body_count=$(echo "$review_bodies" | jq 'length')
-# Authoritative gating count = surviving review bodies + their outside-diff findings.
-review_body_findings=$(( review_body_count + outside_diff_sum ))
+# Authoritative gating count = surviving review bodies + their outside-diff findings
+# (CodeRabbit) + their suppressed findings (Copilot, #374). Both addends are findings
+# with no inline thread, so neither is represented by the body count alone.
+review_body_findings=$(( review_body_count + outside_diff_sum + suppressed_sum ))
 
 if [ "$review_body_findings" -gt 0 ]; then
   if [ "$count_only" = false ] && [ "$itemized" = false ]; then
     # Report BODIES and OUTSIDE-DIFF items separately (#289). Summing them into one integer
     # reported "2 findings" for ONE finding on stillwater #2424, which fed the "the oracle
     # cries wolf" read that ends in a merge override.
-    echo "=== Review-body comments with actionable findings: $review_body_findings ($review_body_count body/bodies + $outside_diff_sum outside-diff) ==="
+    echo "=== Review-body comments with actionable findings: $review_body_findings ($review_body_count body/bodies + $outside_diff_sum outside-diff + $suppressed_sum suppressed) ==="
     echo ""
     echo "$review_bodies"
     echo ""
@@ -1031,13 +1076,36 @@ if [ "$itemized" = true ]; then
                  | if . == null then "?" elif . == true then "yes" else "no" end )
           end ) as $res
       | "inline | \($u) | \($p):\($ln) | \(excerpt(.body)) | replied:no resolved:\($res)" ),
-    # A CR review body can carry N "Outside diff range comments (N)" sub-findings that
-    # count toward the header total but have no separate array element; annotate the line
-    # with that subtotal so the header count == the visible accounting (#252 core).
+    # A review body can carry sub-findings that count toward the header total but have no
+    # separate array element: the CR "Outside diff range comments (N)" block and (#374)
+    # the Copilot "Suppressed comments (N)" block. BOTH are annotated onto the line so
+    # the header count == the visible accounting (#252 core).
+    #
+    # The count is matched as [1-9][0-9]* rather than [0-9]+ so a "(0)" block does not
+# admit a body and then contribute nothing -- that would count the body itself as 1
+# finding when it holds none, the cries-wolf direction (#376 review).
+#
+# NOT scoped to a Copilot login, deliberately, though the same review asked for it:
+# the login is NOT stable across installations. The reviewer on this repo posts as
+# "Copilot" while stillwater sees "copilot-pull-request-reviewer[bot]", so a login
+# allowlist would silently drop findings wherever a third spelling appears -- the
+# exact silent-zero this change exists to end. BOT_LOGIN_FILTER already bounds the
+# set to reviewer bots; a non-Copilot bot emitting this literal element is admitted,
+# which errs toward surfacing a finding rather than hiding one.
+#
+# NOTE, and this bit is load-bearing: NO APOSTROPHES anywhere in this jq program.
+    # It is a single-quoted shell string, so one apostrophe closes the quote and the
+    # whole script dies with a syntax error at the next paren. Caught pre-push on #374.
+    #
+    # Annotating only ONE of them is worse than annotating neither: the row then looks
+    # fully accounted for while N findings sit behind a bland "Pull request overview"
+    # excerpt, and a triager reasonably reads it as a summary and moves on. That is the
+    # same "the oracle cries wolf" path that ends in a merge override.
     ( $reviewbody | .[]
       | (.user | sub("\\[bot\\]$"; "")) as $u
       | ([.body | scan("Outside diff range comments \\(([0-9]+)\\)")] | flatten | map(tonumber) | add // 0) as $od
-      | "review-body | \($u) | (body) | \(excerpt(.body))\(if $od > 0 then " [+\($od) outside-diff]" else "" end) | replied:no resolved:n/a" ),
+      | ([.body | scan("<summary>Suppressed comments \\(([1-9][0-9]*)\\)</summary>")] | flatten | map(tonumber) | add // 0) as $sup
+      | "review-body | \($u) | (body) | \(excerpt(.body))\(if $od > 0 then " [+\($od) outside-diff]" else "" end)\(if $sup > 0 then " [+\($sup) suppressed]" else "" end) | replied:no resolved:n/a" ),
     ( $issue | .[]
       | (.user | sub("\\[bot\\]$"; "")) as $u
       | "issue-level | \($u) | (issue) | \(excerpt(.body)) | replied:n/a resolved:n/a" )'

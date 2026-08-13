@@ -874,6 +874,110 @@ def main():
           "body/bodies" in out and "outside-diff" in out)
 
     print()
+    print("== #374: Copilot SUPPRESSED findings must survive the review-body filter ==")
+    # Copilot parks findings it declined to post inline inside a
+    # "<details><summary>Suppressed comments (N)</summary>" block in the review BODY.
+    # Two predicates conspired to drop every such body before that block was examined:
+    # the CodeRabbit-shaped keyword allowlist (measured: 0 of 99 real Copilot bodies match
+    # it) and, redundantly, a "^## Pull request overview" exclusion. Net effect: --itemized
+    # reported 0 findings on a PR carrying real ones, and 0 is what /handle-review and
+    # ship-gate-preflight read as "clean".
+    COPILOT_SUPPRESSED_2 = (
+        '[{"id":333,"user":{"login":"copilot-pull-request-reviewer[bot]"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T02:00:00Z",'
+        '"body":"## Pull request overview\\n\\nThis PR does things.\\n\\n'
+        '<details><summary>Suppressed comments (2)</summary>\\n\\n'
+        '**internal/publish/thing_test.go:96**\\n* the wg.Wait() can hang the test process\\n'
+        '**internal/publish/other.go:12**\\n* stale doc comment\\n</details>"}]'
+    )
+    rc, out, err = run(["--allow-stale"], reviews=COPILOT_SUPPRESSED_2)
+    n = findings_count(out)
+    # 1 surviving body + 2 suppressed items = 3. Before the fix this was 0.
+    check("#374: a Copilot body with 'Suppressed comments (2)' is NOT dropped, and the "
+          "count SUMS N rather than counting the body as 1 (expect 3)", n == 3)
+    check("#374: exit 0", rc == 0)
+
+    rc, out, err = run(["--itemized", "--allow-stale"], reviews=COPILOT_SUPPRESSED_2)
+    check("#374: --itemized surfaces the suppressed body (the channel /handle-review reads)",
+          "0 finding(s)" not in out)
+
+    # The header total must RECONCILE with the visible rows (#252's accounting rule). The
+    # CR path already annotates "[+N outside-diff]"; without the matching suppressed
+    # annotation the row reads as a bland summary while N real findings hide behind it,
+    # which is how a triager talks themselves into an override. Caught pre-push on #374.
+    check("#374: --itemized ANNOTATES the suppressed subtotal, so the header count equals "
+          "the visible accounting (not a bare row hiding N findings)",
+          "[+2 suppressed]" in out)
+
+    # Two Copilot submissions: the sum must aggregate across BOTH, never latest-per-reviewer
+    # (same argument as the #132 outside-diff sum -- a later APPROVED review does not clear
+    # an earlier submission's suppressed findings).
+    COPILOT_TWO_SUBMISSIONS = (
+        '[{"id":333,"user":{"login":"copilot-pull-request-reviewer[bot]"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T02:00:00Z",'
+        '"body":"## Pull request overview\\n<details><summary>Suppressed comments (2)</summary>x</details>"},'
+        '{"id":444,"user":{"login":"copilot-pull-request-reviewer[bot]"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T03:00:00Z",'
+        '"body":"## Pull request overview\\n<details><summary>Suppressed comments (1)</summary>y</details>"}]'
+    )
+    rc, out, err = run(["--allow-stale"], reviews=COPILOT_TWO_SUBMISSIONS)
+    n = findings_count(out)
+    check("#374: suppressed counts SUM across both submissions (2 bodies + 2 + 1 = 5)", n == 5)
+
+    # BOILERPLATE MUST STAY FILTERED. 58 of the 99 measured Copilot bodies are pure
+    # boilerplate; admitting them would double the checklist with noise, which is the
+    # correct DIRECTION of error but avoidable. The anchor is the literal <summary>
+    # element, not the prose.
+    COPILOT_BOILERPLATE = (
+        '[{"id":555,"user":{"login":"copilot-pull-request-reviewer[bot]"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T02:00:00Z",'
+        '"body":"## Pull request overview\\n\\nCopilot reviewed 3 files and generated no new comments."}]'
+    )
+    rc, out, err = run(["--allow-stale"], reviews=COPILOT_BOILERPLATE)
+    n = findings_count(out)
+    check("#374: a boilerplate Copilot body (no suppressed block) stays FILTERED (expect 0)",
+          n in (0, None))
+
+    # A "(0)" block must NOT admit the body. Admitting it would count the body itself as
+    # 1 finding while it holds none -- the cries-wolf direction that ends in an override.
+    COPILOT_SUPPRESSED_ZERO = (
+        '[{"id":666,"user":{"login":"copilot-pull-request-reviewer[bot]"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T02:00:00Z",'
+        '"body":"## Pull request overview\\n<details><summary>Suppressed comments (0)</summary></details>"}]'
+    )
+    rc, out, err = run(["--allow-stale"], reviews=COPILOT_SUPPRESSED_ZERO)
+    n = findings_count(out)
+    check("#376 review: 'Suppressed comments (0)' does NOT admit the body (expect 0, not 1)",
+          n in (0, None))
+
+    # The Copilot login is NOT stable across installations: this repo's reviewer posts as
+    # "Copilot" while stillwater sees "copilot-pull-request-reviewer[bot]". The matcher is
+    # therefore keyed on the BODY element, not the login -- a login allowlist would silently
+    # drop findings under a third spelling, which is the exact silent-zero #374 fixed.
+    COPILOT_ALT_LOGIN = (
+        '[{"id":777,"user":{"login":"Copilot"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T02:00:00Z",'
+        '"body":"## Pull request overview\\n<details><summary>Suppressed comments (2)</summary>x</details>"}]'
+    )
+    rc, out, err = run(["--allow-stale"], reviews=COPILOT_ALT_LOGIN)
+    n = findings_count(out)
+    check("#376 review: the OTHER real Copilot login ('Copilot', as seen on this repo) is "
+          "surfaced too -- the matcher keys on the body element, not an unstable login", n == 3)
+
+    # The ack channel already exists and must still clear a suppressed body: N items share
+    # ONE review id, so one reply-comment.sh --review <id> ack clears all N together.
+    # Verified in production on stillwater#3018. This is why per-ITEM itemization would
+    # introduce a wedge and was deliberately deferred.
+    ACK = ('[{"id":9001,"user":{"login":"testuser"},'
+           '"created_at":"2026-06-18T04:00:00Z",'
+           '"body":"Fixed in abc1234. (Replying here because the finding arrived as a '
+           'suppressed comment in review 333.)"}]')
+    rc, out, err = run(["--allow-stale"], reviews=COPILOT_SUPPRESSED_2, issue=ACK)
+    n = findings_count(out)
+    check("#374: an ack REFERENCING the review id clears the body AND its suppressed items "
+          "(no wedge: one ack clears all N)", n in (0, None))
+
+    print()
     if FAILS:
         print(f"FAILED ({len(FAILS)}):"); [print("  - " + f) for f in FAILS]; sys.exit(1)
     print("ALL PASSED")
