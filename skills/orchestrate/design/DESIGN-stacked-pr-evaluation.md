@@ -134,7 +134,10 @@ so it is recorded per-PR rather than summarised:
 | [#385](https://github.com/sydlexius/cc-orchestrator/pull/385) | lower, merge-commit path | MERGED | n/a |
 | [#386](https://github.com/sydlexius/cc-orchestrator/pull/386) | upper, merge-commit path | **CLOSED** | `DELETE /repos/:o/:r/git/refs/heads/...` via `gh-delete-branch.sh` (API), issued SEPARATELY, after the merge |
 
-Tooling: `gh` with the `github/gh-stack` extension installed. `gh stack` itself
+Tooling: `gh` **2.97.0** (2026-07-31) with the `github/gh-stack` extension
+**v0.1.0**. Versions are recorded because both findings below are claims about
+TOOL BEHAVIOR, and a version-less claim cannot be re-tested against a later
+release. `gh stack` itself
 was NOT used to create, sync, or merge these PRs -- the failure modes are about
 what GitHub does to a dependent PR, and `gh stack merge` is a merge path that
 carries the same human gate as `gh pr merge`.
@@ -162,7 +165,7 @@ PR #383 reported `mergeStateStatus=CLEAN` while two required checks had never ru
 the exact shape #375 was opened for, arising here spontaneously rather than by
 construction. The oracle merged hours earlier was run against it:
 
-```
+```text
 BLOCK: required check(s) did not run on #383 (absent from the rollup):
   gates (macos-latest), gates (ubuntu-latest)
   expected set from default branch 'main' (fallback: base 'scratch/355-trunk'
@@ -262,7 +265,8 @@ automate. That is the whole value proposition inverted.
 > the graph in its own context and re-derives it after every merge (maintainer,
 > from two live stacked PRs: "the orchestration was the PITA"). What makes it
 > UNFIXABLE rather than merely expensive is the stack tooling's routine `sync`,
-> which cascade-rebases and force-pushes, orphaning the fix SHAs cited in review
+> which cascade-rebases and force-pushes WHEN THE TRUNK HAS MOVED (which is the
+> case a stack exists for), orphaning the fix SHAs cited in review
 > replies -- dispositive for any PR that has been reviewed. Also measured: deleting
 > a merged base branch AUTO-CLOSES the PR stacked on it (the default `/merge-pr`
 > path), and a non-`main` base gets no `gates` CI -- the latter real but NOT a deal
@@ -279,10 +283,15 @@ Two clarifications the original rule lacked, both worth carrying:
    forcing a reviewer to hold three PRs in their head has relocated review burden,
    not reduced it (#353 is the worked example: 1309 LOC, correctly taken as a size
    override rather than split, because the harnesses prove the code they ship with).
-2. **The dispositive hazard is review-state, not mechanics.** An UNREVIEWED stack
-   could in principle be rebased freely. The rule holds regardless because a PR
-   in this repo does not stay unreviewed, but this is the axis to re-test if the
-   review workflow ever stops citing SHAs.
+2. **The three hazards have DIFFERENT trigger conditions; only the SHA one turns on
+   review state.** The CI mode (no `gates` on a non-`main` base) and the
+   base-deletion mode (delete closes the dependent PR) fire regardless of whether
+   anything has been reviewed -- they are properties of the workflow trigger and of
+   GitHub's deletion paths. Only the SHA-rewrite hazard is conditional, and its
+   condition is REWRITE x ALREADY-CITED: an unreviewed branch may be rebased freely
+   (the procedure above depends on that), and a reviewed PR that is never rewritten
+   is equally fine. The SHA axis is the one to re-test if the review workflow ever
+   stops citing SHAs; the other two would be unaffected by that change.
 
 ## What would have to change to revisit this
 
