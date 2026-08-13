@@ -871,8 +871,41 @@ review_bodies=$(jq -n \
     # A pure outside-diff finding is "addressed" only when a later $me comment
     # references this review by id; a bare later comment no longer suppresses it.
     ([$my_comments[] | select((.created_at > $r.submitted_at) and (((.body // "") | test(($r.id | tostring)))))] | length > 0) as $acked_by_reference |
+    # Does this body carry findings of its own, with no inline thread to resolve?
+    # (#378) Both vendor surfaces count: the CR outside-diff collapsible and the
+    # Copilot suppressed collapsible.
+    #
+    # BOTH legs anchor on the literal <summary> ELEMENT and on a POSITIVE count, for
+    # the same two reasons the suppressed leg already did:
+    #   - Prose that MENTIONS the phrase is not a finding. Without the element anchor,
+    #     a body saying "will use Outside diff range comments (3) next round" would make
+    #     that review unclearable by an inline reply. Measured: every real occurrence
+    #     across two repos carries the element (`> <summary>WARNING Outside diff range
+    #     comments (1)</summary><blockquote>`); zero appear as bare prose.
+    #   - A "(0)" block holds no findings, so admitting it would block on a body whose
+    #     own annotation reads "0 outside-diff + 0 suppressed" -- the cries-wolf
+    #     direction this file already rejected once (#376 review).
+    (((.body // "") | test("<summary>[^<]*Outside diff range comments \\(([1-9][0-9]*)\\)</summary>"))
+      or ((.body // "") | test("<summary>Suppressed comments \\(([1-9][0-9]*)\\)</summary>"))) as $has_body_findings |
     if ($inline_ids | length) > 0 then
-      if $has_unreplied_inline then $r else empty end
+      # A review with inline comments USED to clear entirely once those were replied
+      # to -- acked_by_reference was never consulted on this branch. That silently
+      # dropped any body-level findings riding along in the same submission: reply to
+      # the one inline comment and N suppressed/outside-diff findings vanished,
+      # uncounted and unread. Real shape, not hypothetical (stillwater#3014 review
+      # 4913081288: "generated 1 comment" plus Suppressed comments (3)).
+      #
+      # So the two finding classes now clear INDEPENDENTLY, because they genuinely
+      # are independent -- they merely share a submission. Inline findings clear by
+      # reply; body-level findings clear by an id-referencing ack, exactly as they do
+      # for a pure-body review. A review is dropped only when BOTH are satisfied.
+      #
+      # A body with NO sub-finding block keeps the old behavior exactly (a round
+      # summary is not a finding), which is what stops this from turning every
+      # replied-to review into a permanent block.
+      if $has_unreplied_inline then $r
+      elif ($has_body_findings and ($acked_by_reference | not)) then $r
+      else empty end
     else
       if $acked_by_reference then empty else $r end
     end
@@ -887,9 +920,21 @@ review_bodies=$(jq -n \
 # Summed across ALL surviving CR review bodies -- never latest-per-reviewer: an
 # APPROVED later review does not clear an outside-diff Major from an earlier
 # COMMENTED one (stillwater#1931).
-outside_diff_sum=$(echo "$review_bodies" | jq '
-  [ .[] | (.body // "") | scan("Outside diff range comments \\(([0-9]+)\\)") ]
-  | flatten | map(tonumber) | add // 0')
+# CLAMPED (#377). Both sub-finding sums feed a bash $(( )), which is 64-bit, while jq
+# emits arbitrary-precision integers. An absurd N therefore broke the arithmetic and
+# swallowed the ENTIRE count -- and the failure direction was toward ZERO findings,
+# i.e. fail-OPEN on a gate whose whole job is to fail closed. Worse, the swallowed
+# count erased findings contributed by OTHER reviewers in the same run: a real
+# CodeRabbit finding vanished because a Copilot body carried a 19-digit number.
+#
+# Clamp rather than refuse. This helper sits on the /handle-review and ship-gate
+# paths, so a hard refusal would convert a cosmetic parse artifact into a blocked
+# merge; a clamp preserves the already-correct "count is large, gate blocks" behavior.
+# The clamp lives in jq, not in bash, so the unbounded value never reaches the shell.
+CLAMP_MAX=100000
+outside_diff_sum=$(echo "$review_bodies" | jq --argjson cap "$CLAMP_MAX" '
+  [ .[] | (.body // "") | scan("<summary>[^<]*Outside diff range comments \\(([1-9][0-9]*)\\)</summary>") ]
+  | flatten | map(tonumber) | add // 0 | if . > $cap then $cap else . end')
 
 # Suppressed-finding count (#374): the exact same argument as outside_diff_sum above,
 # for Copilot's equivalent surface. Copilot's "Suppressed comments (N)" collapsible
@@ -903,9 +948,12 @@ outside_diff_sum=$(echo "$review_bodies" | jq '
 # together. Splitting them into separately-ackable findings would make them
 # individually unclearable and WEDGE the merge gate, since a suppressed item has no
 # thread to resolve. Count them; do not split them.
-suppressed_sum=$(echo "$review_bodies" | jq '
+#
+# Clamped identically to outside_diff_sum above (#377) -- both, or the hole is only
+# half closed and reads as fixed.
+suppressed_sum=$(echo "$review_bodies" | jq --argjson cap "$CLAMP_MAX" '
   [ .[] | (.body // "") | scan("<summary>Suppressed comments \\(([1-9][0-9]*)\\)</summary>") ]
-  | flatten | map(tonumber) | add // 0')
+  | flatten | map(tonumber) | add // 0 | if . > $cap then $cap else . end')
 
 if [ "$latest_per_reviewer" = true ]; then
   review_bodies=$(echo "$review_bodies" | jq 'group_by(.user.login) | map(max_by(.id)) | flatten |
@@ -1052,6 +1100,7 @@ if [ "$itemized" = true ]; then
     --argjson issue "$actionable_issue" \
     --argjson ids "$unreplied_ids" \
     --argjson nodes "$itemized_nodes" \
+    --argjson cap "$CLAMP_MAX" \
     --arg ok "$itemized_resolved_ok" '
     def excerpt($b): (($b // "") | split("\n")
       | map(gsub("<!--.*?-->"; "")         # HTML comments (lazy; the body may contain >)
@@ -1082,18 +1131,28 @@ if [ "$itemized" = true ]; then
     # the header count == the visible accounting (#252 core).
     #
     # The count is matched as [1-9][0-9]* rather than [0-9]+ so a "(0)" block does not
-# admit a body and then contribute nothing -- that would count the body itself as 1
-# finding when it holds none, the cries-wolf direction (#376 review).
-#
-# NOT scoped to a Copilot login, deliberately, though the same review asked for it:
-# the login is NOT stable across installations. The reviewer on this repo posts as
-# "Copilot" while stillwater sees "copilot-pull-request-reviewer[bot]", so a login
-# allowlist would silently drop findings wherever a third spelling appears -- the
-# exact silent-zero this change exists to end. BOT_LOGIN_FILTER already bounds the
-# set to reviewer bots; a non-Copilot bot emitting this literal element is admitted,
-# which errs toward surfacing a finding rather than hiding one.
-#
-# NOTE, and this bit is load-bearing: NO APOSTROPHES anywhere in this jq program.
+    # admit a body and then contribute nothing -- that would count the body itself as 1
+    # finding when it holds none, the cries-wolf direction (#376 review).
+    #
+    # NOT scoped to a Copilot login, deliberately, though the same review asked for it:
+    # the login is NOT stable across installations. The reviewer on this repo posts as
+    # "Copilot" while stillwater sees "copilot-pull-request-reviewer[bot]", so a login
+    # allowlist would silently drop findings wherever a third spelling appears -- the
+    # exact silent-zero this change exists to end. BOT_LOGIN_FILTER already bounds the
+    # set to reviewer bots; a non-Copilot bot emitting this literal element is admitted,
+    # which errs toward surfacing a finding rather than hiding one.
+    #
+    # The two subtotals are CLAMPED here as the gating sums are (#377), because the
+    # annotation reads the same untrusted (N) and an unclamped display would print the
+    # very truncation artifact the clamp exists to suppress.
+    #
+    # This NARROWS the reconcile gap rather than closing it: the header clamps the SUM
+    # while the annotation clamps PER BODY, so two bodies each just under the cap can
+    # still disagree (2 x 99999 -> header 100002, rows 200000). That needs two bodies
+    # near 50000 findings each, which no real reviewer produces; the case actually
+    # observed -- one absurd count truncating into a meaningless number -- is fixed.
+    #
+    # NOTE, and this bit is load-bearing: NO APOSTROPHES anywhere in this jq program.
     # It is a single-quoted shell string, so one apostrophe closes the quote and the
     # whole script dies with a syntax error at the next paren. Caught pre-push on #374.
     #
@@ -1103,8 +1162,8 @@ if [ "$itemized" = true ]; then
     # same "the oracle cries wolf" path that ends in a merge override.
     ( $reviewbody | .[]
       | (.user | sub("\\[bot\\]$"; "")) as $u
-      | ([.body | scan("Outside diff range comments \\(([0-9]+)\\)")] | flatten | map(tonumber) | add // 0) as $od
-      | ([.body | scan("<summary>Suppressed comments \\(([1-9][0-9]*)\\)</summary>")] | flatten | map(tonumber) | add // 0) as $sup
+      | ([.body | scan("<summary>[^<]*Outside diff range comments \\(([1-9][0-9]*)\\)</summary>")] | flatten | map(tonumber) | add // 0 | if . > $cap then $cap else . end) as $od
+      | ([.body | scan("<summary>Suppressed comments \\(([1-9][0-9]*)\\)</summary>")] | flatten | map(tonumber) | add // 0 | if . > $cap then $cap else . end) as $sup
       | "review-body | \($u) | (body) | \(excerpt(.body))\(if $od > 0 then " [+\($od) outside-diff]" else "" end)\(if $sup > 0 then " [+\($sup) suppressed]" else "" end) | replied:no resolved:n/a" ),
     ( $issue | .[]
       | (.user | sub("\\[bot\\]$"; "")) as $u
