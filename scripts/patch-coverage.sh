@@ -42,6 +42,31 @@
 # projection differs from Go's profile, so treat a pass as authoritative
 # (codecov will pass too) and a narrow miss as "codecov may still pass."
 #
+# VALIDITY RULE (#335): a patch-coverage number from this script is meaningful
+# ONLY at a committed HEAD with no dirty Go source. The two halves of the
+# measurement come from different places -- the diff SCOPE is
+# `git diff BASE..HEAD` (committed history) while the coverage PROFILE was
+# produced by compiling the WORKING TREE -- so a dirty *.go file makes line N
+# mean one thing in the diff and something else in the profile. That produced
+# two distinct exit-0 failures before the guard below existed:
+#   - all changes uncommitted: the scope came back EMPTY, so the script printed
+#     "no Go source changes in scope" and exited 0. The gate could not catch a
+#     regression in the ordinary edit -> gate -> commit workflow and said
+#     nothing about having skipped.
+#   - changes partly committed: the scope was non-empty and the script printed
+#     a plausible figure that was the INTERSECTION of HEAD's diff lines with the
+#     working tree's coverage blocks -- not a wrong measurement of something,
+#     but a measurement of nothing, degrading silently the further the tree
+#     moved from HEAD.
+# The guard is scoped to *.go rather than the whole tree deliberately: the
+# coverage profile itself normally lives untracked IN the repo (COVER_OUT
+# defaults to ./coverage.out), so a bare `git status --porcelain` check would
+# refuse nearly every legitimate run and get routed around. Within *.go it is
+# REPO-GLOBAL and config-independent -- anchored with `:(top)` and pinned to
+# `--untracked-files=normal` -- so neither the invoking directory nor a user's
+# git config can shrink what it looks at (see the call site for the two
+# measured false-CLEANs that earned each).
+#
 # The threshold and excludes default to the repo's own codecov.yml so the local
 # benchmark matches exactly what Codecov enforces -- no per-repo hard-coding in
 # callers. Explicit env vars still win, so a gate or CI can pin a value.
@@ -56,11 +81,25 @@
 #   PATCH_COVERAGE_EXCLUDE     extra pathspec excludes, space-separated.
 #                              Precedence: this env var > the repo's codecov.yml
 #                              `ignore:` globs > none. *_test.go is always added.
+#   PATCH_COVERAGE_ALLOW_DIRTY set to 1 to measure anyway with dirty Go source.
+#                              The figure is then labelled UNRELIABLE (see the
+#                              validity rule above); it is an explicit opt-in so
+#                              a caller declares the compromise rather than
+#                              learning to ignore a gate that refuses.
 #
 # Exit status:
 #   0  patch coverage meets or exceeds the threshold (or nothing to check)
 #   1  patch coverage below threshold
 #   2  configuration error (missing profile, unreadable go.mod, etc.)
+#   3  REFUSED: the validity precondition is not satisfied (dirty Go source, or
+#      an unreadable `git status` that leaves it undetermined). Distinct from 2
+#      ON PURPOSE. Consumers legitimately treat 2 as "this repo has no coverage
+#      tooling -- skip", so reusing it would let a refusal be swallowed as
+#      "nothing to measure": exactly the silent skip this guard exists to end,
+#      one layer up (/handle-review runs mid-fix-round, precisely when the tree
+#      is dirty). A separate code makes that conflation unrepresentable rather
+#      than merely documented-against. 3 means the measurement DID NOT HAPPEN
+#      and the caller must act -- never that there was nothing to measure.
 set -euo pipefail
 
 # -h / --help: print this script's header comment block as usage, then exit.
@@ -176,6 +215,57 @@ if [ -z "$module" ]; then
   exit 2
 fi
 
+# Enforce the validity rule stated in the header (#335): the diff scope is taken
+# from committed history while the profile compiles the working tree, so any
+# dirty Go source makes the two halves describe different versions of the same
+# file. Scoped to `*.go` (NOT the whole tree) because COVER_OUT normally sits
+# untracked in the repo. *_test.go is deliberately INSIDE the guard even though
+# it is excluded from patch scope: test code compiles into the profile and
+# changes which blocks are hit, so a dirty test file diverges the halves just as
+# a dirty source file does. An unreadable status fails CLOSED -- "I could not
+# check" must never read as "the tree is clean".
+DIRTY_NOTE=""
+# The pathspec and the untracked mode are BOTH pinned, and each closes a measured
+# false-CLEAN found in review:
+#   :(top)                  a bare '*.go' pathspec is CWD-RELATIVE, so running the
+#                           estimator from a module dir (the normal shape in a
+#                           multi-module repo, since COVER_OUT is per-module) hid a dirty
+#                           .go anywhere else in the tree and the guard passed. Note a
+#                           BARE `git status --porcelain` is repo-global from a subdir --
+#                           the pathspec is what introduced the scoping, so this is not a
+#                           git default anyone would expect.
+#   --untracked-files=normal  `git status` honors `status.showUntrackedFiles` from user
+#                           config; with it set to `no` (a legitimate perf setting on big
+#                           repos) a brand-new untracked .go file -- the single most common
+#                           shape of "the patch is uncommitted" -- was invisible.
+# Both are the same defect as the one this guard exists to fix: ambient context silently
+# turning "I did not look everywhere" into "there is nothing there", which routes to PASS.
+if ! dirty_go=$(git status --porcelain --untracked-files=normal -- ':(top)*.go' 2>/dev/null); then
+  echo "patch-coverage: REFUSED -- could not read git status to verify the tree is clean." >&2
+  echo "  Undetermined is not clean: a figure computed here could be a chimera." >&2
+  exit 3
+fi
+if [ -n "$dirty_go" ]; then
+  if [ "${PATCH_COVERAGE_ALLOW_DIRTY:-}" = "1" ]; then
+    DIRTY_NOTE="  [UNRELIABLE: measured with dirty Go source via PATCH_COVERAGE_ALLOW_DIRTY]"
+    echo "patch-coverage: WARNING -- PATCH_COVERAGE_ALLOW_DIRTY=1 with uncommitted Go" >&2
+    echo "  changes present. The diff scope comes from HEAD while the profile compiles the" >&2
+    echo "  working tree, so the figure below does not describe either version." >&2
+  else
+    echo "patch-coverage: REFUSED (exit 3) -- uncommitted Go changes are present." >&2
+    echo "  A patch-coverage figure is valid only at a committed HEAD with a clean tree:" >&2
+    echo "  the diff scope comes from 'git diff BASE..HEAD' (committed history) while the" >&2
+    echo "  coverage profile compiles the WORKING TREE. Uncommitted Go changes make those" >&2
+    echo "  two halves describe different versions of the same file, so the result is" >&2
+    echo "  either a silent skip (all changes uncommitted) or a number that measures" >&2
+    echo "  neither version (changes partly committed)." >&2
+    echo "  Commit first, then re-run. To measure anyway, set PATCH_COVERAGE_ALLOW_DIRTY=1" >&2
+    echo "  (the figure is then labelled UNRELIABLE). Dirty Go files:" >&2
+    printf '%s\n' "$dirty_go" | sed 's/^/    /' >&2
+    exit 3
+  fi
+fi
+
 # Build the pathspec exclude list. `*_test.go` is always excluded; callers
 # add their own via PATCH_COVERAGE_EXCLUDE (e.g. generated files, entry
 # points that shouldn't count toward patch coverage).
@@ -199,7 +289,16 @@ done < <(git diff "$BASE"..HEAD --name-only --diff-filter=AMR \
   -- '*.go' "${exclude_specs[@]}" | sort -u)
 
 if [ "${#changed[@]}" -eq 0 ]; then
-  echo "patch-coverage: no Go source changes in scope."
+  # Reaching here now means the scope is genuinely empty. The other way this
+  # line used to print -- changes existing but sitting uncommitted -- is caught
+  # by the dirty-source guard above and reported distinguishably (#335), so the
+  # two cases can no longer be confused for one another.
+  # DIRTY_NOTE rides this line too, not just the total. Under ALLOW_DIRTY this message is
+  # otherwise actively misleading: it asserts the committed range holds no Go changes while
+  # a Go change sits uncommitted right there -- the original face-1 scenario, reading as an
+  # unqualified clean skip on stdout (the warning is on stderr, which is not what a caller
+  # quotes). Every stdout terminal path carries the label or none of them mean anything.
+  echo "patch-coverage: no Go source changes in scope (committed range ${BASE}..HEAD is empty of them).${DIRTY_NOTE}"
   exit 0
 fi
 
@@ -354,14 +453,14 @@ done
 
 if [ "$total_exec" -eq 0 ]; then
   echo ""
-  echo "patch-coverage: no executable lines in patch scope; nothing to enforce."
+  echo "patch-coverage: no executable lines in patch scope; nothing to enforce.${DIRTY_NOTE}"
   exit 0
 fi
 
 pct=$(awk -v c="$total_cov" -v e="$total_exec" 'BEGIN{printf "%.2f", c*100/e}')
 echo ""
-printf "Total patch coverage: %s%% (%d/%d executable lines)\n" \
-  "$pct" "$total_cov" "$total_exec"
+printf "Total patch coverage: %s%% (%d/%d executable lines)%s\n" \
+  "$pct" "$total_cov" "$total_exec" "$DIRTY_NOTE"
 
 if awk -v p="$pct" -v t="$THRESHOLD" 'BEGIN{exit !(p+0 < t+0)}'; then
   echo "FAIL: patch coverage below ${THRESHOLD}% threshold."

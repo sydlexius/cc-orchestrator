@@ -345,6 +345,16 @@ description. An explicit env var always wins over the `codecov.yml` value.
     profile (the repo has no coverage tooling -- e.g. a stdlib-only shell/Python
     repo): treat exit 2 as a SKIP. Print "Patch-coverage gate skipped (no
     coverage profile / no coverage service)." and continue to Step 3.
+- `3` -- **REFUSED (#335): never a skip, on any repo.** The tree has uncommitted
+  Go changes (or `git status` could not be read), so the diff scope comes from
+  committed HEAD while the profile compiles the working tree -- the two halves
+  describe different versions of the same file, which yields either a silent
+  skip or a number that measures neither. It is a SEPARATE code from 2 for
+  exactly this reason: 2 legitimately routes to "skip, this repo has no coverage
+  tooling", and a refusal routed there would be swallowed. STOP and say:
+  > "patch-coverage REFUSED to measure -- uncommitted Go changes are present.
+  > Commit them, then re-run prep-pr. (`PATCH_COVERAGE_ALLOW_DIRTY=1` measures
+  > anyway and labels the figure UNRELIABLE; prefer committing.)"
 
 **If the script is missing** (`${CLAUDE_PLUGIN_ROOT}/scripts/patch-coverage.sh` not found),
 treat as a `2` configuration error: stop and tell the user to reinstall or update

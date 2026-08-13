@@ -461,6 +461,16 @@ repo), treat coverage as SKIP and move on. Neither is a failure. Likewise when
 `.gates.toml` sets `[merge_pr]` `coverage_advisory = false`, report Coverage as
 **N/A** (a self-skip, not a failure).
 
+**Exit 3 is NOT a self-skip (#335).** It means the estimator REFUSED: the tree has
+uncommitted Go changes (or `git status` could not be read), so the diff scope and the
+coverage profile would describe different versions of the same file. This matters most
+HERE, because a fix round is exactly when the tree is dirty -- lumping 3 in with the
+exit-2 skip would swallow the refusal as "nothing to measure" and reproduce the silent
+skip the guard exists to end. On exit 3: COMMIT the round's fixes first, then re-run.
+Do not report Coverage as N/A, and do not reach for `PATCH_COVERAGE_ALLOW_DIRTY=1` to
+make the message go away -- a figure measured that way is labelled UNRELIABLE precisely
+because it describes neither version.
+
 Interpret the result as a **conservative lower bound**: it counts a line covered
 only if every coverage block touching it was hit (mixed-hit lines count as
 missed, matching Codecov's partial accounting), and Codecov's block-to-line
