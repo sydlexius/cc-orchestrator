@@ -964,6 +964,207 @@ def main():
     check("#376 review: the OTHER real Copilot login ('Copilot', as seen on this repo) is "
           "surfaced too -- the matcher keys on the body element, not an unstable login", n == 3)
 
+    print()
+    print("== #377: an absurd sub-finding count must never ZERO the gate ==")
+    # Both sums land in a bash $(( )), which is 64-bit; jq emits arbitrary precision.
+    # An overflowing N made the arithmetic fail and swallowed the WHOLE count -- the
+    # fail-OPEN direction on a fail-CLOSED oracle. The dangerous part is not the
+    # malformed body itself but that it ERASES unrelated real findings from the same
+    # run, so the load-bearing case is a REAL CodeRabbit finding sitting beside it.
+    HUGE = "9223372036854775806"
+    CR_REAL_PLUS_HUGE_COPILOT = (
+        '[{"id":111,"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T02:00:00Z",'
+        '"body":"<summary>Outside diff range comments (6)</summary>"},'
+        '{"id":222,"user":{"login":"copilot-pull-request-reviewer[bot]"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T03:00:00Z",'
+        '"body":"## Pull request overview\\n<details><summary>Suppressed comments (' + HUGE + ')</summary>x</details>"}]'
+    )
+    rc, out, err = run(["--allow-stale"], reviews=CR_REAL_PLUS_HUGE_COPILOT)
+    n = findings_count(out)
+    check("#377: a real CR finding is NOT erased by an overflowing Copilot count "
+          "(count must be >0, never swallowed)", n is not None and n > 0)
+    check("#377: the overflow path still BLOCKS (exit 0 with a nonzero count, never a "
+          "silent 'no unreplied comments')", "No unreplied bot comments" not in out)
+
+    # jq renders a sufficiently large integer in float form, which bash then truncates
+    # into a plausible-looking but meaningless number.
+    FLOATY = "99999999999999999999999999999999999"
+    COPILOT_FLOATY = (
+        '[{"id":333,"user":{"login":"copilot-pull-request-reviewer[bot]"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T02:00:00Z",'
+        '"body":"## Pull request overview\\n<details><summary>Suppressed comments (' + FLOATY + ')</summary>x</details>"}]'
+    )
+    rc, out, err = run(["--allow-stale"], reviews=COPILOT_FLOATY)
+    n = findings_count(out)
+    check("#377: a float-rendered huge count is clamped to a sane number, not a "
+          "truncation artifact", n is not None and 0 < n <= 100001)
+
+    # Same hazard on the PRE-EXISTING CodeRabbit path -- clamping one and not the other
+    # is how a half-closed hole reads as closed.
+    CR_HUGE = (
+        '[{"id":444,"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T02:00:00Z",'
+        '"body":"<summary>Outside diff range comments (' + HUGE + ')</summary>"}]'
+    )
+    rc, out, err = run(["--allow-stale"], reviews=CR_HUGE)
+    n = findings_count(out)
+    check("#377: the CodeRabbit outside-diff sum is clamped too (both paths, or the "
+          "hole is only half closed)", n is not None and 0 < n <= 100001)
+
+    print()
+    print("== #378: an inline reply must not clear a review's BODY-level findings ==")
+    # A review carrying BOTH inline comments and a body-level block routed down the
+    # "has inline comments" branch, where acked_by_reference was never consulted. So
+    # replying to the inline comment alone cleared the whole review and its body-level
+    # findings vanished, uncounted and unread. The shape is real: stillwater#3014
+    # review 4913081288 ("generated 1 comment" + Suppressed comments (3)).
+    #
+    # This is the SHARED addressed-state machine, so the CodeRabbit outside-diff case
+    # has the identical hole and both are asserted here. Fixing one would leave the
+    # other reading as fixed.
+    MIXED_COPILOT = (
+        '[{"id":888,"user":{"login":"copilot-pull-request-reviewer[bot]"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T02:00:00Z",'
+        '"body":"## Pull request overview\\n<details><summary>Suppressed comments (3)</summary>x</details>"}]'
+    )
+    # One inline comment belonging to that review, already REPLIED (absent from unreplied).
+    INLINE_REPLIED = (
+        '[{"id":9501,"user":{"login":"copilot-pull-request-reviewer[bot]"},'
+        '"pull_request_review_id":888,"path":"a.sh","original_line":1,'
+        '"created_at":"2026-06-18T02:00:00Z","commit_id":"abcdef1234",'
+        '"body":"an inline finding"},'
+        '{"id":9601,"user":{"login":"testuser"},"in_reply_to_id":9501,'
+        '"path":"a.sh","original_line":1,"created_at":"2026-06-18T04:00:00Z",'
+        '"commit_id":"abcdef1234","body":"fixed in abc1234"}]'
+    )
+    rc, out, err = run(["--allow-stale"], reviews=MIXED_COPILOT, inline=INLINE_REPLIED)
+    n = findings_count(out)
+    check("#378: inline REPLIED but 3 suppressed body findings unacked -> still reported "
+          "(the body findings do not ride out on the inline reply)",
+          n is not None and n >= 3)
+
+    MIXED_CR = (
+        '[{"id":889,"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T02:00:00Z",'
+        '"body":"<summary>Outside diff range comments (2)</summary>"}]'
+    )
+    INLINE_REPLIED_CR = (
+        '[{"id":9502,"user":{"login":"coderabbitai[bot]"},'
+        '"pull_request_review_id":889,"path":"a.sh","original_line":1,'
+        '"created_at":"2026-06-18T02:00:00Z","commit_id":"abcdef1234",'
+        '"body":"an inline finding"},'
+        '{"id":9602,"user":{"login":"testuser"},"in_reply_to_id":9502,'
+        '"path":"a.sh","original_line":1,"created_at":"2026-06-18T04:00:00Z",'
+        '"commit_id":"abcdef1234","body":"fixed in abc1234"}]'
+    )
+    rc, out, err = run(["--allow-stale"], reviews=MIXED_CR, inline=INLINE_REPLIED_CR)
+    n = findings_count(out)
+    check("#378: the SHARED hole is fixed for CodeRabbit outside-diff too, not just "
+          "Copilot (same branch, same defect)", n is not None and n >= 2)
+
+    # NO WEDGE, and NO over-blocking: once the review id is acked, the body findings
+    # clear even though the inline comment was replied to separately. Both channels
+    # must be satisfiable, or the fix converts a recall hole into a permanent block.
+    ACK_888 = ('[{"id":9601,"user":{"login":"testuser"},'
+               '"created_at":"2026-06-18T05:00:00Z",'
+               '"body":"Addressed the suppressed findings in review 888 - fixed in abc1234."}]')
+    rc, out, err = run(["--allow-stale"], reviews=MIXED_COPILOT,
+                       inline=INLINE_REPLIED, issue=ACK_888)
+    n = findings_count(out)
+    check("#378: inline replied AND review id acked -> fully cleared (the fix must not "
+          "create an unclearable state)", n in (0, None))
+
+    # A review whose body carries NO sub-finding block keeps the old behavior exactly:
+    # an inline reply clears it. This is the regression guard on the shared machine --
+    # a round summary is not a finding.
+    PLAIN_REVIEW = (
+        '[{"id":890,"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T02:00:00Z",'
+        '"body":"**Actionable comments posted: 1**\\n\\nNitpick: a plain round summary."}]'
+    )
+    INLINE_REPLIED_PLAIN = (
+        '[{"id":9503,"user":{"login":"coderabbitai[bot]"},'
+        '"pull_request_review_id":890,"path":"a.sh","original_line":1,'
+        '"created_at":"2026-06-18T02:00:00Z","commit_id":"abcdef1234",'
+        '"body":"an inline finding"},'
+        '{"id":9603,"user":{"login":"testuser"},"in_reply_to_id":9503,'
+        '"path":"a.sh","original_line":1,"created_at":"2026-06-18T04:00:00Z",'
+        '"commit_id":"abcdef1234","body":"fixed in abc1234"}]'
+    )
+    rc, out, err = run(["--allow-stale"], reviews=PLAIN_REVIEW, inline=INLINE_REPLIED_PLAIN)
+    n = findings_count(out)
+    check("#378 REGRESSION GUARD: a review with NO body-level block still clears on an "
+          "inline reply alone (unchanged behavior)", n in (0, None))
+
+    # PROSE MENTIONING the phrase is not a finding. Without the <summary> element anchor
+    # a body saying "will use Outside diff range comments (3) next round" would make its
+    # review unclearable by an inline reply. Measured across two repos: every real
+    # occurrence carries the element; zero appear as bare prose. (#377/#378 pre-push review)
+    PROSE_MENTION = (
+        '[{"id":891,"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T02:00:00Z",'
+        '"body":"**Actionable comments posted: 1**\\nWill use Outside diff range comments (3) next round."}]'
+    )
+    INLINE_REPLIED_PROSE = (
+        '[{"id":9504,"user":{"login":"coderabbitai[bot]"},'
+        '"pull_request_review_id":891,"path":"a.sh","original_line":1,'
+        '"created_at":"2026-06-18T02:00:00Z","commit_id":"abcdef1234",'
+        '"body":"an inline finding"},'
+        '{"id":9604,"user":{"login":"testuser"},"in_reply_to_id":9504,'
+        '"path":"a.sh","original_line":1,"created_at":"2026-06-18T04:00:00Z",'
+        '"commit_id":"abcdef1234","body":"fixed in abc1234"}]'
+    )
+    rc, out, err = run(["--allow-stale"], reviews=PROSE_MENTION, inline=INLINE_REPLIED_PROSE)
+    n = findings_count(out)
+    check("#378: a PROSE mention of 'Outside diff range comments (N)' is not a finding "
+          "(anchored on the <summary> element, so an inline reply still clears it)",
+          n in (0, None))
+
+    # A "(0)" collapsible holds no findings: blocking on it would mean gating a body
+    # whose own annotation reads "0 outside-diff + 0 suppressed".
+    CR_ZERO_BLOCK = (
+        '[{"id":892,"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T02:00:00Z",'
+        '"body":"> <summary>Outside diff range comments (0)</summary><blockquote>"}]'
+    )
+    INLINE_REPLIED_ZERO = (
+        '[{"id":9505,"user":{"login":"coderabbitai[bot]"},'
+        '"pull_request_review_id":892,"path":"a.sh","original_line":1,'
+        '"created_at":"2026-06-18T02:00:00Z","commit_id":"abcdef1234",'
+        '"body":"an inline finding"},'
+        '{"id":9605,"user":{"login":"testuser"},"in_reply_to_id":9505,'
+        '"path":"a.sh","original_line":1,"created_at":"2026-06-18T04:00:00Z",'
+        '"commit_id":"abcdef1234","body":"fixed in abc1234"}]'
+    )
+    rc, out, err = run(["--allow-stale"], reviews=CR_ZERO_BLOCK, inline=INLINE_REPLIED_ZERO)
+    n = findings_count(out)
+    check("#378: an outside-diff '(0)' block does not gate a replied review "
+          "(positive counts only, matching the suppressed leg)", n in (0, None))
+
+    # The REAL CodeRabbit shape carries an emoji between <summary> and the phrase
+    # (`> <summary>WARNING Outside diff range comments (1)</summary><blockquote>`), so
+    # the element anchor must tolerate intervening characters or it would match nothing
+    # in production while passing a tidier fixture.
+    CR_REAL_SHAPE = (
+        '[{"id":893,"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED",'
+        '"submitted_at":"2026-06-18T02:00:00Z",'
+        '"body":"> <summary>\\u26a0\\ufe0f Outside diff range comments (1)</summary><blockquote>x"}]'
+    )
+    INLINE_REPLIED_REAL = (
+        '[{"id":9506,"user":{"login":"coderabbitai[bot]"},'
+        '"pull_request_review_id":893,"path":"a.sh","original_line":1,'
+        '"created_at":"2026-06-18T02:00:00Z","commit_id":"abcdef1234",'
+        '"body":"an inline finding"},'
+        '{"id":9606,"user":{"login":"testuser"},"in_reply_to_id":9506,'
+        '"path":"a.sh","original_line":1,"created_at":"2026-06-18T04:00:00Z",'
+        '"commit_id":"abcdef1234","body":"fixed in abc1234"}]'
+    )
+    rc, out, err = run(["--allow-stale"], reviews=CR_REAL_SHAPE, inline=INLINE_REPLIED_REAL)
+    n = findings_count(out)
+    check("#378: the REAL CR shape (emoji between <summary> and the phrase) is still "
+          "detected -- the anchor tolerates intervening characters", n is not None and n >= 1)
+
     # The ack channel already exists and must still clear a suppressed body: N items share
     # ONE review id, so one reply-comment.sh --review <id> ack clears all N together.
     # Verified in production on stillwater#3018. This is why per-ITEM itemization would
