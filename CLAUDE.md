@@ -183,7 +183,9 @@ Runtime (`scripts/`; canonical source is this repo):
   `has required_status_checks`, NEVER `has rules`: a ref can carry an auto-review-only ruleset
   with ZERO required checks, and a presence-keyed predicate would call that base governed,
   reconcile against an empty set, and pass the identical false green through a longer path.
-  Every unreadable input BLOCKS, per the #334 UNKNOWN precedent. FULL mode only - `--diagnose`
+  Every unreadable RULES-leg input BLOCKS, per the #334 UNKNOWN precedent; the best-effort
+  legacy leg instead degrades with a loud NOTE, which is the asymmetry two sentences up.
+  FULL mode only - `--diagnose`
   keeps its own narrower legacy-protection read.
   THE DEFECT CLASS IT KEEPS RE-GROWING is worth more than the feature: a status or a type
   that goes UNCHECKED turns "I could not read this" into "there was nothing to read", which

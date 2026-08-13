@@ -35,7 +35,7 @@ The oracle blocked that PR only by accident, on an unrelated unreplied review fi
 evaluated *after* the checks gate. Clear that one thread and it returns PASS on a pull
 request missing 17 of 18 required checks.
 
-#3021 has since merged, and the measurement above is NOT reproducible from it: GitHub
+PR #3021 has since merged, and the measurement above is NOT reproducible from it: GitHub
 AUTO-RETARGETED its base to `main` when the parent merged (`automatic_base_change_
 succeeded`, 01:56Z), so the merged PR reports `baseRefName: main` and a 70-context
 rollup. The timeline corroborates the shape — it provably carried a different,

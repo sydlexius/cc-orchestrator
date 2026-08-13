@@ -472,8 +472,18 @@ fi
 # which would make the common case indistinguishable from "unreadable".
 # Echoes one context per line; returns 1 when the ref cannot be read at all.
 _required_contexts_for() {
-  local _ref="$1" _doc _rules _legacy _union
-  _doc="$(gh api "repos/$repo/rules/branches/$_ref" 2>/dev/null)" || return 1
+  local _ref="$1" _doc _rules _legacy _union _lraw _lparsed _eref
+  # PERCENT-ENCODE THE REF. A branch name routinely contains a slash (`fix/375-...`),
+  # and both endpoints below embed it as a raw PATH SEGMENT. Measured live, GitHub's
+  # router does treat the segment as greedy -- `rules/branches/fix/2712-...` returns the
+  # same 1 rule raw and encoded -- so this is not a live defect. But that is undocumented
+  # router behavior standing between a slash-bearing base and an "unreadable expected
+  # set" BLOCK, and the repo already has the idiom (`cleanup-worktree.sh`). Encoding
+  # costs nothing and removes the dependency. Falls back to the raw ref if jq fails, so
+  # a broken encoder degrades to today's working behavior rather than an empty path.
+  _eref="$(printf '%s' "$_ref" | jq -sRr @uri 2>/dev/null)" || _eref=""
+  [ -n "$_eref" ] || _eref="$_ref"
+  _doc="$(gh api "repos/$repo/rules/branches/$_eref" 2>/dev/null)" || return 1
   # An EMPTY body is not malformed and must not read as unreadable: `jq -e .` exits 4 on
   # empty input, which would turn a benign empty response into a BLOCK on every merge.
   # Normalize it to the empty rule array it means, then insist the rest parses.
@@ -528,7 +538,7 @@ _required_contexts_for() {
   # ABSENT contributes nothing SILENTLY (a rulesets-only repo must not be nagged on
   # every merge), PRESENT-BUT-UNPARSEABLE contributes nothing LOUDLY.
   _legacy="[]"
-  if _lraw="$(gh api "repos/$repo/branches/$_ref/protection" 2>/dev/null)"; then
+  if _lraw="$(gh api "repos/$repo/branches/$_eref/protection" 2>/dev/null)"; then
     # `type == "object"` first: this endpoint contracts an object, and a degenerate 200
     # carrying `null` (or an array, or a scalar) would otherwise filter to nothing and
     # read as "legacy requires no checks" -- indistinguishable from a real empty answer.
@@ -646,7 +656,18 @@ if [ -z "$expected" ]; then
 fi
 
 if [ -n "$expected" ]; then
-  present="$(jq -r '[.statusCheckRollup[]? | (.name // .context)] | map(select(. != null)) | unique | .[]' <<<"$json" 2>/dev/null || echo "")"
+  # THE SAME NEWLINE INVARIANT, ON THE OTHER SIDE OF THE COMPARISON. The union guard
+  # rejects a newline-bearing EXPECTED context; without the mirror, a ROLLUP name
+  # carrying one flattens into several lines and any ONE of them can satisfy a required
+  # context by exact-line match -- a required check reported present when no check with
+  # that exact name exists. Same false-PASS class, and the same "applied at one site,
+  # not its sibling" shape a guard on one side alone always leaves behind.
+  # DROP rather than reject: an unusable rollup name errs toward "required check
+  # absent", which BLOCKs, whereas failing the whole read would block on a name that may
+  # be irrelevant to the expected set entirely.
+  present="$(jq -r '[.statusCheckRollup[]? | (.name // .context)]
+                    | map(select(type == "string" and (test("\n") | not)))
+                    | unique | .[]' <<<"$json" 2>/dev/null || echo "")"
   missing=""
   while IFS= read -r _ctx; do
     [ -n "$_ctx" ] || continue

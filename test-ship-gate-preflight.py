@@ -270,7 +270,13 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
                 "    # main does) is expressible. RULES_FAIL fails the route to prove the\n"
                 "    # unreadable path BLOCKS rather than degrading to a pass.\n"
                 "    if [ -n \"${RULES_FAIL:-}\" ]; then echo 'gh: simulated rules-API failure' >&2; exit 1; fi\n"
-                "    case \"$a\" in\n"
+                "    # DECODE the ref before routing. The script percent-encodes it (a\n"
+                "    # branch name routinely contains a slash), and the real endpoint decodes\n"
+                "    # it -- a stub matching the RAW form would route a slash-bearing default\n"
+                "    # branch to the wrong fixture, which is the stub-is-not-reality defect\n"
+                "    # this harness has already been bitten by twice.\n"
+                "    _decoded=\"$(printf '%s' \"$a\" | sed 's/%2F/\\//g; s/%2f/\\//g')\"\n"
+                "    case \"$_decoded\" in\n"
                 "      *\"/rules/branches/${FIXTURE_DEFAULT_BRANCH:-main}\")\n"
                 "        # RULES_MAIN_FAIL fails ONLY the DEFAULT branch's route. RULES_FAIL kills\n"
                 "        # every rules read at once and so exits at the BASE read, leaving the\n"
@@ -380,14 +386,23 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         env.pop("FIXTURE_PROTECTION", None)
         if protection is not None:
             env["FIXTURE_PROTECTION"] = protection
+        # POP BEFORE SETTING, like every other fixture var here (CR #253): `env` is a
+        # copy of os.environ, so a value exported in the developer's shell would
+        # otherwise be inherited by EVERY case and report failures the oracle did not
+        # cause. These six were the only ones missing it.
+        env.pop("FIXTURE_RULES_MAIN", None)
         if rules_main is not None:
             env["FIXTURE_RULES_MAIN"] = rules_main
+        env.pop("FIXTURE_RULES_BASE", None)
         if rules_base is not None:
             env["FIXTURE_RULES_BASE"] = rules_base
+        env.pop("RULES_FAIL", None)
         if rules_fail:
             env["RULES_FAIL"] = "1"
+        env.pop("RULES_MAIN_FAIL", None)
         if rules_main_fail:
             env["RULES_MAIN_FAIL"] = "1"
+        env.pop("DEFAULT_BRANCH_FAIL", None)
         if default_branch_fail:
             env["DEFAULT_BRANCH_FAIL"] = "1"
         # The default branch is a FIXTURE, not a constant. Every case defaulting to
@@ -1432,6 +1447,30 @@ def main():
                           protection=prot_fixture(required_contexts=["gamma\ndelta"]))
     check("#375 I1: a NEWLINE-bearing context from the LEGACY leg is rejected too "
           "(the invariant is on the union, not on one source)", rc == 2)
+
+    # CR: the newline invariant belongs on BOTH sides of the comparison. A ROLLUP name
+    # carrying a newline flattens into several lines, and any ONE of them can satisfy a
+    # required context by exact-line match -- reporting a required check present when no
+    # check with that exact name exists. Same false-PASS class as the union guard, the
+    # other side of the `grep -Fxq`.
+    rc, out, err, _ = run(["1021", "owner/repo"],
+                          fixture_json=rollup(checkrun("Build\nLint", "COMPLETED", "SUCCESS"),
+                                              base_ref="main"),
+                          rules_main=rules_doc(contexts=["Build"]),
+                          rules_base=rules_doc(contexts=["Build"]))
+    check("#375: a NEWLINE-bearing ROLLUP name cannot satisfy a required context by "
+          "matching one of its lines", rc == 2 and "Build" in (out + err))
+
+    # A SLASH-bearing ref is the normal case for a stacked/backport base, and both API
+    # reads embed it as a raw path segment. GitHub's router happens to treat it greedily
+    # (measured), so this pins the working behavior against the encoding change.
+    rc, out, err, _ = run(["1022", "owner/repo"],
+                          fixture_json=rollup(checkrun("Build", "COMPLETED", "SUCCESS"),
+                                              base_ref="release/1.2"),
+                          rules_main=MAIN_REQUIRES,
+                          rules_base=rules_doc(contexts=["Build"]))
+    check("#375: a SLASH-bearing base ref resolves its own required set (the ref is "
+          "URL-encoded, and the encoding does not break the lookup)", rc == 0)
 
     # An EMPTY 200 legacy body is BENIGN, not malformed: the rules leg normalizes exactly
     # this case, and losing that on the legacy leg turned its documented best-effort
