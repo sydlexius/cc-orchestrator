@@ -363,7 +363,7 @@ acknowledge that cleanup ran:
 
 - PR: #$pr_number
 - CR status: <verified clean / fallback check / skipped>
-- Coverage: <patch_pct>% <threshold_state> | N/A
+- Coverage: <patch_pct>% <threshold_state> | not measured | N/A
 - Commit: <squash merge SHA>
 - Post-merge cleanup: see /post-merge-cleanup output above
 ```
@@ -372,3 +372,16 @@ Display "N/A" for Coverage when `--coverage-only` returned `{"status":"none"}`
 (no coverage service on the repo) -- a missing coverage signal is not a failure.
 When `threshold_state` is `none` (codecov commented but posts no gating
 `codecov/patch` check-run), show `<patch_pct>% (advisory-only)` -- also not a failure.
+When `patch_pct` is null in that same state, show `not measured (advisory-only)`;
+never interpolate the null, which renders the literal `null%`.
+
+`patch_pct` may be **`null`** even when `status` is `present` -- codecov reports no
+percentage at all on a diff with no coverable lines ("Coverage not affected"). Show
+"not measured" and print the accompanying `patch_pct_reason`; NEVER render a null as
+`0%`. A fabricated zero reads as a catastrophic coverage failure that did not happen,
+which is the defect #316 fixed at the source -- do not reintroduce it at the display
+layer. `patch_pct_source` names which authority supplied the number (`comment`, the more
+precise reading, or `check_run`, the fallback when codecov's 100%-coverage wording
+omits the percentage line). Only ONE source is ever reported -- the comment wins
+whenever it carries the number -- so the field is diagnostic context for a surprising
+reading, not something to surface routinely.

@@ -188,9 +188,15 @@ Each agent receives this task:
   bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh --coverage-only <number> <repo>
   ```
 
-  Returns a JSON object with `status`, `patch_pct`, `threshold_state`
-  (`pass`/`fail`/`unknown`), `report_url`. Include `patch_pct` and
-  `threshold_state` in the agent's return payload under a `Coverage:` field.
+  Returns a JSON object with `status`, `patch_pct`, `patch_pct_source`,
+  `patch_pct_reason`, `threshold_state` (`pass`/`fail`/`unknown`), `report_url`.
+  Include `patch_pct` and `threshold_state` in the agent's return payload under a
+  `Coverage:` field.
+
+  **A `null` `patch_pct` is not a zero.** Codecov states no percentage on a diff
+  with no coverable lines, so `status: "present"` can carry `patch_pct: null` plus
+  a `patch_pct_reason`. Report that as `not measured`, never as `0%` -- rendering it
+  as a number invents a catastrophic coverage failure (#316).
 
   **Self-skip when no coverage service is active.** If `--coverage-only`
   returns `{"status":"none"}` (no codecov comment on the PR, e.g. a repo with

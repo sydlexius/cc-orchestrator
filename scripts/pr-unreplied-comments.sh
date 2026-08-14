@@ -342,25 +342,62 @@ count_pending_reviewers() {
 # retained as advisory-only context under comment_glyph.
 build_coverage_advisory() {
   local issue_comments codecov_comment body comment_id patch_pct comment_glyph report_url
+  local patch_pct_source patch_pct_reason patch_run patch_run_title
   local script_dir head_sha patch_conclusion threshold_state
 
+  # #316 SIBLING: the SAME errexit-abort shape as the extraction pipeline below, at a
+  # DIFFERENT call site. Two mechanisms make $issue_comments a non-array: gh writes an
+  # error body to STDOUT while exiting nonzero, so `|| echo '[]'` CONCATENATES the
+  # garbage with `[]` rather than replacing it; and on a 5xx that body is HTML, which
+  # makes jq exit 5 and -- unguarded -- kills the script before the jq -n that emits
+  # the JSON. That is the #316 symptom exactly (nonzero exit, empty stdout), reached
+  # by a different input.
+  #
+  # Fixed HERE rather than deferred because a fix that closes one instance of a defect
+  # class while its twin survives twenty lines away reads as "the class is handled"
+  # when it is not.
+  #
+  # The `2>/dev/null || echo ""` on the SELECT is the whole fix, and a preceding
+  # `type == "array"` pre-check was written and then REMOVED: mutation testing showed
+  # the select-guard alone kills every case (an HTML body, a 4xx object, a bare string,
+  # AND an array of non-objects like [1,2,3], which a type check ADMITS and jq then
+  # exits 5 on). Reverting the type check alone changed nothing observable; reverting
+  # the select-guard alone broke 6 cases. Two guards where one suffices is the same
+  # dead-code-that-reads-as-safety trap as the removed check-run type guard below.
   issue_comments=$(gh api "repos/$repo/issues/$pr_number/comments" --paginate 2>/dev/null || echo '[]')
-  codecov_comment=$(echo "$issue_comments" | jq '[.[] | select(.user.login == "codecov[bot]")] | sort_by(.created_at) | last // empty')
+  codecov_comment=$(echo "$issue_comments" | jq '[.[] | select(.user.login == "codecov[bot]")] | sort_by(.created_at) | last // empty' 2>/dev/null || echo "")
 
   if [ -z "$codecov_comment" ] || [ "$codecov_comment" = "null" ]; then
     echo '{"status":"none"}'
     return
   fi
 
-  body=$(echo "$codecov_comment" | jq -r '.body')
-  comment_id=$(echo "$codecov_comment" | jq -r '.id')
+  body=$(echo "$codecov_comment" | jq -r '.body' 2>/dev/null || echo "")
+  # comment_id feeds --argjson, which REJECTS a non-number: a string id would exit 2
+  # and abort. Default to a JSON null so a malformed id degrades the field instead of
+  # the whole advisory.
+  comment_id=$(echo "$codecov_comment" | jq -r 'if (.id | type) == "number" then .id else "null" end' 2>/dev/null || echo "null")
+  [ -n "$comment_id" ] || comment_id="null"
 
   # Patch coverage percentage. The line looks like:
   #   "Patch coverage is `29.78177%` with ..."
   # Matches the first decimal number inside backticks following "Patch coverage is".
+  #
+  # #316: THE `|| true` IS LOAD-BEARING, NOT DEFENSIVE PADDING. Codecov CHANGES ITS
+  # WORDING at 100% patch coverage -- it omits this line entirely and prints only
+  # ":white_check_mark: All modified and coverable lines are covered by tests." A
+  # non-matching grep exits 1, `pipefail` propagates it, and `set -e` then killed the
+  # whole script AT THIS ASSIGNMENT, before the jq -n below ever ran: --coverage-only
+  # exited 1 with EMPTY STDOUT. Measured on 24 of 60 recent stillwater PRs. It hid for
+  # so long because the DEFAULT mode calls this function inside $(...), and command
+  # substitution masks errexit -- so the identical code was merely lossy in one caller
+  # and fatal in the other, with no difference in the code itself.
   # shellcheck disable=SC2016  # literal grep pattern; no shell expansion intended.
   patch_pct=$(echo "$body" | grep -oE 'Patch coverage is[[:space:]]+`[0-9]+\.?[0-9]*%`' | head -1 \
-    | grep -oE '[0-9]+\.?[0-9]*' | head -1)
+    | grep -oE '[0-9]+\.?[0-9]*' | head -1 || true)
+  patch_pct_source=""
+  patch_pct_reason=""
+  if [ -n "$patch_pct" ]; then patch_pct_source="comment"; fi
 
   # Comment glyph -- ADVISORY ONLY (#239). :white_check_mark: => pass; :x: => uncovered
   # patch lines present (NOT a threshold failure); absence => unknown. Never gates.
@@ -381,11 +418,32 @@ build_coverage_advisory() {
   script_dir=$(unset CDPATH; cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || script_dir="."
   head_sha=$("$script_dir/gh-api-get.sh" "repos/$repo/pulls/$pr_number" --jq '.head.sha' 2>/dev/null || echo "")
   patch_conclusion=""
+  patch_run_title=""
   if [ -n "$head_sha" ]; then
     # per_page=100 (single page, no --paginate concat) covers commits with many
     # checks; codecov/patch on a later default page would otherwise read as absent.
-    patch_conclusion=$("$script_dir/gh-api-get.sh" "repos/$repo/commits/$head_sha/check-runs?per_page=100" \
-      --jq '[.check_runs[] | select(.name == "codecov/patch")] | max_by(.started_at) | .conclusion // empty' 2>/dev/null || echo "")
+    #
+    # #316: fetch the check-run OBJECT once and derive both fields from it, rather
+    # than issuing a second request for the title. `output.title` is codecov's own
+    # rendering of the same number the comment carries ("100.00% of diff hit
+    # (target 78.00%)") and is the fallback when the comment omits it.
+    patch_run=$("$script_dir/gh-api-get.sh" "repos/$repo/commits/$head_sha/check-runs?per_page=100" \
+      --jq '[.check_runs[] | select(.name == "codecov/patch")] | max_by(.started_at) // empty' 2>/dev/null || echo "")
+    # A 4xx body lands on STDOUT (gh --jq does not suppress the error payload), so
+    # $patch_run may be a non-check-run object, a bare string, or not JSON at all.
+    # The `2>/dev/null || echo ""` on each read is what absorbs that: jq exits
+    # nonzero, the fallback supplies an empty string, and the field stays unset.
+    #
+    # NO SEPARATE `type == "object"` PRE-VALIDATION HERE, DELIBERATELY. One was
+    # written and then REMOVED: mutation testing showed that deleting it -- and
+    # separately, weakening it -- changed NOTHING observable, because these two
+    # reads already degrade identically on every malformed shape. It was dead code
+    # that READ like a safety property, which is worse than no guard at all: a
+    # future reader would trust it and a future edit would "preserve" it. The
+    # harness pins the BEHAVIOR (4xx object, bare string, unparseable) rather than
+    # the mechanism, so a real regression here still fails loudly.
+    patch_conclusion=$(echo "$patch_run" | jq -r '.conclusion // empty' 2>/dev/null || echo "")
+    patch_run_title=$(echo "$patch_run" | jq -r '.output.title // empty' 2>/dev/null || echo "")
   fi
   case "$patch_conclusion" in
     success)
@@ -397,17 +455,48 @@ build_coverage_advisory() {
       threshold_state="none" ;;
   esac
 
+  # #316 FALLBACK: recover the percentage from the check-run title when the comment
+  # omitted it. THE MATCH IS ANCHORED TO codecov's "<pct>% of diff hit" PHRASE, never a
+  # bare number scan -- the same title carries a TARGET ("(target 78.00%)"), and an
+  # unanchored regex would harvest that and report a threshold nobody measured as if it
+  # were the measured coverage. That is the exact failure class this issue names, so a
+  # loose matcher would re-introduce the bug through a longer path.
+  if [ -z "$patch_pct" ] && [ -n "$patch_run_title" ]; then
+    patch_pct=$(echo "$patch_run_title" \
+      | grep -oE '^[0-9]+\.?[0-9]*% of diff hit' | head -1 \
+      | grep -oE '^[0-9]+\.?[0-9]*' | head -1 || true)
+    if [ -n "$patch_pct" ]; then patch_pct_source="check_run"; fi
+  fi
+
+  # NAME the reason when there is no number. An absent field reads as "measured
+  # nothing"; a caller that coerces it lands on a plausible 0 (#316's reported
+  # symptom). The reason distinguishes "codecov has not reported yet" from "codecov
+  # reported, and this diff has no coverable lines".
+  if [ -z "$patch_pct" ]; then
+    if [ -z "$patch_run_title" ] && [ -z "$patch_conclusion" ]; then
+      patch_pct_reason="no codecov/patch check-run on the head SHA (not reported yet, or absent)"
+    elif [ -z "$patch_run_title" ]; then
+      patch_pct_reason="codecov/patch check-run present but carries no title to parse"
+    else
+      patch_pct_reason="neither the codecov comment nor the check-run title states a patch percentage (title: ${patch_run_title})"
+    fi
+  fi
+
   # First codecov report URL in the body.
   report_url=$(echo "$body" | grep -oE 'https://app\.codecov\.io/[^)"[:space:]]+' | head -1 || true)
 
   jq -n \
     --arg status "present" \
     --arg pct "${patch_pct:-}" \
+    --arg pct_source "${patch_pct_source:-}" \
+    --arg pct_reason "${patch_pct_reason:-}" \
     --arg state "$threshold_state" \
     --arg glyph "$comment_glyph" \
     --arg url "${report_url:-}" \
     --argjson id "$comment_id" \
     '{status: $status, patch_pct: (if $pct == "" then null else ($pct | tonumber) end),
+      patch_pct_source: (if $pct_source == "" then null else $pct_source end),
+      patch_pct_reason: (if $pct_reason == "" then null else $pct_reason end),
       threshold_state: $state, comment_glyph: $glyph,
       report_url: (if $url == "" then null else $url end),
       comment_id: $id}'
