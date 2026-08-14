@@ -267,6 +267,23 @@ def main():
     check("#335: an untracked .go trips the guard even under status.showUntrackedFiles=no",
           rc_ut == 3)
 
+    # A GITIGNORED .go WARNS BUT NEVER REFUSES (CR, PR #388 -- finding taken, patch not).
+    # Go does not consult .gitignore, so an ignored .go DOES compile into the profile: the
+    # finding is real, and by the same argument that put *_test.go inside the guard. But
+    # the proposed fix -- refuse when `--ignored=matching` reports one -- keys on PRESENCE,
+    # and git prints the identical `!! path` for a file rewritten one second ago and one
+    # untouched for a year (measured both ways). A repo that ignores a generated .go would
+    # therefore refuse FOREVER: the refuses-every-legitimate-run failure that already ruled
+    # out the whole-tree pathspec. A condition git cannot evaluate becomes information,
+    # never a gate.
+    rc_ig, out_ig = run_case([f"{BLOCK} 2 1"], go_src=GO_BASE, added_src=GO_ADDED,
+                             committed_extra={".gitignore": "generated.go\n"},
+                             extra_files={"generated.go": "package m\nfunc G() int { return 7 }\n"})
+    check("#388: a gitignored .go does NOT refuse (presence is not evidence of dirtiness)",
+          rc_ig == 0 and "Total patch coverage: 100.00%" in out_ig)
+    check("#388: a gitignored .go IS surfaced as a caveat on the number",
+          "gitignored .go file(s) present" in out_ig and "UNKNOWABLE" in out_ig)
+
     # THE TWO EXIT-3 CAUSES HAVE DIFFERENT REMEDIES, and the message must say which applies
     # (CR, PR #388). The status-fault branch exits BEFORE the ALLOW_DIRTY check, so the
     # override is genuinely inapplicable there -- documenting "commit, or set ALLOW_DIRTY=1"

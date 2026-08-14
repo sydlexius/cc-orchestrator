@@ -260,6 +260,30 @@ if ! dirty_go=$(git status --porcelain --untracked-files=normal -- ':(top)*.go' 
   echo "  tree, and this branch never established one. Repair git access, then re-run." >&2
   exit 3
 fi
+# IGNORED .go files WARN, they never REFUSE, and the asymmetry is forced rather than
+# chosen. Go does not consult .gitignore: an ignored .go compiles into the profile and
+# changes which blocks are hit, exactly like the *_test.go case above (measured -- an
+# ignored helper.go moved a tracked file's coverage). So it IS a real influence on the
+# profile. But git CANNOT tell us whether such a file is dirty: it holds no baseline for
+# an untracked-ignored path, and `git status --ignored=matching` prints the identical
+# `!! path` whether the file was just rewritten or has sat unchanged for a year (measured
+# both ways). Refusing on its mere PRESENCE -- the shape a reviewer proposed -- would wedge
+# the gate permanently for any repo that ignores a generated .go, which is the
+# refuses-every-legitimate-run failure that already ruled out the whole-tree pathspec.
+# A condition we cannot evaluate must not become a gate; it becomes information.
+# The file list is deliberately absent: it can be long and is not actionable per-file.
+if ignored_go=$(git status --porcelain --ignored=matching --untracked-files=normal \
+                  -- ':(top)*.go' 2>/dev/null); then
+  ignored_count=$(printf '%s\n' "$ignored_go" | grep -c '^!! ' || true)
+  if [ "${ignored_count:-0}" -gt 0 ]; then
+    echo "patch-coverage: NOTE -- ${ignored_count} gitignored .go file(s) present." >&2
+    echo "  Go ignores .gitignore, so these COMPILE INTO the profile and can move the" >&2
+    echo "  measured coverage of tracked files. git holds no baseline for an ignored path," >&2
+    echo "  so whether they are freshly edited is UNKNOWABLE -- this is a caveat on the" >&2
+    echo "  number below, not a refusal." >&2
+  fi
+fi
+
 if [ -n "$dirty_go" ]; then
   if [ "${PATCH_COVERAGE_ALLOW_DIRTY:-}" = "1" ]; then
     DIRTY_NOTE="  [UNRELIABLE: measured with dirty Go source via PATCH_COVERAGE_ALLOW_DIRTY]"
