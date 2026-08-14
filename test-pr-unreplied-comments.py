@@ -54,17 +54,29 @@ GRAPHQL_NEXT = os.environ.get("GRAPHQL_NEXT", "")
 HEAD_SHA = os.environ.get("HEAD_SHA", "abcdef1234567890abcdef1234567890abcdef12")
 COMMITTER_DATE = os.environ.get("COMMITTER_DATE", "2026-06-18T00:00:00Z")
 CHECK_RUNS = os.environ.get("CHECK_RUNS_JSON", '{"total_count":0,"check_runs":[]}')
+# #316: the REAL gh writes a 4xx ERROR BODY to STDOUT and exits nonzero even with
+# --jq -- the filter is never applied, so the caller receives the raw payload where
+# it expected filtered JSON. A stub that always pipes through jq is KINDER THAN
+# REALITY and makes the caller's type-validation untestable (a mutation deleting
+# that validation survived until this knob existed). Set CHECK_RUNS_RAW=1 to emit
+# the CHECK_RUNS payload verbatim, bypassing --jq, the way gh actually does.
+CHECK_RUNS_RAW = os.environ.get("CHECK_RUNS_RAW", "") == "1"
 PULL = '{"head":{"sha":"%s"}}' % HEAD_SHA
 COMMIT = '{"commit":{"committer":{"date":"%s"}}}' % COMMITTER_DATE
 
-def emit(data):
-    if "--jq" in args:
+def emit(data, raw=False):
+    if "--jq" in args and not raw:
         expr = args[args.index("--jq") + 1]
         p = subprocess.run(["jq", "-r", expr], input=data, capture_output=True, text=True)
         sys.stdout.write(p.stdout)
-    else:
-        sys.stdout.write(data)
-    sys.exit(0)
+        sys.exit(0)
+    sys.stdout.write(data)
+    # raw mode models a gh ERROR: the body goes to STDOUT with --jq unapplied AND the
+    # exit status is NONZERO. Exiting 0 here would make the stub KINDER THAN REALITY in
+    # the one way that matters: the caller's `|| echo '[]'` fallback would never fire,
+    # so the CONCATENATION path (gh's body + the fallback text, which is what actually
+    # feeds jq garbage) would go untested while looking covered.
+    sys.exit(1 if raw else 0)
 
 if args[:2] == ["api", "user"]:
     emit('{"login":"%s"}' % ME)
@@ -90,12 +102,15 @@ if endpoint.endswith("/reviews"):
 if endpoint.endswith("/comments") and "/pulls/" in endpoint:
     emit(INLINE)
 if endpoint.endswith("/comments") and "/issues/" in endpoint:
-    emit(ISSUE)
+    # ISSUE_RAW=1 mirrors real gh on an error: the body goes to STDOUT with the --jq
+    # filter UNAPPLIED. Needed to exercise the #316-sibling abort at the issue-comments
+    # read (an HTML 5xx body makes jq exit 5 and, unguarded, kills the script).
+    emit(ISSUE, raw=os.environ.get("ISSUE_RAW", "") == "1")
 # The check-runs endpoint (repos/O/R/commits/SHA/check-runs?per_page=100) also
 # contains "/commits/", so it MUST be matched before the generic committer-date
 # branch. Match on substring (a ?query may follow the /check-runs path).
 if "/check-runs" in endpoint:
-    emit(CHECK_RUNS)
+    emit(CHECK_RUNS, raw=CHECK_RUNS_RAW)
 if "/commits/" in endpoint:
     emit(COMMIT)
 emit(PULL)
@@ -442,6 +457,198 @@ def main():
     rc, out, err = run(["--coverage-only"], issue="[]", check_runs=CR_PATCH_PASS)
     adv = json.loads(out)
     check("no codecov comment -> status=none (unchanged)", adv.get("status") == "none")
+
+    print("== #316 --coverage-only: never a silent abort, never an unmeasured number ==")
+    # THE DEFECT: codecov changes its WORDING at 100% patch coverage -- it drops the
+    # "Patch coverage is `NN%`" line entirely and prints only
+    # ":white_check_mark: All modified and coverable lines are covered by tests."
+    # The extractor is a grep|head|grep|head pipeline; a non-matching grep exits 1,
+    # pipefail propagates it, and `set -e` killed the script AT THAT ASSIGNMENT --
+    # before the jq -n that emits the JSON. Measured on 24 of 60 recent stillwater
+    # PRs (15 of which had a codecov/patch check-run reporting a real number).
+    #
+    # It hid because default mode calls build_coverage_advisory inside $(...), and
+    # command substitution masks errexit. Only --coverage-only calls it at top level.
+    COV_FULL = (
+        '[{"id":556,"user":{"login":"codecov[bot]"},"created_at":"2026-07-06T00:00:00Z",'
+        '"body":"## Codecov Report\\n:white_check_mark: All modified and coverable lines '
+        'are covered by tests.\\nSee [report](https://app.codecov.io/gh/o/r/pull/1)."}]'
+    )
+
+    def _cr(title, conclusion="success", status="completed"):
+        return json.dumps({"total_count": 1, "check_runs": [{
+            "name": "codecov/patch", "status": status, "conclusion": conclusion,
+            "output": {"title": title}}]})
+
+    CR_100 = _cr("100.00% of diff hit (target 78.00%)")
+
+    # (1) THE REGRESSION GUARD, and it is AFFIRMATIVE on purpose: the emitted JSON must
+    # carry the real number from the check-run, not merely "not crash". A fix that
+    # swallowed the error and emitted null would pass an absence-only assertion.
+    rc, out, err = run(["--coverage-only"], issue=COV_FULL, check_runs=CR_100)
+    check("100%-wording comment: exits 0 (was: silent abort, exit 1, no output)", rc == 0)
+    adv = json.loads(out) if out.strip() else {}
+    check("100%-wording comment: emits parseable JSON (was: empty stdout)", adv != {})
+    check("100%-wording comment: patch_pct=100.0 from the check-run", adv.get("patch_pct") == 100.0)
+    check("100%-wording comment: patch_pct_source=check_run (names where the number came from)",
+          adv.get("patch_pct_source") == "check_run")
+    check("100%-wording comment: no reason set when a number WAS measured",
+          adv.get("patch_pct") == 100.0 and adv.get("patch_pct_reason") is None)
+
+    # (2) The comment path still wins when the comment HAS the number -- the check-run
+    # is a fallback, not a replacement (the comment carries more precision: 87.20000).
+    rc, out, err = run(["--coverage-only"], issue=CODECOV_XMARK, check_runs=CR_100)
+    adv = json.loads(out)
+    check("comment carries the pct -> comment wins over the check-run title (87.2, not 100.0)",
+          adv.get("patch_pct") == 87.2)
+    check("comment path names its source", adv.get("patch_pct_source") == "comment")
+
+    # (3) NOT MEASURED must be DISTINGUISHABLE from measured -- the issue's core AC.
+    # "Coverage not affected" carries no percentage anywhere.
+    rc, out, err = run(["--coverage-only"], issue=COV_FULL,
+                       check_runs=_cr("Coverage not affected when comparing a1b2c3d...e4f5g6h"))
+    check("no percentage anywhere: exit 0", rc == 0)
+    adv = json.loads(out) if out.strip() else {}
+    # ANCHOR every null-assertion on status=="present". Without it an EMPTY stdout
+    # satisfies "patch_pct is null" vacuously -- the assertion would read as green
+    # against the very abort it exists to catch.
+    check("no percentage anywhere: advisory was actually produced", adv.get("status") == "present")
+    check("no percentage anywhere: patch_pct is null, NEVER 0",
+          adv.get("status") == "present" and adv.get("patch_pct") is None)
+    check("no percentage anywhere: patch_pct_source is null",
+          adv.get("status") == "present" and adv.get("patch_pct_source") is None)
+    check("no percentage anywhere: a reason NAMES why (not merely absent)",
+          isinstance(adv.get("patch_pct_reason"), str) and adv.get("patch_pct_reason") != "")
+
+    # (4) THE FALSE-NUMBER TRAP: an unanchored regex over the check-run title would
+    # harvest the TARGET (78.00) and report it as the patch percentage -- a plausible
+    # number nobody measured, which is exactly the failure class this issue names.
+    rc, out, err = run(["--coverage-only"], issue=COV_FULL,
+                       check_runs=_cr("Coverage not affected (target 78.00%)"))
+    adv = json.loads(out) if out.strip() else {}
+    check("title with only a TARGET pct: advisory was actually produced",
+          adv.get("status") == "present")
+    check("title with only a TARGET pct: must NOT report 78.0 as patch coverage",
+          adv.get("status") == "present" and adv.get("patch_pct") != 78.0)
+    check("title with only a TARGET pct: patch_pct is null",
+          adv.get("status") == "present" and adv.get("patch_pct") is None)
+
+    # (5) No codecov/patch check-run at all -> nothing to fall back to.
+    rc, out, err = run(["--coverage-only"], issue=COV_FULL, check_runs=CR_NO_CODECOV)
+    check("100%-wording comment + no codecov/patch check-run: exit 0", rc == 0)
+    adv = json.loads(out) if out.strip() else {}
+    check("100%-wording comment + no check-run: patch_pct null with a reason",
+          adv.get("patch_pct") is None and isinstance(adv.get("patch_pct_reason"), str))
+
+    # (6) PENDING: the check-run exists but has not concluded. threshold_state stays
+    # "none" (unchanged #239 contract) and a title may not exist yet.
+    rc, out, err = run(["--coverage-only"], issue=COV_FULL,
+                       check_runs=_cr(None, conclusion=None, status="in_progress"))
+    check("pending check-run: exit 0", rc == 0)
+    adv = json.loads(out) if out.strip() else {}
+    check("pending check-run: threshold_state=none (unchanged)", adv.get("threshold_state") == "none")
+    check("pending check-run: patch_pct null, never a number",
+          adv.get("status") == "present" and adv.get("patch_pct") is None)
+
+    # (7) MALFORMED check-run payload -- must degrade, not abort.
+    rc, out, err = run(["--coverage-only"], issue=COV_FULL, check_runs="{not json at all")
+    check("malformed check-runs payload: exit 0 (degrades, never aborts)", rc == 0)
+    adv = json.loads(out) if out.strip() else {}
+    check("malformed check-runs payload: still emits JSON with patch_pct null",
+          adv.get("status") == "present" and adv.get("patch_pct") is None)
+
+    # (7b) THE 4xx-BODY-ON-STDOUT CASE, which (7) does NOT cover. gh does not apply
+    # --jq on an error: it writes the error body to STDOUT and exits nonzero, so the
+    # caller receives a JSON OBJECT that is real JSON but is NOT a check-run -- e.g.
+    # {"message":"Not Found",...}. Reading .output.title off it yields empty (benign).
+    # Both shapes are tested because they fail DIFFERENTLY: the error object parses
+    # cleanly and simply lacks the fields, while a bare string makes jq error outright.
+    # Only the second exercises the per-field `2>/dev/null || echo ""` degradation.
+    ERR_BODY = '{"message":"Not Found","documentation_url":"https://docs.github.com/rest"}'
+    rc, out, err = run(["--coverage-only"], issue=COV_FULL, check_runs=ERR_BODY,
+                       extra_env={"CHECK_RUNS_RAW": "1"})
+    check("4xx error body on stdout: exit 0", rc == 0)
+    adv = json.loads(out) if out.strip() else {}
+    check("4xx error body on stdout: advisory still produced", adv.get("status") == "present")
+    check("4xx error body on stdout: patch_pct null, never a number from the error payload",
+          adv.get("status") == "present" and adv.get("patch_pct") is None)
+    check("4xx error body on stdout: threshold_state=none (never a spurious gating fail)",
+          adv.get("threshold_state") == "none")
+
+    # A NON-OBJECT raw payload. `jq -r '.conclusion'` over a bare JSON string errors
+    # ("Cannot index string with ...") and, under pipefail+errexit, would abort the
+    # script. What absorbs it is the `2>/dev/null || echo ""` on EACH jq read -- NOT a
+    # `type == "object"` pre-check, which was written and then deliberately REMOVED as
+    # dead code (see the comment at the call site). Do not reinstate that guard on the
+    # strength of these assertions: they pin the BEHAVIOR, not any one mechanism.
+    rc, out, err = run(["--coverage-only"], issue=COV_FULL, check_runs='"Not Found"',
+                       extra_env={"CHECK_RUNS_RAW": "1"})
+    check("non-object raw payload: exit 0 (the per-field jq guards absorb it)", rc == 0)
+    adv = json.loads(out) if out.strip() else {}
+    check("non-object raw payload: advisory still produced with patch_pct null",
+          adv.get("status") == "present" and adv.get("patch_pct") is None)
+
+    # (8) DEFAULT MODE must not regress: it rendered "?" for the missing pct (errexit
+    # was masked by $(...)), and it must keep rendering a non-numeric placeholder --
+    # never a fabricated 0 -- while now being able to show the check-run number.
+    rc, out, err = run(["--allow-stale"], issue=COV_FULL, check_runs=CR_100)
+    check("default mode with 100%-wording comment: exit 0", rc == 0)
+    check("default mode surfaces the recovered 100 rather than '?'",
+          "Patch coverage: 100" in out)
+    check("default mode never prints a fabricated 'Patch coverage: 0%'",
+          "Patch coverage:" in out and "Patch coverage: 0%" not in out)
+
+    # (8b) THE NULL case in DEFAULT mode -- which (8) does NOT reach. (8) runs against a
+    # payload whose pct is always 100, so it can never observe how a NULL renders, and a
+    # hostile pass proved it: mutating the renderer's `.patch_pct // "?"` to `// 0` left
+    # every assertion green. An assertion ABOUT a fabricated zero that cannot see a null
+    # is decorative. Same defect class as #390's tests -- a check reading stronger than
+    # it is -- so it gets an AFFIRMATIVE assertion on the placeholder, not just absence.
+    rc, out, err = run(["--allow-stale"], issue=COV_FULL,
+                       check_runs=_cr("Coverage not affected when comparing a1b2c3d...e4f5g6h"))
+    check("default mode, unmeasured pct: exit 0", rc == 0)
+    check("default mode, unmeasured pct: renders the '?' placeholder",
+          "Patch coverage: ?%" in out)
+    check("default mode, unmeasured pct: NEVER renders it as 0%",
+          "Patch coverage: 0%" not in out)
+
+    # (9) THE SIBLING ABORT at the ISSUE-COMMENTS read -- the same defect class as the
+    # extraction pipeline, at a different call site, found by a hostile pre-push pass.
+    # `gh ... || echo '[]'` CONCATENATES on error (gh writes the body to stdout AND
+    # exits nonzero), so the fallback never replaces the garbage; an HTML 5xx body then
+    # makes jq exit 5 and kills the script. Fixing one instance of a defect class while
+    # its twin survives 20 lines away is how a class reads as closed when it is not.
+    for label, payload in [
+        ("HTML 5xx body", "<html><head><title>502 Bad Gateway</title></head></html>"),
+        ("plain-text error", "Gateway Timeout"),
+        ("4xx JSON error object", '{"message":"Not Found","documentation_url":"https://docs.github.com/rest"}'),
+        ("bare JSON string", '"Not Found"'),
+        ("JSON object, not an array", '{"comments":[]}'),
+        # An ARRAY of non-objects passes the `type == "array"` check but makes the
+        # select/sort_by pipeline exit 5 ("Cannot index number with string"). This is
+        # the case that proves the two guards are COMPLEMENTARY rather than redundant:
+        # mutation testing showed either guard alone passed the suite until this shape
+        # was covered, which is what a redundant-looking pair looks like when the tests
+        # simply never reach the half only one of them catches.
+        ("array of numbers", '[1,2,3]'),
+        ("array of strings", '["a","b"]'),
+        ("array of arrays", '[[]]'),
+    ]:
+        rc, out, err = run(["--coverage-only"], issue=payload, extra_env={"ISSUE_RAW": "1"})
+        check(f"issue-comments {label}: exit 0 (was: abort, empty stdout)", rc == 0)
+        adv = json.loads(out) if out.strip() else {}
+        check(f"issue-comments {label}: emits the no-codecov contract, never nothing",
+              adv.get("status") == "none")
+
+    # A non-numeric comment id must not abort either: it feeds jq --argjson, which
+    # REJECTS a JSON string and exits 2.
+    STR_ID = ('[{"id":"not-a-number","user":{"login":"codecov[bot]"},'
+              '"created_at":"2026-07-06T00:00:00Z","body":":x: Patch coverage is `50.00000%` with `1 line`."}]')
+    rc, out, err = run(["--coverage-only"], issue=STR_ID, check_runs=CR_100)
+    check("non-numeric comment id: exit 0 (--argjson would have exited 2)", rc == 0)
+    adv = json.loads(out) if out.strip() else {}
+    check("non-numeric comment id: the advisory still reports the real pct",
+          adv.get("status") == "present" and adv.get("patch_pct") == 50.0)
 
     print("== #252 --itemized: one checkable line per UNADDRESSED finding across all 3 classes ==")
     # An unreplied inline bot comment. path/line must match the GraphQL thread node
