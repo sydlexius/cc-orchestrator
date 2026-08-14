@@ -375,13 +375,29 @@ def main():
     # correct text); testing raw substrings is wrong (the wrap hid it). So assert the
     # STRUCTURE: every occurrence must be governed by "Earlier versions ... measurably
     # false". A header that reinstates the guarantee states it OUTSIDE that frame.
+    # EVERY occurrence, not the first. `flat.index()` returns only the FIRST match, so a
+    # header that KEPT the retraction and then REINSTATED the guarantee further down
+    # passed this check (measured -- Copilot caught it on PR #390, and the exploit was
+    # reproduced before fixing). The comment above already said "every occurrence"; the
+    # code did not do it, which is the same defect class as the three vacuity traps this
+    # PR already fixed: a check that reads as stronger than it is.
     _quote = '"codecov will pass too"'
-    _retraction_ok = (
-        _quote not in flat
-        or ("Earlier versions of this header" in flat
-            and flat.index("Earlier versions of this header") < flat.index(_quote)
-            and "That was measurably false" in flat[flat.index(_quote):])
-    )
+    _lead = "Earlier versions of this header"
+
+    def _governed(hay, needle, lead):
+        """True iff EVERY occurrence of `needle` sits inside the retraction frame:
+        preceded by `lead` and followed by the disavowal."""
+        start = 0
+        while True:
+            i = hay.find(needle, start)
+            if i == -1:
+                return True
+            before = hay.rfind(lead, 0, i)
+            if before == -1 or "That was measurably false" not in hay[i:]:
+                return False
+            start = i + len(needle)
+
+    _retraction_ok = _governed(flat, _quote, _lead)
     check("#336: 'codecov will pass too' appears ONLY inside the retraction, never as a claim",
           _retraction_ok)
     # NB: assert the CLAIM is gone, not the WORD. The corrected header names the old
