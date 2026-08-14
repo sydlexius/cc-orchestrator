@@ -350,6 +350,75 @@ def main():
     check("#335: genuinely-empty scope still exits 0 and names the committed range",
           rc_e == 0 and "no Go source changes in scope (committed range" in out_e)
 
+    # --- #336: the header must not promise an accuracy the script does not deliver.
+    # An 8-PR corpus measured against real Codecov numbers (comment on the issue) puts the
+    # divergence at -3.24 .. +6.60 points: it reads HIGH on 4 of 8 and LOW on 1. The old
+    # header called itself "a slight under-estimate" and told the reader to treat a pass as
+    # authoritative because "codecov will pass too". That is measurably FALSE in the
+    # direction that matters -- a local PASS can be a Codecov FAIL -- and a documented
+    # promise the script does not keep is itself the defect. Asserted on the rendered
+    # --help output, which is what a reader actually sees.
+    print("\n  #336 (honest error bar)")
+    hp = subprocess.run(["bash", SCRIPT, "--help"], capture_output=True, text=True, timeout=30)
+    help_text = hp.stdout
+    # Assert on WHITESPACE-NORMALIZED text. These are multi-word phrases inside WRAPPED
+    # comment prose, so a raw substring test measures the TYPOGRAPHY, not the claim: the
+    # phrase "codecov will pass too" straddles a line break in the current header, which
+    # meant the negative assertion below passed because of where the line broke. That is
+    # wrong in both directions -- a cosmetic reflow would FALSE-RED it, and a header that
+    # REINSTATED the guarantee across the same wrap would sail through.
+    flat = " ".join(help_text.split())
+    check("#336: --help still renders (exit 0, non-trivial)",
+          hp.returncode == 0 and len(help_text) > 500)
+    # The phrase may appear ONLY inside the retraction, never as a live claim. Testing for
+    # its mere absence is wrong (the retraction quotes it verbatim, so that would fail on
+    # correct text); testing raw substrings is wrong (the wrap hid it). So assert the
+    # STRUCTURE: every occurrence must be governed by "Earlier versions ... measurably
+    # false". A header that reinstates the guarantee states it OUTSIDE that frame.
+    # EVERY occurrence, not the first. `flat.index()` returns only the FIRST match, so a
+    # header that KEPT the retraction and then REINSTATED the guarantee further down
+    # passed this check (measured -- Copilot caught it on PR #390, and the exploit was
+    # reproduced before fixing). The comment above already said "every occurrence"; the
+    # code did not do it, which is the same defect class as the three vacuity traps this
+    # PR already fixed: a check that reads as stronger than it is.
+    _quote = '"codecov will pass too"'
+    _lead = "Earlier versions of this header"
+
+    def _governed(hay, needle, lead):
+        """True iff EVERY occurrence of `needle` sits inside the retraction frame:
+        preceded by `lead` and followed by the disavowal."""
+        start = 0
+        while True:
+            i = hay.find(needle, start)
+            if i == -1:
+                return True
+            before = hay.rfind(lead, 0, i)
+            if before == -1 or "That was measurably false" not in hay[i:]:
+                return False
+            start = i + len(needle)
+
+    _retraction_ok = _governed(flat, _quote, _lead)
+    check("#336: 'codecov will pass too' appears ONLY inside the retraction, never as a claim",
+          _retraction_ok)
+    # NB: assert the CLAIM is gone, not the WORD. The corrected header names the old
+    # "slight under-estimate" phrasing in order to disavow it, so a bare substring test
+    # fails on the retraction itself -- the same vacuity trap as the ALLOW_DIRTY label,
+    # inverted. What must be absent is the ASSERTION that the script under-estimates.
+    check("#336: no longer CLAIMS to be an under-estimate (the retraction may name it)",
+          "remains a slight under-estimate" not in flat
+          and "Earlier versions" in flat)
+    check("#336: states the MEASURED two-sided range, with both signs",
+          "-3.24" in flat and "+6.60" in flat)
+    # AN AFFIRMATIVE ASSERTION IS REQUIRED, not just negative ones. Four of these checks
+    # assert a false claim is ABSENT, and absence is satisfiable by ANY rewording -- an
+    # inverted header that dodges the exact substrings passed all of them (found in
+    # hostile review). This pins the load-bearing sentence the correct header opens with,
+    # which an inverting rewrite must delete rather than merely rephrase.
+    check("#336: AFFIRMATIVELY states the two-sided / not-a-bound framing",
+          "TWO-SIDED ERROR BAR, NOT A BOUND" in flat.upper())
+    check("#336: says explicitly that a local PASS can still fail Codecov",
+          "LOCAL PASS CAN STILL FAIL" in flat.upper())
+
     print()
     if FAILS:
         print(f"{len(FAILS)} FAILED:")

@@ -290,14 +290,24 @@ before the first push, not after CI runs.
 The implementation lives in `${CLAUDE_PLUGIN_ROOT}/scripts/patch-coverage.sh`. It mirrors
 Codecov's projection of coverage blocks onto the diff's added lines, using the
 all-hit rule (a line counts as covered only if every block touching it was hit;
-mixed-hit lines count as missed, matching Codecov's partial accounting). It runs
-as a **conservative lower bound**: if the local check passes, Codecov passes
-too. The residual difference is line-projection -- Codecov collapses some
-multi-line statements (e.g. a `fmt.Errorf(...)` error-return spanning two lines)
-that Go's profile counts as two, so Codecov typically reads a few points
-*higher* than this script. A narrow local miss (within ~5 points of threshold)
-may therefore still pass Codecov; gate on the local number but don't pile on
-tests to push it far past the threshold.
+mixed-hit lines count as missed, matching Codecov's partial accounting).
+
+It is an **estimate with a two-sided error bar, NOT a bound** (#336). Measured
+against real Codecov numbers across an 8-PR corpus (table on issue #336), the
+divergence runs **-3.24 to +6.60 percentage points**: it read high on 4 of the 8
+and low on 1. **A local pass can still fail `codecov/patch`, and a local fail can
+still pass.** (An earlier version of this section promised the opposite -- "if the
+local check passes, Codecov passes too" -- which the corpus measured as false.)
+
+The two tools disagree about which lines are EXECUTABLE, not about which are hit:
+Go's block profile marks every line inside a coverage block executable while
+Codecov excludes some outright, so the denominators differ by 20-100% on the same
+patch. The direction depends on whether the extra lines Go counts happen to be
+covered, so the error is not a fixed offset and no constant margin corrects it.
+
+Gate on the local number to catch a REAL gap, which it does well. Do not treat a
+narrow pass or miss as predictive, and don't pile on tests to push it past the
+threshold -- `codecov/patch` on the PR is the authority.
 
 **Run the gate** against the profile produced in Step 2. `patch-coverage.sh`
 resolves both the threshold and the file excludes from the repo's own
