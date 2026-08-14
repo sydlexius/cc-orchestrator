@@ -69,9 +69,14 @@ def emit(data, raw=False):
         expr = args[args.index("--jq") + 1]
         p = subprocess.run(["jq", "-r", expr], input=data, capture_output=True, text=True)
         sys.stdout.write(p.stdout)
-    else:
-        sys.stdout.write(data)
-    sys.exit(0)
+        sys.exit(0)
+    sys.stdout.write(data)
+    # raw mode models a gh ERROR: the body goes to STDOUT with --jq unapplied AND the
+    # exit status is NONZERO. Exiting 0 here would make the stub KINDER THAN REALITY in
+    # the one way that matters: the caller's `|| echo '[]'` fallback would never fire,
+    # so the CONCATENATION path (gh's body + the fallback text, which is what actually
+    # feeds jq garbage) would go untested while looking covered.
+    sys.exit(1 if raw else 0)
 
 if args[:2] == ["api", "user"]:
     emit('{"login":"%s"}' % ME)
@@ -555,10 +560,10 @@ def main():
     # (7b) THE 4xx-BODY-ON-STDOUT CASE, which (7) does NOT cover. gh does not apply
     # --jq on an error: it writes the error body to STDOUT and exits nonzero, so the
     # caller receives a JSON OBJECT that is real JSON but is NOT a check-run -- e.g.
-    # {"message":"Not Found",...}. Reading .output.title off it yields empty (benign),
-    # but a `type == "object"` guard alone ADMITS it, so the guard must be exercised
-    # by a payload that is not an object at all. Both shapes are tested because they
-    # fail differently: the error object parses, a bare string does not.
+    # {"message":"Not Found",...}. Reading .output.title off it yields empty (benign).
+    # Both shapes are tested because they fail DIFFERENTLY: the error object parses
+    # cleanly and simply lacks the fields, while a bare string makes jq error outright.
+    # Only the second exercises the per-field `2>/dev/null || echo ""` degradation.
     ERR_BODY = '{"message":"Not Found","documentation_url":"https://docs.github.com/rest"}'
     rc, out, err = run(["--coverage-only"], issue=COV_FULL, check_runs=ERR_BODY,
                        extra_env={"CHECK_RUNS_RAW": "1"})
@@ -570,12 +575,15 @@ def main():
     check("4xx error body on stdout: threshold_state=none (never a spurious gating fail)",
           adv.get("threshold_state") == "none")
 
-    # A NON-OBJECT raw payload: this is what kills a missing type guard. Without the
-    # `type == "object"` check, `jq -r '.conclusion'` over a bare JSON string errors
-    # ("Cannot index string with ...") and, under pipefail+errexit, aborts the script.
+    # A NON-OBJECT raw payload. `jq -r '.conclusion'` over a bare JSON string errors
+    # ("Cannot index string with ...") and, under pipefail+errexit, would abort the
+    # script. What absorbs it is the `2>/dev/null || echo ""` on EACH jq read -- NOT a
+    # `type == "object"` pre-check, which was written and then deliberately REMOVED as
+    # dead code (see the comment at the call site). Do not reinstate that guard on the
+    # strength of these assertions: they pin the BEHAVIOR, not any one mechanism.
     rc, out, err = run(["--coverage-only"], issue=COV_FULL, check_runs='"Not Found"',
                        extra_env={"CHECK_RUNS_RAW": "1"})
-    check("non-object raw payload: exit 0 (the type guard absorbs it)", rc == 0)
+    check("non-object raw payload: exit 0 (the per-field jq guards absorb it)", rc == 0)
     adv = json.loads(out) if out.strip() else {}
     check("non-object raw payload: advisory still produced with patch_pct null",
           adv.get("status") == "present" and adv.get("patch_pct") is None)

@@ -393,8 +393,8 @@ build_coverage_advisory() {
   # substitution masks errexit -- so the identical code was merely lossy in one caller
   # and fatal in the other, with no difference in the code itself.
   # shellcheck disable=SC2016  # literal grep pattern; no shell expansion intended.
-  patch_pct=$(echo "$body" | grep -oE 'Patch coverage is[[:space:]]+`[0-9]+\.?[0-9]*%`' | head -1 \
-    | grep -oE '[0-9]+\.?[0-9]*' | head -1 || true)
+  patch_pct=$(echo "$body" | grep -oE 'Patch coverage is[[:space:]]+`[0-9]+(\.[0-9]+)?%`' | head -1 \
+    | grep -oE '[0-9]+(\.[0-9]+)?' | head -1 || true)
   patch_pct_source=""
   patch_pct_reason=""
   if [ -n "$patch_pct" ]; then patch_pct_source="comment"; fi
@@ -463,8 +463,8 @@ build_coverage_advisory() {
   # loose matcher would re-introduce the bug through a longer path.
   if [ -z "$patch_pct" ] && [ -n "$patch_run_title" ]; then
     patch_pct=$(echo "$patch_run_title" \
-      | grep -oE '^[0-9]+\.?[0-9]*% of diff hit' | head -1 \
-      | grep -oE '^[0-9]+\.?[0-9]*' | head -1 || true)
+      | grep -oE '^[0-9]+(\.[0-9]+)?% of diff hit' | head -1 \
+      | grep -oE '^[0-9]+(\.[0-9]+)?' | head -1 || true)
     if [ -n "$patch_pct" ]; then patch_pct_source="check_run"; fi
   fi
 

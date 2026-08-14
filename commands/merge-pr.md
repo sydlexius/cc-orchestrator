@@ -372,13 +372,18 @@ Display "N/A" for Coverage when `--coverage-only` returned `{"status":"none"}`
 (no coverage service on the repo) -- a missing coverage signal is not a failure.
 When `threshold_state` is `none` (codecov commented but posts no gating
 `codecov/patch` check-run), show `<patch_pct>% (advisory-only)` -- also not a failure.
-When `patch_pct` is null in that same state, show `not measured (advisory-only)`;
-never interpolate the null, which renders the literal `null%`.
-
 `patch_pct` may be **`null`** even when `status` is `present` -- codecov reports no
 percentage at all on a diff with no coverable lines ("Coverage not affected"). Show
 "not measured" and print the accompanying `patch_pct_reason`; NEVER render a null as
-`0%`. A fabricated zero reads as a catastrophic coverage failure that did not happen,
+`0%`, and never interpolate it, which renders the literal `null%`.
+
+THE NULL RULE IS STATE-INDEPENDENT: it binds to `patch_pct` being null, NOT to any
+particular `threshold_state`. A null is reachable under `fail` too -- the
+`codecov/patch` check-run can conclude `failure` while neither the comment nor the
+check-run title states a percentage -- so the `fail` prompt template above must print
+`patch coverage not measured` plus `patch_pct_reason` rather than `patch coverage
+<pct>%`. Scoping the rule to `none` alone lets the display defect back in through the
+one state the rule does not cover. A fabricated zero reads as a catastrophic coverage failure that did not happen,
 which is the defect #316 fixed at the source -- do not reintroduce it at the display
 layer. `patch_pct_source` names which authority supplied the number (`comment`, the more
 precise reading, or `check_run`, the fallback when codecov's 100%-coverage wording

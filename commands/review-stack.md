@@ -189,9 +189,10 @@ Each agent receives this task:
   ```
 
   Returns a JSON object with `status`, `patch_pct`, `patch_pct_source`,
-  `patch_pct_reason`, `threshold_state` (`pass`/`fail`/`unknown`), `report_url`.
+  `patch_pct_reason`, `threshold_state` (`pass`/`fail`/`none`), `report_url`.
   Include `patch_pct` and `threshold_state` in the agent's return payload under a
-  `Coverage:` field.
+  `Coverage:` field, rendered as `<patch_pct>% (<threshold_state>)`,
+  `not measured (<threshold_state>)`, or `N/A`.
 
   **A `null` `patch_pct` is not a zero.** Codecov states no percentage on a diff
   with no coverable lines, so `status: "present"` can carry `patch_pct: null` plus
