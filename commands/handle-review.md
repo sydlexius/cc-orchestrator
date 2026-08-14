@@ -478,19 +478,23 @@ Read the stderr to tell the two causes apart; they need different actions:
   is a git repository, `.git` is readable, and no other git process holds a lock -- then
   re-run.
 
-Interpret the result as a **conservative lower bound**: it counts a line covered
-only if every coverage block touching it was hit (mixed-hit lines count as
-missed, matching Codecov's partial accounting), and Codecov's block-to-line
-projection typically reads a few points *higher* than this script. So:
+Interpret the result as an **estimate with a two-sided error bar, NOT a bound**
+(#336). Measured against real Codecov numbers across an 8-PR corpus (table on
+issue #336), the divergence runs **-3.24 to +6.60 percentage points** -- high on 4
+of 8, low on 1. So a local pass can still fail `codecov/patch`, and a local fail
+can still pass. The two tools disagree about which lines are EXECUTABLE (Go's
+block profile counts every line inside a block; Codecov excludes some), which is
+why the error is not a fixed offset and no constant margin corrects it.
 
-- **Local estimate >= threshold** -> Codecov will pass. Stop adding tests.
-- **Local estimate within ~5 points below threshold** -> Codecov may still
-  pass. Add coverage for the cheapest genuinely-reachable branches to clear the
-  *local* number, then push and let Codecov be the source of truth. Do **not**
-  grind the local number far past the threshold -- that over-tests defensive
-  error paths Codecov never counted, the exact "nickel-and-diming" failure mode
-  this guidance exists to prevent.
-- **Local estimate well below threshold** -> there is a real gap; close it.
+- **Local estimate >= threshold** -> a real gap is unlikely, but this does NOT
+  guarantee Codecov passes. Stop adding tests; let `codecov/patch` on the PR be
+  the authority.
+- **Local estimate near the threshold, either side** -> genuinely uninformative
+  at this error bar. Do not grind the local number: that over-tests defensive
+  error paths Codecov may never have counted, the "nickel-and-diming" failure
+  mode this guidance exists to prevent. Push and read the real check.
+- **Local estimate well below threshold** -> there is a real gap; close it. This
+  is what the estimator is actually good for.
 
 Target the *local* metric to just clear the threshold, not to maximize it.
 

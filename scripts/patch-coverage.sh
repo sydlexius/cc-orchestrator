@@ -37,10 +37,36 @@
 # switch arms) was counted covered locally but partial-missed by codecov,
 # so the gate could false-pass and then codecov would fail the push. The
 # all-hit rule above closes that gap without needing codecov's full
-# branch-analysis pipeline. It remains a slight under-estimate: codecov
-# may count a few more lines as fully covered when its block-to-line
-# projection differs from Go's profile, so treat a pass as authoritative
-# (codecov will pass too) and a narrow miss as "codecov may still pass."
+# branch-analysis pipeline.
+#
+# ACCURACY: THIS IS AN ESTIMATE WITH A TWO-SIDED ERROR BAR, NOT A BOUND (#336).
+# Measured against real Codecov numbers across an 8-PR corpus (method and full
+# table on issue #336): the divergence runs from -3.24 to +6.60 percentage
+# points. It read HIGH on 4 of the 8 and LOW on 1.
+#
+#   A LOCAL PASS CAN STILL FAIL codecov/patch, and a local FAIL can still pass.
+#
+# Earlier versions of this header called the script "a slight under-estimate"
+# and told the reader to treat a pass as authoritative because "codecov will
+# pass too". That was measurably false in the direction that matters, and a
+# documented promise the script does not keep is itself a defect -- an agent or
+# a human quotes it into a PR body in good faith.
+#
+# WHY it diverges, so far as the corpus establishes: the two tools disagree
+# about which lines are EXECUTABLE, not about which are hit. Go's block profile
+# marks every line inside a coverage block executable; Codecov excludes some
+# outright, so the denominators differ by 20-100% on the same patch. The
+# direction depends on whether the extra lines Go counts happen to be COVERED,
+# which is why the error is not a fixed offset and cannot be corrected with a
+# constant margin. Partial-count is NOT the variable (two corpus PRs with 3
+# partials each landed at +0.02 and +6.60).
+#
+# So: use this to catch a REAL coverage gap before pushing, which it does well.
+# Do not treat a narrow pass or a narrow miss as predictive of Codecov, and do
+# not chase the local number past the threshold -- codecov/patch on the PR is
+# the authority.
+#
+# Closing the gap (matching Codecov's line-eligibility rules) is tracked as #389.
 #
 # VALIDITY RULE (#335): a patch-coverage number from this script is meaningful
 # ONLY at a committed HEAD with no dirty Go source. The two halves of the
