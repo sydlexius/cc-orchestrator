@@ -95,6 +95,21 @@ endpoint -- see #239). Do NOT do a separate coverage read here; use that JSON.
   (yes / cancel / show-report)
   ```
 
+  **When `patch_pct` is null, use this template instead** -- a null is reachable
+  under `fail`, not only under `none` (see THE NULL RULE below). Never interpolate
+  a null: it renders the literal `null%`, and a fabricated `0%` reads as a
+  catastrophic coverage failure that did not happen.
+
+  ```text
+  Coverage advisory: the codecov/patch gate failed on this PR (patch coverage not
+  measured -- <patch_pct_reason>).
+  Report: <url>
+
+  Merging anyway is fine if the coverage regression is intentional or the
+  missing lines are in generated code. Cancel and add tests if not. Proceed?
+  (yes / cancel / show-report)
+  ```
+
   Default to waiting for explicit confirmation. If the user chose to proceed in a
   prior conversation turn, do not re-prompt.
 
@@ -380,10 +395,10 @@ percentage at all on a diff with no coverable lines ("Coverage not affected"). S
 THE NULL RULE IS STATE-INDEPENDENT: it binds to `patch_pct` being null, NOT to any
 particular `threshold_state`. A null is reachable under `fail` too -- the
 `codecov/patch` check-run can conclude `failure` while neither the comment nor the
-check-run title states a percentage -- so the `fail` prompt template above must print
-`patch coverage not measured` plus `patch_pct_reason` rather than `patch coverage
-<pct>%`. Scoping the rule to `none` alone lets the display defect back in through the
-one state the rule does not cover. A fabricated zero reads as a catastrophic coverage failure that did not happen,
+check-run title states a percentage -- so the `fail` prompt has TWO templates above and
+the null one is not optional: print `patch coverage not measured` plus
+`patch_pct_reason` rather than `patch coverage <pct>%`. Scoping the rule to `none` alone
+lets the display defect back in through the one state the rule does not cover. A fabricated zero reads as a catastrophic coverage failure that did not happen,
 which is the defect #316 fixed at the source -- do not reintroduce it at the display
 layer. `patch_pct_source` names which authority supplied the number (`comment`, the more
 precise reading, or `check_run`, the fallback when codecov's 100%-coverage wording
