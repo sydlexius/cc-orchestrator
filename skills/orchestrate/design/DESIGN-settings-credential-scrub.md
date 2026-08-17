@@ -62,7 +62,7 @@ three dead grants were removed individually, and a classifier pass over the rema
 **505 removed 409 one-and-done verbatim command lines**, leaving 96. The five largest of
 25 categories:
 
-```
+```text
 170  one-shot diagnostic echo      echo "rc=$?", echo "GATE_RC=$?", ...
  45  one-off mutation/probe        sed -i version bumps, perl -0pi mutations
  35  pinned to a PR/comment id     reply-comment.sh 138 3440206801 "..."
@@ -114,7 +114,7 @@ rule stores the command line VERBATIM, quoted prose arguments included. Measured
 the 508 pre-prune rules on 2026-08-16: **42 stored rules carry long quoted English**,
 including full PR-reply bodies —
 
-```
+```text
 Bash(./scripts/reply-comment.sh 138 3440336301 "Fixed in e616f3b: git ls-remote no
   longer uses || true; a read failure now aborts with exit 2 (fail closed)...")
 ```
@@ -126,16 +126,32 @@ carry the load, and they are not optional garnish.
 
 ---
 
-## The enforcement-point finding (VERIFIED, and it is not what the plan assumed)
+## The enforcement-point finding (and it is not what the plan assumed)
 
 The open question was whether a `PermissionRequest` hook can MODIFY the rule that gets
-persisted, or only allow/deny. Verified against Claude Code **2.1.233** from the live
-docs plus the shipped binary's zod schemas.
+persisted, or only allow/deny. Established against Claude Code **2.1.233**.
 
-**It can write an arbitrary rule.** The hook receives the proposed rule text on stdin as
-`permission_suggestions[].rules[].ruleContent`, and may emit its own
-`decision.updatedPermissions` array of the same entry shape with a persisting
-`destination`. The docs state the equivalence outright:
+**Read the evidence grade before relying on any of this.** Two different strengths are in
+play and the distinction decides what may be built on what:
+
+| Claim | Evidence | Grade |
+| :-- | :-- | :-- |
+| The hook receives the proposed rule (`permission_suggestions`) | documented input schema + binary's input builder | **DOCUMENTED** |
+| The output schema admits `decision.updatedPermissions`, and `ruleContent` is an unconstrained string | published schema + binary zod | **DOCUMENTED** |
+| Echoing a suggestion equals a user's "always allow" click | explicit doc statement | **DOCUMENTED** |
+| The hook fires BEFORE the dialog | explicit doc statement | **DOCUMENTED** |
+| `updatedPermissions` actually REACHES the rule store and writes the file | decompiled call path (`sEe -> wPe`), **no observed write** | **INFERRED** |
+| A hook-supplied `ruleContent` survives downstream normalization | not traced past `wPe -> JEd(...)` | **UNTESTED** |
+
+The schema-level facts are solid and they are what the DECISION below rests on. The
+persistence behavior is inferred from a decompiled path, not from a settings file observed
+changing — sufficient to reject a design, not sufficient to build one on. **Any hook
+implementation must first execute a hook and inspect the resulting settings file.**
+
+**The schema admits an arbitrary rule.** The hook receives the proposed rule text on stdin
+as `permission_suggestions[].rules[].ruleContent`, and may emit its own
+`decision.updatedPermissions` array of the same entry shape with a `destination` the docs
+describe as persisting. The docs state the equivalence outright:
 
 > A hook can echo one of the `permission_suggestions` it received as its own
 > `updatedPermissions` output, which is equivalent to the user selecting that
@@ -221,7 +237,7 @@ above recorded so the deferral is a decision rather than an omission.
 
 Rationale, in the order that mattered:
 
-- The scrubber is the only option that cleans the **15 measured historical leaks**. They
+- The scrubber is the only option that cleans the **14 measured historical leaks**. They
   are on disk now; a preventive hook does nothing about them.
 - The scrubber's failure mode is a MISSED CLEANUP. The hook's failure mode is an
   AUTO-GRANTED PERMISSION the user never saw. Those are not comparable, and the cheap
@@ -274,12 +290,12 @@ ship its actuating half until this is ratified.**
 
 Two census lessons are load-bearing and both must hold:
 
-- A scan matching only `KEY=VALUE` and not flag-style args **passes on nothing**. A scan
-  matching only flag-style args misses **11 of 15**. It must do BOTH. (The current
-  CLAUDE.md wording names only flag-style and asserts the inverse; that fix is tracked on
-  the sibling policy issue.)
-- Placeholders must be excluded or the report is noise. The census cleanly separated 3
-  placeholders (`test`, `testkey`, `dummy`) from 15 real values.
+- A scan matching only `KEY=VALUE` and not flag-style args **passes on nothing** (long
+  credential flags carried 0 of 14). A scan matching only flag-style args misses **10 of
+  14**. It must do BOTH. (The current CLAUDE.md wording names only flag-style and asserts
+  the inverse; that fix is tracked on the sibling policy issue.)
+- Placeholders must be excluded or the report is noise. The census cleanly separated 4
+  `test`-shaped stubs from the 14 real values, out of 18 matches total.
 
 Carrier set:
 
@@ -339,10 +355,33 @@ Python, because detection needs JSON parsing, SHA-256, entropy scoring, and atom
 writes — and because the only existing cascade parser is Python.
 
 - **Cascade discovery** reuses the `_cascade_files()` approach from
-  `orchestrate-setup.py:1352`, including an `ORCHESTRATE_SETTINGS_FILES`-style
-  colon-separated override so the harness can point at temp fixtures.
-  `orchestrate-setup.py` is hyphenated and not importable, so the small helper is
-  replicated rather than imported.
+  `orchestrate-setup.py:1352`. Because it is REPLICATED rather than imported (the module
+  is hyphenated and not importable), the copy can drift from its original — so the
+  contract is stated here and asserted by parity tests, not left to a comment:
+  - **Order is part of the contract**: user `settings.json`, user `settings.local.json`,
+    project `settings.json`, project `settings.local.json`.
+  - `ORCHESTRATE_SETTINGS_FILES` (colon-separated) **REPLACES** the cascade, never appends
+    to it — an empty-string entry is dropped, and an empty override yields an empty list
+    (scan nothing), not the default cascade.
+  - **Project root** resolves from an explicit project-dir env var, else `git rev-parse
+    --show-toplevel`, else project files are SKIPPED entirely (never guessed from `$PWD`).
+  - **Duplicate paths** (user and project resolving to the same file, or a repeat in an
+    override) are scanned ONCE and reported once; a duplicate must never yield two
+    findings for one secret, nor two writes to one file.
+  - A **parity test** asserts this list matches `orchestrate-setup.py`'s for the same
+    inputs, so the replication is checkable rather than assumed.
+
+- **The tracked-file opt-in is part of the CLI contract**, not an implementation detail.
+  `--yes <target>` alone does not say what a target IS, so define it:
+  - **Target classification**: each discovered file is `local` (a `settings.local.json`)
+    or `tracked-capable` (a `settings.json`, which is frequently committed). Classify by
+    FILENAME, not by asking git — an untracked `settings.json` today can be committed
+    tomorrow, and the conservative class must not depend on transient repo state.
+  - **Default target selection**: actuation applies to `local` files only.
+  - **A `tracked-capable` file is REPORTED but never modified** unless an explicit
+    separate flag is passed. `--yes` must never be sufficient on its own to write one.
+  - Tests: a finding in a `settings.json` appears in the report and the file is
+    byte-identical afterward under `--yes` alone.
 - **Fault isolation per file**: a malformed or non-dict settings file is skipped with a
   loud warning and **never treated as clean**. This is the #334/#375 rule — "I could not
   read this" must never render as "there was nothing to read".
@@ -352,19 +391,55 @@ writes — and because the only existing cascade parser is Python.
 
   | exit | meaning |
   | ---: | :-- |
-  | 0 | scanned successfully, nothing found |
+  | 0 | scanned every in-scope file; **no findings from the configured detectors** |
   | 1 | scanned successfully, findings present |
-  | 2 | could not determine (unreadable file, malformed invocation) |
+  | 2 | could not determine (a file was unreadable or skipped, or malformed invocation) |
+
+  **Exit 0 is NOT "no credential exists."** It is the weaker claim that the configured
+  detectors found nothing, and the report must say so in those words. The design already
+  concedes a low-entropy real password is missed by construction, so a code that means
+  "clean" would contradict the tool's own stated coverage — and a false all-clear is worse
+  than silence, because a human reasonably concludes there is nothing to rotate.
+
+  **Precedence: 2 OUTRANKS both 0 and 1.** If ANY in-scope file was skipped or unreadable,
+  the exit is 2 even when other files produced findings — and the report still lists those
+  findings in full. A partial scan reported as 0 is the #334/#375 defect exactly; a partial
+  scan reported as 1 is subtler and just as wrong, since a caller that treats 1 as "the
+  complete finding set" acts on an incomplete one. Mixed-result cases (findings + an
+  unreadable sibling) get their own harness tests.
 
   A blanket "every non-malformed path exits 0" would make *12 credentials found*, *clean*,
   and *3 files unreadable* indistinguishable to any caller — which is precisely the
   #334/#375 defect this doc invokes two paragraphs above, where "I could not read this"
   renders as "there was nothing to read". A fail-open exit belongs on a chore that must
   never abort a pipeline (`cache-reclaim --nudge`); it does not belong on an oracle.
-- **Write discipline**: back up before any write, verify the backup EXISTS rather than
-  inferring it from a call that returned (the #292/#327 lesson — `shutil.copy2` onto a
-  directory does not raise, it copies INTO it), refuse the write if the backup cannot be
-  made, then atomic `os.replace`.
+- **Write discipline.** Atomic `os.replace` is the LAST step, not the whole discipline —
+  it makes the swap indivisible but says nothing about whether the bytes being replaced
+  are still the bytes that were scanned. In order:
+  1. **Hash the source when it is read**, and re-hash immediately before replacing. If it
+     changed, ABORT that file — another session or the user may have edited it during the
+     scan, and a scrub computed against stale content would silently revert their edit.
+     This is a real TOCTOU window, not a theoretical one: the scan-then-write gap spans a
+     whole cascade walk.
+  2. **Back up, then VERIFY THE BACKUP** — that it exists, is a regular file (not a
+     directory, not a symlink), and its bytes match the source hash. Existence alone is
+     insufficient: the #292/#327 lesson is that `shutil.copy2` onto a DIRECTORY does not
+     raise, it copies INTO it, so a bare try/except reports a backup that is not there.
+     Refuse the write if any of that fails.
+  3. **Then** atomic `os.replace`.
+
+  Reject a symlinked target outright rather than following it; a settings path that is a
+  symlink is not a shape this tool should silently write through.
+
+★ Jargon ───────────────────────────────────────
+**TOCTOU** (time-of-check to time-of-use) - a bug where a program checks a condition,
+then acts on it later, and the world changes in between so the action is applied to
+state that no longer matches the check.
+Usage: hashing the file at scan time and re-hashing before the write closes the TOCTOU
+window between reading a settings file and scrubbing it.
+Origin: standard security vocabulary, from filesystem race conditions where an
+attacker swaps a file between a permission check and the open that follows it.
+─────────────────────────────────────────────────
 - **Harness** in the repo's stdlib-only subprocess style; `ruff check --select F,E741`
   clean; full gate green.
 - **Gate registration is part of the deliverable, not follow-up.** A new script plus its
@@ -410,7 +485,9 @@ per the deferral above.
 
 1. **An implementation issue** for `settings-scrub.py` referencing this doc (standing rule:
    a design doc needing implementation gets its own tracked issue).
-2. **An empirical test** of whether a hook-supplied `ruleContent` survives downstream
+2. **An empirical test that EXECUTES a hook and inspects the resulting settings file** —
+   establishing that `updatedPermissions` writes at all (currently INFERRED from a
+   decompiled path), and separately whether a hook-supplied `ruleContent` survives downstream
    normalization — the one unverified premise the deferred hook would depend on.
 3. **Maintainer ratification** of the CLAUDE.md-tension section before the
    actuating half ships.
