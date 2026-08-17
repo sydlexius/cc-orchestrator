@@ -168,14 +168,24 @@ MDt = W0("type",[ be({type:kt("addRules"), rules:ht(tli()), behavior:eli(), dest
 
 Two facts constrain how far this goes:
 
-1. **`updatedPermissions` is the ONLY field that reaches the rule store.** `updatedInput`
-   rewrites this invocation's arguments and never persists. Redacting what is STORED and
-   redacting what RUNS are separate mechanisms requiring separate fields.
-2. **The hook fires BEFORE the dialog, not after a click.** There is no event that
-   intercepts an actual "always allow" click. So the mechanism is PRE-EMPTION: the hook
-   must return `behavior: "allow"` plus a redacted `updatedPermissions`, which suppresses
-   the dialog entirely. If the hook declines to decide, the dialog appears and the user's
-   click persists the ORIGINAL unredacted suggestion, which the hook can no longer amend.
+1. **`updatedPermissions` is the only field that appears to reach the rule store
+   [INFERRED].** `updatedInput` rewrites this invocation's arguments and is documented as
+   not persisting. Redacting what is STORED and redacting what RUNS are therefore separate
+   mechanisms requiring separate fields. The separation of the two fields' ROLES is
+   DOCUMENTED; that `updatedPermissions` completes a write is INFERRED from the decompiled
+   path, so treat the mechanism as identified but the write as unconfirmed.
+2. **The hook fires BEFORE the dialog, not after a click [DOCUMENTED].** So the mechanism
+   is PRE-EMPTION: the hook must return `behavior: "allow"` plus a redacted
+   `updatedPermissions`, which suppresses the dialog entirely.
+   - That **no event intercepts an actual "always allow" click** is ABSENCE OF EVIDENCE
+     [UNTESTED]: no such event appears in the documented event list or the binary's event
+     enum, which is not proof none exists.
+   - That **a click on the undisturbed dialog persists the ORIGINAL unredacted
+     suggestion** is [INFERRED] from the same unobserved write path as point 1. It is the
+     expected behavior, not a measured one.
+
+   Both sub-points are premises of the redact strategy's deferral below. If the empirical
+   test contradicts either, revisit that deferral rather than assuming it still holds.
 
 ### Two hook strategies, with opposite failure directions
 
@@ -365,11 +375,29 @@ writes — and because the only existing cascade parser is Python.
     (scan nothing), not the default cascade.
   - **Project root** resolves from an explicit project-dir env var, else `git rev-parse
     --show-toplevel`, else project files are SKIPPED entirely (never guessed from `$PWD`).
-  - **Duplicate paths** (user and project resolving to the same file, or a repeat in an
-    override) are scanned ONCE and reported once; a duplicate must never yield two
-    findings for one secret, nor two writes to one file.
-  - A **parity test** asserts this list matches `orchestrate-setup.py`'s for the same
-    inputs, so the replication is checkable rather than assumed.
+  - **Duplicate paths** (user and project resolving to the same file, or a repeat in a
+    colon-separated override) are scanned ONCE and reported once; a duplicate must never
+    yield two findings for one secret, nor two writes to one file.
+
+  **The dedup and the parity test operate at DIFFERENT stages, and conflating them makes
+  the contract self-contradictory.** `orchestrate-setup.py`'s `_cascade_files()` does NOT
+  deduplicate — the override branch returns `[p for p in override.split(":") if p]`
+  verbatim, and the project branch `append`s paths that can equal the user ones. So a
+  parity test demanding an identical list and a dedup requirement cannot both hold on
+  duplicate input. The boundary:
+
+  1. **DISCOVERY** produces the raw cascade. The parity test asserts THIS list matches
+     `_cascade_files()` exactly for the same inputs, duplicates included — that is what
+     makes the replication checkable rather than assumed.
+  2. **A scrubber-specific stable dedup** (order-preserving, first occurrence wins) runs
+     after discovery and is NOT part of parity. Its own tests assert one finding and at
+     most one write per physical path.
+
+  Compare by RESOLVED identity, not by string: two different strings can name one file
+  (a symlink, `~` vs `$HOME`, a relative override entry). Resolve before deduping, or the
+  double-write this rule exists to prevent slips through under a second spelling.
+
+  Both test families belong to the implementation issue (#393); this PR is design-only.
 
 - **The tracked-file opt-in is part of the CLI contract**, not an implementation detail.
   `--yes <target>` alone does not say what a target IS, so define it:
