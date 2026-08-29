@@ -47,8 +47,12 @@ ROOT = Path(__file__).parent
 SETUP = ROOT / "scripts" / "orchestrate-setup.py"
 STEER = ROOT / "scripts" / "orchestrate-steer.sh"
 
-# HELPER_NAMES holds 27 entries today. A floor well below that catches a broken parse while
-# leaving room to add helpers; setting it AT the count would fail for the wrong reason.
+# A floor well below the real count catches a broken parse while leaving room to add helpers;
+# setting it AT the count would fail for the wrong reason (that pin is test-orchestrate-steer.py's
+# #284 job, and it is deliberate there). The exact count is NOT restated here on purpose: this
+# file exists to catch stale hand-maintained lists, and a hardcoded count in its own comment is
+# one -- it drifted from 27 to 29 within a single PR and CodeRabbit caught it, which is precisely
+# the read-only drift a gate cannot see.
 MIN_HELPERS = 20
 
 # Files that may reference a helper by name. Scanned for `$HOME/.claude/scripts/<name>` and
