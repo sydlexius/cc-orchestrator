@@ -126,6 +126,32 @@ HELPER_NAMES = (
     # (cr-quota-watch.sh reads comments; elmer-enqueue.sh reads a PR + writes one local
     # queue entry); neither posts, and neither is a reason to widen any allow-list.
     "cr-quota-watch.sh", "elmer-enqueue.sh", "elmer-triage.sh", "elmer-tick.sh",
+    # THE gh-* WRAPPERS THE STEER HOOK ADVERTISES (#402). orchestrate-steer.sh rule 2 tells the
+    # user, on every raw `gh api` mutation, to reach for these six by name. All six were absent
+    # from this tuple, so following the repo's OWN nudge produced "No such file or directory" for
+    # anyone without a repo checkout beside them - measured live during a post-merge cleanup.
+    #
+    # THE PREDICATE THAT MATTERS IS "DOES THIS REPO TELL PEOPLE TO USE IT", not "does a command
+    # file invoke it". A steer rule naming a remedy the install does not provide is worse than no
+    # nudge: it costs a turn and teaches the reader to distrust the channel. `test-helper-deploy-
+    # coverage.py` asserts that predicate so the next wrapper added to the nudge cannot be
+    # forgotten here - the #216/#217/#330 omissions above were each found the same way, by
+    # someone hitting them, after they shipped.
+    #
+    # (gh-react.sh is NOT repeated here: #234 already added it above, for a different reason - it
+    # is a live `[ -x ]` dependency of ship-gate-preflight.sh's ack gate, which FAILS CLOSED
+    # without it.)
+    "gh-api-get.sh", "gh-comment.sh", "gh-codeql-dismiss.sh",
+    "gh-codeql-autofix.sh", "gh-resolve-thread.sh", "gh-delete-branch.sh",
+    # FOUND BY THE #402 HARNESS ITSELF, on its first run, and both are the same class:
+    #  - orchestrate-status.sh is a LIVE dependency of elmer-triage.sh, which IS deployed and
+    #    resolves the oracle at ${HOME}/.claude/scripts/orchestrate-status.sh. So the unattended
+    #    loop would hit a missing file on a plugin install - the #216 shape exactly, in the one
+    #    workflow that runs without a human watching.
+    #  - orchestrate-feedback.sh is named by steer rule 1 as the canonical way to log feedback
+    #    instead of editing a canonical file mid-run. Same argument as the gh-* wrappers above:
+    #    the remedy has to exist wherever the nudge is read.
+    "orchestrate-status.sh", "orchestrate-feedback.sh",
 )
 # The _helper_deploy_action results that warrant an actual deploy write (vs. None / informational).
 HELPER_DEPLOY_ACTIONS = ("deploy", "refresh", "replace-symlink", "replace-broken-symlink")

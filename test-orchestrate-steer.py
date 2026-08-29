@@ -438,11 +438,15 @@ def main():
     _osetup = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(_osetup)
     helper_names = list(_osetup.HELPER_NAMES)
-    # 21 = 16 + the four elmer helpers (cr-quota-watch, elmer-enqueue, elmer-triage,
-    # elmer-tick) + base-freshness.sh, which #330 made a live stable-path dependency
-    # of the DEPLOYED safe-push.sh.
+    # 29 = the prior 21 + the eight #402 additions: the six gh-* wrappers orchestrate-steer.sh
+    # ADVERTISES as the remedy for a raw `gh api` mutation (a nudge naming a helper the install
+    # does not provide is worse than no nudge), plus orchestrate-status.sh (a live stable-path
+    # dependency of the DEPLOYED elmer-triage.sh - the #216 shape in the one workflow that runs
+    # unattended) and orchestrate-feedback.sh (named by steer rule 1 as the canonical way to log
+    # feedback). Bumping this number is DELIBERATE, not bookkeeping: pinning it is what makes a
+    # helper added to the deploy set impossible to add without also making it canonical below.
     check("#284 lockstep: HELPER_NAMES imported (exact count -- a truncated parse must not pass)",
-          len(helper_names) == 21)
+          len(helper_names) == 29)
     for h in helper_names:
         p = os.path.join(repo, "scripts", h)
         rc, err = run_steer({"file_path": p}, channel="stdin", tool_name="Edit", marker_active=True)
