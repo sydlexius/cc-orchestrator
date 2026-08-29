@@ -483,7 +483,18 @@ _required_contexts_for() {
   # a broken encoder degrades to today's working behavior rather than an empty path.
   _eref="$(printf '%s' "$_ref" | jq -sRr @uri 2>/dev/null)" || _eref=""
   [ -n "$_eref" ] || _eref="$_ref"
-  _doc="$(gh api "repos/$repo/rules/branches/$_eref" 2>/dev/null)" || return 1
+  # PAGINATE, AND SLURP. Without --paginate a ref carrying enough rules to span a page
+  # under-reports the required set, and an under-reported EXPECTED set is the dangerous
+  # direction here: #375's reconciliation blocks a required check ABSENT from the rollup,
+  # so a context missing from the expected set has nothing to reconcile against and the
+  # same never-ran check passes through a longer path.
+  #
+  # `--paginate` on an array endpoint emits CONCATENATED arrays, not one merged array, so
+  # the `type == "array"` assertion below would reject its own paginated output. `jq -s
+  # 'add // []'` merges them, mirroring the reviews read at :1070. Applying --paginate
+  # ALONE would convert a silent under-report into a hard BLOCK - correct direction, wrong
+  # outcome - which is why the two halves ship together.
+  _doc="$(gh api --paginate "repos/$repo/rules/branches/$_eref" 2>/dev/null | jq -s 'add // []' 2>/dev/null)" || return 1
   # An EMPTY body is not malformed and must not read as unreadable: `jq -e .` exits 4 on
   # empty input, which would turn a benign empty response into a BLOCK on every merge.
   # Normalize it to the empty rule array it means, then insist the rest parses.

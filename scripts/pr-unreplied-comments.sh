@@ -269,6 +269,59 @@ repo="${2:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"
 me=$(gh api user --jq .login)
 
 # --- Core function: count unreplied bot comments ---
+# THE `|| echo ""` IDIOM IS NOT UNIFORMLY WRONG, AND THE AUDIT MATTERS MORE THAN THE FIX.
+# This file carries 16 instances; ship-gate-preflight.sh 3; pr-watch.sh 1. All 20 were read
+# during #403/#404 and they split cleanly in two:
+#
+#   CORRECT (17) -- `jq` or `git` over data ALREADY FETCHED AND VALIDATED. There is no second
+#     stream to concatenate, the command writes nothing to stdout on failure, and EMPTY is the
+#     intended result (an absent field, a filter matching nothing, an unresolvable local ref).
+#     `grep -v` exiting 1 when it filters everything out is the canonical case. Left alone
+#     deliberately: "re-fix" them and the next reader cannot tell which sites were reasoned
+#     about.
+#
+#   WRONG (3, all fixed here) -- reads whose value reaches a URL PATH. `gh --jq` does NOT
+#     suppress its error body: on a 4xx it writes the payload to STDOUT and exits nonzero, so
+#     `|| echo ""` CONCATENATES rather than replaces and a `[ -z ]` guard passes on the blob.
+#     Those three built `commits/<blob>/status`, `commits/<blob>/check-runs` and a substring.
+#
+# The distinction is the CONSUMER, not the command: an empty string is a fine sentinel, and an
+# ERROR BODY masquerading as one is not. Two further gh reads here (:749/:750, base/head ref)
+# keep the idiom because their consumer is `git rev-parse`, which fails cleanly on garbage and
+# is already emptiness-guarded -- same idiom, no path interpolation, no fix owed.
+#
+# _gh_read_sha <api-path> [reader] -- read a commit SHA from a gh endpoint, or return EMPTY.
+#
+# CAPTURE, THEN DECIDE -- never `|| echo ""`. `gh --jq` does NOT suppress the error body: on a
+# 4xx it writes the payload to STDOUT and exits nonzero, so `|| echo ""` CONCATENATES rather
+# than replaces. The variable then holds `{"message":"Not Found",...}` and a `[ -z ]` guard
+# passes on it, because an error blob is not empty. Three call sites interpolated the result
+# straight into a URL path (`commits/<sha>/status`, `commits/<sha>/check-runs`), producing a
+# request against a path built from an error message.
+#
+# VERIFY THE SHAPE, DO NOT CLASSIFY THE ERROR. A SHA is 7-40 hex characters and nothing else,
+# so the sanctioned shape is checkable directly and the check is immune to whatever prose
+# GitHub returns. This is the same construction ship-gate-preflight.sh:462 already uses for a
+# ref NAME; that fix was never propagated here, which is why this is a shared helper rather
+# than a fourth ad-hoc guard.
+#
+# The optional second argument routes the read through gh-api-get.sh where a caller already
+# resolves it, so the wrapper's own hardening is not bypassed.
+_gh_read_sha() {
+  local _path="$1" _reader="${2:-}" _out=""
+  if [ -n "$_reader" ] && [ -x "$_reader" ]; then
+    _out=$("$_reader" "$_path" --jq '.head.sha' 2>/dev/null) || _out=""
+  else
+    _out=$(gh api "$_path" --jq '.head.sha' 2>/dev/null) || _out=""
+  fi
+  # Reject anything that is not a plausible SHA: an error body, `null` (which --jq prints for
+  # an absent field), whitespace, or JSON punctuation all fail this.
+  case "$_out" in
+    "" | *[!0-9a-fA-F]* ) printf '' ;;
+    * ) [ "${#_out}" -ge 7 ] && [ "${#_out}" -le 40 ] && printf '%s' "$_out" || printf '' ;;
+  esac
+}
+
 count_unreplied() {
   local all_comments
   all_comments=$(gh api "repos/$repo/pulls/$pr_number/comments" --paginate)
@@ -305,7 +358,7 @@ count_pending_reviewers() {
   # status per context. The raw /statuses endpoint returns ALL statuses including
   # superseded "pending" entries, which causes false positives.
   local head_sha
-  head_sha=$(gh api "repos/$repo/pulls/$pr_number" --jq '.head.sha' 2>/dev/null || echo "")
+  head_sha=$(_gh_read_sha "repos/$repo/pulls/$pr_number")
   local status_pending=0
   if [ -n "$head_sha" ]; then
     # Include codecov alongside coderabbit/copilot: codecov posts "pending"
@@ -416,7 +469,7 @@ build_coverage_advisory() {
   # only, never a spurious gating "fail"); a genuine regression is still blocked upstream
   # by the required coverage CI check via the CI-green / ship-gate gate.
   script_dir=$(unset CDPATH; cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || script_dir="."
-  head_sha=$("$script_dir/gh-api-get.sh" "repos/$repo/pulls/$pr_number" --jq '.head.sha' 2>/dev/null || echo "")
+  head_sha=$(_gh_read_sha "repos/$repo/pulls/$pr_number" "$script_dir/gh-api-get.sh")
   patch_conclusion=""
   patch_run_title=""
   if [ -n "$head_sha" ]; then
@@ -1331,7 +1384,7 @@ fi
 # code, so callers that branch on a non-zero exit are unaffected. Suppressed in
 # --count-only (numeric-only) output.
 if [ "$count_only" = false ] && [ "$itemized" = false ]; then
-  head_full_sha=$(gh api "repos/$repo/pulls/$pr_number" --jq '.head.sha' 2>/dev/null || echo "")
+  head_full_sha=$(_gh_read_sha "repos/$repo/pulls/$pr_number")
   head_committer_date=$(gh api "repos/$repo/commits/$head_full_sha" --jq '.commit.committer.date' 2>/dev/null || echo "")
   if [ -n "$head_full_sha" ] && [ -n "$head_committer_date" ]; then
     short_head="${head_full_sha:0:8}"
