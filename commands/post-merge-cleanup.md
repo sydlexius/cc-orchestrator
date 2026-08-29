@@ -228,12 +228,37 @@ A version-bumping merge ships a new version, so the matching `vX.Y.Z` tag and Gi
 
 Detect whether this merge changed a version-defining file. This is repo-agnostic: key off a version file changing in the merge, NOT a hardcoded path. Adapt the globs to how the target repo versions (this repo uses a `SKILL.md` `**Version**` line locked to `plugin.json`; others use `package.json`, `Cargo.toml`, `pyproject.toml`, etc.):
 
+The name match is only a CANDIDATE filter. `(^|/)` anchors to a path segment, not to a
+directory, so `SKILL.md` matches ANY `SKILL.md` anywhere in any repo -- and most of them
+carry no version at all (measured on a stillwater docs-only merge, whose only `SKILL.md` is
+`.claude/skills/helper-scripts/SKILL.md`). Confirm each candidate actually DEFINES a
+version before treating the merge as a release:
+
 ```bash
-version_changed=$(git show "$sha" --format= --name-only \
+version_changed=""
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  # READ THE FILE AT THE MERGE COMMIT, not from the working tree: this step runs after
+  # main has already moved, and the path may not exist at HEAD (or may differ).
+  if git show "$sha:$f" 2>/dev/null \
+      | grep -qE '^\*\*Version[[:space:]]|"version"[[:space:]]*:|^version[[:space:]]*='; then
+    version_changed="$version_changed$f"$'\n'
+  fi
+done <<EOF
+$(git show "$sha" --format= --name-only \
   | grep -iE '(^|/)(plugin\.json|package\.json|Cargo\.toml|pyproject\.toml|SKILL\.md)$' || true)
+EOF
 ```
 
-If `version_changed` is empty, SKIP this step (this merge did not ship a new version) and continue to the summary.
+Adapt the version-line pattern to how the target repo declares a version; the three
+alternatives above cover the `**Version X.Y.Z**` line, JSON manifests, and TOML manifests.
+
+If `version_changed` is empty, SKIP this step and continue to the summary. That covers BOTH
+"no version file changed" and "a candidate matched by name but declares no version" -- the
+second is not a failure and needs no report. Do NOT reach for a sibling-`plugin.json` test
+instead: it hard-codes this repo's packaging into a step whose contract is repo-agnostic, and
+it would silently MISS a repo that versions a `SKILL.md` without being a plugin. A false
+negative here costs a delayed tag; catching a real release is the whole point of the step.
 
 Otherwise, read the shipped version and compare it to the latest release tag:
 
