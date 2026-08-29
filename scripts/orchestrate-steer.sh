@@ -375,7 +375,7 @@ is_redundant_reread() {
 # (4) read-dedup WARN: only a `Read` tool call, marker-independent. Evaluated before the canonical-edit
 # rule so a Read never falls through to it (and the canonical rule is itself gated off for Read below).
 if [ "$tool_name" = "Read" ] && [ -n "$file_path" ] && is_redundant_reread "$file_path" "$session_id"; then
-  emit_warn "Redundant re-Read: '$file_path' was already read this session and is unchanged (mtime/size) - its content is already in context; skip the Read (post-compaction re-read is the valid exception)."
+  emit_warn "Redundant re-Read: '$file_path' is unchanged since you read it this session - skip it (a post-compaction re-read is the valid exception)."
 fi
 
 # (1) canonical-edit WARN: marker-gated. tool_name=='Read' is excluded so wiring the hook for Read
@@ -419,7 +419,13 @@ fi
 #      that teammate). Deliberately NOT special-cased: a nesting check would add a fragile inference
 #      for an advisory nudge whose advice ("do not block yourself on a foreground agent") still holds.
 if [ "$tool_name" = "Agent" ] && is_foreground_agent "$tool_input_json" && marker_active; then
-  emit_warn "Foreground Agent in a marker-active session: run_in_background=false BLOCKS the lead console for the agent's ENTIRE run, freezing your ability to drive the team. REMEDY = give it a 'name' AND omit run_in_background:false (BOTH halves: a name alone does not make it async - named + foreground still blocks; dropping the flag alone leaves it UNNAMED and backgrounded, which cannot answer a permission prompt and will stall silently on privileged work). Collect it via its completion notification / SendMessage. Bare background (no name) is allowed ONLY for a provably-0%-prompt read-only pass. If NO teammates are live (solo work in a stale-marker pane), a foreground one-shot is sanctioned - ignore this."
+  # ONE LINE, and deliberately so (#406). This fires on EVERY foreground spawn in a marker
+  # session and blocks nothing, so its body is re-read by someone who has already seen it.
+  # The full argument -- why BOTH halves are required, the nested-spawn imprecision, the
+  # solo-in-a-stale-marker-pane exception -- is in the comment block directly above, which is
+  # where a reader who needs convincing will look. A nudge states the fix; the file states
+  # the case.
+  emit_warn "Foreground Agent blocks the lead console for its whole run: give it a 'name' AND omit run_in_background:false (both halves). Sanctioned if you are solo."
 fi
 
 # (2) raw gh-api mutation WARN: marker-independent.
@@ -429,7 +435,7 @@ fi
 
 # (3) raw gh pr comment/create -> canonical path WARN: marker-independent (#159; advisory only).
 if [ -n "$cmd" ] && is_raw_gh_pr_mutation "$cmd"; then
-  emit_warn "Canonical path for gh pr: 'gh pr comment' -> reply-comment.sh / gh-comment.sh; 'gh pr create' -> open the PR via /prep-pr (the required gate). Other gh pr subcommands (incl. merge) are intentionally not flagged."
+  emit_warn "Canonical path: 'gh pr comment' -> reply-comment.sh / gh-comment.sh; 'gh pr create' -> /prep-pr (the required gate)."
 fi
 
 exit 0
