@@ -190,7 +190,7 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         codoki_ack_fail=False, codoki_ack_missing=False,
         threads_json="__DEFAULT__", threads_fail=False, protection=None, comments=None,
         comments_fail=False, reviews=None, reviews_fail=False,
-        rules_main=None, rules_base=None, rules_fail=False, default_branch_fail=False,
+        rules_main=None, rules_base=None, rules_page2=None, rules_fail=False, default_branch_fail=False,
         rules_main_fail=False, default_branch=None):
     """Invoke the oracle with stubbed gh + pr-unreplied-comments.sh + gh-react.sh.
     Returns (exit_code, stdout, stderr, argv) where argv is the recorded helper
@@ -285,7 +285,17 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
                 "        # separates the four unreadable paths from each other.\n"
                 "        if [ -n \"${RULES_MAIN_FAIL:-}\" ]; then echo 'gh: simulated rules-API failure (default branch)' >&2; exit 1; fi\n"
                 "        printf '%s' \"${FIXTURE_RULES_MAIN:-[]}\"; exit 0;;\n"
-                "      *) printf '%s' \"${FIXTURE_RULES_BASE:-[]}\"; exit 0;;\n"
+                "      *) \n"
+                "        # RULES_PAGED=1 emits TWO CONCATENATED ARRAYS, which is what real\n"
+                "        # `gh api --paginate` produces on an array endpoint -- NOT one merged\n"
+                "        # array. A stub emitting a single merged array would be kinder than\n"
+                "        # reality and would pass whether or not the caller slurps, making the\n"
+                "        # #403 case vacuous. The second page carries the required context, so\n"
+                "        # a non-paginating (or non-slurping) read under-reports it.\n"
+                "        if [ -n \"${RULES_PAGED:-}\" ]; then\n"
+                "          printf '%s' \"${FIXTURE_RULES_BASE:-[]}\"; printf '%s' \"${FIXTURE_RULES_PAGE2:-[]}\"; exit 0;\n"
+                "        fi\n"
+                "        printf '%s' \"${FIXTURE_RULES_BASE:-[]}\"; exit 0;;\n"
                 "    esac;;\n"
                 "  *protection)\n"
                 "    # `gh api repos/.../branches/<base>/protection`. TWO callers: --diagnose\n"
@@ -396,6 +406,11 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         env.pop("FIXTURE_RULES_BASE", None)
         if rules_base is not None:
             env["FIXTURE_RULES_BASE"] = rules_base
+        env.pop("FIXTURE_RULES_PAGE2", None)
+        env.pop("RULES_PAGED", None)
+        if rules_page2 is not None:
+            env["FIXTURE_RULES_PAGE2"] = rules_page2
+            env["RULES_PAGED"] = "1"
         env.pop("RULES_FAIL", None)
         if rules_fail:
             env["RULES_FAIL"] = "1"
@@ -1223,6 +1238,26 @@ def main():
     check("#375: ...and it does NOT block on main-only contexts that do not apply to "
           "that base (a protected release base is not measured against main)",
           "Test" not in blob500.split("did not run")[-1].split("\n")[0])
+
+    # --- #403: the rules read must PAGINATE, and slurp the concatenated arrays --------
+    # An under-reported EXPECTED set is the dangerous direction: #375's reconciliation
+    # BLOCKs a required check absent from the ROLLUP, so a context missing from the
+    # EXPECTED set has nothing to reconcile against and a never-ran check sails through.
+    #
+    # The stub emits TWO CONCATENATED ARRAYS under RULES_PAGED, which is what real
+    # `gh api --paginate` produces on an array endpoint. `PagedOnly` lives on page 2 and
+    # is ABSENT from the rollup, so the oracle must BLOCK naming it. Without --paginate
+    # page 2 is never fetched; without the `jq -s add` slurp the concatenated body fails
+    # the `type == "array"` assertion and the read returns 1 -- so this case pins BOTH
+    # halves, which is why they shipped together.
+    rc, out, err, _ = run(["501", "owner/repo"], fixture_json=RELEASE_BASE,
+                          rules_main=MAIN_REQUIRES,
+                          rules_base=rules_doc(contexts=["Build"]),
+                          rules_page2=rules_doc(contexts=["PagedOnly"]))
+    blob501 = out + err
+    check("#403: a required context on PAGE 2 of the rules read is still expected "
+          "(BLOCKs on it, proving the paginated body was fetched AND merged)",
+          rc == 2 and "PagedOnly" in blob501)
 
     RELEASE_OK = rollup(
         checkrun("Build", "COMPLETED", "SUCCESS"),

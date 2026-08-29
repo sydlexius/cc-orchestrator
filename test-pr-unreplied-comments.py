@@ -113,7 +113,12 @@ if "/check-runs" in endpoint:
     emit(CHECK_RUNS, raw=CHECK_RUNS_RAW)
 if "/commits/" in endpoint:
     emit(COMMIT)
-emit(PULL)
+# PULLS_RAW=1 mirrors real gh on an error at the PULL read: nonzero exit AND the error
+# body on STDOUT with --jq unapplied. That is the shape `|| echo ""` concatenates rather
+# than replaces, so head_sha held an error blob and was interpolated into a URL path.
+# A stub that returned EMPTY on failure would be kinder than reality and make every test
+# around it vacuous -- the same trap CHECK_RUNS_RAW / ISSUE_RAW exist to avoid.
+emit(PULL, raw=os.environ.get("PULLS_RAW", "") == "1")
 '''
 
 
@@ -433,6 +438,30 @@ def main():
     CR_NO_CODECOV = '{"total_count":1,"check_runs":[{"name":"gates (ubuntu-latest)","status":"completed","conclusion":"success"}]}'
 
     # Core bug: :x: glyph in the comment BUT the codecov/patch check-run PASSED -> not fail.
+    # --- #404: a failing PULL read must not put an error body into a URL path ---------
+    # `gh --jq` writes its error body to STDOUT and exits nonzero, so the old
+    # `|| echo ""` CONCATENATED rather than replaced: head_sha held
+    # `{"message":"Not Found",...}`, the `[ -z ]` guard passed on it (an error blob is
+    # not empty), and it was interpolated into `commits/<sha>/check-runs`.
+    #
+    # ASSERT THE ERROR TEXT IS ABSENT FROM THE OUTPUT, not merely that the exit code is
+    # 0. A crash-free run proves nothing here: the defect degraded politely to
+    # threshold_state:none, so "it did not blow up" was TRUE while the bug was live.
+    rc, out, err = run(["--coverage-only"], issue=CODECOV_XMARK, check_runs=CR_PATCH_PASS,
+                       extra_env={"PULLS_RAW": "1"})
+    check("#404: failing PULL read -> still exits 0 (degrades, never aborts)", rc == 0)
+    check("#404: no gh error body leaks into the coverage output",
+          "Not Found" not in out and "message" not in out.lower())
+    # The COMMENT read is a separate call that did not fail, so a percentage sourced from
+    # it is a genuine measurement and must survive. What must degrade is the CHECK-RUN
+    # derived field, since that read is the one head_sha feeds. Asserting "patch_pct is
+    # null" here would have been WRONG and would have pinned the wrong behavior - the
+    # first draft of this case did exactly that, and reading the actual output corrected it.
+    check("#404: threshold_state degrades to none when head_sha is unreadable",
+          '"threshold_state": "none"' in out)
+    check("#404: a percentage from the still-healthy comment read is preserved",
+          '"patch_pct_source": "comment"' in out)
+
     rc, out, err = run(["--coverage-only"], issue=CODECOV_XMARK, check_runs=CR_PATCH_PASS)
     adv = json.loads(out)
     check("glyph :x: but codecov/patch check-run success -> threshold_state=pass (not fail)",
