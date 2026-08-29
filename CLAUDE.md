@@ -483,6 +483,7 @@ ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.
 python3 test-orchestrate-guard.py
 python3 test-orchestrate-authorize-merge.py
 python3 test-orchestrate-steer.py
+python3 test-steer-nudge-length.py
 python3 test-orchestrate-context-meter.py
 python3 test-orchestrate-resources.py
 python3 test-orchestrate-setup.py
