@@ -250,8 +250,12 @@ def main():
 
     # ---- Rule 3 per-clause invocation matching (the maintainer rejected the old "accepted" FP) ----
     # The old matcher grepped the WHOLE line for gh / pr / comment|create independently, so any gh pr
-    # READ plus a stray `create`/`comment` word anywhere warned. It now requires a real invocation:
-    # gh at clause command position, `pr`, optional flag groups, then create/comment as the next word.
+    # READ plus a stray `create`/`comment` word anywhere warned. It now requires the words to appear
+    # as ONE CONTIGUOUS SEQUENCE - `gh`, optional flag groups, `pr`, optional flag groups, then
+    # create|comment|new - WITHIN A SINGLE CLAUSE of a code frame. The sequence may sit anywhere in
+    # that clause, NOT only at its command position: `echo next: gh pr create` still warns, and is
+    # the accepted false positive documented in _steer_scan (bash cannot tell an echo argument from
+    # a command word without knowing what the words are used for).
     GH_PR_INVOCATION_WARN = [
         "gh pr create --fill",
         "gh pr comment 5 -b hi",
@@ -373,7 +377,10 @@ def main():
         "gh api graphql -f query='{a}' -f body=\"x mutation Foo y\"",
         "gh pr view 5 --comments && gh pr list",
         # flag groups never span an UNQUOTED separator (a flag value glued to `|`/`;`, then the
-        # coreutils `pr` command): the pr-rule's flag tokens exclude ; & | ( )
+        # coreutils `pr` command). NOT because the flag token class excludes those bytes - _FLAGS
+        # is `[^[:space:]]+`, which matches `;` `&` `|` `(` `)` like any other non-space byte. The
+        # scanner CUTS THE CLAUSE at an unquoted separator BEFORE it judges, so the words on either
+        # side are never in the same clause for the sequence to match across.
         "gh --version -R o/r| pr create.txt",
         "gh -R o/r; pr comment.txt",
         # M-3: an unescaped newline ends a command in bash, so `gh pr` NEWLINE `create` is two
@@ -516,14 +523,20 @@ def main():
 
     # PERF: a long read chain never reaches awk (the prefilter), and one that does (every clause
     # carries `comment`) is scanned in ONE pass, not one fork per clause.
+    # The limit matches the 3.0s the linearity block above uses: run_steer measures the WHOLE
+    # subprocess (shell start, jq, the awk scan), so a loaded CI runner can blow a 1s bound while
+    # the scanner itself is fine. Correctness (exit 0, silent) stays unconditional; only the timing
+    # is runner-tolerant. dt is captured ONCE - measuring separately for the label and the assertion
+    # let a failure print a passing-looking number.
     for label, c in (
             ("300-clause read chain", " && ".join(f"gh pr view {i} --json title" for i in range(300))),
             ("300-clause prefilter-hit chain",
              " && ".join(f"gh pr view {i} --comments" for i in range(300)))):
         t0 = time.time()
         rc, err = run_steer({"command": c}, channel="stdin")
-        check(f"perf: {label} scans in < 1s, silent, exit 0 ({time.time() - t0:.2f}s)",
-              rc == 0 and not warned(err) and time.time() - t0 < 1.0)
+        dt = time.time() - t0
+        check(f"perf: {label} scans in < 3s, silent, exit 0 ({dt:.2f}s)",
+              rc == 0 and not warned(err) and dt < 3.0)
 
     # ---- Rule 4: read-dedup advisory WARN (marker-independent, #226) ----
     # A 2nd+ Read of a path already read THIS session with UNCHANGED mtime/size warns; the first
