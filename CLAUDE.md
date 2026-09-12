@@ -70,9 +70,24 @@ Runtime (`scripts/`; canonical source is this repo):
   `reply-comment.sh`, ...) and `commands/*.md` - they are canonical-source by the same argument as the
   guard, and their omission made a mid-run `safe-push.sh` edit SILENT (the #283 miss). Matched under a
   `scripts/`/`commands/` PARENT so a same-named file elsewhere is not swallowed;
-  (2) a raw `gh api` mutation not via a `gh-*` wrapper -> use the wrapper;
-  (3) a raw `gh pr comment`/`gh pr create` -> canonical path (reply-comment.sh/gh-comment.sh; /prep-pr)
-  (#159; canonical-steering only - `merge` and the allow-listed lifecycle subcommands are NOT flagged);
+  (2) a raw `gh api` mutation not via a `gh-*` wrapper -> use the wrapper (per shell clause, split by
+  ONE linear-time, quote-aware awk scan in which every code frame - top level, `$(...)`, backticks, a
+  `bash -c`/`eval` script, a heredoc fed to a shell - owns its own clauses, so a separator inside
+  quotes never splits a call and a `|` inside `$(...)` never cuts the outer one; REST keeps the base
+  -X/-f/-F/--field/--input test; a `gh api graphql` call warns when its query DOCUMENT on the line is
+  a `mutation` operation, or on an explicit `-X`/`--method PATCH|PUT|DELETE` (which GraphQL never
+  takes, so that is a mis-aimed REST mutation); a `--jq` filter never counts, so GraphQL READS are
+  silent, and with no document on the line and no such verb - `-F query=@file`, `--input`,
+  `-f query="$Q"` - it is silent-on-doubt);
+  (3) a raw `gh pr comment`/`gh pr create` (or its alias `gh pr new`) -> canonical path
+  (reply-comment.sh/gh-comment.sh; /prep-pr) (#159; canonical-steering only - `merge` and the
+  allow-listed lifecycle subcommands are NOT flagged; matched as a `gh [flags] pr [flags]
+  create|comment|new` word sequence within one clause of any code frame, so `sudo`/`env`/`timeout`/
+  `xargs`/`$(...)`/`bash -c`/`bash <<EOF` shapes warn, while a gh pr READ with a stray
+  `create`/`comment` word, quoted prose (including a quote nested inside a `-c` script), comments, and
+  heredoc bodies not fed to a shell are silent; unquoted echo prose is an accepted false positive). A
+  fork-free prefilter keeps commands with no gh api/pr shape at base cost (a command with a
+  backslash-newline bypasses it, since a continuation can split any word);
   (4) a redundant re-`Read` of a path already read this session with unchanged mtime+size -> skip the
   Read (#226; stateful per-session state keyed on the stdin `session_id`, marker-independent, advisory
   so the post-compaction re-read exception stays valid);

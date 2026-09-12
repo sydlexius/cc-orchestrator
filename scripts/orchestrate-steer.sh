@@ -24,11 +24,22 @@
 #       Gated OFF
 #       for a `Read` tool call (a Read carries a file_path too) so wiring the hook for Read never
 #       turns reading a canonical file into a spurious "do not edit" nag.
-#   (2) RAW GH-API MUTATION -> WRAPPER: a Bash command invoking `gh api` with a MUTATION flag
-#       (-X/--method, -f/-F/--field/--raw-field/--input) directly on the command line and NOT via a
-#       gh-* wrapper script -> WARN: use the gh-* wrapper. Marker-independent (steer every session).
-#   (3) RAW GH PR comment/create -> CANONICAL PATH: `gh pr comment`/`gh pr create` on the command
-#       line -> WARN toward reply-comment.sh/gh-comment.sh / /prep-pr. Marker-independent (#159).
+#   (2) RAW GH-API MUTATION -> WRAPPER: a shell clause (split quote-aware in EVERY code frame, see
+#       _steer_scan) invoking `gh api` NOT via a gh-* wrapper, with a REST mutation flag (-X/--method,
+#       -f/-F/--field/--raw-field/--input; same test as before 0.97.2) or, for `gh api graphql`, a
+#       query DOCUMENT on the line that is a `mutation` operation, or an explicit -X/--method
+#       PATCH|PUT|DELETE (which GraphQL never takes, so that is a mis-aimed REST mutation). A GraphQL
+#       READ is silent; a --jq filter never counts; with no document on the line and no such verb it
+#       is silent-on-doubt (-F query=@file, --input, -f query="$Q") -> WARN: use the gh-* wrapper.
+#       Marker-independent (steer every session).
+#   (3) RAW GH PR comment/create -> CANONICAL PATH: a `gh [flags] pr [flags] create|comment|new` word
+#       sequence anywhere in one clause of the command's CODE - the top level, $(...), backticks, a
+#       `sh|bash|... [opts] -c` / eval script, or a heredoc fed to a shell - so sudo/env/timeout/xargs
+#       shapes warn; quoted prose, comments, arithmetic and heredoc bodies not fed to a shell are
+#       masked -> WARN toward reply-comment.sh/gh-comment.sh / /prep-pr. A gh pr READ never warns on
+#       its own subcommand; the only way a read-only command warns is unquoted prose elsewhere on it
+#       (`echo next: gh pr create`), an ACCEPTED false positive (see _steer_scan). Quote it to silence.
+#       Marker-independent (#159).
 #   (4) REDUNDANT RE-READ -> WARN (#226): a 2nd+ `Read` of a path already read THIS session with an
 #       unchanged mtime+size -> WARN: the content is already in context, skip the Read. Stateful
 #       (per-session, keyed on the stdin session_id), marker-independent, advisory only. The valid
@@ -79,6 +90,16 @@ if [ "${1:-}" = "--self-test" ]; then
     { [ "$st_rc" -eq 0 ] && printf '%s' "$st_out" | grep -q 'STEER'; } \
       || st_fail="gh-pr rule (create) (rc=$st_rc out=$st_out)"
   fi
+  # (2r)/(3r) the two READ shapes that used to false-positive must stay SILENT at exit 0: a GraphQL
+  # read, and a gh pr read compounded with a standalone `create` word.
+  for st_cmd in "gh api graphql -f query='{viewer{login}}'" "gh pr view 943 && echo create"; do
+    [ -n "$st_fail" ] && break
+    st_payload=$(jq -cn --arg c "$st_cmd" '{tool_name:"Bash",tool_input:{command:$c}}' 2>/dev/null) \
+      || { st_fail="read-silence (jq unavailable)"; break; }
+    st_out=$(printf '%s' "$st_payload" | "$0" 2>&1); st_rc=$?
+    { [ "$st_rc" -eq 0 ] && ! printf '%s' "$st_out" | grep -q 'STEER'; } \
+      || st_fail="read-silence '$st_cmd' (rc=$st_rc out=$st_out)"
+  done
   # (4) read-dedup: a 2nd Read of an unchanged path (same session) must WARN at exit 0; the 1st is
   # silent. Uses an isolated temp state dir + file so the self-test never touches real read state.
   if [ -z "$st_fail" ]; then
@@ -104,7 +125,7 @@ if [ "${1:-}" = "--self-test" ]; then
     fi
   fi
   if [ -z "$st_fail" ]; then
-    echo "orchestrate-steer self-test PASS (raw gh-api + raw gh pr comment/create mutations + read-dedup warned, exit 0)"
+    echo "orchestrate-steer self-test PASS (raw gh-api + raw gh pr comment/create mutations + read-dedup warned, graphql read + gh pr read silent, exit 0)"
     exit 0
   fi
   echo "orchestrate-steer self-test FAIL: expected a STEER warn at exit 0, got $st_fail" >&2
@@ -239,40 +260,374 @@ is_foreground_agent() {
   printf '%s' "$1" | jq -e '.run_in_background == false' >/dev/null 2>&1
 }
 
-# A raw `gh api` MUTATION on the command line, NOT routed through a gh-* wrapper. Requires the `gh`
-# word, the `api` subcommand, and a mutation flag. A wrapper-ALONE invocation (e.g. `gh-comment.sh
-# 5 hi`) is already silent because the bare-`gh` check requires `gh` followed by space/EOL, and the
-# char after `gh` in `gh-comment.sh` is `-`, not a boundary - so no global gh-*.sh exemption is
-# needed (and a blanket exemption is WRONG: in a compound `gh-comment.sh ... && gh api -X PATCH ...`
-# a bare `gh api` mutation IS present and must still warn).
-# Separator-tolerant (space/=/glued), mirroring the guard's is_merge_api flag matching.
-is_raw_gh_api_mutation() {
-  local c="$1"
-  printf '%s' "$c" | grep -Eq '(^|[^[:alnum:]_-])gh([[:space:]]|$)' || return 1
-  printf '%s' "$c" | grep -Eq '(^|[[:space:]])api([[:space:]]|$)' || return 1
-  printf '%s' "$c" | grep -Eq '(--method[[:space:]=]|-X[[:space:]=]?[A-Za-z])' && return 0
-  printf '%s' "$c" | grep -Eq '(^|[[:space:]])(--(field|input|raw-field)[[:space:]=]|-[fF][[:space:]=]?[^[:space:]])' && return 0
+# --- shared command scanner for rules (2) and (3) -------------------------------
+# HISTORY. The base (pre-0.97.2) grepped the WHOLE command line for independent words, so a gh READ
+# plus a stray word (`gh pr view 943 && echo create`) or any GraphQL read (`gh api graphql -f
+# query='{...}'`) drew a nudge. The first per-clause rewrite fixed those but required `gh` at the
+# clause's command position (so `URL=$(gh pr create)`, `sudo gh pr create`, `bash -c 'gh pr create'`
+# went SILENT), split clauses quote-blind, and forked 2-4 greps PER CLAUSE. The second rewrite (one awk
+# pass over a byte-aligned masked copy) fixed those, but judged every nested-code shape against the
+# OUTER clause (a `|` inside `$(...)` cut the outer call off its -f flag; a `;` inside `bash -c '...'`
+# never split), read a heredoc fed to a shell as prose, and had a quadratic tail. This is round 3.
+#
+# THE SCAN (_steer_scan, ONE awk process, linear time). It walks the command once with a FRAME STACK.
+# Every CODE frame owns its own clause buffer and is judged on its own clauses:
+#   U  the top level;           P  $(...), <(...), >(...);          B  `...`;
+#   S/D/E  the script argument of `sh|bash|zsh|dash|ksh [opts] -c` or `eval` ('...', "..." or $'...');
+#   H  a heredoc BODY fed to a shell as code: `bash|sh|... [opts] <<[-]DELIM` (quoted or unquoted
+#      delimiter, bare or -s), or `cat <<DELIM | bash`.
+# PROSE frames contribute ONE placeholder word (`Q`) to the enclosing clause and nothing else: '...',
+# "...", $'...' (unless one of the code cases above), a `#` comment, $((...))/((...)) arithmetic (so a
+# `<<` shift is never a heredoc), a heredoc body NOT fed to a shell, and - inside a code quote - a
+# nested quote (`bash -c 'echo "gh pr create"'` is prose inside the script). A nested code frame
+# contributes the placeholder `X` to its parent (so `repos/$(...)/comments` stays one word), and its
+# own separators never cut the parent's clause. A quoted token therefore stays ONE non-space word, so a
+# quoted flag value (`-H 'X-A: 1'`, `--repo 'o/r'`) still reads as a single flag value.
+# CLAUSE boundaries, in EVERY code frame (including inside a -c/eval script and a shell-fed heredoc):
+# `&&`, `||`, `;`, `|`, an unescaped newline, or a LONE `&` (not part of `&&`, `>&`, `<&`, `&>`).
+# Backslash-newline continuations are joined (they are removed, as bash does). Each quote that is the
+# GraphQL query value (`query=` right before it, or a quote that begins `query=`) and a heredoc body in
+# a `graphql` clause is ALSO copied to that clause's DOCUMENT buffer, which is what the mutation test
+# reads (so a `--jq` filter mentioning `mutation` never counts).
+# RULE 2 (raw gh api mutation) is judged PER CLAUSE: the clause must contain the `gh` and `api` words; if
+# `api` [flag groups] `graphql` is the endpoint, it warns only when the query DOCUMENT carries a
+# `mutation` operation (at the document's start, at the start of a line, or after the `}` closing a
+# preceding fragment), when an unquoted `query=mutation...` is on the clause, or on -X PATCH/PUT/DELETE;
+# otherwise (REST) it warns on an explicit -X/--method or any -f/-F/--field/--raw-field/--input.
+# RULE 3 (raw gh pr create/comment) is a WORD SEQUENCE anywhere in one clause:
+# `gh` [flag groups] `pr` [flag groups] `create|comment|new` (`new` is create's alias), where `gh` is a
+# standalone word (a path prefix like /opt/homebrew/bin/gh counts; gh-comment.sh does not). A read
+# differs in the SUBCOMMAND word, so `gh pr view 5 && echo create` stays silent while `sudo gh pr
+# create`, `URL=$(gh pr create)`, `xargs gh pr comment` and `bash -c 'gh pr create'` warn. An unescaped
+# newline ends a command, so `gh pr` NEWLINE `create` is two commands and silent.
+#
+# _FLAGS mirrors orchestrate-guard.sh's flag-group regex (inside `is_pr_merge`): zero or more
+# `-flag [value]` groups, a value being a token that does not itself start with `-`.
+_FLAGS='([[:space:]]+-[^[:space:]]+([[:space:]]+[^-[:space:]][^[:space:]]*)?)*'
+
+# PREFILTER (#perf): a no-fork bash test that a command COULD match rule 2 or 3. It must be a true
+# SUPERSET of what _steer_scan can flag. Rule 3 needs a `gh` word, a `pr` word and create|comment|new;
+# rule 2 needs `gh`, `api` and one of the mutation flags (a GraphQL mutation always carries its query
+# via -f/-F/--field/--raw-field, whose spellings all contain `-f`/`-F`). Each word test ends on any
+# non-word byte, NOT on whitespace: the scanner's own GH also accepts end-of-string, and heredoc()
+# rewrites a `<<WORD` to a space, so `gh api<<D graphql -f query=...` reads as `gh api graphql ...`
+# to the scanner while the raw bytes have `<` after `api`. Demanding whitespace there filtered out
+# commands the scanner DOES flag, inverting the containment. A backslash-newline can split
+# ANY of those words (`gh\<NL> pr`, `cre\<NL>ate`), and joining in bash (`${c//\\$'\n'/}`) is
+# super-linear on a long command, so a command carrying one skips the prefilter and goes straight to
+# the (linear) scanner, which joins it. Everything else costs what it did on base: no awk, no grep.
+_steer_prefilter() {
+  local c="$1" re_gh re_pr re_sub re_api re_flag
+  [[ $c == *\\$'\n'* ]] && return 0
+  re_gh='(^|[^[:alnum:]_-])gh([^[:alnum:]_-]|$)'
+  re_pr='(^|[^[:alnum:]_-])pr([^[:alnum:]_-]|$)'
+  re_sub='(create|comment|new)'
+  re_api='(^|[^[:alnum:]_-])api([^[:alnum:]_-]|$)'
+  re_flag='(-[XfF]|--method|--input)'
+  [[ $c =~ $re_gh ]] || return 1
+  [[ $c =~ $re_pr && $c =~ $re_sub ]] && return 0
+  [[ $c =~ $re_api && $c =~ $re_flag ]] && return 0
   return 1
 }
 
-# A raw `gh pr` SUBCOMMAND that has a real canonical alternative, run directly on the command line
-# (#159). This is canonical-STEERING, NOT creep prevention: every high-traffic gh pr subcommand is
-# already allow-listed (so it never prompts), and a hook cannot intercept the "always allow" click -
-# so warning the allow-listed set buys nothing. We nudge ONLY the two subcommands with a canonical
-# target: `comment` (-> reply-comment.sh / gh-comment.sh) and `create` (-> /prep-pr). DELIBERATELY
-# EXCLUDES `merge` (floor-denied in a marker session, AND the sanctioned prompt-free path in solo -
-# a nag there is wrong), plus `edit`/`ready`/`close`/`review` and all reads (allow-listed lifecycle
-# or no canonical redirect). A wrapper-ALONE invocation (gh-comment.sh, reply-comment.sh) is already
-# silent: the bare-`gh` check needs `gh` + space/EOL and the char after `gh` in those names is `-`;
-# likewise `comment`/`create` inside a wrapper name is not space-delimited. ACCEPTED false-positive
-# (mirrors is_raw_gh_api_mutation's F30 class): a gh pr READ compounded with a standalone
-# `comment`/`create` word in an arg trips the whole-line grep - harmless (advisory WARN, exit 0).
-is_raw_gh_pr_mutation() {
-  local c="$1"
-  printf '%s' "$c" | grep -Eq '(^|[^[:alnum:]_-])gh([[:space:]]|$)' || return 1
-  printf '%s' "$c" | grep -Eq '(^|[[:space:]])pr([[:space:]]|$)' || return 1
-  printf '%s' "$c" | grep -Eq '(^|[[:space:]])(comment|create)([[:space:]]|$)' && return 0
-  return 1
+# Print `api` (rule 2 fires), `pr` (rule 3 fires) or nothing. LC_ALL=C so the walk is bytewise.
+# LINEAR by construction: the input is split to a char array once; every buffer is appended in 256-byte
+# chunks and joined pairwise only when a clause is judged; no substr() of the whole command is ever
+# taken in the loop (BWK awk's substr is O(length of the source string), which is what made the
+# previous scanner quadratic: 1MB of `'a'` words took 58s there, ~1s on base).
+# KNOWN RESIDUALS (advisory; all are either rare or undecidable without running bash):
+#   - UNQUOTED PROSE: `echo next: gh pr create` warns. bash cannot tell an echo argument from a
+#     command word without knowing what the words are used for, and silencing `echo`/`printf` clauses
+#     would also silence `echo gh pr create | bash`, a real invocation that base and round 2 warned on.
+#     A warn-only nudge on a rare shape is the right side to err on. Quote the prose to silence it.
+#   - A QUOTED string piped to a shell (`echo 'gh pr create' | bash`) and a quote passed to a shell
+#     other than sh/bash/zsh/dash/ksh -c or eval (e.g. `ssh host 'gh pr create'`) are prose: silent.
+#   - A GraphQL document not on the command line (-F query=@file, --input FILE, `--input -` with a
+#     heredoc JSON body, -f query="$Q") cannot be classified and is SILENT-ON-DOUBT.
+#   - A `query=` field whose VALUE is a search string beginning `mutation <word>` warns.
+#   - Inside a $'...' -c script, a `\'` is taken as an escape, not as a nested prose quote.
+#   - `case x in a) ...` inside $(...) closes the substitution early (as round 2 did).
+_steer_scan() {
+  printf '%s' "$1" | LC_ALL=C awk -v FL="$_FLAGS" '
+    # ---- chunked buffers: append O(1) amortized, joined pairwise (O(n log n)) only when judged ----
+    function bapp(k, c) {
+      sb[k] = sb[k] c
+      if (++sl[k] >= 256) {
+        ch[k, ++nch[k]] = sb[k]
+        if (!gq[k] && index(lc[k] sb[k], "graphql")) gq[k] = 1
+        lc[k] = sb[k]; sb[k] = ""; sl[k] = 0
+      }
+    }
+    function bget(k,   i, m, w) {
+      m = nch[k]; if (m == 0) return sb[k]
+      for (i = 1; i <= m; i++) W[i] = ch[k, i]
+      W[++m] = sb[k]
+      while (m > 1) { w = 0; for (i = 1; i <= m; i += 2) W[++w] = (i < m ? W[i] W[i + 1] : W[i]); m = w }
+      return W[1]
+    }
+    function bclr(k) { sb[k] = ""; sl[k] = 0; nch[k] = 0; lc[k] = ""; gq[k] = 0 }
+    function tail(k,   s, l) { s = lc[k] sb[k]; l = length(s); return (l > 64 ? substr(s, l - 63) : s) }
+    # ---- judging one clause of code frame k ----
+    function judge(k,   s, dc) {
+      s = bget(k)
+      if (!index(s, "gh") || s !~ GH) return
+      if (index(s, "api") && s ~ API) {
+        if (index(s, "graphql") && s ~ GQL) {
+          dc = bget("d" k)
+          if (dc ~ MUTD || s ~ MUTU || s ~ GQLM) { print "api"; exit }
+        } else if (s ~ RM || s ~ RF) { print "api"; exit }
+      }
+      if (!FPR && index(s, "pr") && s ~ PR) FPR = 1
+    }
+    function cut(sep) { judge(d); bclr(d); bclr("d" d); lastcut[d] = sep }
+    # ---- the frame stack ----
+    function push(t, code, st,   p) {
+      p = d; d++
+      ft[d] = t; fc[d] = code; fp[d] = 0; dk[d] = 0; dq[d] = 0; pb[d] = ""; fst[d] = st
+      csq[d] = csq[p]; qd[d] = qd[p]
+      if (t == "P" || t == "B" || t == "A") qd[d] = 0
+      if (code && (t == "S" || t == "E")) csq[d] = d
+      if (code && t == "D") qd[d] = d
+      if (code) { bclr(d); bclr("d" d); lastcut[d] = "" }
+    }
+    function pop() {
+      if (fc[d]) judge(d)
+      if (ft[d] == "H") { HD = hprev[d]; HE = (HD ? he[HD] : -1) }
+      if (dk[d] && !dq[d]) bapp("d" dk[d], "\n")
+      d--
+    }
+    function closeto(k) { if (k < 2) k = 2; while (d >= k) pop() }
+    # a quote in a code frame: CODE when it is the script of `<shell> [opts] -c` or `eval`
+    function codeq(   tl, k, w) {
+      # cheap necessary condition on the raw bytes first (no string building on the common path): the
+      # quote follows whitespace, and the word before it is `eval` or a `-...c...` option cluster
+      k = j - 1
+      while (k >= 1 && (a[k] == " " || a[k] == "\t" || a[k] == "\n" || a[k] == "\\")) k--
+      if (k == j - 1 || k < 1) return 0
+      w = ""
+      while (k >= 1 && k > j - 24 && a[k] !~ /[[:space:]]/) { w = a[k] w; k-- }
+      if (w != "eval" && w !~ /^-[A-Za-z]*c[A-Za-z]*$/) return 0
+      tl = tail(d)
+      if (!index(tl, "sh") && !index(tl, "eval")) return 0
+      return (tl ~ CODEQ || tl ~ /(^|[^[:alnum:]_.-])eval[[:space:]]+$/)
+    }
+    function cq(t, st) { bapp(d, "Q"); push(t, 1, st) }
+    # a PROSE quote: placeholder word for the clause; its text feeds the document buffer only when it
+    # is the query= value (confirmed now, or probed from its own first 6 bytes)
+    function pq(t, st,   p, tl) {
+      p = d; bapp(p, "Q"); push(t, 0, st)
+      # the query= value? (raw adjacency: `query=` is unquoted code directly before the quote)
+      tl = (j > 6 && a[j - 1] == "=" && a[j - 6] == "q") ? a[j-6] a[j-5] a[j-4] a[j-3] a[j-2] "=" : ""
+      dk[d] = p; dq[d] = (tl == "query=" ? 0 : 1)
+    }
+    # FAST PATH for the common prose single quote: not inside a code "..." (whose `"` must still close
+    # it), not a possible query= value (a `=` before it, or content starting with `q`): skip to the
+    # closing quote without a frame. (Inside a single-quoted code script a quote never reaches here: the main loop
+    # closes the script first.) Bounded by the enclosing shell-fed heredoc body; unbalanced -> slow path.
+    function sqprose(   k, lim) {
+      if (qd[d] || a[j - 1] == "=" || a[j + 1] == "q") { pq("S", j + 1); return }
+      lim = (HD ? HE : n + 1)
+      k = j + 1; while (k < lim && a[k] != SQ) k++
+      if (k >= lim) { pq("S", j + 1); return }
+      bapp(d, "Q"); j = k
+    }
+    function dapp(c) {
+      if (dq[d]) {
+        pb[d] = pb[d] c
+        if (length(pb[d]) >= 6) { if (pb[d] == "query=") dq[d] = 0; else dk[d] = 0 }
+        return
+      }
+      bapp("d" dk[d], c)
+    }
+    function ws() { return (j == 1 || j == fst[d] || a[j - 1] ~ /[[:space:];&|(]/) }
+    # ---- heredocs ----
+    function heredoc(   k, w, wl, strip, c2, tl, i, m) {
+      tl = tail(d)
+      k = j + 2; strip = 0; w = ""; wl = 0
+      if (a[k] == "-") { strip = 1; k++ }
+      while (a[k] == " " || a[k] == "\t") k++
+      while (k <= n && a[k] !~ /[[:space:];&|<>()]/) {
+        c2 = a[k]
+        if (c2 != SQ && c2 != "\"" && c2 != "\\" && ++wl <= 256) w = w c2
+        k++
+      }
+      if (w != "") {
+        nhd++; hs[nhd] = strip; m = split(w, HT, ""); hl[nhd] = m
+        for (i = 1; i <= m; i++) hdc[nhd, i] = HT[i]
+        hc[nhd] = (index(tl, "sh") && tl ~ SHFEED)
+        hg[nhd] = (gq[d] || index(lc[d] sb[d], "graphql") > 0)
+      }
+      return k - 1
+    }
+    # j is at a code-frame newline with pending heredocs: locate every body (linear, no substr), copy a
+    # graphql prose body into the document, judge the clause, then skip prose bodies / enter code ones.
+    function hbodies(   h, k, bs, de, p, i, L, ok, nq, code, pipe) {
+      k = j + 1; nq = 0
+      pipe = (lastcut[d] == "|" && nch[d] == 0 && sb[d] ~ SHALONE)
+      for (h = 1; h <= nhd; h++) {
+        bs = k; de = n + 1
+        while (k <= n) {
+          p = k
+          if (hs[h]) while (a[p] == "\t") p++
+          L = hl[h]; ok = 1
+          for (i = 1; i <= L; i++) if (a[p + i - 1] != hdc[h, i]) { ok = 0; break }
+          if (ok && (p + L > n || a[p + L] == "\n")) { de = k; k = p + L + 1; break }
+          while (k <= n && a[k] != "\n") k++
+          k++
+        }
+        if (k > n + 1) k = n + 1
+        code = (hc[h] || pipe)
+        nq++; Qs[d, nq] = bs; Qe[d, nq] = de; Qk[d, nq] = k; Qc[d, nq] = code
+        if (!code && hg[h]) { for (i = bs; i < de; i++) bapp("d" d, a[i]); bapp("d" d, "\n") }
+      }
+      nhd = 0
+      cut("")
+      qn[d] = nq; qi[d] = 1
+      runq()
+    }
+    function runq(   i, p) {
+      p = d
+      while (qi[p] <= qn[p]) {
+        i = qi[p]++
+        if (Qc[p, i]) {
+          push("H", 1, Qs[p, i]); he[d] = Qe[p, i]; hk[d] = Qk[p, i]
+          hprev[d] = HD; HD = d; HE = he[d]; j = Qs[p, i] - 1
+          return
+        }
+        j = Qk[p, i] - 1
+      }
+    }
+    { L[NR] = $0 }
+    END {
+      # join the lines pairwise (O(n log n); a running T = T "\n" $0 is quadratic) and split ONCE
+      m = NR
+      while (m > 1) { w = 0; for (i = 1; i <= m; i += 2) L[++w] = (i < m ? L[i] "\n" L[i + 1] : L[i]); m = w }
+      n = (NR ? split(L[1], a, "") : 0)
+      SQ = sprintf("%c", 39)
+      # the only bytes a code frame / a prose "..." acts on; everything else is appended as-is
+      m = split("\\ \" $ ( ) ` # < ; | &", tmp, " "); for (i = 1; i <= m; i++) SPC[tmp[i]] = 1
+      SPC[SQ] = 1; SPC["\n"] = 1
+      DSP["\\"] = 1; DSP["\""] = 1; DSP["$"] = 1; DSP["`"] = 1
+      SHC = "(ba|z|da|k)?sh([[:space:]]+(-[A-Za-z]+|--[A-Za-z-]+|[-+]O[[:space:]]+[A-Za-z_]+))*"
+      CODEQ = "(^|[^[:alnum:]_.-])" SHC "[[:space:]]+-[A-Za-z]*c[A-Za-z]*[[:space:]]+$"
+      SHFEED = "(^|[^[:alnum:]_.-])" SHC "[[:space:]]*$"
+      SHALONE = "^[[:space:]]*((sudo|command|exec)[[:space:]]+)?" SHC "[[:space:]]*$"
+      GH = "(^|[^[:alnum:]_-])gh([[:space:]]|$)"
+      API = "(^|[[:space:]])api([[:space:]]|$)"
+      GQL = "(^|[[:space:]])api" FL "[[:space:]]+graphql([[:space:]]|$)"
+      MTAIL = "mutation([[:space:]]*[({]|[[:space:]]+[A-Za-z_]|[[:space:]]*$)"
+      MUTD = "((^|\n)[[:space:]]*|[}][[:space:]]*)" MTAIL
+      MUTU = "query=" MTAIL
+      GQLM = "(--method[[:space:]=]+|-X[[:space:]=]*)(PATCH|PUT|DELETE)"
+      RM = "(--method[[:space:]=]|-X[[:space:]=]?[A-Za-z])"
+      RF = "(^|[[:space:]])(--(field|input|raw-field)[[:space:]=]|-[fF][[:space:]=]?[^[:space:]])"
+      PR = "(^|[^[:alnum:]_.-])gh" FL "[[:space:]]+pr" FL "[[:space:]]+(create|comment|new)([^[:alnum:]_-]|$)"
+      d = 1; ft[1] = "U"; fc[1] = 1; fp[1] = 0; csq[1] = 0; qd[1] = 0; fst[1] = 1
+      bclr(1); bclr("d1"); HD = 0; HE = -1; nhd = 0; FPR = 0
+      for (j = 1; j <= n; j++) {
+        if (HD && j >= HE) {
+          # the innermost shell-fed heredoc body ended: close it (and anything left open inside it)
+          k0 = hk[HD]; closeto(HD)
+          if (j < k0) j = k0 - 1; else j--
+          runq(); continue
+        }
+        c = a[j]; t = ft[d]
+        # a single quote ALWAYS ends an enclosing -c/eval single-quoted script (bash has no escape in '')
+        if (c == SQ && csq[d]) { closeto(csq[d]); continue }
+        if (t == "K") {
+          if (c != "\n") { if (c == "\"" && qd[d]) closeto(qd[d]); continue }
+          pop(); t = ft[d]
+        }
+        if (!fc[d]) {
+          if (t == "S") {
+            if (c == SQ) pop(); else if (c == "\"" && qd[d]) closeto(qd[d]); else if (dk[d]) dapp(c)
+            continue
+          }
+          if (t == "E") {
+            if (c == "\\") { j++; if (dk[d]) dapp(a[j]) }
+            else if (c == SQ) pop(); else if (c == "\"" && qd[d]) closeto(qd[d]); else if (dk[d]) dapp(c)
+            continue
+          }
+          if (t == "X") {
+            if (c == "\\" && a[j + 1] == "\"") { j++; pop() }
+            else if (c == "\\") { j++; if (dk[d]) dapp(a[j]) }
+            else if (c == "\"") closeto(qd[d]); else if (dk[d]) dapp(c)
+            continue
+          }
+          if (t == "D") {
+            if (!(c in DSP)) { if (dk[d]) dapp(c); continue }
+            if (c == "\\") { j++; if (dk[d]) dapp(a[j]) }
+            else if (c == "\"") pop()
+            else if (c == "$" && a[j + 1] == "(") {
+              if (a[j + 2] == "(") { push("A", 0, j + 3); j += 2 } else { push("P", 1, j + 2); j++ }
+            }
+            else if (c == "`") push("B", 1, j + 1)
+            else if (dk[d]) dapp(c)
+            continue
+          }
+          if (t == "A") {
+            if (c == "(") fp[d]++
+            else if (c == ")") { if (fp[d] > 0) fp[d]--; else { if (a[j + 1] == ")") j++; pop() } }
+            continue
+          }
+        }
+        # ---- a code frame: U, P, B, H, or a code quote S/D/E ----
+        if (!(c in SPC)) { bapp(d, c); continue }
+        if (c == "\\") {
+          nx = a[j + 1]
+          if (nx == "\n") { j++; continue }
+          if (t == "D" && nx == "\"") { pq("X", j + 2); j++; continue }
+          if (t == "E" && nx == "n") { j++; c = "\n" }
+          else if (nx == SQ && csq[d] && ft[csq[d]] == "S") continue
+          else { bapp(d, c); bapp(d, nx); j++; continue }
+        }
+        if (c == SQ) { if (codeq()) cq("S", j + 1); else sqprose(); continue }
+        if (c == "\"") {
+          if (t == "D") { pop(); continue }
+          if (qd[d]) { closeto(qd[d]); continue }
+          if (codeq()) cq("D", j + 1); else pq("D", j + 1)
+          continue
+        }
+        # !csq[d]: inside a single-quoted code script bash has no ANSI-C quote -- it ends the string
+        # at the next SQ, so that SQ is the script CLOSE, not the open of one. Without the guard this
+        # branch beats the SQ close above whenever a $ sits immediately before the closing quote (a
+        # trailing regex anchor is the common way that happens), eats that quote, and opens a frame
+        # that never closes -- silencing every clause after it. Vector: SQ_DOLLAR_WARN.
+        if (c == "$" && a[j + 1] == SQ && !csq[d]) { if (codeq()) cq("E", j + 2); else pq("E", j + 2); j++; continue }
+        if (c == "$" && a[j + 1] == "(") {
+          bapp(d, "X")
+          if (a[j + 2] == "(") { push("A", 0, j + 3); j += 2 } else { push("P", 1, j + 2); j++ }
+          continue
+        }
+        if (c == "(" && a[j + 1] == "(" && ws()) { bapp(d, "X"); push("A", 0, j + 2); j++; continue }
+        if (c == "(" && j > 1 && (a[j - 1] == "<" || a[j - 1] == ">")) { bapp(d, "X"); push("P", 1, j + 1); continue }
+        if (c == "`") { if (t == "B") pop(); else { bapp(d, "X"); push("B", 1, j + 1) } ; continue }
+        if (t == "P" && c == "(") { fp[d]++; bapp(d, c); continue }
+        if (t == "P" && c == ")") { if (fp[d] > 0) { fp[d]--; bapp(d, c) } else pop(); continue }
+        if (c == "#" && ws()) { push("K", 0, j + 1); continue }
+        if (c == "<" && a[j + 1] == "<" && a[j + 2] != "<" && !(j > 1 && a[j - 1] == "<")) {
+          j = heredoc(); bapp(d, " "); continue
+        }
+        if (c == "\n") { if (nhd > 0) hbodies(); else cut(""); continue }
+        if (c == ";") { cut(""); continue }
+        if (c == "|") { if (a[j + 1] == "|") { j++; cut("") } else cut("|"); continue }
+        if (c == "&") {
+          if (a[j + 1] == "&") { j++; cut("") }
+          else if (!(j > 1 && (a[j - 1] == ">" || a[j - 1] == "<")) && a[j + 1] != ">") cut("")
+          else bapp(d, c)
+          continue
+        }
+        bapp(d, c)
+      }
+      closeto(2); judge(1)
+      if (FPR) print "pr"
+    }'
+}
+
+# Which command rule (if any) fires: prints api | pr | nothing. Prefilter first (no fork on a miss).
+_command_rule() {
+  _steer_prefilter "$1" || return 0
+  _steer_scan "$1"
 }
 
 # #312: EVERY key this session could have armed under, first-precedence first. Mirrors the guard's
@@ -429,14 +784,18 @@ if [ "$tool_name" = "Agent" ] && is_foreground_agent "$tool_input_json" && marke
   emit_warn "Foreground Agent blocks the lead console for its whole run: give it a 'name' AND omit run_in_background:false (both halves). Sanctioned if you are solo."
 fi
 
-# (2) raw gh-api mutation WARN: marker-independent.
-if [ -n "$cmd" ] && is_raw_gh_api_mutation "$cmd"; then
-  emit_warn "Use the gh-* wrapper (gh-api-get.sh / gh-comment.sh / gh-codeql-dismiss.sh / gh-codeql-autofix.sh / gh-resolve-thread.sh / gh-delete-branch.sh) instead of raw gh api."
-fi
-
-# (3) raw gh pr comment/create -> canonical path WARN: marker-independent (#159; advisory only).
-if [ -n "$cmd" ] && is_raw_gh_pr_mutation "$cmd"; then
-  emit_warn "Canonical path: 'gh pr comment' -> reply-comment.sh / gh-comment.sh; 'gh pr create' -> /prep-pr (the required gate)."
+# (2)/(3) command rules, marker-independent (#159; advisory only). ONE scan decides both; the
+# prefilter inside _command_rule keeps a command with no gh api/pr shape fork-free.
+if [ -n "$cmd" ]; then
+  cmd_rule=$(_command_rule "$cmd" 2>/dev/null)
+  # (2) raw gh-api mutation WARN.
+  if [ "$cmd_rule" = "api" ]; then
+    emit_warn "Use the gh-* wrapper (gh-api-get.sh / gh-comment.sh / gh-codeql-dismiss.sh / gh-codeql-autofix.sh / gh-resolve-thread.sh / gh-delete-branch.sh) instead of raw gh api."
+  fi
+  # (3) raw gh pr comment/create -> canonical path WARN.
+  if [ "$cmd_rule" = "pr" ]; then
+    emit_warn "Canonical path: 'gh pr comment' -> reply-comment.sh / gh-comment.sh; 'gh pr create' -> /prep-pr (the required gate)."
+  fi
 fi
 
 exit 0
