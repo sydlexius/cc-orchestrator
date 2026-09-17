@@ -973,7 +973,7 @@ fi
 
 # The actionable-body test is a DISJUNCTION of two reviewer-shaped clauses. Keeping
 # them separate is deliberate: the first is CodeRabbit's prose vocabulary, the second
-# anchors on a literal Copilot HTML element, and collapsing them would let CR phrasing
+# anchors on Copilot's structural suppressed-block shape, and collapsing them would let CR phrasing
 # admit a Copilot boilerplate body (and vice versa) on a wording coincidence.
 #
 # #374: the CR clause's keyword allowlist matches NONE of Copilot's vocabulary --
@@ -986,10 +986,11 @@ fi
 # The "^## Pull request overview" exclusion stays on the CR clause ONLY. It was never
 # the mechanism that dropped Copilot (the allowlist already had, independently), and
 # removing it would let a CR body that happens to open with that heading through.
-# Anchoring the Copilot clause on the literal <summary> element rather than on prose
-# is the "demand the exact shape" technique the floor matchers use: a boilerplate
-# "generated no new comments" body carries no such element and stays filtered, which
-# keeps the 58-of-99 pure-boilerplate majority out of the checklist.
+# Anchoring the Copilot clause on a STRUCTURAL shape (SUPPRESSED_RE: the <summary> element
+# or, since #417, a line-anchored h2-h4 heading) rather than on prose is the "demand the
+# exact shape" technique the floor matchers use: a boilerplate "generated no new comments"
+# body carries neither shape and stays filtered, which keeps the 58-of-99 pure-boilerplate
+# majority out of the checklist.
 review_bodies_raw=$(echo "$all_reviews" | jq --arg sup_re "$SUPPRESSED_RE" '[.[] | select(
   .body != "" and .body != null and
   '"$BOT_LOGIN_FILTER"' and
@@ -1065,9 +1066,10 @@ review_bodies=$(jq -n \
     # (#378) Both vendor surfaces count: the CR outside-diff collapsible and the
     # Copilot suppressed collapsible.
     #
-    # BOTH legs anchor on the literal <summary> ELEMENT and on a POSITIVE count, for
-    # the same two reasons the suppressed leg already did:
-    #   - Prose that MENTIONS the phrase is not a finding. Without the element anchor,
+    # BOTH legs anchor on a STRUCTURAL shape and on a POSITIVE count: the CR leg on the
+    # literal <summary> element, the Copilot leg on SUPPRESSED_RE (the element or, since
+    # #417, a line-anchored h2-h4 heading). Two reasons:
+    #   - Prose that MENTIONS the phrase is not a finding. Without the structural anchor,
     #     a body saying "will use Outside diff range comments (3) next round" would make
     #     that review unclearable by an inline reply. Measured: every real occurrence
     #     across two repos carries the element (`> <summary>WARNING Outside diff range
@@ -1321,7 +1323,8 @@ if [ "$itemized" = true ]; then
     # the Copilot "Suppressed comments (N)" block. BOTH are annotated onto the line so
     # the header count == the visible accounting (#252 core).
     #
-    # The count is matched as [1-9][0-9]* rather than [0-9]+ so a "(0)" block does not
+    # Both shapes are matched structurally (the CR <summary> element; the SUPPRESSED_RE element
+    # or heading for Copilot, #417). The count is matched as [1-9][0-9]* rather than [0-9]+ so a "(0)" block does not
     # admit a body and then contribute nothing -- that would count the body itself as 1
     # finding when it holds none, the cries-wolf direction (#376 review).
     #

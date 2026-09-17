@@ -104,9 +104,18 @@ for n in "${prs[@]}"; do
   # Unreplied count via the read-only helper; degrade to "?" on any failure.
   unrep="?"
   if [ -x "$helper" ]; then
-    if c=$("$helper" --count-only "$n" "$repo" 2>/dev/null); then
+    # stderr is captured to a temp file rather than discarded, for ONE reason (#417): the
+    # helper's SUPPRESSED-FORMAT-WARN canary means an unrecognized Copilot shape may be
+    # reading as 0 here. Only that line is forwarded (to stderr); the rest of the helper's
+    # stderr stays suppressed and the one-line-per-PR stdout contract is unchanged.
+    helper_err=$(mktemp 2>/dev/null) || helper_err=/dev/null
+    if c=$("$helper" --count-only "$n" "$repo" 2>"$helper_err"); then
       c=${c//[[:space:]]/}
       [[ "$c" =~ ^[0-9]+$ ]] && unrep="$c"
+    fi
+    if [ "$helper_err" != /dev/null ]; then
+      grep -E '^SUPPRESSED-FORMAT-WARN:' "$helper_err" >&2 || true
+      rm -f "$helper_err"
     fi
   fi
 
