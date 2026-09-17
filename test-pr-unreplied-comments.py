@@ -1573,6 +1573,14 @@ def main():
     check("#417 canary: a recognized '(0)' heading is silent", "SUPPRESSED-FORMAT" not in err)
     rc, out, err = run(["--allow-stale"], reviews=COPILOT_BOILERPLATE)
     check("#417 canary: boilerplate with no phrase is silent", "SUPPRESSED-FORMAT" not in err)
+    # The login match is EXACT, not a prefix: a login that merely STARTS with "Copilot"
+    # is not the Copilot reviewer. (fix-scoped hostile review, PR #418)
+    rc, out, err = run(["--allow-stale"],
+                       reviews=copilot(437, "## x\n**Suppressed comments (3)**\n", login="Copilot-fan"))
+    check("#417 canary: a login that only PREFIXES Copilot does not WARN", "SUPPRESSED-FORMAT" not in err)
+    rc, out, err = run(["--allow-stale"],
+                       reviews=copilot(438, "## x\n**Suppressed comments (3)**\n", login="Copilot"))
+    check("#417 canary: the exact 'Copilot' login still WARNs", "SUPPRESSED-FORMAT" in err and "438" in err)
 
     print()
     if FAILS:

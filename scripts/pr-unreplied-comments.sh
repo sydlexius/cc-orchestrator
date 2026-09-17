@@ -1014,7 +1014,7 @@ review_bodies_raw=$(echo "$all_reviews" | jq --arg sup_re "$SUPPRESSED_RE" '[.[]
 # suppressed comments on generated files" from any bot is not a format change, and a canary
 # that cries wolf is one nobody reads.
 echo "$all_reviews" | jq -r --arg shape_re "$SUPPRESSED_SHAPE_RE" '.[] | select(
-  (.user.login | test("^(Copilot|copilot-pull-request-reviewer)")) and
+  (.user.login | test("^(Copilot|copilot-pull-request-reviewer\\[bot\\])$")) and
   ((.body // "") | test("Suppressed comments \\(")) and
   ((.body // "") | test($shape_re) | not)
 ) | "SUPPRESSED-FORMAT-WARN: review \(.id) by \(.user.login) mentions Suppressed comments in an unrecognized shape; its findings are NOT counted. Read it by hand and update SUPPRESSED_RE."' >&2 || true

@@ -109,6 +109,9 @@ for n in "${prs[@]}"; do
     # reading as 0 here. Only that line is forwarded (to stderr); the rest of the helper's
     # stderr stays suppressed and the one-line-per-PR stdout contract is unchanged.
     helper_err=$(mktemp 2>/dev/null) || helper_err=/dev/null
+    # Removed on EXIT too, so a signal between mktemp and the rm below leaves no temp file.
+    # shellcheck disable=SC2064  # expand NOW: the trap must name THIS iteration's file
+    [ "$helper_err" != /dev/null ] && trap "rm -f '$helper_err'" EXIT
     if c=$("$helper" --count-only "$n" "$repo" 2>"$helper_err"); then
       c=${c//[[:space:]]/}
       [[ "$c" =~ ^[0-9]+$ ]] && unrep="$c"
@@ -116,6 +119,7 @@ for n in "${prs[@]}"; do
     if [ "$helper_err" != /dev/null ]; then
       grep -E '^SUPPRESSED-FORMAT-WARN:' "$helper_err" >&2 || true
       rm -f "$helper_err"
+      trap - EXIT
     fi
   fi
 
