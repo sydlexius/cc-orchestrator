@@ -815,6 +815,14 @@ for _attempt in 1 2 3; do
   fi
 done
 unreplied_out="$(cat "$unreplied_capture")"
+# FORWARD the helper's format-drift canary (#417). The capture above is deleted on success,
+# so a SUPPRESSED-FORMAT-WARN the helper printed was invisible exactly where it matters: an
+# unrecognized Copilot suppressed-comments shape counts as 0 findings and this oracle PASSes.
+# ADVISORY by design, never a BLOCK: nothing an agent can do clears a vendor format change,
+# so blocking would wedge every Copilot-reviewed PR until the matcher is updated. Stderr only,
+# so no stdout consumer sees it; orchestrate-authorize-merge.sh reads 2>&1 but extracts only
+# a `headRefOid=<40-hex>` token, which this line cannot contain.
+printf '%s\n' "$unreplied_out" | grep -E '^SUPPRESSED-FORMAT-WARN:' >&2 || true
 if [ "$helper_rc" -ne 0 ]; then
   helper_tail="$(tail -n 5 "$unreplied_capture")"
   rm -f "$unreplied_capture"

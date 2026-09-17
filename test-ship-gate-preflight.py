@@ -191,7 +191,7 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         threads_json="__DEFAULT__", threads_fail=False, protection=None, comments=None,
         comments_fail=False, reviews=None, reviews_fail=False,
         rules_main=None, rules_base=None, rules_page2=None, rules_fail=False, default_branch_fail=False,
-        rules_main_fail=False, default_branch=None):
+        rules_main_fail=False, default_branch=None, unreplied_warn=False):
     """Invoke the oracle with stubbed gh + pr-unreplied-comments.sh + gh-react.sh.
     Returns (exit_code, stdout, stderr, argv) where argv is the recorded helper
     argv content (one line per invocation, read back from the log) -- used to
@@ -363,6 +363,11 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
                     "  echo \"=== Review-body comments with actionable findings: ${UNREPLIED_RAW} ===\"\n"
                     "  echo 'some other output line'; exit 0\n"
                     "fi\n"
+                    "# UNREPLIED_WARN: emit a SUPPRESSED-FORMAT-WARN on the helper's stderr\n"
+                    "# (#417), to prove the oracle forwards it without changing the verdict.\n"
+                    "if [ -n \"${UNREPLIED_WARN:-}\" ]; then\n"
+                    "  echo 'SUPPRESSED-FORMAT-WARN: review 77 by Copilot mentions Suppressed comments in an unrecognized shape' >&2\n"
+                    "fi\n"
                     "n=\"${UNREPLIED_FINDINGS:-0}\"\n"
                     "# Real script prints the line ONLY when N>0.\n"
                     "if [ \"$n\" -gt 0 ]; then\n"
@@ -445,6 +450,9 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         if gh_fail:
             env["GH_FAIL"] = "1"
         env["UNREPLIED_FINDINGS"] = str(unreplied_findings)
+        env.pop("UNREPLIED_WARN", None)
+        if unreplied_warn:
+            env["UNREPLIED_WARN"] = "1"
         if unreplied_fail:
             env["UNREPLIED_FAIL"] = "1"
         if unreplied_raw is not None:
@@ -1597,6 +1605,24 @@ def main():
     check("#375 M5c: a CLEAN reconciliation says so on the PASS path (a reconciled "
           "PASS must be distinguishable from a pre-#375 one)",
           rc == 0 and "reconciled against" in (out + err))
+
+    print()
+    print("== #417: the helper's SUPPRESSED-FORMAT-WARN reaches the oracle's caller ==")
+    # The oracle captures the helper's combined output into a temp file and deletes it on
+    # success, so a format-drift warning was invisible exactly where it matters: a future
+    # Copilot shape reads as 0 findings and PASSes. Forwarded to stderr, ADVISORY: it must
+    # not change the verdict (nothing an agent can do clears a vendor format change, so
+    # blocking on it would wedge the gate) and must stay off stdout. (Copilot, PR #418)
+    rc, out, err, _ = run(["123", "owner/repo"], fixture_json=ALL_GREEN, unreplied_warn=True)
+    check("#417: a helper SUPPRESSED-FORMAT-WARN is forwarded to the oracle's stderr",
+          "SUPPRESSED-FORMAT-WARN" in err)
+    check("#417: the forwarded warning does not change the verdict (still PASS, exit 0)", rc == 0)
+    check("#417: the forwarded warning stays off stdout", "SUPPRESSED-FORMAT-WARN" not in out)
+    rc, out, err, _ = run(["123", "owner/repo"], fixture_json=ALL_GREEN)
+    check("#417: no warning from the helper -> none forwarded", "SUPPRESSED-FORMAT-WARN" not in err)
+    rc, out, err, _ = run(["123", "owner/repo"], fixture_json=ALL_GREEN, unreplied_findings=3, unreplied_warn=True)
+    check("#417: warning is forwarded on the BLOCK path too, and findings still BLOCK",
+          rc != 0 and "SUPPRESSED-FORMAT-WARN" in err)
 
     print()
     if FAILS:

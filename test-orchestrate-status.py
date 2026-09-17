@@ -83,6 +83,9 @@ pr = None
 for a in args:
     if a.isdigit():
         pr = a; break
+if os.environ.get("UNREPLIED_WARN_%s" % pr) == "1":
+    sys.stderr.write("SUPPRESSED-FORMAT-WARN: review 77 by Copilot mentions Suppressed comments in an unrecognized shape\n")
+    sys.stderr.write("some other helper stderr noise\n")
 if os.environ.get("UNREPLIED_FAIL_%s" % pr) == "1":
     sys.stderr.write("unreplied boom\n"); sys.exit(2)
 sys.stdout.write(os.environ.get("UNREPLIED_%s" % pr, "0") + "\n")
@@ -91,7 +94,7 @@ sys.exit(0)
 
 
 def run(args, *, prlist="[]", views=None, unreplied=None, unreplied_fail=None,
-        gh_list_fail=False):
+        gh_list_fail=False, unreplied_warn=None):
     views = views or {}
     unreplied = unreplied or {}
     unreplied_fail = unreplied_fail or []
@@ -120,6 +123,8 @@ def run(args, *, prlist="[]", views=None, unreplied=None, unreplied_fail=None,
             env["PRVIEW_%s_JSON" % n] = doc
         for n, cnt in unreplied.items():
             env["UNREPLIED_%s" % n] = str(cnt)
+        for n in (unreplied_warn or []):
+            env["UNREPLIED_WARN_%s" % n] = "1"
         for n in unreplied_fail:
             env["UNREPLIED_FAIL_%s" % n] = "1"
 
@@ -269,6 +274,23 @@ def main():
     verbs = {tuple(c[:2]) for c in calls}
     check("read-only: only pr list/view + repo view verbs used",
           verbs <= {("pr", "list"), ("pr", "view"), ("repo", "view")})
+
+    print()
+    # #417: the helper's SUPPRESSED-FORMAT-WARN used to die in `2>/dev/null`, so a future
+    # Copilot format change read as `unreplied:0` with no signal anywhere. Forward ONLY that
+    # line to stderr: the one-line-per-PR stdout contract is unchanged, and the rest of the
+    # helper's stderr stays suppressed. (Copilot, PR #418)
+    rc, out, err, calls = run(
+        [], prlist='[{"number":12}]',
+        views={"12": view(rollup=[cr("gates", "SUCCESS")])},
+        unreplied={"12": 0}, unreplied_warn=["12"],
+    )
+    check("#417: the helper's SUPPRESSED-FORMAT-WARN is forwarded to stderr",
+          "SUPPRESSED-FORMAT-WARN" in err)
+    check("#417: other helper stderr stays suppressed", "some other helper stderr noise" not in err)
+    check("#417: stdout contract unchanged (the PR line, unreplied:0, no warning text)",
+          "unreplied:0" in (line_for(out, "12") or "") and "SUPPRESSED-FORMAT-WARN" not in out)
+    check("#417: still exit 0", rc == 0)
 
     print()
     if FAILS:

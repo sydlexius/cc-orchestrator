@@ -129,6 +129,38 @@ case "${1:-}" in
   -h|--help) awk 'NR==1{next} /^#/{sub(/^#[[:space:]]?/,""); print; next} {exit}' "$0"; exit 0 ;;
 esac
 
+# Copilot "Suppressed comments (N)" block: the SINGLE source of truth for its shape, read by
+# the admit filter, the clearing predicate, the gating sum, and the itemized annotation (#417).
+# Four hand-copied literals is how the format change below went unnoticed at every site at
+# once, and fixing only the admit filter would have counted the body as 1 while hiding N.
+#
+# Two alternatives, both STRUCTURAL (never prose), both requiring a POSITIVE count:
+#   1. the literal <summary> element (#374; the original format), and
+#   2. a markdown heading at h2-h4 on a line of its own. Copilot switched to this form inside
+#      a "Review details" collapsible; measured on a consumer repo, 9 of 9 recent suppressed
+#      blocks used it and 0 used the element, so #374 had gone silently inert.
+#
+# jq (oniguruma, as jq drives it) treats ^ and $ as WHOLE-STRING anchors, not per-line, so the
+# obvious "^#{2,4} ...$" matches nothing inside a real body. The line boundary is spelled out
+# instead: start-of-string or a lookbehind on the newline (a lookbehind, not a consumed \n, so
+# scan() does not eat the boundary an ADJACENT heading is anchored on), and a lookahead on an
+# optional CR plus newline or end-of-string. Within the line it accepts what CommonMark
+# accepts for an ATX heading: up to 3 leading spaces, any run of spaces after the #s, and an
+# optional closing #-sequence, which CommonMark only recognizes when WHITESPACE precedes it
+# ("(3)###" is literal heading content, not a closer). Never a 4-space indent (a code block). Oniguruma rejects "^" inside a lookbehind, hence
+# the (?:^|(?<=\n)) spelling. A value passed with --arg needs SINGLE backslashes.
+#
+# Each alternative has its own capture group, so scan() yields one null per match; consumers
+# drop the null before tonumber (an unfiltered null would make tonumber throw).
+SUPPRESSED_RE='<summary>Suppressed comments \(([1-9][0-9]*)\)</summary>|(?:^|(?<=\n))[ ]{0,3}#{2,4}[ \t]+Suppressed comments \(([1-9][0-9]*)\)(?:[ \t]+(?:#+[ \t]*)?)?(?=\r?\n|$)'
+# The same two shapes with the admit grammar's count PLUS a bare 0 -- never any digit run. A
+# looser count here (e.g. [0-9]+) would recognize "(01)", which the admit pattern rejects, so
+# that body would be neither counted nor warned about: the exact silent gap the canary exists
+# to close. Used only by the format canary: a
+# recognized "(0)" block holds nothing and must stay silent, so the canary fires only when
+# the phrase appears in NEITHER recognized shape.
+SUPPRESSED_SHAPE_RE='<summary>Suppressed comments \((?:0|[1-9][0-9]*)\)</summary>|(?:^|(?<=\n))[ ]{0,3}#{2,4}[ \t]+Suppressed comments \((?:0|[1-9][0-9]*)\)(?:[ \t]+(?:#+[ \t]*)?)?(?=\r?\n|$)'
+
 # Single source of truth for bot login detection.
 # Used in jq select() expressions -- must be valid jq.
 BOT_LOGIN_FILTER='(
@@ -941,7 +973,7 @@ fi
 
 # The actionable-body test is a DISJUNCTION of two reviewer-shaped clauses. Keeping
 # them separate is deliberate: the first is CodeRabbit's prose vocabulary, the second
-# anchors on a literal Copilot HTML element, and collapsing them would let CR phrasing
+# anchors on Copilot's structural suppressed-block shape, and collapsing them would let CR phrasing
 # admit a Copilot boilerplate body (and vice versa) on a wording coincidence.
 #
 # #374: the CR clause's keyword allowlist matches NONE of Copilot's vocabulary --
@@ -954,11 +986,12 @@ fi
 # The "^## Pull request overview" exclusion stays on the CR clause ONLY. It was never
 # the mechanism that dropped Copilot (the allowlist already had, independently), and
 # removing it would let a CR body that happens to open with that heading through.
-# Anchoring the Copilot clause on the literal <summary> element rather than on prose
-# is the "demand the exact shape" technique the floor matchers use: a boilerplate
-# "generated no new comments" body carries no such element and stays filtered, which
-# keeps the 58-of-99 pure-boilerplate majority out of the checklist.
-review_bodies_raw=$(echo "$all_reviews" | jq '[.[] | select(
+# Anchoring the Copilot clause on a STRUCTURAL shape (SUPPRESSED_RE: the <summary> element
+# or, since #417, a line-anchored h2-h4 heading) rather than on prose is the "demand the
+# exact shape" technique the floor matchers use: a boilerplate "generated no new comments"
+# body carries neither shape and stays filtered, which keeps the 58-of-99 pure-boilerplate
+# majority out of the checklist.
+review_bodies_raw=$(echo "$all_reviews" | jq --arg sup_re "$SUPPRESSED_RE" '[.[] | select(
   .body != "" and .body != null and
   '"$BOT_LOGIN_FILTER"' and
   (
@@ -967,9 +1000,24 @@ review_bodies_raw=$(echo "$all_reviews" | jq '[.[] | select(
       (.body | test("^## Pull request overview"; "") | not)
     )
     or
-    (.body | test("<summary>Suppressed comments \\(([1-9][0-9]*)\\)</summary>"; ""))
+    (.body | test($sup_re))
   )
 )]')
+
+# FORMAT CANARY (#417). The suppressed anchor is structural on purpose, which means the next
+# Copilot format change silently matches nothing and reads as a clean 0 -- exactly how #374
+# went inert unnoticed. So when a reviewer-bot body carries the phrase in NEITHER recognized
+# shape, say so on STDERR. Advisory only: never changes the count or the exit code, and stays
+# off stdout, which ship-gate-preflight.sh line-greps and orchestrate-status.sh reads as the
+# count. A recognized "(0)" block is not a format change and stays silent. Scoped to the
+# Copilot logins and to the case-sensitive "Suppressed comments (" token: prose such as "I
+# suppressed comments on generated files" from any bot is not a format change, and a canary
+# that cries wolf is one nobody reads.
+echo "$all_reviews" | jq -r --arg shape_re "$SUPPRESSED_SHAPE_RE" '.[] | select(
+  (.user.login | test("^(Copilot|copilot-pull-request-reviewer\\[bot\\])$")) and
+  ((.body // "") | test("Suppressed comments \\(")) and
+  ((.body // "") | test($shape_re) | not)
+) | "SUPPRESSED-FORMAT-WARN: review \(.id) by \(.user.login) mentions Suppressed comments in an unrecognized shape; its findings are NOT counted. Read it by hand and update SUPPRESSED_RE."' >&2 || true
 
 # A review body is "addressed" when every inline comment belonging to it has
 # been replied to by $me. Each inline comment has a pull_request_review_id
@@ -996,6 +1044,7 @@ review_bodies=$(jq -n \
   --slurpfile unreplied      "$_rb_tmpdir/unreplied.json" \
   --slurpfile issue_comments "$_rb_tmpdir/issue_comments.json" \
   --arg me "$me" \
+  --arg sup_re "$SUPPRESSED_RE" \
   '
   ($reviews[0]) as $reviews |
   ($all_comments[0]) as $all_comments |
@@ -1017,9 +1066,10 @@ review_bodies=$(jq -n \
     # (#378) Both vendor surfaces count: the CR outside-diff collapsible and the
     # Copilot suppressed collapsible.
     #
-    # BOTH legs anchor on the literal <summary> ELEMENT and on a POSITIVE count, for
-    # the same two reasons the suppressed leg already did:
-    #   - Prose that MENTIONS the phrase is not a finding. Without the element anchor,
+    # BOTH legs anchor on a STRUCTURAL shape and on a POSITIVE count: the CR leg on the
+    # literal <summary> element, the Copilot leg on SUPPRESSED_RE (the element or, since
+    # #417, a line-anchored h2-h4 heading). Two reasons:
+    #   - Prose that MENTIONS the phrase is not a finding. Without the structural anchor,
     #     a body saying "will use Outside diff range comments (3) next round" would make
     #     that review unclearable by an inline reply. Measured: every real occurrence
     #     across two repos carries the element (`> <summary>WARNING Outside diff range
@@ -1028,7 +1078,7 @@ review_bodies=$(jq -n \
     #     own annotation reads "0 outside-diff + 0 suppressed" -- the cries-wolf
     #     direction this file already rejected once (#376 review).
     (((.body // "") | test("<summary>[^<]*Outside diff range comments \\(([1-9][0-9]*)\\)</summary>"))
-      or ((.body // "") | test("<summary>Suppressed comments \\(([1-9][0-9]*)\\)</summary>"))) as $has_body_findings |
+      or ((.body // "") | test($sup_re))) as $has_body_findings |
     if ($inline_ids | length) > 0 then
       # A review with inline comments USED to clear entirely once those were replied
       # to -- acked_by_reference was never consulted on this branch. That silently
@@ -1093,9 +1143,9 @@ outside_diff_sum=$(echo "$review_bodies" | jq --argjson cap "$CLAMP_MAX" '
 #
 # Clamped identically to outside_diff_sum above (#377) -- both, or the hole is only
 # half closed and reads as fixed.
-suppressed_sum=$(echo "$review_bodies" | jq --argjson cap "$CLAMP_MAX" '
-  [ .[] | (.body // "") | scan("<summary>Suppressed comments \\(([1-9][0-9]*)\\)</summary>") ]
-  | flatten | map(tonumber) | add // 0 | if . > $cap then $cap else . end')
+suppressed_sum=$(echo "$review_bodies" | jq --argjson cap "$CLAMP_MAX" --arg sup_re "$SUPPRESSED_RE" '
+  [ .[] | (.body // "") | scan($sup_re) | map(select(. != null)) | .[0] ]
+  | map(tonumber) | add // 0 | if . > $cap then $cap else . end')
 
 if [ "$latest_per_reviewer" = true ]; then
   review_bodies=$(echo "$review_bodies" | jq 'group_by(.user.login) | map(max_by(.id)) | flatten |
@@ -1243,6 +1293,7 @@ if [ "$itemized" = true ]; then
     --argjson ids "$unreplied_ids" \
     --argjson nodes "$itemized_nodes" \
     --argjson cap "$CLAMP_MAX" \
+    --arg sup_re "$SUPPRESSED_RE" \
     --arg ok "$itemized_resolved_ok" '
     def excerpt($b): (($b // "") | split("\n")
       | map(gsub("<!--.*?-->"; "")         # HTML comments (lazy; the body may contain >)
@@ -1272,7 +1323,8 @@ if [ "$itemized" = true ]; then
     # the Copilot "Suppressed comments (N)" block. BOTH are annotated onto the line so
     # the header count == the visible accounting (#252 core).
     #
-    # The count is matched as [1-9][0-9]* rather than [0-9]+ so a "(0)" block does not
+    # Both shapes are matched structurally (the CR <summary> element; the SUPPRESSED_RE element
+    # or heading for Copilot, #417). The count is matched as [1-9][0-9]* rather than [0-9]+ so a "(0)" block does not
     # admit a body and then contribute nothing -- that would count the body itself as 1
     # finding when it holds none, the cries-wolf direction (#376 review).
     #
@@ -1305,7 +1357,7 @@ if [ "$itemized" = true ]; then
     ( $reviewbody | .[]
       | (.user | sub("\\[bot\\]$"; "")) as $u
       | ([.body | scan("<summary>[^<]*Outside diff range comments \\(([1-9][0-9]*)\\)</summary>")] | flatten | map(tonumber) | add // 0 | if . > $cap then $cap else . end) as $od
-      | ([.body | scan("<summary>Suppressed comments \\(([1-9][0-9]*)\\)</summary>")] | flatten | map(tonumber) | add // 0 | if . > $cap then $cap else . end) as $sup
+      | ([.body | scan($sup_re) | map(select(. != null)) | .[0]] | map(tonumber) | add // 0 | if . > $cap then $cap else . end) as $sup
       | "review-body | \($u) | (body) | \(excerpt(.body))\(if $od > 0 then " [+\($od) outside-diff]" else "" end)\(if $sup > 0 then " [+\($sup) suppressed]" else "" end) | replied:no resolved:n/a" ),
     ( $issue | .[]
       | (.user | sub("\\[bot\\]$"; "")) as $u

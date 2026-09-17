@@ -1440,6 +1440,149 @@ def main():
           "(no wedge: one ack clears all N)", n in (0, None))
 
     print()
+    print("== #417: Copilot's HEADING form of the suppressed block ==")
+    # Copilot moved the block from a <summary> element to a markdown heading inside a
+    # "Review details" collapsible. Measured on a consumer repo: 9 of 9 recent suppressed
+    # blocks used "### Suppressed comments (N)", 0 used the element, so #374 had gone
+    # silently inert. Shape below is copied from a real body (LF endings, blank line after).
+    def copilot(rid, body, login="copilot-pull-request-reviewer[bot]"):
+        return json.dumps([{"id": rid, "user": {"login": login}, "state": "COMMENTED",
+                            "submitted_at": "2026-06-18T02:00:00Z", "body": body}])
+
+    HEADING_3 = copilot(417, "## Pull request overview\n\nThis PR does things.\n\n"
+                             "<details>\n<summary>Review details</summary>\n\n"
+                             "* **web/x_templ.go**: Generated file\n\n"
+                             "### Suppressed comments (3)\n\n"
+                             "**internal/api/openapi.yaml:15708**\n* a real finding\n</details>")
+    rc, out, err = run(["--allow-stale"], reviews=HEADING_3)
+    check("#417: '### Suppressed comments (3)' admits the body AND sums N (1 + 3 = 4)",
+          findings_count(out) == 4)
+    rc, out, err = run(["--itemized", "--allow-stale"], reviews=HEADING_3)
+    check("#417: --itemized is not 0 and annotates the heading-form subtotal",
+          "0 finding(s)" not in out and "[+3 suppressed]" in out)
+    check("#417: a matched heading emits NO format canary", "SUPPRESSED-FORMAT" not in err)
+    rc, out, err = run(["--count-only", "--allow-stale"], reviews=HEADING_3)
+    check("#417: --count-only reports the heading-form findings (not 0)",
+          out.strip() not in ("", "0"))
+
+    # The acked heading form must still clear (no wedge introduced by the new anchor).
+    ACK_417 = ('[{"id":9417,"user":{"login":"testuser"},"created_at":"2026-06-18T04:00:00Z",'
+               '"body":"Addressed suppressed findings in review 417."}]')
+    rc, out, err = run(["--allow-stale"], reviews=HEADING_3)
+    unacked = findings_count(out)
+    rc, out, err = run(["--allow-stale"], reviews=HEADING_3, issue=ACK_417)
+    check("#417: an id-referencing ack clears the heading form (4 without the ack, 0 with it)",
+          unacked == 4 and findings_count(out) in (0, None))
+
+    # #378 machine: an inline reply must not clear heading-form body findings either.
+    INLINE_REPLIED_417 = (
+        '[{"id":9517,"user":{"login":"copilot-pull-request-reviewer[bot]"},'
+        '"pull_request_review_id":417,"path":"a.sh","original_line":1,'
+        '"created_at":"2026-06-18T02:00:00Z","commit_id":"abcdef1234","body":"inline"},'
+        '{"id":9617,"user":{"login":"testuser"},"in_reply_to_id":9517,"path":"a.sh",'
+        '"original_line":1,"created_at":"2026-06-18T04:00:00Z","commit_id":"abcdef1234",'
+        '"body":"fixed in abc1234"}]')
+    rc, out, err = run(["--allow-stale"], reviews=HEADING_3, inline=INLINE_REPLIED_417)
+    check("#417: inline replied, heading-form body findings unacked -> still reported (4)",
+          findings_count(out) == 4)
+
+    # CRLF line endings and trailing spaces on the heading line.
+    rc, out, err = run(["--allow-stale"],
+                       reviews=copilot(418, "## Pull request overview\r\n\r\n### Suppressed comments (2)  \r\n\r\nx"))
+    check("#417: CRLF + trailing whitespace on the heading still matches (1 + 2 = 3)",
+          findings_count(out) == 3)
+
+    # Heading at the very start of the body, and two adjacent headings (scan must not let
+    # one match consume the newline the next one is anchored on).
+    rc, out, err = run(["--allow-stale"],
+                       reviews=copilot(419, "### Suppressed comments (1)\n### Suppressed comments (2)\n"))
+    check("#417: adjacent headings both count, incl. one at body start (1 + 1 + 2 = 4)",
+          findings_count(out) == 4)
+
+    # Both formats in ONE body sum; the pre-existing element form stays pinned above.
+    rc, out, err = run(["--allow-stale"],
+                       reviews=copilot(420, "## Suppressed comments (5)\n"
+                                            "<details><summary>Suppressed comments (1)</summary>x</details>"))
+    check("#417: heading + element forms in one body both sum (1 + 5 + 1 = 7)",
+          findings_count(out) == 7)
+
+    # Every CommonMark ATX heading variant is still a heading (hostile review, #417).
+    for label, body in [
+        ("3 leading spaces", "x\n   ### Suppressed comments (3)\n"),
+        ("two spaces after the #s", "x\n###  Suppressed comments (3)\n"),
+        ("closing #-sequence", "x\n### Suppressed comments (3) ###\n"),
+    ]:
+        rc, out, err = run(["--allow-stale"], reviews=copilot(430, body))
+        check(f"#417: ATX variant ({label}) counts (1 + 3 = 4)", findings_count(out) == 4)
+    # CommonMark: a closing #-sequence must be PRECEDED by whitespace. "(3)###" is literal
+    # heading content, not a closer, so the anchor must not match -- and because the phrase
+    # is present in an unrecognized shape, the canary must speak. (CodeRabbit, PR #418)
+    rc, out, err = run(["--allow-stale"], reviews=copilot(434, "x\n### Suppressed comments (3)###\n"))
+    check("#418 review: '(3)###' (no space before the closer) is not a heading match (expect 0)",
+          findings_count(out) in (0, None))
+    check("#418 review: '(3)###' is an unrecognized shape, so the canary WARNs",
+          "SUPPRESSED-FORMAT" in err and "434" in err)
+
+    # The canary's shape grammar must match the admit grammar except for the zero case.
+    # "(01)" is neither admitted nor recognized, so it must WARN rather than fall silent in
+    # the gap between the two patterns. (CodeRabbit, PR #418)
+    for rid, body in [(435, "x\n### Suppressed comments (01)\n"),
+                      (436, "<summary>Suppressed comments (01)</summary>")]:
+        rc, out, err = run(["--allow-stale"], reviews=copilot(rid, body))
+        check(f"#418 review: zero-padded '(01)' is not counted and WARNs (review {rid})",
+              findings_count(out) in (0, None) and "SUPPRESSED-FORMAT" in err and str(rid) in err)
+
+    rc, out, err = run(["--allow-stale"], reviews=copilot(431, "x\n    ### Suppressed comments (3)\n"))
+    check("#417: a 4-space indent is a code block, not a heading (expect 0)",
+          findings_count(out) in (0, None))
+
+    # Canary scope: prose from another bot, or lowercase prose from Copilot, is silent.
+    CR_PROSE = json.dumps([{"id": 432, "user": {"login": "coderabbitai[bot]"},
+                            "state": "COMMENTED", "submitted_at": "2026-06-18T02:00:00Z",
+                            "body": "**Actionable comments posted: 1**\nI suppressed comments on generated files."}])
+    rc, out, err = run(["--allow-stale"], reviews=CR_PROSE)
+    check("#417 canary: another bot's prose never WARNs", "SUPPRESSED-FORMAT" not in err)
+    rc, out, err = run(["--allow-stale"],
+                       reviews=copilot(433, "## Pull request overview\nNo suppressed comments this round."))
+    check("#417 canary: lowercase Copilot prose never WARNs", "SUPPRESSED-FORMAT" not in err)
+
+    # STRUCTURAL anchor, not prose: these are NOT headings and must not admit the body.
+    for label, body in [
+        ("mid-line prose", "## Pull request overview\nsee ### Suppressed comments (3) here"),
+        ("text after the count", "## Pull request overview\n### Suppressed comments (3) and more"),
+        ("blockquoted", "## Pull request overview\n> ### Suppressed comments (3)"),
+        ("h1", "## Pull request overview\n# Suppressed comments (3)"),
+        ("h5", "## Pull request overview\n##### Suppressed comments (3)"),
+        ("zero count", "## Pull request overview\n### Suppressed comments (0)\n"),
+    ]:
+        rc, out, err = run(["--allow-stale"], reviews=copilot(421, body))
+        check(f"#417: non-anchor shape ({label}) does NOT admit the body (expect 0)",
+              findings_count(out) in (0, None))
+
+    # CANARY: the phrase present, NO anchor matched -> the next format change must fail
+    # LOUD on stderr instead of reading as a clean 0. A "(0)" block is a recognized shape
+    # holding nothing, so it must stay silent (no cries-wolf).
+    rc, out, err = run(["--allow-stale"],
+                       reviews=copilot(422, "## Pull request overview\n**Suppressed comments (3)**\n"))
+    check("#417 canary: an unrecognized suppressed-comments shape WARNs on stderr",
+          "SUPPRESSED-FORMAT" in err and "422" in err)
+    check("#417 canary: the WARN stays off stdout (ship-gate parses stdout+stderr lines, "
+          "status parses --count-only stdout)", "SUPPRESSED-FORMAT" not in out)
+    rc, out, err = run(["--allow-stale"],
+                       reviews=copilot(423, "## Pull request overview\n### Suppressed comments (0)\n"))
+    check("#417 canary: a recognized '(0)' heading is silent", "SUPPRESSED-FORMAT" not in err)
+    rc, out, err = run(["--allow-stale"], reviews=COPILOT_BOILERPLATE)
+    check("#417 canary: boilerplate with no phrase is silent", "SUPPRESSED-FORMAT" not in err)
+    # The login match is EXACT, not a prefix: a login that merely STARTS with "Copilot"
+    # is not the Copilot reviewer. (fix-scoped hostile review, PR #418)
+    rc, out, err = run(["--allow-stale"],
+                       reviews=copilot(437, "## x\n**Suppressed comments (3)**\n", login="Copilot-fan"))
+    check("#417 canary: a login that only PREFIXES Copilot does not WARN", "SUPPRESSED-FORMAT" not in err)
+    rc, out, err = run(["--allow-stale"],
+                       reviews=copilot(438, "## x\n**Suppressed comments (3)**\n", login="Copilot"))
+    check("#417 canary: the exact 'Copilot' login still WARNs", "SUPPRESSED-FORMAT" in err and "438" in err)
+
+    print()
     if FAILS:
         print(f"FAILED ({len(FAILS)}):"); [print("  - " + f) for f in FAILS]; sys.exit(1)
     print("ALL PASSED")
