@@ -1514,6 +1514,24 @@ def main():
     ]:
         rc, out, err = run(["--allow-stale"], reviews=copilot(430, body))
         check(f"#417: ATX variant ({label}) counts (1 + 3 = 4)", findings_count(out) == 4)
+    # CommonMark: a closing #-sequence must be PRECEDED by whitespace. "(3)###" is literal
+    # heading content, not a closer, so the anchor must not match -- and because the phrase
+    # is present in an unrecognized shape, the canary must speak. (CodeRabbit, PR #418)
+    rc, out, err = run(["--allow-stale"], reviews=copilot(434, "x\n### Suppressed comments (3)###\n"))
+    check("#418 review: '(3)###' (no space before the closer) is not a heading match (expect 0)",
+          findings_count(out) in (0, None))
+    check("#418 review: '(3)###' is an unrecognized shape, so the canary WARNs",
+          "SUPPRESSED-FORMAT" in err and "434" in err)
+
+    # The canary's shape grammar must match the admit grammar except for the zero case.
+    # "(01)" is neither admitted nor recognized, so it must WARN rather than fall silent in
+    # the gap between the two patterns. (CodeRabbit, PR #418)
+    for rid, body in [(435, "x\n### Suppressed comments (01)\n"),
+                      (436, "<summary>Suppressed comments (01)</summary>")]:
+        rc, out, err = run(["--allow-stale"], reviews=copilot(rid, body))
+        check(f"#418 review: zero-padded '(01)' is not counted and WARNs (review {rid})",
+              findings_count(out) in (0, None) and "SUPPRESSED-FORMAT" in err and str(rid) in err)
+
     rc, out, err = run(["--allow-stale"], reviews=copilot(431, "x\n    ### Suppressed comments (3)\n"))
     check("#417: a 4-space indent is a code block, not a heading (expect 0)",
           findings_count(out) in (0, None))

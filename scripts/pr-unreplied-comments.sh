@@ -146,16 +146,20 @@ esac
 # scan() does not eat the boundary an ADJACENT heading is anchored on), and a lookahead on an
 # optional CR plus newline or end-of-string. Within the line it accepts what CommonMark
 # accepts for an ATX heading: up to 3 leading spaces, any run of spaces after the #s, and an
-# optional closing #-sequence. Never a 4-space indent (that is a code block, not a heading). Oniguruma rejects "^" inside a lookbehind, hence
+# optional closing #-sequence, which CommonMark only recognizes when WHITESPACE precedes it
+# ("(3)###" is literal heading content, not a closer). Never a 4-space indent (a code block). Oniguruma rejects "^" inside a lookbehind, hence
 # the (?:^|(?<=\n)) spelling. A value passed with --arg needs SINGLE backslashes.
 #
 # Each alternative has its own capture group, so scan() yields one null per match; consumers
 # drop the null before tonumber (an unfiltered null would make tonumber throw).
-SUPPRESSED_RE='<summary>Suppressed comments \(([1-9][0-9]*)\)</summary>|(?:^|(?<=\n))[ ]{0,3}#{2,4}[ \t]+Suppressed comments \(([1-9][0-9]*)\)[ \t]*(?:#+[ \t]*)?(?=\r?\n|$)'
-# The same two shapes with ANY count, including 0. Used only by the format canary: a
+SUPPRESSED_RE='<summary>Suppressed comments \(([1-9][0-9]*)\)</summary>|(?:^|(?<=\n))[ ]{0,3}#{2,4}[ \t]+Suppressed comments \(([1-9][0-9]*)\)(?:[ \t]+(?:#+[ \t]*)?)?(?=\r?\n|$)'
+# The same two shapes with the admit grammar's count PLUS a bare 0 -- never any digit run. A
+# looser count here (e.g. [0-9]+) would recognize "(01)", which the admit pattern rejects, so
+# that body would be neither counted nor warned about: the exact silent gap the canary exists
+# to close. Used only by the format canary: a
 # recognized "(0)" block holds nothing and must stay silent, so the canary fires only when
 # the phrase appears in NEITHER recognized shape.
-SUPPRESSED_SHAPE_RE='<summary>Suppressed comments \([0-9]+\)</summary>|(?:^|(?<=\n))[ ]{0,3}#{2,4}[ \t]+Suppressed comments \([0-9]+\)[ \t]*(?:#+[ \t]*)?(?=\r?\n|$)'
+SUPPRESSED_SHAPE_RE='<summary>Suppressed comments \((?:0|[1-9][0-9]*)\)</summary>|(?:^|(?<=\n))[ ]{0,3}#{2,4}[ \t]+Suppressed comments \((?:0|[1-9][0-9]*)\)(?:[ \t]+(?:#+[ \t]*)?)?(?=\r?\n|$)'
 
 # Single source of truth for bot login detection.
 # Used in jq select() expressions -- must be valid jq.
