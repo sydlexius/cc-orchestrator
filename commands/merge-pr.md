@@ -56,8 +56,16 @@ sg_rc=2
 [ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/ship-gate-preflight.sh' "$pr_number" "$repo"; sg_rc=$?; }
 [ "$leg" = stable ] && { bash ~/.claude/scripts/ship-gate-preflight.sh "$pr_number" "$repo"; sg_rc=$?; }
 [ "$leg" = none ]   && echo "ship-gate-preflight.sh not found; readiness NOT verified -- STOP" >&2
-echo "ship-gate rc=$sg_rc"
+echo "ship-gate rc=$sg_rc leg=$leg"
+(exit "$sg_rc")
 ```
+
+Each GATE block here (readiness, code-scanning) ENDS by propagating the helper's own exit
+code (`(exit "$sg_rc")`), never a trailing `echo` / `|| true` / `true`: a block whose last
+command is an `echo` returns 0 even when the helper returned 2, so a caller reading the
+block's status would see "ready" on an unready PR. `leg=none` keeps the pre-set nonzero
+value, so a missing helper is never 0. The ADVISORY coverage block instead carries its
+status in the printed `coverage rc=` value, which the text below reads.
 
 ```bash
 # Coverage advisory (informational; outside the oracle's scope). This is only
@@ -65,16 +73,22 @@ echo "ship-gate rc=$sg_rc"
 # has no coverage integration, the script returns {"status":"none"} -- treat that
 # as SKIP / "N/A", not a failure and not a merge block (there is simply no
 # coverage comment yet). Only a returned threshold-fail is worth surfacing, and
-# even then it is advisory.
+# even then it is advisory. A helper that is MISSING or exits non-zero is a
+# different thing again: the read did NOT RUN, which is reported as such, never
+# folded into the status:none skip.
 if [ -f scripts/pr-unreplied-comments.sh ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh' ]; then leg=plugin
 elif [ -f ~/.claude/scripts/pr-unreplied-comments.sh ]; then leg=stable
 else leg=none; fi
-[ "$leg" = repo ]   && bash scripts/pr-unreplied-comments.sh --coverage-only "$pr_number"
-[ "$leg" = plugin ] && bash '${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh' --coverage-only "$pr_number"
-[ "$leg" = stable ] && bash ~/.claude/scripts/pr-unreplied-comments.sh --coverage-only "$pr_number"
-[ "$leg" = none ]   && echo "pr-unreplied-comments.sh not found; coverage advisory skipped" >&2
-true
+cov_rc=2
+[ "$leg" = repo ]   && { bash scripts/pr-unreplied-comments.sh --coverage-only "$pr_number"; cov_rc=$?; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh' --coverage-only "$pr_number"; cov_rc=$?; }
+[ "$leg" = stable ] && { bash ~/.claude/scripts/pr-unreplied-comments.sh --coverage-only "$pr_number"; cov_rc=$?; }
+[ "$leg" = none ]   && echo "Coverage: NOT RUN (pr-unreplied-comments.sh not found)" >&2
+[ "$leg" != none ] && [ "$cov_rc" -ne 0 ] && echo "Coverage: NOT RUN (coverage read failed, rc=$cov_rc)" >&2
+# ADVISORY: the status is carried in the PRINTED cov_rc (read below), not the block's own
+# exit, so an advisory read failure can never fail - or cancel - a parallel gate call.
+echo "coverage rc=$cov_rc leg=$leg"
 ```
 
 ```bash
@@ -89,7 +103,8 @@ cq_rc=2
 [ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/pr-codeql-autofixes.sh' "$pr_number"; cq_rc=$?; }
 [ "$leg" = stable ] && { bash ~/.claude/scripts/pr-codeql-autofixes.sh "$pr_number"; cq_rc=$?; }
 [ "$leg" = none ]   && echo "pr-codeql-autofixes.sh not found; code-scanning alerts NOT checked" >&2
-echo "codeql rc=$cq_rc"
+echo "codeql rc=$cq_rc leg=$leg"
+(exit "$cq_rc")
 ```
 
 If `ship-gate-preflight.sh` was not found (`leg=none`) or its block was denied, the readiness
@@ -113,6 +128,12 @@ This step is OPTIONAL and only applies when the target repo uses a coverage
 service (codecov being the common one). It is not assumed present: a repo with
 no coverage integration posts no codecov signal, and this step self-skips cleanly
 with nothing to report.
+
+**NOT RUN is not a skip.** If the Step 1 coverage block printed `Coverage: NOT RUN` (the
+helper was not found, exited non-zero, or the block was hook-denied), the coverage read did
+not happen. Report `Coverage: NOT RUN (<reason>)` in the Step 5 summary. It stays ADVISORY -
+it never blocks the merge - but it is never reported as `N/A` or silently dropped: only the
+helper's own `{"status":"none"}` output (rc 0) is the non-blocking advisory skip.
 
 The `--coverage-only` readout from Step 1 already carries the one gating signal:
 `threshold_state`, derived from the **`codecov/patch` check-run** conclusion on the
@@ -331,18 +352,33 @@ auth_rc=2
 [ "$leg" = repo ]   && { bash scripts/orchestrate-authorize-merge.sh "$pr_number"; auth_rc=$?; }
 [ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/orchestrate-authorize-merge.sh' "$pr_number"; auth_rc=$?; }
 [ "$leg" = none ]   && echo "orchestrate-authorize-merge.sh not found (load via /orchestrate:merge-pr); NO token armed" >&2
-echo "authorize rc=$auth_rc"
+echo "authorize rc=$auth_rc leg=$leg"
+(exit "$auth_rc")
 ```
 
 On PASS (`authorize rc=0`) it prints the head SHA it pinned the token to. Merge with that
-EXACT sha, as a separate command:
+EXACT sha, as a separate command. Type BOTH values LITERALLY - the PR number as bare digits
+and the full 40-hex SHA the helper printed (never `head_sha` from an earlier read, which a
+later push can have moved). The floor reads the command TEXT: it demands
+`gh pr merge <digits> --squash --match-head-commit <40-hex>` in exactly that order, so a
+`"$pr_number"` or `"$sha"` variable there is DENIED (deny-on-doubt), not expanded:
 
-```bash
-gh pr merge "$pr_number" --squash --match-head-commit <sha>
+```text
+gh pr merge <pr_number> --squash --match-head-commit <sha>
 ```
 
-`leg=none` or a hook-denied authorize block means NO token was armed: take the FALLBACK
-below, never a variable-path or `sh -c` retry.
+NO token was armed unless `authorize rc=0`. The two no-token cases are handled DIFFERENTLY,
+and never by a variable-path or `sh -c` retry:
+
+- **`leg=none` (the helper is not installed on any leg).** The FALLBACK below is available,
+  but ONLY because the Step 1 readiness oracle (`ship-gate-preflight.sh`) already exited 0
+  in THIS run. If Step 1 did not PASS in this run, re-run it first; never take the fallback
+  on a stale or absent oracle result.
+- **The authorize block was HOOK-DENIED.** STOP. Do NOT take the fallback: the helper did
+  not run, so the readiness check it performs did not run either, and a plain
+  `gh pr merge` from another terminal would merge without it. Report
+  `authorize: NOT RUN (denied by hook: <reason>)` and fix the command path (the
+  **Hook-denied gate command** rule in `prep-pr.md`).
 
 The `--match-head-commit` pin is load-bearing, not ceremony: the token binds to one head
 SHA, so a push landing between the arm and the merge invalidates it rather than merging
@@ -351,8 +387,10 @@ the second terminal to route around a failed readiness gate. That is the one mov
 design forbids.
 
 **FALLBACK -- separate plain terminal or the GitHub UI.** Still valid, and what the
-guard's own deny message offers, for when a token cannot be armed (the helper is
-unavailable, or the maintainer simply prefers to run it). PRINT the command and STOP;
+guard's own deny message offers, for when a token cannot be armed because the helper is
+unavailable (`leg=none`, with the Step 1 oracle already PASSED this run), or when the
+maintainer simply prefers to run it. NEVER after a hook-denied or non-zero authorize - see
+above. PRINT the command and STOP;
 do NOT run it as an in-session `!` bang, which fails outright in IDE-hosted sessions:
 
 ```text
@@ -438,13 +476,16 @@ acknowledge that cleanup ran:
 
 - PR: #$pr_number
 - CR status: <verified clean / fallback check / skipped>
-- Coverage: <patch_pct>% <threshold_state> | not measured | N/A
+- Coverage: <patch_pct>% <threshold_state> | not measured | N/A | NOT RUN (<reason>)
 - Commit: <squash merge SHA>
 - Post-merge cleanup: see /post-merge-cleanup output above
 ```
 
 Display "N/A" for Coverage when `--coverage-only` returned `{"status":"none"}`
 (no coverage service on the repo) -- a missing coverage signal is not a failure.
+Display `NOT RUN (<reason>)` when the Step 1 coverage block reported NOT RUN (helper
+missing, non-zero `coverage rc`, or hook-denied) -- advisory, not a merge block, but never
+shown as N/A.
 When `threshold_state` is `none` (codecov commented but posts no gating
 `codecov/patch` check-run), show `<patch_pct>% (advisory-only)` -- also not a failure.
 `patch_pct` may be **`null`** even when `status` is `present` -- codecov reports no

@@ -109,16 +109,17 @@ Map the type to its label:
 - bug: `bug`
 - task: `chore`
 
+Set `issue_label` to that mapped label first (an unquoted `<label>` is a shell redirection).
 Carry the milestone answer from Step 3 into the create itself - do NOT create first and edit
 after (#344), which is denied outright in a repo that requires a milestone at creation time:
 
 ```bash
 # With a milestone (the answer from Step 3):
-gh issue create --title "<title>" --body-file /tmp/gh-issue-body.md --label <label> \
+gh issue create --title "<title>" --body-file /tmp/gh-issue-body.md --label "$issue_label" \
   --milestone "<title-from-step-3>"
 
 # On "skip", omit the flag entirely - do NOT pass an empty --milestone "":
-gh issue create --title "<title>" --body-file /tmp/gh-issue-body.md --label <label>
+gh issue create --title "<title>" --body-file /tmp/gh-issue-body.md --label "$issue_label"
 ```
 
 If the create is REJECTED for an unknown milestone (a title typo, or one closed since Step 3

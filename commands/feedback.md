@@ -35,7 +35,8 @@ fb_rc=2
 [ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/orchestrate-feedback.sh' add my-slug < /tmp/fb-body.md; fb_rc=$?; }
 [ "$leg" = stable ] && { bash ~/.claude/scripts/orchestrate-feedback.sh add my-slug < /tmp/fb-body.md; fb_rc=$?; }
 [ "$leg" = none ]   && echo "orchestrate-feedback.sh not found (repo-local, plugin, or ~/.claude/scripts/)" >&2
-echo "fb_rc=$fb_rc"
+echo "fb_rc=$fb_rc leg=$leg"
+(exit "$fb_rc")
 ```
 
 Detect and run in the SAME Bash call - each tool call is a fresh shell. The helper path is
@@ -65,7 +66,8 @@ fb_rc=2
 [ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/orchestrate-feedback.sh' list; fb_rc=$?; }
 [ "$leg" = stable ] && { bash ~/.claude/scripts/orchestrate-feedback.sh list; fb_rc=$?; }
 [ "$leg" = none ]   && echo "orchestrate-feedback.sh not found (repo-local, plugin, or ~/.claude/scripts/)" >&2
-echo "fb_rc=$fb_rc"
+echo "fb_rc=$fb_rc leg=$leg"
+(exit "$fb_rc")
 ```
 
 Shows the undrained entries in the inbox. Read-only; changes nothing.

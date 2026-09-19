@@ -308,6 +308,8 @@ Runtime (`scripts/`; canonical source is this repo):
   (null on exactly the PR carrying bot findings and cited fix SHAs), and an UNREADABLE count takes
   the WARN branch - fail toward surfacing, never toward acting. Both paths block ONLY on the
   helper's exit 1; unknown stays non-blocking on every path, and NEITHER ever suggests `--rebase`.
+  A helper MISSING on every leg is not "unknown": `/prep-pr` Step 1c prints `freshness: NOT RUN`
+  and STOPS (`fresh_rc=3`, the gate did not run - #438 review); an unresolvable BASE stays unknown.
 - `scripts/open-pr-staleness-sweep.sh` - the merge-side open-PR staleness sweep (#282), called from
   `/post-merge-cleanup` with the just-merged PR (which it EXCLUDES). A merge advances the base and
   silently leaves every OTHER open PR behind it; this notices them. THE SAFETY HINGE is the reviewed

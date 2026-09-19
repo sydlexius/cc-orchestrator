@@ -77,6 +77,13 @@ not improvise a replacement. A hook DENYING a helper call is `NOT RUN (denied by
 never an empty result (the **Hook-denied gate command** rule in `prep-pr.md`); a gate step
 (the merge-readiness or unreplied-count checks) STOPS on it.
 
+**Shell variables.** Command ARGUMENTS in the fenced blocks below are quoted variables, never
+bare `<placeholder>` tokens (an unquoted `<x>` is a shell REDIRECTION, so the block fails to
+parse or the helper gets missing arguments). Set the ones a block uses in the same Bash call
+first: `pr_number` (Step 1), `comment_id` (one inline comment id), `comment_ids` (a bash array
+of comment ids, e.g. `comment_ids=(123 456)`), `review_id` (a review-body id). `<...>` inside a
+QUOTED reply text is prose to fill in, not an argument.
+
 Why not `${CLAUDE_PLUGIN_ROOT}` directly: Claude Code substitutes that token only when this
 command loads as `/orchestrate:*`. Loaded through a `~/.claude/commands/<name>.md` symlink (a
 supported install) it stays literal, and the safety hook denies it unquoted or double-quoted.
@@ -228,8 +235,9 @@ Each line is `<class> | <user> | <loc> | <excerpt> | replied:<..> resolved:<..>`
 A **review-body** finding has NO inline thread to resolve: it clears when you ACK
 THE REVIEW BY ID -- a comment of yours whose body REFERENCES the review id:
 
-```sh
-reply-comment.sh --review <review-id> <pr> "<why it is addressed / the fix SHA>"
+```bash
+# HELPER_DIR/ -> the literal path Step 0 printed; set review_id first (see "Shell variables" in Step 0).
+bash HELPER_DIR/reply-comment.sh --review "$review_id" "$pr_number" "<why it is addressed / the fix SHA>"
 ```
 
 The review id is the ack token. A reply WITHOUT it does NOT clear the finding --
@@ -471,16 +479,25 @@ re-implementing per-stack test commands here:
 
 ```bash
 git diff --name-only   # identify changed files
-if [ -f scripts/gate-runner.py ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then
-  python3 scripts/gate-runner.py
-else
-  python3 ~/.claude/scripts/gate-runner.py
-fi
-gate_rc=$?
+# Literal helper path in every leg (the "Helper exec paths" rule in prep-pr.md): repo-local ONLY
+# inside cc-orchestrator itself, else the plugin copy, else the deployed copy. No runner on any
+# leg = `gate: NOT RUN`, gate_rc=2, treated as a FAILED gate (fail closed, never a pass).
+if [ -f scripts/gate-runner.py ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/gate-runner.py' ]; then leg=plugin
+elif [ -f ~/.claude/scripts/gate-runner.py ]; then leg=stable
+else leg=none; fi
+gate_rc=2
+[ "$leg" = repo ]   && { python3 scripts/gate-runner.py; gate_rc=$?; }
+[ "$leg" = plugin ] && { python3 '${CLAUDE_PLUGIN_ROOT}/scripts/gate-runner.py'; gate_rc=$?; }
+[ "$leg" = stable ] && { python3 ~/.claude/scripts/gate-runner.py; gate_rc=$?; }
+[ "$leg" = none ]   && echo "gate: NOT RUN (gate-runner.py not found on any leg: repo/plugin/deployed)" >&2
+echo "gate_rc=$gate_rc leg=$leg"
+(exit "$gate_rc")
 ```
 
 The runner prints a per-step `[PASS]` / `[SKIP]` / `[FAIL]` line and exits
-non-zero on the first required-gate failure. *Illustrative -- what runs in
+non-zero on the first required-gate failure. A `gate: NOT RUN` line (no runner found on any
+leg) is a FAILED gate, not a skip: stop and report it. *Illustrative -- what runs in
 cc-orchestrator:* its `.gates.toml` enumerates `shellcheck` on the shell
 scripts, `ruff check --select F,E741` on the `.py` files, the
 `orchestrate-guard.sh`/`orchestrate-steer.sh` `--self-test` runs, and the
@@ -499,11 +516,11 @@ it is a no-op -- skip it. When it does apply, **do not write an ad-hoc coverage
 script.** Use the maintained estimator, which mirrors Codecov's projection
 (all-hit rule + trailing-brace correction). The profile-generation step below is
 illustrative (a Go example); substitute the target repo's coverage-profile
-command:
+command. Set `coverage_target` to the repo's patch target first:
 
 ```bash
 go test -count=1 -coverprofile=/tmp/cover.out ./...
-COVER_OUT=/tmp/cover.out PATCH_COVERAGE_THRESHOLD=<repo target> \
+COVER_OUT=/tmp/cover.out PATCH_COVERAGE_THRESHOLD="$coverage_target" \
   PATCH_COVERAGE_EXCLUDE="<codecov.yml ignore globs>" \
   bash HELPER_DIR/patch-coverage.sh   # the literal path Step 0 printed
 ```
@@ -676,7 +693,7 @@ Now substitute the real SHA into all "Fixed in <sha>" reply drafts from step 6.
 Post threaded replies for **inline** comments only (do not wait between them):
 
 ```bash
-bash HELPER_DIR/reply-comment.sh "$pr_number" {COMMENT_ID} '<reply text>'
+bash HELPER_DIR/reply-comment.sh "$pr_number" "$comment_id" '<reply text>'
 ```
 
 Run one call per inline comment. Log each one as it completes.
@@ -800,15 +817,15 @@ The default
 call covers all three bots when the IDs span them:
 
 ```bash
-bash HELPER_DIR/resolve-threads.sh "$pr_number" <comment_id> [<comment_id>...]
+bash HELPER_DIR/resolve-threads.sh "$pr_number" "${comment_ids[@]}"
 ```
 
 If you need to scope to a single bot (e.g. you triaged only Greptile in this
 round), pass `--bot`:
 
 ```bash
-bash HELPER_DIR/resolve-threads.sh --bot greptile "$pr_number" <id...>
-bash HELPER_DIR/resolve-threads.sh --bot copilot  "$pr_number" <id...>
+bash HELPER_DIR/resolve-threads.sh --bot greptile "$pr_number" "${comment_ids[@]}"
+bash HELPER_DIR/resolve-threads.sh --bot copilot  "$pr_number" "${comment_ids[@]}"
 ```
 
 The script fetches all review threads, matches each ID to a thread whose first

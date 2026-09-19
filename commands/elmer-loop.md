@@ -61,7 +61,8 @@ tick_rc=2
 [ "$leg" = stable ] && { bash ~/.claude/scripts/elmer-tick.sh; tick_rc=$?; }
 [ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/elmer-tick.sh'; tick_rc=$?; }
 [ "$leg" = none ]   && echo "elmer-tick.sh not found (repo-local, deployed, or plugin)" >&2
-echo "tick_rc=$tick_rc"
+echo "tick_rc=$tick_rc leg=$leg"
+(exit "$tick_rc")
 ```
 
 On `--dry-run`, set `ELMER_DRY_RUN=1` in front of the command: it does everything except the post
@@ -97,7 +98,7 @@ QUOTA_RC=0
 [ "$leg" = repo ]   && { bash scripts/cr-quota-watch.sh "$PR_FOR_QUOTA" || QUOTA_RC=$?; }
 [ "$leg" = stable ] && { bash ~/.claude/scripts/cr-quota-watch.sh "$PR_FOR_QUOTA" || QUOTA_RC=$?; }
 [ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/cr-quota-watch.sh' "$PR_FOR_QUOTA" || QUOTA_RC=$?; }
-[ "$leg" = none ]   && echo "cr-quota-watch.sh not found (repo-local, deployed, or plugin); no quota reading"
+[ "$leg" = none ]   && { echo "quota: NOT RUN -- cr-quota-watch.sh not found (repo-local, deployed, or plugin)"; QUOTA_RC=2; }
 echo "quota rc=$QUOTA_RC leg=$leg"
 ```
 
@@ -113,7 +114,11 @@ under a caller running `set -e`). The missing-PR guard still fails loudly - the 
 to the helper call alone.
 
 Exit 1 means limited, and the output carries the remaining time plus a Pacific-labeled deadline.
-Exit 0 means no announced limit.
+Exit 0 means no announced limit. `quota rc=2` is a FAILURE, never an all-clear: either the
+helper's own setup/read error, or (`leg=none`, `quota: NOT RUN`) no quota helper was found on
+any leg. There is no reading to pace against - report it, sleep the long default (20-30 min),
+and re-query; never schedule an early wake on the assumption that no limit is active. A
+missing helper does not heal between wakes, so surface `leg=none` to the maintainer.
 
 Then call `ScheduleWakeup` with a delay derived from that reading, and pass this same `/elmer-loop`
 input back as the prompt so the next firing re-enters the loop.
@@ -143,17 +148,29 @@ On `--once`, do Step 1 and stop. No wakeup is scheduled.
 Overnight the loop triggers reviews and CR posts findings. `elmer-triage.sh` composes those into a
 per-PR maildir digest so a TL wakes to a readable queue instead of a raw comment dump:
 
+Set `TRIAGE_PRS` to the space-separated PR numbers to digest (the PRs in the drained queue)
+before running the block. The helper REQUIRES at least one PR number - called bare it prints its
+usage and exits 2 - so a `:?` guard fails loudly when the value was never set.
+
 ```bash
+read -r -a triage_prs <<< "${TRIAGE_PRS:?set to the space-separated PR numbers to triage}"
 if [ -f scripts/elmer-triage.sh ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
 elif [ -f ~/.claude/scripts/elmer-triage.sh ]; then leg=stable
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/elmer-triage.sh' ]; then leg=plugin
 else leg=none; fi
-[ "$leg" = repo ]   && { bash scripts/elmer-triage.sh || true; }
-[ "$leg" = stable ] && { bash ~/.claude/scripts/elmer-triage.sh || true; }
-[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/elmer-triage.sh' || true; }
-[ "$leg" = none ]   && echo "elmer-triage.sh not found (repo-local, deployed, or plugin); no triage drop"
-true
+triage_rc=2
+[ "$leg" = repo ]   && { bash scripts/elmer-triage.sh "${triage_prs[@]}"; triage_rc=$?; }
+[ "$leg" = stable ] && { bash ~/.claude/scripts/elmer-triage.sh "${triage_prs[@]}"; triage_rc=$?; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/elmer-triage.sh' "${triage_prs[@]}"; triage_rc=$?; }
+[ "$leg" = none ]   && echo "triage: NOT RUN -- elmer-triage.sh not found (repo-local, deployed, or plugin); no triage drop" >&2
+echo "triage_rc=$triage_rc leg=$leg"
+(exit "$triage_rc")
 ```
+
+`triage_rc=0` means the drop was written (a per-PR read failure is recorded INSIDE that PR's
+entry, never omitted). Non-zero means no drop was written - a setup error, or `leg=none`. The
+step is optional, so it never stops the loop, but report it as NOT RUN rather than as an empty
+queue.
 
 No model is involved, which is what keeps this a dumb pipe: every field is a read-only helper's
 output. Entries record `triaged_sha` on its own line, so a reader greps it and compares to HEAD -

@@ -65,7 +65,8 @@ rc=2
 [ "$leg" = repo ]   && { bash scripts/cache-reclaim.sh "${args[@]}"; rc=$?; }
 [ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/cache-reclaim.sh' "${args[@]}"; rc=$?; }
 [ "$leg" = none ]   && echo "cache-reclaim.sh not found (load via /orchestrate:reclaim-cache)"
-echo "report rc=$rc"
+echo "report rc=$rc leg=$leg"
+(exit "$rc")
 ```
 
 Present the report to the user. Point out the biggest reclaimable items and note that npm and
@@ -96,7 +97,8 @@ rc=2
 [ "$leg" = repo ]   && { bash scripts/cache-reclaim.sh --yes "$TARGETS"; rc=$?; }
 [ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/cache-reclaim.sh' --yes "$TARGETS"; rc=$?; }
 [ "$leg" = none ]   && echo "cache-reclaim.sh not found (load via /orchestrate:reclaim-cache)"
-echo "reclaim rc=$rc"
+echo "reclaim rc=$rc leg=$leg"
+(exit "$rc")
 ```
 
 The helper only ever runs the toolchain's own clean command (never a hand-rolled `rm`) and

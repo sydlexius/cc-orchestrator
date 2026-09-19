@@ -63,7 +63,8 @@ eq_rc=2
 [ "$leg" = stable ] && { bash ~/.claude/scripts/elmer-enqueue.sh "$PR_TO_ENQUEUE" --receipt "$RECEIPT"; eq_rc=$?; }
 [ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/elmer-enqueue.sh' "$PR_TO_ENQUEUE" --receipt "$RECEIPT"; eq_rc=$?; }
 [ "$leg" = none ]   && echo "elmer-enqueue.sh not found (repo-local, deployed, or plugin)" >&2
-echo "eq_rc=$eq_rc"
+echo "eq_rc=$eq_rc leg=$leg"
+(exit "$eq_rc")
 ```
 
 The helper path is LITERAL in every leg, never a variable (the "Helper exec paths" rule in

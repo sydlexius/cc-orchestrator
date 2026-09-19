@@ -225,8 +225,10 @@ remote_head=$(git -C "$worktree" ls-remote origin "refs/heads/$head_ref" | cut -
   > "round <round>: local HEAD advanced to `<post_head>` but origin/<head_ref>
   > is still `<remote_head>`. This is the pipe-swallow silent-failure mode.
   > Retry the push manually via `cd <worktree> && bash <safe-push.sh> <head_ref>`, where
-  > `<safe-push.sh>` is the LITERAL path of the leg `/prep-pr` Step 7 resolves (plugin copy or
-  > deployed `~/.claude/scripts/` copy), then re-run `/autofix-pr <pr>`."
+  > `<safe-push.sh>` is the LITERAL path of the leg `/prep-pr` Step 7 resolves: repo-local
+  > `scripts/safe-push.sh` (the first leg, but ONLY inside cc-orchestrator itself - a consumer
+  > repo's same-named script never substitutes), else the plugin copy, else the deployed
+  > `~/.claude/scripts/` copy. Then re-run `/autofix-pr <pr>`."
   > Exit with status **ABORT**.
 - `post_head != pre_head` AND `remote_head == post_head` -> fix pushed
   and verified. Increment round counter and loop back to 2a.
@@ -298,8 +300,9 @@ with status **CAP**:
 > "Hit round cap of <max_rounds>. CR is still flagging findings; this PR
 > may be in a sticky pattern (e.g. a fix introduces a new finding next
 > round). Manual triage recommended: `gh pr view <pr>` +
-> `bash <pr-unreplied-comments.sh> <pr>` (the LITERAL path of the resolved leg: plugin copy
-> or deployed `~/.claude/scripts/` copy)."
+> `bash <pr-unreplied-comments.sh> <pr>` (the LITERAL path of the resolved leg: repo-local
+> `scripts/pr-unreplied-comments.sh` first, but ONLY inside cc-orchestrator itself; else the
+> plugin copy; else the deployed `~/.claude/scripts/` copy)."
 
 Per `feedback_cap_cr_rounds`, do NOT silently continue past the cap.
 Offer the user an explicit "bump cap" path: "Re-run with
