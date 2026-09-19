@@ -52,6 +52,46 @@ and the `pr-watch.sh` quiet-period gate. Its inline threads resolve via GraphQL
 
 ---
 
+## Step 0 -- Resolve helper paths (once, before any other step)
+
+This command calls several bundled helpers many times, so instead of a per-call detection chain
+it resolves them ONCE here. The block only TESTS and PRINTS - it executes nothing:
+
+```bash
+for h in patch-coverage.sh pr-codeql-autofixes.sh pr-read-comments.sh pr-unreplied-comments.sh reply-comment.sh resolve-threads.sh; do
+  if [ -f "scripts/$h" ] && jq -e '.name == "orchestrate"' .claude-plugin/plugin.json >/dev/null 2>&1; then echo "$h -> scripts/$h"
+  elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/'"$h" ]; then echo "$h -> "'${CLAUDE_PLUGIN_ROOT}/scripts/'"$h"
+  elif [ -f ~/.claude/scripts/"$h" ]; then echo "$h -> ~/.claude/scripts/$h"
+  else echo "$h -> NOT FOUND"; fi
+done
+```
+
+Every later block writes a helper as `HELPER_DIR/<name>`. **Before running any such block, replace
+`HELPER_DIR/<name>` with the LITERAL path printed above for that name** (e.g.
+`bash ~/.claude/scripts/reply-comment.sh ...`). Never store the path in a variable and execute the
+variable, and never wrap the call in `sh -c`/`eval`: a PreToolUse safety hook denies an
+interpreter whose script path it cannot read statically (the "Helper exec paths" rule in
+`prep-pr.md`). The same literal paths go into any subagent prompt this command spawns - a prompt
+is never substituted. A helper printed as `NOT FOUND` means that step cannot run: say so, and do
+not improvise a replacement. A hook DENYING a helper call is `NOT RUN (denied by hook: <reason>)`,
+never an empty result (the **Hook-denied gate command** rule in `prep-pr.md`); a gate step
+(the merge-readiness or unreplied-count checks) STOPS on it.
+
+**Shell variables.** Command ARGUMENTS in the fenced blocks below are quoted variables, never
+bare `<placeholder>` tokens (an unquoted `<x>` is a shell REDIRECTION, so the block fails to
+parse or the helper gets missing arguments). Set the ones a block uses in the same Bash call
+first: `pr_number` (Step 1), `comment_id` (one inline comment id), `comment_ids` (a bash array
+of comment ids, e.g. `comment_ids=(123 456)`), `review_id` (a review-body id). `<...>` inside a
+QUOTED reply text is prose to fill in, not an argument.
+
+Why not `${CLAUDE_PLUGIN_ROOT}` directly: Claude Code substitutes that token only when this
+command loads as `/orchestrate:*`. Loaded through a `~/.claude/commands/<name>.md` symlink (a
+supported install) it stays literal, and the safety hook denies it unquoted or double-quoted.
+The `scripts/<name>` leg is printed only inside cc-orchestrator itself (the `plugin.json` name
+check); in any other repo a same-named `scripts/<name>` is that repo's own script and is never used.
+
+---
+
 ## Step 1 -- Identify the PR
 
 Resolve `pr_number` and `repo`:
@@ -144,9 +184,31 @@ this loop only *waits* for reviews already in flight. Poll with increasing
 intervals: **15s → 30s → 60s → 120s**. At each interval:
 
 ```bash
-pending=$(bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh --pending-only "$pr_number")
-unreplied=$(bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh --count-only "$pr_number")
+# Full per-leg block (not HELPER_DIR/): this is a GATE. A missing/unsubstituted helper exits
+# 127 with an EMPTY capture, and an empty capture must never read as 0 / "stable".
+if [ -f scripts/pr-unreplied-comments.sh ] && jq -e '.name == "orchestrate"' .claude-plugin/plugin.json >/dev/null 2>&1; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh' ]; then leg=plugin
+elif [ -f ~/.claude/scripts/pr-unreplied-comments.sh ]; then leg=stable
+else leg=none; fi
+pending=""; unreplied=""; p_rc=127; u_rc=127
+[ "$leg" = repo ]   && { pending=$(bash scripts/pr-unreplied-comments.sh --pending-only "$pr_number"); p_rc=$?; }
+[ "$leg" = repo ]   && { unreplied=$(bash scripts/pr-unreplied-comments.sh --count-only "$pr_number"); u_rc=$?; }
+[ "$leg" = plugin ] && { pending=$(bash '${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh' --pending-only "$pr_number"); p_rc=$?; }
+[ "$leg" = plugin ] && { unreplied=$(bash '${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh' --count-only "$pr_number"); u_rc=$?; }
+[ "$leg" = stable ] && { pending=$(bash ~/.claude/scripts/pr-unreplied-comments.sh --pending-only "$pr_number"); p_rc=$?; }
+[ "$leg" = stable ] && { unreplied=$(bash ~/.claude/scripts/pr-unreplied-comments.sh --count-only "$pr_number"); u_rc=$?; }
+if [ "$p_rc" -ne 0 ] || [ "$u_rc" -ne 0 ] || [ -z "$pending" ] || [ -z "$unreplied" ]; then
+  echo "readiness: NOT RUN (leg=$leg p_rc=$p_rc u_rc=$u_rc pending='$pending' unreplied='$unreplied') -> NOT ready"
+else
+  echo "readiness: pending=$pending unreplied=$unreplied"
+fi
 ```
+
+An empty count means NOT RUN, never 0: a `readiness: NOT RUN` line (helper missing, non-zero
+exit, hook-denied, or an empty capture) is NOT ready - fail toward not-ready, never toward
+"stable". It does not count as one of the consecutive polls. If it says `leg=none`, the
+helper is MISSING and will not appear between polls: STOP now and report NOT RUN rather than
+burning the remaining polls.
 
 If `pending == 0` AND `unreplied` count matches the previous check → ready.
 If not stable after 4 polls (~3.75 minutes), tell the user which bots are still
@@ -166,15 +228,16 @@ actionable comments), so no class can be dropped by an inline-only glance. Triag
 against THIS complete list, never against a glance at inline comments alone:
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh --itemized "$pr_number"
+bash HELPER_DIR/pr-unreplied-comments.sh --itemized "$pr_number"
 ```
 
 Each line is `<class> | <user> | <loc> | <excerpt> | replied:<..> resolved:<..>`.
 A **review-body** finding has NO inline thread to resolve: it clears when you ACK
 THE REVIEW BY ID -- a comment of yours whose body REFERENCES the review id:
 
-```sh
-reply-comment.sh --review <review-id> <pr> "<why it is addressed / the fix SHA>"
+```bash
+# HELPER_DIR/ -> the literal path Step 0 printed; set review_id first (see "Shell variables" in Step 0).
+bash HELPER_DIR/reply-comment.sh --review "$review_id" "$pr_number" "<why it is addressed / the fix SHA>"
 ```
 
 The review id is the ack token. A reply WITHOUT it does NOT clear the finding --
@@ -194,21 +257,21 @@ Then pull the full bodies per class for the actual fixes:
 # codecov[bot] has posted a coverage summary on the PR. That advisory is
 # informational only -- codecov comments are coverage reports, not review
 # threads, and require no reply.
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh "$pr_number"
+bash HELPER_DIR/pr-unreplied-comments.sh "$pr_number"
 
 # Full bodies of all unreplied inline comments
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-read-comments.sh "$pr_number"
+bash HELPER_DIR/pr-read-comments.sh "$pr_number"
 
 # Full bodies of review-body comments (actionable findings in review summaries)
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-read-comments.sh --reviews "$pr_number"
+bash HELPER_DIR/pr-read-comments.sh --reviews "$pr_number"
 
 # Full bodies of issue-level bot comments (e.g. github-actions docs-drift
 # advisories that workflows post on the PR conversation tab, not on the diff).
 # These have no threaded-reply surface but often carry actionable signals.
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-read-comments.sh --issue "$pr_number"
+bash HELPER_DIR/pr-read-comments.sh --issue "$pr_number"
 
 # Full bodies of specific comment IDs only
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-read-comments.sh "$pr_number" 123456 789012
+bash HELPER_DIR/pr-read-comments.sh "$pr_number" 123456 789012
 ```
 
 ### Code-scanning (GHAS / CodeQL) alerts -- separate API surface
@@ -220,7 +283,7 @@ alert, and a committable autofix, otherwise sails right past this flow. Always
 surface them:
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-codeql-autofixes.sh "$pr_number"
+bash HELPER_DIR/pr-codeql-autofixes.sh "$pr_number"
 ```
 
 For each open alert it prints the location, message, alert URL, and whether a
@@ -416,16 +479,25 @@ re-implementing per-stack test commands here:
 
 ```bash
 git diff --name-only   # identify changed files
-if [ -f scripts/gate-runner.py ]; then
-  python3 scripts/gate-runner.py
-else
-  python3 ~/.claude/scripts/gate-runner.py
-fi
-gate_rc=$?
+# Literal helper path in every leg (the "Helper exec paths" rule in prep-pr.md): repo-local ONLY
+# inside cc-orchestrator itself, else the plugin copy, else the deployed copy. No runner on any
+# leg = `gate: NOT RUN`, gate_rc=2, treated as a FAILED gate (fail closed, never a pass).
+if [ -f scripts/gate-runner.py ] && jq -e '.name == "orchestrate"' .claude-plugin/plugin.json >/dev/null 2>&1; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/gate-runner.py' ]; then leg=plugin
+elif [ -f ~/.claude/scripts/gate-runner.py ]; then leg=stable
+else leg=none; fi
+gate_rc=2
+[ "$leg" = repo ]   && { python3 scripts/gate-runner.py; gate_rc=$?; }
+[ "$leg" = plugin ] && { python3 '${CLAUDE_PLUGIN_ROOT}/scripts/gate-runner.py'; gate_rc=$?; }
+[ "$leg" = stable ] && { python3 ~/.claude/scripts/gate-runner.py; gate_rc=$?; }
+[ "$leg" = none ]   && echo "gate: NOT RUN (gate-runner.py not found on any leg: repo/plugin/deployed)" >&2
+echo "gate_rc=$gate_rc leg=$leg"
+(exit "$gate_rc")
 ```
 
 The runner prints a per-step `[PASS]` / `[SKIP]` / `[FAIL]` line and exits
-non-zero on the first required-gate failure. *Illustrative -- what runs in
+non-zero on the first required-gate failure. A `gate: NOT RUN` line (no runner found on any
+leg) is a FAILED gate, not a skip: stop and report it. *Illustrative -- what runs in
 cc-orchestrator:* its `.gates.toml` enumerates `shellcheck` on the shell
 scripts, `ruff check --select F,E741` on the `.py` files, the
 `orchestrate-guard.sh`/`orchestrate-steer.sh` `--self-test` runs, and the
@@ -444,13 +516,13 @@ it is a no-op -- skip it. When it does apply, **do not write an ad-hoc coverage
 script.** Use the maintained estimator, which mirrors Codecov's projection
 (all-hit rule + trailing-brace correction). The profile-generation step below is
 illustrative (a Go example); substitute the target repo's coverage-profile
-command:
+command. Set `coverage_target` to the repo's patch target first:
 
 ```bash
 go test -count=1 -coverprofile=/tmp/cover.out ./...
-COVER_OUT=/tmp/cover.out PATCH_COVERAGE_THRESHOLD=<repo target> \
+COVER_OUT=/tmp/cover.out PATCH_COVERAGE_THRESHOLD="$coverage_target" \
   PATCH_COVERAGE_EXCLUDE="<codecov.yml ignore globs>" \
-  bash ${CLAUDE_PLUGIN_ROOT}/scripts/patch-coverage.sh   # or repo-local scripts/patch-coverage.sh
+  bash HELPER_DIR/patch-coverage.sh   # the literal path Step 0 printed
 ```
 
 Self-skip on the absent-signal cases: if `patch-coverage.sh` exits 0 reporting
@@ -621,7 +693,7 @@ Now substitute the real SHA into all "Fixed in <sha>" reply drafts from step 6.
 Post threaded replies for **inline** comments only (do not wait between them):
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh "$pr_number" {COMMENT_ID} '<reply text>'
+bash HELPER_DIR/reply-comment.sh "$pr_number" "$comment_id" '<reply text>'
 ```
 
 Run one call per inline comment. Log each one as it completes.
@@ -638,7 +710,7 @@ noise in the Conversation tab anyway.
 fix touched (or a nearby in-diff line) using the 4th form of the helper:
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh "$pr_number" \
+bash HELPER_DIR/reply-comment.sh "$pr_number" \
   --file path/to/file.go --line 663 \
   "Fixed in <sha>. <one-line rationale>."
 ```
@@ -655,7 +727,7 @@ already-fixed pointer to an earlier SHA).
 - **bug / spec-drift / test-gap**: anchor to the line your fix changed.
 
   ```bash
-  bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh "$pr_number" \
+  bash HELPER_DIR/reply-comment.sh "$pr_number" \
     --file internal/foo/bar.go --line 42 \
     "Fixed in <sha>. <one-line>."
   ```
@@ -664,7 +736,7 @@ already-fixed pointer to an earlier SHA).
   in the same file) with the rebuttal:
 
   ```bash
-  bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh "$pr_number" \
+  bash HELPER_DIR/reply-comment.sh "$pr_number" \
     --file internal/foo/bar.go --line 42 \
     "<evidence-based rebuttal, one or two sentences>."
   ```
@@ -673,7 +745,7 @@ already-fixed pointer to an earlier SHA).
   earlier SHA:
 
   ```bash
-  bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh "$pr_number" \
+  bash HELPER_DIR/reply-comment.sh "$pr_number" \
     --file internal/foo/bar.go --line 42 \
     "Fixed in <earlier-sha>."
   ```
@@ -681,7 +753,7 @@ already-fixed pointer to an earlier SHA).
 - **wont-fix**: anchor to the referenced line with the tracking issue:
 
   ```bash
-  bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh "$pr_number" \
+  bash HELPER_DIR/reply-comment.sh "$pr_number" \
     --file internal/foo/bar.go --line 42 \
     "Tracking in #<issue>. <one-line justification>."
   ```
@@ -715,7 +787,7 @@ runs before the push instead; it acts on already-replied threads either way.)
 Post a single PR-level comment to resolve all addressed CR threads at once:
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh "$pr_number" '@coderabbitai resolve'
+bash HELPER_DIR/reply-comment.sh "$pr_number" '@coderabbitai resolve'
 ```
 
 This tells CodeRabbit to mark all of its threads that have been replied to as
@@ -745,15 +817,15 @@ The default
 call covers all three bots when the IDs span them:
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/resolve-threads.sh "$pr_number" <comment_id> [<comment_id>...]
+bash HELPER_DIR/resolve-threads.sh "$pr_number" "${comment_ids[@]}"
 ```
 
 If you need to scope to a single bot (e.g. you triaged only Greptile in this
 round), pass `--bot`:
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/resolve-threads.sh --bot greptile "$pr_number" <id...>
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/resolve-threads.sh --bot copilot  "$pr_number" <id...>
+bash HELPER_DIR/resolve-threads.sh --bot greptile "$pr_number" "${comment_ids[@]}"
+bash HELPER_DIR/resolve-threads.sh --bot copilot  "$pr_number" "${comment_ids[@]}"
 ```
 
 The script fetches all review threads, matches each ID to a thread whose first

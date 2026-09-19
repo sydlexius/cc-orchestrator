@@ -47,6 +47,52 @@ dependent PRs via rebase.
 
 ---
 
+## Step 0 -- Resolve helper paths (once, before any other step)
+
+This command calls several bundled helpers many times, so instead of a per-call detection chain
+it resolves them ONCE here. The block only TESTS and PRINTS - it executes nothing:
+
+```bash
+for h in patch-coverage.sh pr-read-comments.sh pr-unreplied-comments.sh reply-comment.sh; do
+  if [ -f "scripts/$h" ] && jq -e '.name == "orchestrate"' .claude-plugin/plugin.json >/dev/null 2>&1; then echo "$h -> scripts/$h"
+  elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/'"$h" ]; then echo "$h -> "'${CLAUDE_PLUGIN_ROOT}/scripts/'"$h"
+  elif [ -f ~/.claude/scripts/"$h" ]; then echo "$h -> ~/.claude/scripts/$h"
+  else echo "$h -> NOT FOUND"; fi
+done
+```
+
+`patch-coverage.sh` is resolved here because a fix round that touches a failing `codecov/patch`
+status estimates coverage the `/handle-review` way ("Estimating patch coverage (do not hand-roll)"),
+which runs `HELPER_DIR/patch-coverage.sh`; a `NOT FOUND` there is a coverage NOT RUN, never a pass.
+
+Every later block writes a helper as `HELPER_DIR/<name>`. **Before running any such block, replace
+`HELPER_DIR/<name>` with the LITERAL path printed above for that name** (e.g.
+`bash ~/.claude/scripts/reply-comment.sh ...`). Never store the path in a variable and execute the
+variable, and never wrap the call in `sh -c`/`eval`: a PreToolUse safety hook denies an
+interpreter whose script path it cannot read statically (the "Helper exec paths" rule in
+`prep-pr.md`). The same literal paths go into any subagent prompt this command spawns - a prompt
+is never substituted. A helper printed as `NOT FOUND` means that step cannot run: say so, and do
+not improvise a replacement. A hook DENYING a helper call is `NOT RUN (denied by hook: <reason>)`,
+never an empty result (the **Hook-denied gate command** rule in `prep-pr.md`); a gate step
+(the merge-readiness or unreplied-count checks) STOPS on it.
+
+**Shell variables.** Command ARGUMENTS in the fenced blocks below are quoted variables, never
+bare `<placeholder>` tokens (an unquoted `<x>` is a shell REDIRECTION, so the block fails to
+parse or the helper gets missing arguments). Set the ones a block uses in the same Bash call
+first: `pr_number` (the PR being worked), `repo` (Step 1), `comment_id` (one inline comment
+id), `comment_ids` (a bash array, e.g. `comment_ids=(123 456)`), `file_path` + `line_number`
+(the anchor for a 4-arg reply), `changed_files` (a bash array of the files this round changed, Step 4e), `branch_name` / `next_branch` / `fixed_branch` (Step 4b /
+restack). The same names go into each per-PR agent prompt. `<...>` inside a QUOTED reply text is
+prose to fill in, not an argument.
+
+Why not `${CLAUDE_PLUGIN_ROOT}` directly: Claude Code substitutes that token only when this
+command loads as `/orchestrate:*`. Loaded through a `~/.claude/commands/<name>.md` symlink (a
+supported install) it stays literal, and the safety hook denies it unquoted or double-quoted.
+The `scripts/<name>` leg is printed only inside cc-orchestrator itself (the `plugin.json` name
+check); in any other repo a same-named `scripts/<name>` is that repo's own script and is never used.
+
+---
+
 ## Step 1 -- Identify the stack
 
 This step runs first because all subsequent parallel work depends on knowing the PR list.
@@ -137,12 +183,34 @@ Each agent receives this task:
 > pass would help, note it and let the maintainer allocate one.
 >
 > **Step B -- Poll for review readiness (geometric cooldown):**
-> Poll at 15s, 30s, 60s, 120s intervals. At each interval check:
+> Poll at 15s, 30s, 60s, 120s intervals. At each interval, with `pr_number` set to
+> this PR's number, check:
 >
 > ```bash
-> pending=$(bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh --pending-only <number>)
-> unreplied=$(bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh --count-only <number>)
+> # Full per-leg block (not HELPER_DIR/): this is a GATE. A missing/unsubstituted helper exits
+> # 127 with an EMPTY capture, and an empty capture must never read as 0 / "stable".
+> if [ -f scripts/pr-unreplied-comments.sh ] && jq -e '.name == "orchestrate"' .claude-plugin/plugin.json >/dev/null 2>&1; then leg=repo
+> elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh' ]; then leg=plugin
+> elif [ -f ~/.claude/scripts/pr-unreplied-comments.sh ]; then leg=stable
+> else leg=none; fi
+> pending=""; unreplied=""; p_rc=127; u_rc=127
+> [ "$leg" = repo ]   && { pending=$(bash scripts/pr-unreplied-comments.sh --pending-only "$pr_number"); p_rc=$?; }
+> [ "$leg" = repo ]   && { unreplied=$(bash scripts/pr-unreplied-comments.sh --count-only "$pr_number"); u_rc=$?; }
+> [ "$leg" = plugin ] && { pending=$(bash '${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh' --pending-only "$pr_number"); p_rc=$?; }
+> [ "$leg" = plugin ] && { unreplied=$(bash '${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh' --count-only "$pr_number"); u_rc=$?; }
+> [ "$leg" = stable ] && { pending=$(bash ~/.claude/scripts/pr-unreplied-comments.sh --pending-only "$pr_number"); p_rc=$?; }
+> [ "$leg" = stable ] && { unreplied=$(bash ~/.claude/scripts/pr-unreplied-comments.sh --count-only "$pr_number"); u_rc=$?; }
+> if [ "$p_rc" -ne 0 ] || [ "$u_rc" -ne 0 ] || [ -z "$pending" ] || [ -z "$unreplied" ]; then
+>   echo "readiness: NOT RUN (leg=$leg p_rc=$p_rc u_rc=$u_rc pending='$pending' unreplied='$unreplied') -> NOT ready"
+> else
+>   echo "readiness: pending=$pending unreplied=$unreplied"
+> fi
 > ```
+>
+> An empty count means NOT RUN, never 0: a `readiness: NOT RUN` line (helper missing, non-zero
+> exit, hook-denied, or an empty capture) is NOT ready - fail toward not-ready, never toward
+> "stable". It does not count as one of the consecutive polls. If it says `leg=none`, the
+> helper is MISSING and will not appear between polls: STOP now and report NOT RUN.
 >
 > Ready when `pending == 0` AND `unreplied` count matches the previous check.
 > If not stable after 4 polls, report the PR as WAITING with details.
@@ -150,15 +218,15 @@ Each agent receives this task:
 > **Step C -- Fetch all unreplied bot comments (overview then full bodies):**
 >
 > ```bash
-> bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh <number>
-> bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-read-comments.sh <number>
-> bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-read-comments.sh --reviews <number>
+> bash HELPER_DIR/pr-unreplied-comments.sh "$pr_number"
+> bash HELPER_DIR/pr-read-comments.sh "$pr_number"
+> bash HELPER_DIR/pr-read-comments.sh --reviews "$pr_number"
 > ```
 >
 > For specific comment IDs only:
 >
 > ```bash
-> bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-read-comments.sh <number> <id1> <id2> ...
+> bash HELPER_DIR/pr-read-comments.sh "$pr_number" "${comment_ids[@]}"
 > ```
 >
 > **Return format:**
@@ -185,7 +253,7 @@ Each agent receives this task:
   Instead, capture the coverage advisory separately:
 
   ```bash
-  bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh --coverage-only <number> <repo>
+  bash HELPER_DIR/pr-unreplied-comments.sh --coverage-only "$pr_number" "$repo"
   ```
 
   Returns a JSON object with `status`, `patch_pct`, `patch_pct_source`,
@@ -338,8 +406,8 @@ If confirmed, skip to Step 4f (reply) with "Already addressed in HEAD." for each
 ### 4b. Switch to the PR's branch
 
 ```bash
-git checkout <branch_name>
-git pull --rebase origin <branch_name>
+git checkout "$branch_name"
+git pull --rebase origin "$branch_name"
 ```
 
 ### 4c. Execute fixes
@@ -368,12 +436,20 @@ runner `/prep-pr` Step 2 uses -- one source of truth, no per-stack detection
 re-implemented here:
 
 ```bash
-if [ -f scripts/gate-runner.py ]; then
-  python3 scripts/gate-runner.py
-else
-  python3 ~/.claude/scripts/gate-runner.py
-fi
-gate_rc=$?
+# Literal helper path in every leg (the "Helper exec paths" rule in prep-pr.md): repo-local ONLY
+# inside cc-orchestrator itself, else the plugin copy, else the deployed copy. No runner on any
+# leg = `gate: NOT RUN`, gate_rc=2, treated as a FAILED gate (fail closed, never a pass).
+if [ -f scripts/gate-runner.py ] && jq -e '.name == "orchestrate"' .claude-plugin/plugin.json >/dev/null 2>&1; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/gate-runner.py' ]; then leg=plugin
+elif [ -f ~/.claude/scripts/gate-runner.py ]; then leg=stable
+else leg=none; fi
+gate_rc=2
+[ "$leg" = repo ]   && { python3 scripts/gate-runner.py; gate_rc=$?; }
+[ "$leg" = plugin ] && { python3 '${CLAUDE_PLUGIN_ROOT}/scripts/gate-runner.py'; gate_rc=$?; }
+[ "$leg" = stable ] && { python3 ~/.claude/scripts/gate-runner.py; gate_rc=$?; }
+[ "$leg" = none ]   && echo "gate: NOT RUN (gate-runner.py not found on any leg: repo/plugin/deployed)" >&2
+echo "gate_rc=$gate_rc leg=$leg"
+(exit "$gate_rc")
 ```
 
 *Illustrative -- this repo's gates (from its `.gates.toml`):* `shellcheck` on
@@ -381,7 +457,8 @@ the shell scripts, `ruff check --select F,E741` on the `.py` files, the
 guard/steer self-tests, and the `python3 test-*.py` harnesses. Another target
 repo declares a different set (or relies on the fallback chain).
 
-If `gate_rc` is non-zero, fix the failures before proceeding.
+If `gate_rc` is non-zero, fix the failures before proceeding. A `gate: NOT RUN` line (no
+runner found on any leg) is a FAILED gate, not a skip: stop and report it.
 
 If the repo uses templ and any `.templ` files were changed (self-skip when no
 `.templ` files exist), regenerate:
@@ -395,7 +472,7 @@ fi
 ### 4e. Commit
 
 ```bash
-git add <specific files that were changed>
+git add -- "${changed_files[@]}"   # the specific files this round changed
 git commit -m "address PR review feedback
 
 - <one-line summary per fix>
@@ -410,7 +487,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - `reply_type: "inline"` comments (inline diff annotations) -- use the **3-arg form**:
 
   ```bash
-  bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh <PR> <comment_id> '<text>'
+  bash HELPER_DIR/reply-comment.sh "$pr_number" "$comment_id" '<text>'
   ```
 
   This posts a threaded reply under the code annotation.
@@ -424,25 +501,25 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 Fix now:
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh <PR> <comment_id> 'Fixed in <short-sha>.'
+bash HELPER_DIR/reply-comment.sh "$pr_number" "$comment_id" 'Fixed in <short-sha>.'
 ```
 
 Rebut:
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh <PR> <comment_id> '<evidence-based rebuttal>'
+bash HELPER_DIR/reply-comment.sh "$pr_number" "$comment_id" '<evidence-based rebuttal>'
 ```
 
 Stacked-PR repeat:
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh <PR> <comment_id> 'This is wired in PR #<later_pr>. Per-PR review limitation on stacked PRs.'
+bash HELPER_DIR/reply-comment.sh "$pr_number" "$comment_id" 'This is wired in PR #<later_pr>. Per-PR review limitation on stacked PRs.'
 ```
 
 Defer:
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh <PR> <comment_id> 'Tracked in #<issue-number>. Requires <brief justification for deferral>.'
+bash HELPER_DIR/reply-comment.sh "$pr_number" "$comment_id" 'Tracked in #<issue-number>. Requires <brief justification for deferral>.'
 ```
 
 **For review body IDs (reply_type: "top-level") -- use the 4-arg form:**
@@ -456,8 +533,8 @@ no-toplevel-summaries hook and produces Conversation-tab noise anyway.
 fix touched (or a nearby in-diff line for rebuttals) using the 4-arg form:
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh <PR> \
-  --file <path> --line <n> \
+bash HELPER_DIR/reply-comment.sh "$pr_number" \
+  --file "$file_path" --line "$line_number" \
   '<reply text>'
 ```
 
@@ -501,7 +578,7 @@ After a successful push, record the PR number in the session breadcrumb file:
 REPO_NAME="$(basename "$(git remote get-url origin 2>/dev/null)" .git)"
 REPO_NAME="${REPO_NAME:-$(basename "$PWD")}"
 SESSION_PRS_FILE="/tmp/${REPO_NAME}-session-prs.txt"
-echo "<PR>" >> "$SESSION_PRS_FILE"
+echo "$pr_number" >> "$SESSION_PRS_FILE"
 ```
 
 ### 4h. Cascade check
@@ -517,8 +594,8 @@ If yes:
 
 ```bash
 # Without Graphite (manual rebase chain):
-git checkout <next_branch>
-git rebase <fixed_branch>
+git checkout "$next_branch"
+git rebase "$fixed_branch"
 # ... repeat up the chain
 ```
 

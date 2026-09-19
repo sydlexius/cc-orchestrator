@@ -285,10 +285,18 @@ that build). So this step is a single cheap `df` check that prints at most one a
 cleans nothing. Reclaiming is on-demand via `/reclaim-cache`.
 
 ```bash
-if [ -f scripts/cache-reclaim.sh ]; then PL=scripts/cache-reclaim.sh
-elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/cache-reclaim.sh" ]; then PL="${CLAUDE_PLUGIN_ROOT}/scripts/cache-reclaim.sh"
-else PL=""; fi
-[ -n "$PL" ] && bash "$PL" --nudge || true
+# Literal helper path in every leg (the "Helper exec paths" rule in prep-pr.md). cache-reclaim.sh
+# is NOT deployed to ~/.claude/scripts/, so there is no stable leg.
+if [ -f scripts/cache-reclaim.sh ] && jq -e '.name == "orchestrate"' .claude-plugin/plugin.json >/dev/null 2>&1; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/cache-reclaim.sh' ]; then leg=plugin
+else leg=none; fi
+nudge_rc=2
+[ "$leg" = repo ]   && { nudge_rc=0; bash scripts/cache-reclaim.sh --nudge || nudge_rc=$?; }
+[ "$leg" = plugin ] && { nudge_rc=0; bash '${CLAUDE_PLUGIN_ROOT}/scripts/cache-reclaim.sh' --nudge || nudge_rc=$?; }
+[ "$leg" = none ]   && echo "disk nudge: NOT RUN (cache-reclaim.sh not found; load via /orchestrate:post-merge-cleanup)"
+# ADVISORY: the status rides in the PRINTED nudge_rc, and the block itself deliberately ends 0
+# so a nudge problem can never abort cleanup (`|| nudge_rc=$?` also keeps it safe under `set -e`). Nonzero nudge_rc = NOT RUN, report it and continue.
+echo "nudge_rc=$nudge_rc leg=$leg"
 ```
 
 `--nudge` reads `df` only (no `du` scan, no clean), prints "Disk N% full - run /reclaim-cache ..."
@@ -305,10 +313,18 @@ BEHIND. Surface that now, while the merge is fresh, rather than discovering it a
 gate. The sweep EXCLUDES the PR that just merged.
 
 ```bash
-if [ -f scripts/open-pr-staleness-sweep.sh ]; then SW=scripts/open-pr-staleness-sweep.sh
-elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/open-pr-staleness-sweep.sh" ]; then SW="${CLAUDE_PLUGIN_ROOT}/scripts/open-pr-staleness-sweep.sh"
-else SW=""; fi
-[ -n "$SW" ] && bash "$SW" "$pr_number" "$repo" || true
+# Literal helper path in every leg (the "Helper exec paths" rule in prep-pr.md).
+# open-pr-staleness-sweep.sh is NOT deployed to ~/.claude/scripts/, so there is no stable leg.
+if [ -f scripts/open-pr-staleness-sweep.sh ] && jq -e '.name == "orchestrate"' .claude-plugin/plugin.json >/dev/null 2>&1; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/open-pr-staleness-sweep.sh' ]; then leg=plugin
+else leg=none; fi
+sweep_rc=2
+[ "$leg" = repo ]   && { sweep_rc=0; bash scripts/open-pr-staleness-sweep.sh "$pr_number" "$repo" || sweep_rc=$?; }
+[ "$leg" = plugin ] && { sweep_rc=0; bash '${CLAUDE_PLUGIN_ROOT}/scripts/open-pr-staleness-sweep.sh' "$pr_number" "$repo" || sweep_rc=$?; }
+[ "$leg" = none ]   && echo "staleness sweep: NOT RUN (open-pr-staleness-sweep.sh not found; load via /orchestrate:post-merge-cleanup)"
+# ADVISORY: status rides in the PRINTED sweep_rc; the block deliberately ends 0 so the sweep can
+# never abort cleanup (`|| sweep_rc=$?` keeps it `set -e` safe). Nonzero sweep_rc = NOT RUN (missing helper or malformed call), report it.
+echo "sweep_rc=$sweep_rc leg=$leg"
 ```
 
 The sweep is ADVISORY and FAIL-OPEN by contract: it exits 0 on every operational path (including a

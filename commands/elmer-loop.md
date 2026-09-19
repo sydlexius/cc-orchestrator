@@ -46,18 +46,23 @@ amending CLAUDE.md FIRST.
 
 ## Step 1 -- One tick
 
-Resolve the helper in the SAME Bash call that uses it - each tool call is a fresh shell.
+Detect and run the helper in the SAME Bash call - each tool call is a fresh shell. Every helper
+path in this command is LITERAL, never a variable (the "Helper exec paths" rule in `prep-pr.md`),
+and the deployed `~/.claude/scripts/` leg is checked before the plugin leg on purpose: that is what
+keeps the unattended loop inside the existing wrapper grant (see Notes).
 
 ```bash
-TK=""
-if [ -f scripts/elmer-tick.sh ]; then TK=scripts/elmer-tick.sh
-elif [ -f "$HOME/.claude/scripts/elmer-tick.sh" ]; then TK="$HOME/.claude/scripts/elmer-tick.sh"
-elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/elmer-tick.sh" ]; then
-  TK="${CLAUDE_PLUGIN_ROOT}/scripts/elmer-tick.sh"
-fi
-[ -n "$TK" ] || { echo "elmer-tick.sh not found (repo-local, deployed, or plugin)" >&2; exit 2; }
-
-bash "$TK"
+if [ -f scripts/elmer-tick.sh ] && jq -e '.name == "orchestrate"' .claude-plugin/plugin.json >/dev/null 2>&1; then leg=repo
+elif [ -f ~/.claude/scripts/elmer-tick.sh ]; then leg=stable
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/elmer-tick.sh' ]; then leg=plugin
+else leg=none; fi
+tick_rc=2
+[ "$leg" = repo ]   && { bash scripts/elmer-tick.sh; tick_rc=$?; }
+[ "$leg" = stable ] && { bash ~/.claude/scripts/elmer-tick.sh; tick_rc=$?; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/elmer-tick.sh'; tick_rc=$?; }
+[ "$leg" = none ]   && echo "elmer-tick.sh not found (repo-local, deployed, or plugin)" >&2
+echo "tick_rc=$tick_rc leg=$leg"
+(exit "$tick_rc")
 ```
 
 On `--dry-run`, set `ELMER_DRY_RUN=1` in front of the command: it does everything except the post
@@ -65,7 +70,7 @@ and prints the exact command it would have run. Use this the first time you run 
 environment - it exercises the lock, the cap, the quota read, and the queue pick without spending a
 review slot.
 
-### Reading the exit code
+### Reading the exit code (`tick_rc`)
 
 | Exit | Meaning | Next |
 |---|---|---|
@@ -84,14 +89,17 @@ A fixed hourly tick drifts out of phase with the real window and wastes slots. A
 when the current limit expires and wake then:
 
 ```bash
-QW=""
-if [ -f scripts/cr-quota-watch.sh ]; then QW=scripts/cr-quota-watch.sh
-elif [ -f "$HOME/.claude/scripts/cr-quota-watch.sh" ]; then QW="$HOME/.claude/scripts/cr-quota-watch.sh"
-fi
 PR_FOR_QUOTA="${PR_FOR_QUOTA:?set to a PR number from the queue (ls the inbox; entries are named <repo-slug>--<pr>--<sha12>.json)}"
+if [ -f scripts/cr-quota-watch.sh ] && jq -e '.name == "orchestrate"' .claude-plugin/plugin.json >/dev/null 2>&1; then leg=repo
+elif [ -f ~/.claude/scripts/cr-quota-watch.sh ]; then leg=stable
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/cr-quota-watch.sh' ]; then leg=plugin
+else leg=none; fi
 QUOTA_RC=0
-if [ -n "$QW" ]; then bash "$QW" "$PR_FOR_QUOTA" || QUOTA_RC=$?; fi
-echo "quota rc=$QUOTA_RC"
+[ "$leg" = repo ]   && { bash scripts/cr-quota-watch.sh "$PR_FOR_QUOTA" || QUOTA_RC=$?; }
+[ "$leg" = stable ] && { bash ~/.claude/scripts/cr-quota-watch.sh "$PR_FOR_QUOTA" || QUOTA_RC=$?; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/cr-quota-watch.sh' "$PR_FOR_QUOTA" || QUOTA_RC=$?; }
+[ "$leg" = none ]   && { echo "quota: NOT RUN -- cr-quota-watch.sh not found (repo-local, deployed, or plugin)"; QUOTA_RC=2; }
+echo "quota rc=$QUOTA_RC leg=$leg"
 ```
 
 `PR_FOR_QUOTA` is a `:?` guard, not a `<a-PR#>` placeholder: a bare `<...>` is a shell
@@ -106,7 +114,11 @@ under a caller running `set -e`). The missing-PR guard still fails loudly - the 
 to the helper call alone.
 
 Exit 1 means limited, and the output carries the remaining time plus a Pacific-labeled deadline.
-Exit 0 means no announced limit.
+Exit 0 means no announced limit. `quota rc=2` is a FAILURE, never an all-clear: either the
+helper's own setup/read error, or (`leg=none`, `quota: NOT RUN`) no quota helper was found on
+any leg. There is no reading to pace against - report it, sleep the long default (20-30 min),
+and re-query; never schedule an early wake on the assumption that no limit is active. A
+missing helper does not heal between wakes, so surface `leg=none` to the maintainer.
 
 Then call `ScheduleWakeup` with a delay derived from that reading, and pass this same `/elmer-loop`
 input back as the prompt so the next firing re-enters the loop.
@@ -136,13 +148,42 @@ On `--once`, do Step 1 and stop. No wakeup is scheduled.
 Overnight the loop triggers reviews and CR posts findings. `elmer-triage.sh` composes those into a
 per-PR maildir digest so a TL wakes to a readable queue instead of a raw comment dump:
 
+Set `TRIAGE_PRS` to the space-separated PR numbers to digest before running the block: the PRs
+the loop triggered SINCE THE LAST TRIAGE. `drained/` is a permanent audit trail that only grows,
+so take recent entries, not all of them. Entries are named `<repo-slug>--<pr>--<sha12>.json`, so
+for the last 24 hours:
+`TRIAGE_PRS=$(find ~/.claude/elmer/drained -name '*.json' -mtime -1 | sed -E 's/.*--([0-9]+)--[0-9a-f]+\.json$/\1/' | sort -un | tr '\n' ' ')`.
+The helper REQUIRES at least one PR number - called bare it prints its usage and exits 2 - so the block
+checks the BUILT ARRAY and stops loudly when it is empty. (Not a `${TRIAGE_PRS:?}` guard: inside
+a `$(...)` zsh does not abort the outer command on it, so the helper would still run bare.)
+
+The array is built with `printf` word-splitting, NOT `read -a`: the Bash tool runs the user's
+shell, and zsh rejects `read -a` (`bad option: -a`) and leaves the array EMPTY, which would call
+the helper bare - the exact defect this block exists to close.
+
 ```bash
-TR=""
-if [ -f scripts/elmer-triage.sh ]; then TR=scripts/elmer-triage.sh
-elif [ -f "$HOME/.claude/scripts/elmer-triage.sh" ]; then TR="$HOME/.claude/scripts/elmer-triage.sh"
+triage_prs=( $(printf '%s\n' "${TRIAGE_PRS:-}") )
+if [ "${#triage_prs[@]}" -eq 0 ]; then
+  echo "triage: NOT RUN -- TRIAGE_PRS is unset or empty; set it to the PR numbers to triage" >&2
+  exit 2
 fi
-[ -n "$TR" ] && bash "$TR" || true
+if [ -f scripts/elmer-triage.sh ] && jq -e '.name == "orchestrate"' .claude-plugin/plugin.json >/dev/null 2>&1; then leg=repo
+elif [ -f ~/.claude/scripts/elmer-triage.sh ]; then leg=stable
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/elmer-triage.sh' ]; then leg=plugin
+else leg=none; fi
+triage_rc=2
+[ "$leg" = repo ]   && { bash scripts/elmer-triage.sh "${triage_prs[@]}"; triage_rc=$?; }
+[ "$leg" = stable ] && { bash ~/.claude/scripts/elmer-triage.sh "${triage_prs[@]}"; triage_rc=$?; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/elmer-triage.sh' "${triage_prs[@]}"; triage_rc=$?; }
+[ "$leg" = none ]   && echo "triage: NOT RUN -- elmer-triage.sh not found (repo-local, deployed, or plugin); no triage drop" >&2
+echo "triage_rc=$triage_rc leg=$leg"
+(exit "$triage_rc")
 ```
+
+`triage_rc=0` means the drop was written (a per-PR read failure is recorded INSIDE that PR's
+entry, never omitted). Non-zero means no drop was written - a setup error, or `leg=none`. The
+step is optional, so it never stops the loop, but report it as NOT RUN rather than as an empty
+queue.
 
 No model is involved, which is what keeps this a dumb pipe: every field is a read-only helper's
 output. Entries record `triaged_sha` on its own line, so a reader greps it and compares to HEAD -
