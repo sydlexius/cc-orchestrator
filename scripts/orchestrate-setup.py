@@ -156,6 +156,36 @@ HELPER_NAMES = (
 # The _helper_deploy_action results that warrant an actual deploy write (vs. None / informational).
 HELPER_DEPLOY_ACTIONS = ("deploy", "refresh", "replace-symlink", "replace-broken-symlink")
 
+# #428: the orchestrate ROLE DEFINITIONS (#427) - Claude Code subagent files whose `tools:` allowlist
+# the harness enforces. They deploy to USER scope (~/.claude/agents) rather than shipping in the
+# plugin's auto-loaded agents/ dir, for one live copy and because user scope is where Claude Code
+# honors the fields plugin scope drops. That same property makes a deployed file a PRIVILEGE
+# SURFACE: a `permissionMode` there applies in every repo that spawns the type (#426 measured
+# `acceptEdits` escalating a default-mode parent), and the merge-gate shadow scan never reads it.
+# So doctor HARD-FAILS the privilege-bearing keys below and configure refuses to deploy a source
+# carrying one.
+#
+# DISCOVERED BY GLOB, never a hand-kept tuple: a role added to the source dir cannot be silently
+# left undeployed (the #216/#217/#330 omission class HELPER_NAMES keeps hitting).
+AGENTS_DIR = os.environ.get("ORCHESTRATE_AGENTS_DIR", os.path.join(HOME, ".claude", "agents"))
+BUNDLED_AGENTS_DIR = os.environ.get("ORCHESTRATE_BUNDLED_AGENTS_DIR", os.path.normpath(
+    os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "skills", "orchestrate",
+                 "agent-definitions")))
+AGENT_PREFIX = "orchestrate-"
+# Keys that GRANT privilege or RUN code. Their presence in a deployed orchestrate role is a FAIL.
+AGENT_FORBIDDEN_KEYS = ("permissionmode", "hooks", "mcpservers")
+# Keys #426 measured as IGNORED for teammates: present means a definition is relying on a guarantee
+# it does not get. WARN, not FAIL - they grant nothing.
+AGENT_INERT_KEYS = ("omitclaudemd", "effort")
+# ONE top-level key line of the STRICT frontmatter grammar _frontmatter() accepts: an unindented,
+# plain or simply-quoted identifier (no escapes), a colon, then whitespace or end-of-line. Group 2 is
+# the value. Anything else at column 0 is outside the grammar and reads as DOUBT - see _frontmatter.
+_CLEAN_NAME_RE = re.compile(r'^(?:"([A-Za-z0-9_-]+)"|\'([A-Za-z0-9_-]+)\'|([A-Za-z0-9_-]+))$')
+# Claude Code's own frontmatter split (CC 2.1.277, after a BOM strip): the region it hands to YAML.
+_CC_FM_RE = re.compile(r'^---\s*\n([\s\S]*?)---\s*\n?')
+_FM_KEY_RE = re.compile(r'^(?:"([A-Za-z][A-Za-z0-9_-]*)"|\'([A-Za-z][A-Za-z0-9_-]*)\'|([A-Za-z][A-Za-z0-9_-]*))'
+                        r'[ ]*:(?:[ ]+(.*))?$')
+
 PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
 
 
@@ -796,6 +826,357 @@ def _emit_helper_warnings(missing, unreadable):
     for name in unreadable:
         print(f"configure: WARNING - deployed helper {os.path.join(SCRIPTS_DIR, name)} is unreadable; "
               "refusing to clobber it blind (the rest still applies).", file=sys.stderr)
+
+
+def _frontmatter(path):
+    """Parse a Markdown agent file's frontmatter under a STRICT GRAMMAR. Returns (keys, name) - the
+    TOP-LEVEL keys, lowercased, and the `name:` value (or None) - or None for DOUBT. Every caller
+    treats doubt as the unsafe answer: a file whose keys cannot be established must never be reported
+    as carrying none (the "could not read" -> "nothing to read" -> PASS class this repo keeps
+    re-growing).
+
+    WHY A WHITELIST, NOT A KEY MATCHER (#428 hostile review). Claude Code parses this block with a
+    full YAML 1.2 parser, so a privilege key can arrive in shapes a line matcher never sees: a flow
+    mapping `{permissionMode: x}`, a JSON document, an indented root mapping, an anchor `&k key:`, a
+    tag `!!str key:`, an escaped quoted key `"permission\x4dode":`, a merge key `<<: *a`, or tab
+    indentation (CC retries with tabs turned into spaces). The first version matched unindented
+    `key:` lines and IGNORED everything else, so each of those returned a confident EMPTY set -
+    configure deployed a `bypassPermissions` role and doctor passed it. So instead of recognizing
+    bad keys, this recognizes the ONE shape a role definition needs and calls everything else doubt:
+      - blank lines and full-line `#` comments;
+      - an unindented `key:` (plain, or quoted WITHOUT escapes) followed by a space or end-of-line;
+      - SPACE-indented continuation lines, only after a key (nested values, block scalars).
+    A tab in the indentation, an indented first line, or any other column-0 shape returns None.
+    A leading BOM is stripped (CC strips it too) and CRLF is tolerated. Stdlib only."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    lines = [ln[:-1] if ln.endswith("\r") else ln for ln in text.split("\n")]
+    if not lines or lines[0].rstrip() != "---":
+        return None
+    keys, name, seen_key = set(), None, False
+    for line in lines[1:]:
+        if line.rstrip() == "---":
+            return keys, name
+        stripped = line.strip()
+        if not stripped or line.lstrip(" ").startswith("#"):
+            continue
+        indent = line[:len(line) - len(line.lstrip())]
+        if "\t" in indent:
+            return None                      # tab indentation: CC re-parses it as spaces - doubt
+        if indent:
+            if not seen_key:
+                return None                  # an indented ROOT mapping - doubt
+            continue                         # a nested value / block-scalar continuation
+        m = _FM_KEY_RE.match(line)
+        if not m:
+            return None                      # flow / JSON / anchor / tag / merge / escape / `?` - doubt
+        key = (m.group(1) or m.group(2) or m.group(3)).lower()
+        keys.add(key)
+        seen_key = True
+        if key == "name":
+            # Only a CLEAN name is a KNOWN name: a bare or wholly-quoted token and nothing after it.
+            # `"x" # c`, `>-` + continuation, `!!str x`, `&a x`, an escape, or an empty value (the
+            # name on the next line) all make CC's name differ from this text - so they leave the
+            # name UNKNOWN (None), and _agent_is_ours() then judges ownership from the raw text.
+            nm = _CLEAN_NAME_RE.match((m.group(4) or "").strip())
+            name = (nm.group(1) or nm.group(2) or nm.group(3)) if nm else None
+    return None  # no closing delimiter: the frontmatter extent is unknown
+
+
+def _frontmatter_keys(path):
+    """The top-level key set of _frontmatter(path), or None on doubt."""
+    fm = _frontmatter(path)
+    return None if fm is None else fm[0]
+
+
+def _agent_names():
+    """The bundled orchestrate role definitions, by basename, sorted. None when the bundled dir is
+    absent or unreadable (a dev-layout problem the caller reports - never an empty 'all current')."""
+    try:
+        entries = os.listdir(BUNDLED_AGENTS_DIR)
+    except OSError:
+        return None
+    return sorted(n for n in entries
+                  if n.startswith(AGENT_PREFIX) and n.endswith(".md")
+                  and os.path.isfile(os.path.join(BUNDLED_AGENTS_DIR, n)))
+
+
+def _agent_deploy_action(name):
+    """What `configure` must do to put bundled role definition `name` at AGENTS_DIR. The helper
+    vocabulary (_helper_deploy_action), plus 'forbidden-source': the BUNDLED file itself carries a
+    privilege-bearing key (or its frontmatter is unparseable), so it is refused rather than
+    deployed-then-failed-by-doctor."""
+    src = os.path.join(BUNDLED_AGENTS_DIR, name)
+    dest = os.path.join(AGENTS_DIR, name)
+    if not os.path.isfile(src):
+        return "missing-source"
+    keys = _frontmatter_keys(src)
+    if keys is None or keys & set(AGENT_FORBIDDEN_KEYS):
+        return "forbidden-source"
+    if os.path.islink(dest):
+        return "replace-symlink" if os.path.exists(dest) else "replace-broken-symlink"
+    if not os.path.exists(dest):
+        return "deploy"
+    if not os.access(dest, os.R_OK):
+        return "unreadable"
+    if not _files_identical(src, dest):
+        return "refresh"
+    return None
+
+
+def _deploy_agent(name):
+    """Deploy bundled role definition `name` to AGENTS_DIR. Same contract as _deploy_helper - a
+    symlink dest is moved aside to <dest>.bak, a differing regular file is backed up to <dest>.bak
+    (VERIFIED, via the one shared _backup_before_overwrite) and the overwrite REFUSED if that fails,
+    atomic temp-then-replace - except the copy is NOT made executable: it is a Markdown definition.
+    Returns (ok, message)."""
+    src = os.path.join(BUNDLED_AGENTS_DIR, name)
+    dest = os.path.join(AGENTS_DIR, name)
+    action = _agent_deploy_action(name)
+    if action == "missing-source":
+        return False, f"agent {name}: bundled source missing at {src} - cannot deploy"
+    if action == "forbidden-source":
+        return False, (f"agent {name}: bundled source {src} carries a privilege-bearing frontmatter key "
+                       f"({'/'.join(AGENT_FORBIDDEN_KEYS)}) or unparseable frontmatter - refusing to deploy")
+    if action == "unreadable":
+        return False, f"agent {name}: dest {dest} exists but is unreadable - refusing to clobber blind"
+    if action is None:
+        return True, f"agent {name}: already current"
+    try:
+        os.makedirs(AGENTS_DIR, exist_ok=True)
+        if os.path.islink(dest):
+            os.replace(dest, dest + ".bak")
+        elif action == "refresh":
+            ok, err = _backup_before_overwrite(dest)
+            if not ok:
+                return False, (f"agent {name}: could not back up {dest} before overwriting it "
+                               f"({err}); refusing to replace it unbacked")
+        fd, tmp = tempfile.mkstemp(dir=AGENTS_DIR, prefix=".orch-agent-")
+        os.close(fd)
+        try:
+            shutil.copy2(src, tmp)
+            os.replace(tmp, dest)  # atomic
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        verb = {"deploy": "deployed", "refresh": "refreshed (differed)",
+                "replace-symlink": "replaced symlink for",
+                "replace-broken-symlink": "replaced broken symlink for"}.get(action, "deployed")
+        return True, f"agent {name}: {verb} -> {dest}"
+    except OSError as e:
+        return False, f"agent {name}: FAILED to deploy to {dest}: {e}"
+
+
+def _project_agents_dir():
+    """The current project's .claude/agents dir, or None. ORCHESTRATE_PROJECT_AGENTS_DIR overrides it
+    outright (the harness points it at a fixture); else ORCHESTRATE_PROJECT_DIR, else the git
+    toplevel of CWD - the same project resolution _cascade_files uses. Project scope OUTRANKS user
+    scope for a same-named agent per the Claude Code docs, so a target repo shipping its own
+    orchestrate-<role>.md silently replaces the deployed role."""
+    override = os.environ.get("ORCHESTRATE_PROJECT_AGENTS_DIR")
+    if override:
+        return override
+    proj = os.environ.get("ORCHESTRATE_PROJECT_DIR")
+    if not proj:
+        try:
+            p = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True,
+                               text=True, timeout=10)
+            proj = p.stdout.strip() if p.returncode == 0 else ""
+        except (OSError, subprocess.SubprocessError):
+            proj = ""
+    return os.path.join(proj, ".claude", "agents") if proj else None
+
+
+def _cc_frontmatter_region(path):
+    """The raw text Claude Code would hand to its YAML parser as this file's frontmatter, via CC's own
+    split regex: a str, "" when CC finds no frontmatter (so it loads no name and no keys), or None
+    when the file cannot be read."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    m = _CC_FM_RE.match(text)
+    return m.group(1) if m else ""
+
+
+def _agent_is_ours(path, fm):
+    """Could Claude Code load this file AS an orchestrate role? True / False / None (unreadable).
+
+    CC names an agent from its frontmatter `name:`, not its filename. When _frontmatter() read a
+    CLEAN name, that name decides. When it could NOT (out-of-grammar frontmatter, or a name in any
+    YAML form other than a bare/quoted token), the question is answered FAIL-CLOSED from the raw
+    region CC itself parses: ours if it contains `orchestrate` or a backslash. That is sufficient
+    because a YAML name can only yield the contiguous `orchestrate-` prefix by containing it
+    literally or through an escape - folding and plain multi-line scalars join with a SPACE (#428
+    fix-scoped review: a quoted-name-plus-comment, a `>-` name, and a flow mapping in a
+    non-prefixed file each loaded AS an orchestrate role while doctor judged them foreign)."""
+    if os.path.basename(path).startswith(AGENT_PREFIX):
+        return True
+    if fm is not None and fm[1] is not None:
+        return fm[1].startswith(AGENT_PREFIX)
+    region = _cc_frontmatter_region(path)
+    if region is None:
+        return None
+    return "orchestrate" in region.lower() or "\\" in region
+
+
+def _walk_agent_files(root):
+    """Every `*.md` under `root`, RECURSIVELY and following symlinks - the set Claude Code itself
+    loads (its agent-dir walk descends into subdirectories). Returns (paths, errors). A directory
+    that cannot be listed is an ERROR, never an empty result, and a symlink cycle is cut by tracking
+    real paths. Paths are sorted for stable output."""
+    paths, errors, seen = [], [], set()
+
+    def onerror(e):
+        errors.append(f"cannot list {getattr(e, 'filename', root)} ({e.strerror or e})")
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=onerror, followlinks=True):
+        real = os.path.realpath(dirpath)
+        if real in seen:
+            dirnames[:] = []
+            continue
+        seen.add(real)
+        paths.extend(os.path.join(dirpath, f) for f in filenames if f.endswith(".md"))
+    return sorted(paths), errors
+
+
+def check_agents():
+    """Doctor check for the deployed role definitions (#428). Read-only. Order = severity:
+      FAIL - a deployed agent that is OURS carries permissionMode/hooks/mcpServers, or its
+             frontmatter is outside the strict grammar (doubt is a FAIL: an unverifiable file might
+             carry exactly those keys); or the agents dir cannot be fully listed.
+             OURS = the FILENAME starts with `orchestrate-` OR its frontmatter `name:` does. Claude
+             Code names an agent from `name:`, not the filename, and walks SUBDIRECTORIES - so a
+             prefix-only, top-level-only scan missed `sub/orchestrate-x.md` and a `notours.md` whose
+             `name: orchestrate-implementer` loads AS that role (#428 hostile review).
+      WARN - an orchestrate role uses a key #426 measured as ignored (omitClaudeMd/effort); another
+             tool's agent sets permissionMode (same cross-repo broadening class, not ours to fail);
+             a project .claude/agents/orchestrate-*.md shadows a deployed role, or that project dir
+             cannot be read; a bundled role is undeployed, DIFFERS, or was REFUSED by configure.
+      PASS - otherwise."""
+    fail, warn = [], []
+    if os.path.lexists(AGENTS_DIR) and not os.path.isdir(AGENTS_DIR):
+        fail.append(f"{AGENTS_DIR} exists but is not a directory - role definitions cannot deploy there")
+        files, errors = [], []
+    else:
+        files, errors = _walk_agent_files(AGENTS_DIR) if os.path.isdir(AGENTS_DIR) else ([], [])
+    for e in errors:
+        fail.append(f"{e}; deployed agent definitions unverifiable")
+    for path in files:
+        rel = os.path.relpath(path, AGENTS_DIR)
+        fm = _frontmatter(path)
+        ours = _agent_is_ours(path, fm)
+        if fm is None:
+            if ours is False and _cc_frontmatter_region(path) == "":
+                # CC's own split finds NO frontmatter here, so CC reads no keys from it at all: it
+                # cannot grant anything, and warning about an unrelated Markdown file is noise
+                # (Copilot on PR #431). A PREFIXED file never reaches this branch as not-ours, so
+                # a broken orchestrate role definition still FAILs below.
+                continue
+            if ours is False:
+                # CC cannot load this as an orchestrate role, but its keys are still unknown.
+                warn.append(f"{rel}: frontmatter outside the strict grammar - cannot verify it does "
+                            "not set permissionMode")
+            else:
+                fail.append(f"{rel}: frontmatter unreadable or outside the strict grammar, and it may "
+                            "load as an orchestrate role - cannot verify it grants nothing")
+            continue
+        keys, name = fm
+        if ours is None:
+            ours = True  # readable enough to parse, yet unreadable for the region: doubt -> ours
+        if not ours:
+            label = rel
+        elif name is not None and not os.path.basename(path).startswith(AGENT_PREFIX):
+            label = f"{rel} (name: {name})"
+        elif name is None and not os.path.basename(path).startswith(AGENT_PREFIX):
+            label = f"{rel} (name unclear - may load as an orchestrate role)"
+        else:
+            label = rel
+        bad = sorted(keys & set(AGENT_FORBIDDEN_KEYS))
+        if ours and bad:
+            fail.append(f"{label}: carries {', '.join(bad)}")
+        elif not ours and "permissionmode" in keys:
+            warn.append(f"{rel} (not an orchestrate role) sets permissionMode - it applies in EVERY repo "
+                        "that spawns it and escalates a default-mode parent")
+        inert = sorted(keys & set(AGENT_INERT_KEYS))
+        if ours and inert:
+            warn.append(f"{label}: uses {', '.join(inert)}, which #426 measured as IGNORED for teammates")
+    proj = _project_agents_dir()
+    if proj and os.path.isdir(proj) and os.path.realpath(proj) != os.path.realpath(AGENTS_DIR):
+        pfiles, perrors = _walk_agent_files(proj)
+        for e in perrors:
+            warn.append(f"{e}; cannot check the project for a shadowing orchestrate role")
+        shadows = []
+        for path in pfiles:
+            owner = _agent_is_ours(path, _frontmatter(path))
+            if owner is None:
+                warn.append(f"cannot read {path}; cannot check whether it shadows an orchestrate role")
+            elif owner:
+                shadows.append(os.path.relpath(path, proj))
+        if shadows:
+            warn.append(f"project {proj} defines {', '.join(shadows)} - project scope OUTRANKS the "
+                        "deployed user-scope role of the same name")
+    names = _agent_names()
+    if names is None:
+        warn.append(f"bundled agent definitions not found at {BUNDLED_AGENTS_DIR}; cannot verify deployment")
+    else:
+        actions = {n: _agent_deploy_action(n) for n in names}
+        undeployed = [n for n, a in actions.items() if a == "deploy"]
+        differ = [n for n, a in actions.items() if a in ("refresh", "replace-symlink", "replace-broken-symlink")]
+        refused = [n for n, a in actions.items() if a in ("forbidden-source", "unreadable", "missing-source")]
+        if undeployed:
+            warn.append(f"role definition(s) not yet deployed ({', '.join(undeployed)}) - run "
+                        "`orchestrate-setup.py configure --apply`; until then roles spawn without a tool allowlist")
+        if differ:
+            warn.append(f"deployed role definition(s) DIFFER from the bundled copies ({', '.join(differ)}) - "
+                        "usually the bundle is newer: `configure --apply` refreshes (overwritten copy -> <dest>.bak)")
+        if refused:
+            warn.append(f"role definition(s) configure CANNOT deploy ({', '.join(refused)}) - a bundled source "
+                        "carries a privilege key or unparseable frontmatter, or the dest is unreadable")
+    for m in fail:
+        _emit(FAIL, f"agent definition {m}")
+    for m in warn:
+        _emit(WARN, f"agent definitions: {m}")
+    if fail:
+        return FAIL
+    if warn:
+        return WARN
+    return _emit(PASS, "deployed orchestrate role definitions are current and carry no privilege-bearing keys")
+
+
+def _report_agent_block(blocked):
+    """The one line --apply prints before exiting nonzero on role definitions it could not deploy -
+    a refused privilege-bearing source, an unreadable dest it will not clobber, or a vanished source.
+    Each is a role that will spawn WITHOUT its tool allowlist, so a scripted setup must not read the
+    run as success."""
+    print(f"configure: {len(blocked)} role definition(s) NOT deployed ({', '.join(blocked)}; see the "
+          "warnings above) - exiting nonzero.", file=sys.stderr)
+
+
+def _emit_agent_warnings(agent_list, problems):
+    """stderr WARNINGs for role definitions configure cannot deploy. A missing bundled dir is
+    reported, never read as 'nothing to deploy'."""
+    if agent_list is None:
+        print(f"configure: WARNING - bundled agent definitions not found at {BUNDLED_AGENTS_DIR}; "
+              "cannot deploy the orchestrate role definitions (the rest still applies).", file=sys.stderr)
+        return
+    why = {"missing-source": "bundled source missing",
+           "forbidden-source": "bundled source carries a privilege-bearing key or unparseable frontmatter",
+           "unreadable": "deployed copy is unreadable - refusing to clobber it blind"}
+    for name, a in problems:
+        print(f"configure: WARNING - role definition {name}: {why[a]}; not deployed "
+              "(the rest still applies).", file=sys.stderr)
 
 
 def check_repo_main(repo):
@@ -1567,7 +1948,7 @@ def cmd_doctor(args):
     repo_status, _head = check_repo_main(getattr(args, "repo", None))
     results = [check_agent_teams(settings), check_tmux(),
                check_guard_wired(settings), check_guard_healthy(), check_guard_stale(),
-               check_helpers_stale(), check_steer(settings), check_ctxmeter(settings),
+               check_helpers_stale(), check_agents(), check_steer(settings), check_ctxmeter(settings),
                check_session_init_hook(settings),
                repo_status, check_allowlist(settings),
                check_merge_gate_shadows(), check_slack_channel(), check_slack_bot_user_id()]
@@ -2032,6 +2413,16 @@ def cmd_configure(args):
     helpers_actionable = [(n, a) for n, a in helper_actions if a in HELPER_DEPLOY_ACTIONS]
     helper_missing = [n for n, a in helper_actions if a == "missing-source"]
     helper_unreadable = [n for n, a in helper_actions if a == "unreadable"]
+    # #428: the orchestrate role definitions, same Option-A deploy (to AGENTS_DIR, not executable).
+    _agent_list = _agent_names()
+    agent_actions = [(n, _agent_deploy_action(n)) for n in (_agent_list or [])]
+    agents_actionable = [(n, a) for n, a in agent_actions if a in HELPER_DEPLOY_ACTIONS]
+    # A REFUSED role (privilege key / unparseable frontmatter in the BUNDLED source) is a security-
+    # relevant non-deploy: --apply exits nonzero on it so a scripted setup cannot read it as success.
+    agent_blocked = [n for n, a in agent_actions
+                     if a in ("forbidden-source", "unreadable", "missing-source")]
+    agent_problems = [(n, a) for n, a in agent_actions
+                      if a in ("missing-source", "forbidden-source", "unreadable")]
     # #95: advisory steering hooks. Skipped entirely with --no-steer, and gated on the bundled steer
     # source existing (never wire a hook pointing at a script we cannot deploy). steer_action drives
     # the deploy; steer_blocks_to_add drives the settings wiring.
@@ -2056,6 +2447,7 @@ def cmd_configure(args):
     session_init_ok = setup_action != "missing-source"
     add_session_init = session_init_ok and not _session_init_hook_present(settings)
     deploy_needed = (guard_action in ("deploy", "refresh") or bool(helpers_actionable)
+                     or bool(agents_actionable)
                      or steer_deploy_needed or ctxmeter_deploy_needed or setup_deploy_needed)
     settings_changes = (add_hook or bool(missing_allow) or bool(steer_blocks_to_add)
                         or bool(ctxmeter_blocks_to_add) or add_session_init)
@@ -2069,12 +2461,17 @@ def cmd_configure(args):
             print(f"configure: {SETTINGS} already has the floor hook + all documented allow-list entries, "
                   "and the deployed guard + helper scripts match the bundled plugin copies.")
         _emit_helper_warnings(helper_missing, helper_unreadable)
+        _emit_agent_warnings(_agent_list, agent_problems)
         if not getattr(args, "no_steer", False) and steer_action == "missing-source":
             print(f"configure: WARNING - the bundled steer script {BUNDLED_STEER} is missing; skipping "
                   "the advisory steering hooks (the rest still applies).", file=sys.stderr)
         if not getattr(args, "no_ctxmeter", False) and ctxmeter_action == "missing-source":
             print(f"configure: WARNING - the bundled meter script {BUNDLED_CTXMETER} is missing; "
                   "skipping the advisory context-budget meter (the rest still applies).", file=sys.stderr)
+        if args.apply and agent_blocked:
+            _report_agent_block(agent_blocked)
+            _narrow_merge_gate_shadows(args.apply, args.yes)
+            return 1
         return _narrow_merge_gate_shadows(args.apply, args.yes)
 
     if settings_changes:
@@ -2108,6 +2505,14 @@ def cmd_configure(args):
                      "replace-symlink": "replace claude-kit symlink",
                      "replace-broken-symlink": "replace broken symlink"}[action]
             print(f"  [{label}] {os.path.join(BUNDLED_SCRIPTS_DIR, name)} -> {os.path.join(SCRIPTS_DIR, name)}")
+    if agents_actionable:
+        print(f"configure will DEPLOY/REFRESH {len(agents_actionable)} orchestrate role definition(s) "
+              f"(#428; tools-allowlist subagents, user scope):")
+        for name, action in agents_actionable:
+            label = {"deploy": "deploy", "refresh": "refresh (differs)",
+                     "replace-symlink": "replace symlink",
+                     "replace-broken-symlink": "replace broken symlink"}[action]
+            print(f"  [{label}] {os.path.join(BUNDLED_AGENTS_DIR, name)} -> {os.path.join(AGENTS_DIR, name)}")
     if steer_deploy_needed:
         verb = "DEPLOY" if steer_action == "deploy" else "REFRESH (stale)"
         print(f"configure will {verb} the steering hook:")
@@ -2126,6 +2531,7 @@ def cmd_configure(args):
         print(f"configure: WARNING - the bundled meter script {BUNDLED_CTXMETER} is missing; skipping "
               "the advisory context-budget meter (the rest still applies).", file=sys.stderr)
     _emit_helper_warnings(helper_missing, helper_unreadable)
+    _emit_agent_warnings(_agent_list, agent_problems)
 
     if not args.apply:
         print("\n(preview only; re-run with --apply to write. settings.json is backed up first, "
@@ -2210,6 +2616,21 @@ def cmd_configure(args):
             helper_failed = True
     if helper_failed:
         print("configure: one or more helper scripts failed to deploy (see above).", file=sys.stderr)
+        return 1
+
+    # #428: role-definition deploy - same continue-past-a-failure shape as the helpers.
+    agent_failed = False
+    for name, _action in agents_actionable:
+        ok, msg = _deploy_agent(name)
+        print(f"configure: {msg}")
+        if not ok:
+            agent_failed = True
+    if agent_failed:
+        print("configure: one or more role definitions failed to deploy (see above).", file=sys.stderr)
+        return 1
+    if agent_blocked:
+        _report_agent_block(agent_blocked)
+        _narrow_merge_gate_shadows(args.apply, args.yes)
         return 1
 
     # After applying, narrow any cascade shadow (own scan/diff/consent).

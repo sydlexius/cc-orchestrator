@@ -98,6 +98,14 @@ def run(args, *, env_overrides=None, tmux=True):
     # gated off). Tests exercising the init hook override ORCHESTRATE_BUNDLED_SETUP / _SETUP_DEST.
     env["ORCHESTRATE_BUNDLED_SETUP"] = "/nonexistent/orchestrate-setup-bundled.py"
     env["ORCHESTRATE_SETUP_DEST"] = "/nonexistent/orchestrate-setup-deployed.py"
+    # #428 AGENTS ISOLATION: point BOTH agent dirs at non-existent paths by DEFAULT, so an unrelated
+    # configure test never writes role definitions into the real ~/.claude/agents, and doctor never
+    # reads the developer's real agents dir or project .claude/agents (which would make the gate
+    # machine-dependent, the #305 failure). A missing bundled dir reads as "not found" -> skipped.
+    # Tests exercising the deploy override all three via env_overrides.
+    env["ORCHESTRATE_BUNDLED_AGENTS_DIR"] = "/nonexistent/agent-definitions-bundled"
+    env["ORCHESTRATE_AGENTS_DIR"] = "/nonexistent/agents-deployed"
+    env["ORCHESTRATE_PROJECT_AGENTS_DIR"] = "/nonexistent/project-agents"
     if tmux:
         # Force the fixture TMUX unconditionally (not `env.get("TMUX") or ...`): when the
         # harness itself runs INSIDE a real tmux (e.g. a teammate pane), inheriting the
@@ -1224,6 +1232,257 @@ def main():
         rc, out = run(["configure", "--apply", "--yes"], env_overrides=hov_ms)
         check("#133: a missing bundled helper source WARNs, does not crash",
               rc in (0, 1) and "missing" in out.lower())
+
+    # #428: configure deploys the orchestrate ROLE DEFINITIONS to the agents dir (user scope), and
+    # doctor HARD-FAILS a deployed role carrying a privilege-bearing frontmatter key. SETTINGS-
+    # ISOLATED like every case here (run() pins the cascade): #426's review showed a user's own
+    # allow-rules masquerading as a frontmatter effect, so nothing below may read the real ~/.claude.
+    def agent_md(name, extra=""):
+        return (f"---\nname: {name}\ndescription: \"fixture role\"\ntools: Bash, Read\n{extra}---\n"
+                f"body for {name}\n")
+    with tempfile.TemporaryDirectory() as td:
+        abundle = os.path.join(td, "agent-definitions"); os.makedirs(abundle)
+        roles = ["orchestrate-alpha.md", "orchestrate-beta.md"]
+        for r in roles:
+            open(os.path.join(abundle, r), "w").write(agent_md(r[:-3]))
+        # A non-prefixed file in the bundle must NOT be deployed (only orchestrate-*.md is a role).
+        # It carries VALID, privilege-free frontmatter on purpose: a frontmatter-less file is already
+        # refused as unparseable, which would mask a missing prefix filter (mutation-proven).
+        open(os.path.join(abundle, "README.md"), "w").write(agent_md("readme-not-a-role"))
+        adest = os.path.join(td, "agents")  # deploy target (initially absent)
+        aproj = os.path.join(td, "proj-agents")
+        aguard = os.path.join(td, "aguard.sh"); write_stub_guard(aguard)
+        atpl = os.path.join(td, "atpl"); os.makedirs(atpl)
+        open(os.path.join(atpl, "required-permissions.md"), "w").write(
+            "## Needed allow-list entries\n- `Bash(x *)`\n")
+        as_ = os.path.join(td, "settings.json")
+        json.dump({"hooks": {"PreToolUse": [GUARD_HOOK]}, "permissions": {"allow": ["Bash(x *)"]}}, open(as_, "w"))
+        aov = {"ORCHESTRATE_SETTINGS": as_, "ORCHESTRATE_TEMPLATES_DIR": atpl,
+               "ORCHESTRATE_SETTINGS_FILES": as_, "ORCHESTRATE_GUARD": aguard,
+               "ORCHESTRATE_BUNDLED_GUARD": aguard,
+               "ORCHESTRATE_SCRIPTS_DIR": os.path.join(td, "scripts"),
+               "ORCHESTRATE_BUNDLED_SCRIPTS_DIR": os.path.join(td, "no-helpers"),
+               "ORCHESTRATE_AGENTS_DIR": adest, "ORCHESTRATE_BUNDLED_AGENTS_DIR": abundle,
+               "ORCHESTRATE_PROJECT_AGENTS_DIR": aproj}
+
+        rc, out = run(["configure"], env_overrides=aov)
+        check("#428: dry-run previews the role-definition DEPLOY, writes NOTHING",
+              "orchestrate role definition(s)" in out and not os.path.exists(adest))
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=aov)
+        landed = all(os.path.isfile(os.path.join(adest, r))
+                     and open(os.path.join(adest, r), "rb").read() == open(os.path.join(abundle, r), "rb").read()
+                     for r in roles)
+        check("#428: configure --apply deploys every orchestrate-*.md, byte-identical", landed)
+        check("#428: a non-orchestrate-* file in the bundle is NOT deployed",
+              not os.path.exists(os.path.join(adest, "README.md")))
+        # A Markdown definition is not a script: deploy must not mark it executable.
+        check("#428: a deployed definition is NOT made executable",
+              not (os.stat(os.path.join(adest, roles[0])).st_mode & 0o111))
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=aov)
+        check("#428: configure is idempotent once definitions are deployed",
+              "orchestrate role definition(s)" not in out and "FAILED" not in out)
+        rc, out = run(["doctor"], env_overrides=aov)
+        check("#428: doctor PASSes current, clean deployed definitions",
+              "[PASS] deployed orchestrate role definitions are current" in out)
+
+        # REFRESH backs the overwritten copy up (the #292 contract, via the shared helper).
+        dep = os.path.join(adest, roles[0])
+        open(dep, "w").write(agent_md("orchestrate-alpha", "# locally edited\n"))
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=aov)
+        check("#428: a differing deployed definition is refreshed to the bundled bytes",
+              open(dep, "rb").read() == open(os.path.join(abundle, roles[0]), "rb").read())
+        check("#428: the refresh BACKS UP the overwritten copy to <dest>.bak",
+              os.path.isfile(dep + ".bak") and "locally edited" in open(dep + ".bak").read())
+        # A backup that cannot be written REFUSES the overwrite (DIRECTORY at .bak: copy2 does not
+        # raise there, so only the verified-backup contract catches it).
+        os.remove(dep + ".bak"); os.makedirs(dep + ".bak")
+        open(dep, "w").write(agent_md("orchestrate-alpha", "# edited again\n"))
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=aov)
+        check("#428: a failed backup REFUSES the overwrite (original bytes intact)",
+              "edited again" in open(dep).read() and rc != 0)
+        shutil.rmtree(dep + ".bak")
+
+        # DOCTOR HARD-FAILS each privilege-bearing key in a DEPLOYED role. One key at a time, so a
+        # matcher that caught only one of the three cannot pass all three checks.
+        for key_line, label in [("permissionMode: acceptEdits\n", "permissionMode"),
+                                ("hooks:\n  PreToolUse: []\n", "hooks"),
+                                ("mcpServers:\n  - slack\n", "mcpServers")]:
+            open(dep, "w").write(agent_md("orchestrate-alpha", key_line))
+            rc, out = run(["doctor"], env_overrides=aov)
+            check(f"#428: doctor HARD-FAILS a deployed role carrying {label}",
+                  f"[FAIL] agent definition {roles[0]}" in out and rc == 1)
+        # Quoted key form is still caught (a quote must not smuggle the key past the matcher).
+        open(dep, "w").write(agent_md("orchestrate-alpha", '"permissionMode": acceptEdits\n'))
+        rc, out = run(["doctor"], env_overrides=aov)
+        check("#428: a QUOTED privilege key is still a FAIL", "[FAIL] agent definition" in out)
+        # A NESTED (indented) key is NOT a top-level key: no false positive. The indented lines
+        # START with the key name on purpose - a line starting with prose ("mentions hooks: ...")
+        # cannot match even a loosened regex, so it would not catch a lost column-0 anchor
+        # (mutation-proven).
+        open(dep, "w").write("---\nname: orchestrate-alpha\ndescription: |\n  permissionMode: acceptEdits\n"
+                             "metadata:\n  hooks: none\n  mcpServers: none\ntools: Bash\n---\nbody\n")
+        rc, out = run(["doctor"], env_overrides=aov)
+        check("#428: an INDENTED mention inside a block scalar is not a privilege key",
+              "[FAIL] agent definition" not in out)
+        # DOUBT IS A FAIL: unparseable frontmatter (no closing ---) cannot be shown to grant nothing.
+        open(dep, "w").write("---\nname: orchestrate-alpha\ntools: Bash\nbody with no closing delimiter\n")
+        rc, out = run(["doctor"], env_overrides=aov)
+        check("#428: UNPARSEABLE frontmatter on a deployed role is a FAIL, never a silent pass",
+              "[FAIL] agent definition" in out and "outside the strict grammar" in out and rc == 1)
+        # Inert keys (#426: ignored for teammates) WARN, never FAIL.
+        open(dep, "w").write(agent_md("orchestrate-alpha", "omitClaudeMd: true\neffort: low\n"))
+        rc, out = run(["doctor"], env_overrides=aov)
+        check("#428: omitClaudeMd/effort on a deployed role WARNs (ignored for teammates), not FAIL",
+              "IGNORED for teammates" in out and "[FAIL] agent definition" not in out)
+        shutil.copy2(os.path.join(abundle, roles[0]), dep)
+        # Another tool's agent with permissionMode: WARN (same broadening class), never FAIL.
+        open(os.path.join(adest, "someone-elses.md"), "w").write(
+            "---\nname: someone-elses\ndescription: x\npermissionMode: acceptEdits\n---\nbody\n")
+        rc, out = run(["doctor"], env_overrides=aov)
+        check("#428: a NON-orchestrate agent with permissionMode WARNs, does not FAIL",
+              "someone-elses.md (not an orchestrate role) sets permissionMode" in out
+              and "[FAIL] agent definition" not in out)
+        os.remove(os.path.join(adest, "someone-elses.md"))
+        # A frontmatter-less Markdown file (notes, a README) is not an agent: CC reads no keys from
+        # it, so doctor must not WARN about it (Copilot on PR #431). The prefixed-file case is
+        # covered above: an unparseable orchestrate-*.md still FAILs.
+        open(os.path.join(adest, "NOTES.md"), "w").write("# just notes\nno frontmatter here\n")
+        rc, out = run(["doctor"], env_overrides=aov)
+        check("#428: a frontmatter-less non-role Markdown file is NOT warned about",
+              "NOTES.md" not in out)
+        os.remove(os.path.join(adest, "NOTES.md"))
+        # A project-scope shadow of a role name WARNs.
+        os.makedirs(aproj); open(os.path.join(aproj, roles[1]), "w").write(agent_md("orchestrate-beta"))
+        rc, out = run(["doctor"], env_overrides=aov)
+        check("#428: a project .claude/agents/orchestrate-*.md shadow WARNs (project scope outranks user)",
+              "OUTRANKS the deployed user-scope role" in out)
+        shutil.rmtree(aproj)
+
+        # EVASION FORMS (#428 hostile review): each is valid YAML that Claude Code's loader HONORS as
+        # carrying a privilege key, and the first parser returned a confident EMPTY key set for every
+        # one of them. Under the strict grammar each must be DOUBT -> doctor FAIL, never a PASS.
+        evasions = {
+            "flow mapping": "---\n{name: orchestrate-alpha, permissionMode: bypassPermissions}\n---\nb\n",
+            "JSON document": '---\n{"name": "orchestrate-alpha", "permissionMode": "acceptEdits"}\n---\nb\n',
+            "indented root": "---\n  name: orchestrate-alpha\n  hooks: {Stop: []}\n---\nb\n",
+            "comment then indented root": "---\n# c\n  permissionMode: acceptEdits\n  name: x\n---\nb\n",
+            "tab indentation": "---\nname: orchestrate-alpha\ndescription: d\n\tpermissionMode: acceptEdits\n---\nb\n",
+            "anchor on key": "---\nname: orchestrate-alpha\n&k permissionMode: acceptEdits\n---\nb\n",
+            "tag on key": "---\nname: orchestrate-alpha\n!!str permissionMode: acceptEdits\n---\nb\n",
+            "escaped quoted key": '---\nname: orchestrate-alpha\n"permission\\x4dode": acceptEdits\n---\nb\n',
+            "merge key": "---\nname: orchestrate-alpha\na: &a {permissionMode: acceptEdits}\n<<: *a\n---\nb\n",
+            "explicit key": "---\nname: orchestrate-alpha\n? permissionMode\n: acceptEdits\n---\nb\n",
+        }
+        for label, text in evasions.items():
+            open(dep, "w").write(text)
+            rc, out = run(["doctor"], env_overrides=aov)
+            check(f"#428: evasion form '{label}' is DOUBT -> doctor FAIL, never a pass",
+                  "[FAIL] agent definition" in out and rc == 1)
+        # CRLF and a BOM are tolerated (CC tolerates both): the key is SEEN, not doubted into noise.
+        open(dep, "w", newline="").write("﻿---\r\nname: orchestrate-alpha\r\npermissionMode: acceptEdits\r\n---\r\nb\r\n")
+        rc, out = run(["doctor"], env_overrides=aov)
+        check("#428: a BOM + CRLF file is parsed and its privilege key FAILs by name",
+              "carries permissionmode" in out)
+        shutil.copy2(os.path.join(abundle, roles[0]), dep)
+
+        # RECURSIVE + BY-NAME: CC walks subdirectories and names an agent from `name:`.
+        os.makedirs(os.path.join(adest, "sub"))
+        open(os.path.join(adest, "sub", "orchestrate-hidden.md"), "w").write(
+            agent_md("orchestrate-hidden", "permissionMode: bypassPermissions\n"))
+        rc, out = run(["doctor"], env_overrides=aov)
+        check("#428: a privilege key in a SUBDIRECTORY orchestrate role is a FAIL (recursive walk)",
+              "sub/orchestrate-hidden.md: carries permissionmode" in out and rc == 1)
+        shutil.rmtree(os.path.join(adest, "sub"))
+        open(os.path.join(adest, "notours.md"), "w").write(
+            agent_md("orchestrate-implementer", "permissionMode: bypassPermissions\n"))
+        rc, out = run(["doctor"], env_overrides=aov)
+        check("#428: a file whose NAME is an orchestrate role is OURS and FAILs, whatever its filename",
+              "notours.md (name: orchestrate-implementer): carries permissionmode" in out and rc == 1)
+        os.remove(os.path.join(adest, "notours.md"))
+        # FAIL-CLOSED OWNERSHIP (#428 fix-scoped review): a non-prefixed file whose NAME Claude Code
+        # reads as an orchestrate role, but which doctor cannot read as a CLEAN name, must still be
+        # ours. Each of these loaded AS orchestrate-implementer with a privilege key while doctor
+        # judged it foreign (silent for hooks/mcpServers, a mere WARN for permissionMode).
+        unclear = {
+            "quoted name + comment": '---\nname: "orchestrate-implementer" # c\nhooks: {}\n---\nb\n',
+            "folded >- name": "---\nname: >-\n  orchestrate-implementer\nhooks: {}\n---\nb\n",
+            "name on the next line": "---\nname:\n  orchestrate-implementer\nmcpServers: [x]\n---\nb\n",
+            "escaped name": '---\nname: "orch\\x65strate-implementer"\npermissionMode: acceptEdits\n---\nb\n',
+            "flow mapping in a non-prefixed file":
+                "---\n{name: orchestrate-implementer, permissionMode: bypassPermissions}\n---\nb\n",
+        }
+        for label, text in unclear.items():
+            open(os.path.join(adest, "notours.md"), "w").write(text)
+            rc, out = run(["doctor"], env_overrides=aov)
+            check(f"#428: a non-prefixed role with an UNCLEAR name ({label}) is ours -> FAIL",
+                  "[FAIL] agent definition notours.md" in out and rc == 1)
+        # ...while a genuinely FOREIGN agent (clean non-orchestrate name) stays foreign: WARN only.
+        open(os.path.join(adest, "notours.md"), "w").write(
+            "---\nname: helper\ndescription: d\npermissionMode: acceptEdits\n---\nb\n")
+        rc, out = run(["doctor"], env_overrides=aov)
+        check("#428: a clean FOREIGN name stays foreign (WARN, no FAIL) - fail-closed does not over-reach",
+              "notours.md (not an orchestrate role)" in out and "[FAIL] agent definition" not in out)
+        os.remove(os.path.join(adest, "notours.md"))
+        # An unreadable project dir WARNs instead of reading as "no shadows".
+        os.makedirs(aproj); os.chmod(aproj, 0o311)
+        try:
+            rc, out = run(["doctor"], env_overrides=aov)
+            check("#428: an UNREADABLE project agents dir WARNs, never a silent no-shadow pass",
+                  "cannot check the project for a shadowing orchestrate role" in out
+                  or os.geteuid() == 0)
+        finally:
+            os.chmod(aproj, 0o755); shutil.rmtree(aproj)
+
+        # CONFIGURE REFUSES a bundled source carrying a privilege key (never deploy-then-fail).
+        os.remove(os.path.join(adest, roles[1]))
+        open(os.path.join(abundle, roles[1]), "w").write(agent_md("orchestrate-beta", "permissionMode: acceptEdits\n"))
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=aov)
+        check("#428: configure REFUSES to deploy a bundled role carrying a privilege key",
+              not os.path.exists(os.path.join(adest, roles[1]))
+              and "privilege-bearing key" in out)
+        check("#428: a refusal makes configure --apply exit NONZERO (a script cannot read it as success)",
+              rc != 0)
+        rc, out = run(["doctor"], env_overrides=aov)
+        check("#428: doctor names a REFUSED role instead of reporting 'current'",
+              "configure CANNOT deploy (orchestrate-beta.md)" in out
+              and "[PASS] deployed orchestrate role definitions" not in out)
+        # A missing bundled dir is REPORTED, never read as "nothing to deploy".
+        aov_nb = dict(aov); aov_nb["ORCHESTRATE_BUNDLED_AGENTS_DIR"] = os.path.join(td, "no-such-dir")
+        rc, out = run(["configure"], env_overrides=aov_nb)
+        check("#428: a missing bundled agent dir WARNs in configure, never silent",
+              "bundled agent definitions not found" in out)
+        rc, out = run(["doctor"], env_overrides=aov_nb)
+        check("#428: a missing bundled agent dir WARNs in doctor, never a PASS",
+              "bundled agent definitions not found" in out
+              and "[PASS] deployed orchestrate role definitions" not in out)
+
+    # #428 REAL-BUNDLE COVERAGE: the glob discovers every role in the SHIPPED agent-definitions dir,
+    # each shipped definition passes the same privilege check doctor applies, and the discovered set
+    # matches the SKILL.md capability matrix. A glob that silently matched nothing would deploy zero
+    # roles and report "nothing to do" - so the count is asserted against the matrix, not just > 0.
+    real_bundle = os.path.join(os.path.dirname(os.path.abspath(SCRIPT)), "..", "skills", "orchestrate",
+                               "agent-definitions")
+    with tempfile.TemporaryDirectory() as td:
+        rdest = os.path.join(td, "agents")
+        rov = {"ORCHESTRATE_BUNDLED_AGENTS_DIR": real_bundle, "ORCHESTRATE_AGENTS_DIR": rdest,
+               "ORCHESTRATE_SCRIPTS_DIR": os.path.join(td, "scripts"),
+               "ORCHESTRATE_BUNDLED_SCRIPTS_DIR": os.path.join(td, "no-helpers"),
+               "ORCHESTRATE_SETTINGS": os.path.join(td, "s.json"),
+               "ORCHESTRATE_GUARD": os.path.join(td, "g.sh"), "ORCHESTRATE_BUNDLED_GUARD": os.path.join(td, "g.sh")}
+        write_stub_guard(rov["ORCHESTRATE_GUARD"])
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=rov)
+        shipped = sorted(os.listdir(rdest)) if os.path.isdir(rdest) else []
+        skill = open(os.path.join(os.path.dirname(os.path.abspath(SCRIPT)), "..", "skills", "orchestrate",
+                                  "SKILL.md")).read()
+        matrix = sorted("orchestrate-" + m + ".md" for m in re.findall(
+            r"^\| (implementer|adversarial-prep|adversarial-review|pr-prep|pr-shipper|pr-triage|planner|"
+            r"plan-steward)[ (|]", skill, re.M))
+        check(f"#428: every SKILL.md capability-matrix role ships a definition that deploys "
+              f"({len(shipped)} deployed vs {len(matrix)} in the matrix)",
+              len(matrix) >= 8 and shipped == matrix)
+        rc, out = run(["doctor"], env_overrides=rov)
+        check("#428: every SHIPPED definition passes doctor's privilege check",
+              "[FAIL] agent definition" not in out and "[PASS] deployed orchestrate role definitions" in out)
 
     # #95/#226: configure wires the 4 advisory steering hooks + deploys orchestrate-steer.sh (Option A);
     # --no-steer opts out; doctor WARNs (never FAILs) when steering is missing.
