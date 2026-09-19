@@ -5,7 +5,7 @@ description: Use when scaffolding and running a lead-orchestrated multi-agent se
 
 # Orchestrate: lead-run multi-agent PR pipeline
 
-**Version 0.97.3** (semver; releases tagged `vX.Y.Z`). Bump on any material change to this skill, its templates, or the runtime - PATCH for a fix, MINOR for a new rule/feature, MAJOR for a breaking charter or deterministic-floor change - so `/reload-skills` surfaces the new number and drift between the symlinked repo and the loaded skill is visible. History: `git log` + the GitHub Release notes cut at each `vX.Y.Z` tag.
+**Version 0.98.0** (semver; releases tagged `vX.Y.Z`). Bump on any material change to this skill, its templates, or the runtime - PATCH for a fix, MINOR for a new rule/feature, MAJOR for a breaking charter or deterministic-floor change - so `/reload-skills` surfaces the new number and drift between the symlinked repo and the loaded skill is visible. History: `git log` + the GitHub Release notes cut at each `vX.Y.Z` tag.
 
 You are the LEAD (orchestrator). You delegate building and the mechanical PR
 lifecycle to single-purpose teammates, and you keep for yourself the decisions
@@ -45,10 +45,40 @@ charter, because Agent-Teams teammates SHARE the global allow-list - you cannot
 give a teammate a narrower permission set than the lead, so the charter is the
 wall. Spawn each from its template charter.
 
+ROLE DEFINITIONS NARROW THE TOOL LIST (#427; measured #426). Each role also has a
+Claude Code subagent definition, `skills/orchestrate/agent-definitions/orchestrate-<role>.md`,
+whose `tools:` allowlist the harness enforces. Spawn a role with
+`subagent_type: "orchestrate-<role>"` (plus its `name` for a teammate) and pass the
+instantiated charter as the prompt, exactly as before - the definition body is a thin
+pointer, because a definition cannot carry per-spawn placeholder values. What this does
+and does not buy:
+- It NARROWS: a role without `Edit`/`Write` does not have those tools, and no role is
+  granted a write-capable MCP tool (adversarial-review alone gets the Playwright browser
+  tools its #53 rendered-evidence rule needs; a different Playwright install names them
+  differently, so its charter's UNVERIFIABLE path still applies there). Measured for all 8 roles as NAMED split-pane teammates, the mode
+  this skill requires.
+- Only `tools` is relied on. #426 measured `omitClaudeMd` IGNORED for split-pane
+  teammates and `effort` IGNORED for every teammate, so neither appears in a definition,
+  and PR-blindness stays a charter rule. `permissionMode`/`hooks`/`mcpServers` are never
+  used: plugin agents drop them, and `permissionMode: acceptEdits` measurably ESCALATED a
+  default-mode parent (#426's review); at user scope that would apply in every repo.
+- It is NOT read-only enforcement. `Bash` stays in every list (the docs say a `disallowedTools`
+  specifier such as `Bash(git push *)` removes the WHOLE tool, so a Bash sub-command cannot be
+  carved out), and Bash can write files, so the charter
+  REMAINS the wall. Never describe a role as mechanically read-only.
+- `Agent` is withheld from every role that must not edit code, because a spawned
+  subagent carries its OWN tool list (usually every tool) and would undo the narrowing.
+  Only `implementer` and `adversarial-review` keep it, and adversarial-review's charter
+  binds what it may spawn.
+- The definitions only take effect once deployed to `~/.claude/agents/` (#428,
+  `configure --apply`). They deliberately do NOT live in the plugin's auto-loaded
+  `agents/` directory: one live copy, and user scope is the one that can later carry
+  what plugin scope drops. Until deployed, spawn exactly as before.
+
 | Bot | Model / Mode | CAN do | CANNOT (charter-enforced) | Charter template |
 |---|---|---|---|---|
 | implementer (1 per cluster) | issue hints, else Opus / medium; acceptEdits | edit OWN worktree, commit, run local tests, act on fix-instructions | push, any `gh`, see/know the PR or CR (PR-BLIND), merge, touch other worktrees | implementer-charter.md |
-| adversarial-prep | Sonnet / auto | run `/prep-pr` (tests, gate, generated-file + coverage), report pass/fail | push, edit code, reply, merge | adversarial-prep-charter.md |
+| adversarial-prep | Sonnet / auto | run `/prep-pr`'s GATE STEPS directly (gate-runner, patch coverage, lockstep - never the `/prep-pr` command, which pushes), report pass/fail | push, edit code, reply, merge | adversarial-prep-charter.md |
 | adversarial-review | Sonnet or Opus / auto, READ-ONLY | run `/pr-review-toolkit:review-pr` in HOSTILE mode, draft findings | any mutation | adversarial-review-charter.md |
 | pr-prep (1-shot per PR) | Sonnet / auto | read branch diff, `gh issue view N`, draft title/body_file/closes-list, write body_file to /tmp/<team>/ | push, edit code, append to stack (lead is single-writer), see/act on CR, emit human prompts, merge | pr-prep-charter.md |
 | pr-shipper | Sonnet / auto | safe-push ANY stacked branch, `gh pr create`, background `pr-watch.sh`, rate-limit probe | MERGE, post-merge-cleanup, edit code | pr-shipper-brief.md |
@@ -105,7 +135,7 @@ wall. Spawn each from its template charter.
 ```
 dispatch-map entry
   -> implementer builds (own worktree+port, issue hints) + commits, PR-blind
-  -> adversarial-prep gate (/prep-pr) -> fail loops back to implementer
+  -> adversarial-prep gate (/prep-pr gate steps, run directly) -> fail loops back to implementer
   -> adversarial-review (hostile /pr-review-toolkit:review-pr) -> findings loop back
   -> lead gates SHIPPABLE (maintainer UAT: punch-list or AskUserQuestion + live URL)
   -> lead spawns a short-lived pr-prep subagent -> produces title + body_file + closes-list into /tmp/<team>/
@@ -192,7 +222,7 @@ GUARDRAILS (naive Ralph bites here):
 
 ## Context discipline (protect every long-lived window)
 A Medium-effort Opus lead survives only a few hours before forced compaction, and teammates burn context too. Treat context as a budgeted resource, not free.
-- DELEGATE-OR-SUMMARIZE is the default. Any agent (lead OR teammate) pushes context-heavy work to short-lived SUB-AGENTS that return CONCLUSIONS, not transcripts. Context-heavy work = Playwright UAT/screenshots, RCA, big file/log reads + greps, rebase-conflict resolution, hostile review passes, doc sweeps. The long-lived window should hold DECISIONS + the checkpoint, not raw output. This trigger is judgment-based; as a rule of thumb, delegate any task whose raw output would exceed a few hundred lines, or any multi-file read/grep, RCA, UAT, or hostile-review pass.
+- DELEGATE-OR-SUMMARIZE is the default. Any agent (lead OR teammate) pushes context-heavy work to short-lived SUB-AGENTS that return CONCLUSIONS, not transcripts - EXCEPT a role whose definition withholds `Agent` (every role but the implementer and adversarial-review, #427): it tees heavy output to a file and reads back only the excerpt, or hands the work to the lead. Context-heavy work = Playwright UAT/screenshots, RCA, big file/log reads + greps, rebase-conflict resolution, hostile review passes, doc sweeps. The long-lived window should hold DECISIONS + the checkpoint, not raw output. This trigger is judgment-based; as a rule of thumb, delegate any task whose raw output would exceed a few hundred lines, or any multi-file read/grep, RCA, UAT, or hostile-review pass.
   - DIGEST SUBAGENT is the concrete pattern for RAW-STATE reads (#227, enforcing this same DELEGATE-OR-SUMMARIZE rule - not a new mechanism). Instead of the lead `Read`ing SESSION-STATE, a full `gh pr list`/`git worktree list`/`git log` dump, a big diff, or a build/test log DIRECTLY into its own window (raw reads are ~42% of a lead's context), it dispatches a THROWAWAY READ-ONLY subagent whose task is "read <raw source> and return a bounded digest (<=500 tokens): the decision-relevant enums, counts, names, pointers, and exit codes - never the haystack." The raw content lands in the subagent's context and never enters the LEAD's long-lived window; only the <=500-token digest crosses back. The subagent is READ-ONLY (it returns text, mutates nothing). BACKGROUNDING follows the standing background-agent rule, NOT "it's read-only": background it ONLY if it is provably-0%-prompt (pure Read/Grep/Glob). A digest over `gh pr list` / `git log` / other Bash reads is NOT provably-0%-prompt (those can hit an allow-list/sandbox prompt), so it runs FOREGROUND like any other privileged-capable read - see the background-agent ban in the user-global CLAUDE.md. TRIGGER: reach for it whenever a raw-state read would exceed the few-hundred-line rule of thumb above, and ESPECIALLY when the context-budget meter (#228) fires its 70%/85% warning ("delegate reads, checkpoint / force digest handoff"). It does NOT replace a read the lead must REASON over line-by-line (a diff it is authoring a fix against, a charter it is editing) - digest is for ROUTING/VERIFYING raw state, not for the substance the lead is actually thinking about.
   - CONTEXT-BUDGET METER (#228) is the trigger INSTRUMENT for the two rules above. A PostToolUse hook (`scripts/orchestrate-context-meter.sh`, advisory + fail-open, wired by `configure`) accumulates a per-session PROXY of window growth (compact tool_input + tool_response bytes /4) and emits a one-time `CTX-METER:` WARN at ~70% ("delegate raw-state reads to a digest subagent + checkpoint now") and ~85% ("force a checkpoint + hand raw-state reads to the digest subagent; wrap up this window") of `ORCHESTRATE_CONTEXT_BUDGET_TOKENS` (default 200000). It is a rough PROXY (tool I/O only, not the full window) and NEVER blocks - treat its WARN as the concrete cue to delegate-or-summarize and checkpoint, not a hard gate.
   - PLAYWRIGHT MCP UAT GOTCHAS (so a delegated UAT does not mislead): (a) the MCP browser renders LIGHT by default - for dark-mode UAT set `colorScheme: dark` (browser context / emulate) or the app shows light and the screenshot lies about the theme; (b) `browser_take_screenshot` with a RELATIVE filename writes to the REPO ROOT and pollutes the tree - always direct screenshots under `.playwright-mcp/` (gitignored), never a bare filename.
