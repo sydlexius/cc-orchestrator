@@ -287,7 +287,7 @@ cleans nothing. Reclaiming is on-demand via `/reclaim-cache`.
 ```bash
 # Literal helper path in every leg (the "Helper exec paths" rule in prep-pr.md). cache-reclaim.sh
 # is NOT deployed to ~/.claude/scripts/, so there is no stable leg.
-if [ -f scripts/cache-reclaim.sh ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
+if [ -f scripts/cache-reclaim.sh ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/cache-reclaim.sh' ]; then leg=plugin
 else leg=none; fi
 [ "$leg" = repo ]   && { bash scripts/cache-reclaim.sh --nudge || true; }
@@ -312,7 +312,7 @@ gate. The sweep EXCLUDES the PR that just merged.
 ```bash
 # Literal helper path in every leg (the "Helper exec paths" rule in prep-pr.md).
 # open-pr-staleness-sweep.sh is NOT deployed to ~/.claude/scripts/, so there is no stable leg.
-if [ -f scripts/open-pr-staleness-sweep.sh ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
+if [ -f scripts/open-pr-staleness-sweep.sh ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/open-pr-staleness-sweep.sh' ]; then leg=plugin
 else leg=none; fi
 [ "$leg" = repo ]   && { bash scripts/open-pr-staleness-sweep.sh "$pr_number" "$repo" || true; }

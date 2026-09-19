@@ -128,7 +128,7 @@ if [ "$state_pre" = "BEHIND" ]; then
   # this contradicts the BEHIND-BASE ROUTING rule in SKILL.md otherwise.
   # Literal helper path in every leg (the "Helper exec paths" rule in prep-pr.md). A missing
   # helper or a failed read leaves unreplied=1, which SKIPS the refresh (fail toward not acting).
-  if [ -f scripts/pr-unreplied-comments.sh ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
+  if [ -f scripts/pr-unreplied-comments.sh ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
   elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh' ]; then leg=plugin
   elif [ -f ~/.claude/scripts/pr-unreplied-comments.sh ]; then leg=stable
   else leg=none; fi

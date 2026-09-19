@@ -18,7 +18,7 @@ cc-orchestrator itself, see below), then the plugin copy `'${CLAUDE_PLUGIN_ROOT}
 then the deployed `~/.claude/scripts/<helper>` (only for helpers `orchestrate-setup.py configure`
 deploys) - and then runs the ONE matching `[ "$leg" = ... ] && { ...; }` line.
 
-The repo leg is `[ -f scripts/<helper> ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json`:
+The repo leg is `[ -f scripts/<helper> ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json`:
 it is taken ONLY when the working repo IS cc-orchestrator (dogfooding the working-tree copy). In
 any other repo a same-named `scripts/<helper>` is that CONSUMER's own script, and it must never
 substitute for a gate: a consumer's older `scripts/safe-push.sh` with no freshness refusal pushed
@@ -158,7 +158,7 @@ fi
 # missing helper would otherwise surface as 127, which matches no documented branch.
 # Literal helper path in every leg - see "Helper exec paths" at the top of this file.
 if [ -z "$base_name" ]; then leg=nobase
-elif [ -f scripts/base-freshness.sh ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
+elif [ -f scripts/base-freshness.sh ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/base-freshness.sh' ]; then leg=plugin
 elif [ -f ~/.claude/scripts/base-freshness.sh ]; then leg=stable
 else leg=none; fi
@@ -247,7 +247,7 @@ to it:
 # there -- and worktrees are the normal case for this workflow. --git-dir resolves
 # correctly in both, and is per-worktree, so receipts never leak between them.
 RECEIPT_PATH="$(git rev-parse --git-dir)/prep-pr-receipt.json"
-if [ -f scripts/gate-runner.py ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then
+if [ -f scripts/gate-runner.py ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then
   python3 scripts/gate-runner.py --receipt "$RECEIPT_PATH"
 else
   python3 ~/.claude/scripts/gate-runner.py --receipt "$RECEIPT_PATH"
@@ -357,7 +357,7 @@ hard-coded excludes needed here:
 
 ```bash
 # Literal helper path in every leg - see "Helper exec paths" at the top of this file.
-if [ -f scripts/patch-coverage.sh ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
+if [ -f scripts/patch-coverage.sh ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/patch-coverage.sh' ]; then leg=plugin
 elif [ -f ~/.claude/scripts/patch-coverage.sh ]; then leg=stable
 else leg=none; fi
@@ -792,7 +792,7 @@ separate command:
 
 ```bash
 # Literal helper path in every leg - see "Helper exec paths" at the top of this file.
-if [ -f scripts/safe-push.sh ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
+if [ -f scripts/safe-push.sh ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh' ]; then leg=plugin
 elif [ -f ~/.claude/scripts/safe-push.sh ]; then leg=stable
 else leg=none; fi
@@ -941,7 +941,7 @@ the PR:
 # through a ~/.claude/commands symlink outside this repo it reports skipped. Capture the
 # exit code with `|| pl_rc=$?` so a non-zero result can NEVER abort the caller under
 # `set -e` -- this check is strictly advisory.
-if [ -f scripts/prose-lint.sh ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
+if [ -f scripts/prose-lint.sh ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/prose-lint.sh' ]; then leg=plugin
 else leg=none; fi
 pl_rc=0

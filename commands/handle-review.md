@@ -59,7 +59,7 @@ it resolves them ONCE here. The block only TESTS and PRINTS - it executes nothin
 
 ```bash
 for h in patch-coverage.sh pr-codeql-autofixes.sh pr-read-comments.sh pr-unreplied-comments.sh reply-comment.sh resolve-threads.sh; do
-  if [ -f "scripts/$h" ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then echo "$h -> scripts/$h"
+  if [ -f "scripts/$h" ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then echo "$h -> scripts/$h"
   elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/'"$h" ]; then echo "$h -> "'${CLAUDE_PLUGIN_ROOT}/scripts/'"$h"
   elif [ -f ~/.claude/scripts/"$h" ]; then echo "$h -> ~/.claude/scripts/$h"
   else echo "$h -> NOT FOUND"; fi
@@ -179,7 +179,7 @@ intervals: **15s → 30s → 60s → 120s**. At each interval:
 ```bash
 # Full per-leg block (not HELPER_DIR/): this is a GATE. A missing/unsubstituted helper exits
 # 127 with an EMPTY capture, and an empty capture must never read as 0 / "stable".
-if [ -f scripts/pr-unreplied-comments.sh ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
+if [ -f scripts/pr-unreplied-comments.sh ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh' ]; then leg=plugin
 elif [ -f ~/.claude/scripts/pr-unreplied-comments.sh ]; then leg=stable
 else leg=none; fi
@@ -199,7 +199,9 @@ fi
 
 An empty count means NOT RUN, never 0: a `readiness: NOT RUN` line (helper missing, non-zero
 exit, hook-denied, or an empty capture) is NOT ready - fail toward not-ready, never toward
-"stable". It does not count as one of the consecutive polls.
+"stable". It does not count as one of the consecutive polls. If it says `leg=none`, the
+helper is MISSING and will not appear between polls: STOP now and report NOT RUN rather than
+burning the remaining polls.
 
 If `pending == 0` AND `unreplied` count matches the previous check → ready.
 If not stable after 4 polls (~3.75 minutes), tell the user which bots are still
@@ -469,7 +471,7 @@ re-implementing per-stack test commands here:
 
 ```bash
 git diff --name-only   # identify changed files
-if [ -f scripts/gate-runner.py ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then
+if [ -f scripts/gate-runner.py ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then
   python3 scripts/gate-runner.py
 else
   python3 ~/.claude/scripts/gate-runner.py

@@ -45,7 +45,7 @@ The poll interval is not configurable in normal use -- the script polls every 30
 The script is silent until done; the single terminal stdout line becomes the only event. Wait for it without polling.
 
 ```bash
-if [ -f scripts/issue-watch.sh ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
+if [ -f scripts/issue-watch.sh ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/issue-watch.sh' ]; then leg=plugin
 elif [ -f ~/.claude/scripts/issue-watch.sh ]; then leg=stable
 else leg=none; fi

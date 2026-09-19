@@ -78,7 +78,7 @@ prints findings but never blocks issue creation.
 # Literal helper path in every leg (the "Helper exec paths" rule in prep-pr.md). prose-lint.sh
 # is NOT deployed to ~/.claude/scripts/, so there is no stable leg. Capture the exit code with
 # `|| pl_rc=$?` so a non-zero result can NEVER abort the caller under `set -e` -- advisory only.
-if [ -f scripts/prose-lint.sh ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
+if [ -f scripts/prose-lint.sh ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/prose-lint.sh' ]; then leg=plugin
 else leg=none; fi
 pl_rc=0
