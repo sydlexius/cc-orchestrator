@@ -1343,6 +1343,14 @@ def main():
               "someone-elses.md (not an orchestrate role) sets permissionMode" in out
               and "[FAIL] agent definition" not in out)
         os.remove(os.path.join(adest, "someone-elses.md"))
+        # A frontmatter-less Markdown file (notes, a README) is not an agent: CC reads no keys from
+        # it, so doctor must not WARN about it (Copilot on PR #431). The prefixed-file case is
+        # covered above: an unparseable orchestrate-*.md still FAILs.
+        open(os.path.join(adest, "NOTES.md"), "w").write("# just notes\nno frontmatter here\n")
+        rc, out = run(["doctor"], env_overrides=aov)
+        check("#428: a frontmatter-less non-role Markdown file is NOT warned about",
+              "NOTES.md" not in out)
+        os.remove(os.path.join(adest, "NOTES.md"))
         # A project-scope shadow of a role name WARNs.
         os.makedirs(aproj); open(os.path.join(aproj, roles[1]), "w").write(agent_md("orchestrate-beta"))
         rc, out = run(["doctor"], env_overrides=aov)

@@ -1078,6 +1078,12 @@ def check_agents():
         fm = _frontmatter(path)
         ours = _agent_is_ours(path, fm)
         if fm is None:
+            if ours is False and _cc_frontmatter_region(path) == "":
+                # CC's own split finds NO frontmatter here, so CC reads no keys from it at all: it
+                # cannot grant anything, and warning about an unrelated Markdown file is noise
+                # (Copilot on PR #431). A PREFIXED file never reaches this branch as not-ours, so
+                # a broken orchestrate role definition still FAILs below.
+                continue
             if ours is False:
                 # CC cannot load this as an orchestrate role, but its keys are still unknown.
                 warn.append(f"{rel}: frontmatter outside the strict grammar - cannot verify it does "
