@@ -113,7 +113,16 @@ Runtime (`scripts/`; canonical source is this repo):
   `gh-react.sh`, #303 added `run-paths.sh`, and the elmer front half added `cr-quota-watch.sh`,
   `elmer-enqueue.sh`, `elmer-triage.sh` + `elmer-tick.sh` - for those the stable path is LOAD-BEARING, since it is what keeps the
   unattended loop inside the existing wrapper grant instead of needing a broad `gh` one; retiring
-  any claude-kit symlink, backed up to `<dest>.bak`), and (unless `--no-steer`) DEPLOYS + wires the advisory
+  any claude-kit symlink, backed up to `<dest>.bak`), DEPLOYS the orchestrate ROLE DEFINITIONS
+  (#428: every `skills/orchestrate/agent-definitions/orchestrate-*.md`, discovered by GLOB so a new
+  role cannot be silently left out) to USER scope `~/.claude/agents/` - not executable, same verified
+  backup-first contract - and REFUSES a bundled source carrying `permissionMode`/`hooks`/`mcpServers`.
+  A user-scope agent file is a PRIVILEGE SURFACE the merge-gate shadow scan never reads (a deployed
+  `permissionMode` measurably escalated a default-mode parent in every repo, #426), so doctor HARD-FAILS
+  those keys - and UNREADABLE frontmatter, because doubt must never read as "carries none" - on any
+  deployed `orchestrate-*.md`, WARNs on another tool's agent setting `permissionMode`, on the
+  teammate-ignored `omitClaudeMd`/`effort`, and on a project `.claude/agents/orchestrate-*.md`
+  (project scope outranks user scope). And (unless `--no-steer`) DEPLOYS + wires the advisory
   steering hook `orchestrate-steer.sh` for Edit/Write/Bash/Read/Agent (#95/#226/#231; doctor only ever WARNs about it),
   DEPLOYS this script to the stable path + wires a read-only SessionStart `init` advisory hook (#162;
   the `init` subcommand reuses the single `_scan_merge_gate_shadows` matcher to surface a `gh pr *`
