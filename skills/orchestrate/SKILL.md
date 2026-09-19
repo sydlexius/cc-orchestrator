@@ -78,7 +78,7 @@ and does not buy:
 | Bot | Model / Mode | CAN do | CANNOT (charter-enforced) | Charter template |
 |---|---|---|---|---|
 | implementer (1 per cluster) | issue hints, else Opus / medium; acceptEdits | edit OWN worktree, commit, run local tests, act on fix-instructions | push, any `gh`, see/know the PR or CR (PR-BLIND), merge, touch other worktrees | implementer-charter.md |
-| adversarial-prep | Sonnet / auto | run `/prep-pr` (tests, gate, generated-file + coverage), report pass/fail | push, edit code, reply, merge | adversarial-prep-charter.md |
+| adversarial-prep | Sonnet / auto | run `/prep-pr`'s GATE STEPS directly (gate-runner, patch coverage, lockstep - never the `/prep-pr` command, which pushes), report pass/fail | push, edit code, reply, merge | adversarial-prep-charter.md |
 | adversarial-review | Sonnet or Opus / auto, READ-ONLY | run `/pr-review-toolkit:review-pr` in HOSTILE mode, draft findings | any mutation | adversarial-review-charter.md |
 | pr-prep (1-shot per PR) | Sonnet / auto | read branch diff, `gh issue view N`, draft title/body_file/closes-list, write body_file to /tmp/<team>/ | push, edit code, append to stack (lead is single-writer), see/act on CR, emit human prompts, merge | pr-prep-charter.md |
 | pr-shipper | Sonnet / auto | safe-push ANY stacked branch, `gh pr create`, background `pr-watch.sh`, rate-limit probe | MERGE, post-merge-cleanup, edit code | pr-shipper-brief.md |
@@ -135,7 +135,7 @@ and does not buy:
 ```
 dispatch-map entry
   -> implementer builds (own worktree+port, issue hints) + commits, PR-blind
-  -> adversarial-prep gate (/prep-pr) -> fail loops back to implementer
+  -> adversarial-prep gate (/prep-pr gate steps, run directly) -> fail loops back to implementer
   -> adversarial-review (hostile /pr-review-toolkit:review-pr) -> findings loop back
   -> lead gates SHIPPABLE (maintainer UAT: punch-list or AskUserQuestion + live URL)
   -> lead spawns a short-lived pr-prep subagent -> produces title + body_file + closes-list into /tmp/<team>/
