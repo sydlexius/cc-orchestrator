@@ -148,12 +148,25 @@ On `--once`, do Step 1 and stop. No wakeup is scheduled.
 Overnight the loop triggers reviews and CR posts findings. `elmer-triage.sh` composes those into a
 per-PR maildir digest so a TL wakes to a readable queue instead of a raw comment dump:
 
-Set `TRIAGE_PRS` to the space-separated PR numbers to digest (the PRs in the drained queue)
-before running the block. The helper REQUIRES at least one PR number - called bare it prints its
-usage and exits 2 - so a `:?` guard fails loudly when the value was never set.
+Set `TRIAGE_PRS` to the space-separated PR numbers to digest before running the block: the PRs
+the loop triggered SINCE THE LAST TRIAGE. `drained/` is a permanent audit trail that only grows,
+so take recent entries, not all of them. Entries are named `<repo-slug>--<pr>--<sha12>.json`, so
+for the last 24 hours:
+`TRIAGE_PRS=$(find ~/.claude/elmer/drained -name '*.json' -mtime -1 | sed -E 's/.*--([0-9]+)--[0-9a-f]+\.json$/\1/' | sort -un | tr '\n' ' ')`.
+The helper REQUIRES at least one PR number - called bare it prints its usage and exits 2 - so the block
+checks the BUILT ARRAY and stops loudly when it is empty. (Not a `${TRIAGE_PRS:?}` guard: inside
+a `$(...)` zsh does not abort the outer command on it, so the helper would still run bare.)
+
+The array is built with `printf` word-splitting, NOT `read -a`: the Bash tool runs the user's
+shell, and zsh rejects `read -a` (`bad option: -a`) and leaves the array EMPTY, which would call
+the helper bare - the exact defect this block exists to close.
 
 ```bash
-read -r -a triage_prs <<< "${TRIAGE_PRS:?set to the space-separated PR numbers to triage}"
+triage_prs=( $(printf '%s\n' "${TRIAGE_PRS:-}") )
+if [ "${#triage_prs[@]}" -eq 0 ]; then
+  echo "triage: NOT RUN -- TRIAGE_PRS is unset or empty; set it to the PR numbers to triage" >&2
+  exit 2
+fi
 if [ -f scripts/elmer-triage.sh ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
 elif [ -f ~/.claude/scripts/elmer-triage.sh ]; then leg=stable
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/elmer-triage.sh' ]; then leg=plugin

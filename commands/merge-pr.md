@@ -398,7 +398,10 @@ All pre-merge checks passed for #<pr_number>.
 Run it in a SEPARATE PLAIN TERMINAL outside the IDE, or use the GitHub UI
 "Squash and merge" button:
 
-    gh pr merge <pr_number> --squash
+    gh pr merge <pr_number> --squash --match-head-commit <headRefOid>
+
+(<headRefOid> is the 40-hex SHA from Step 1's `RESULT: PASS ... headRefOid=<sha>` line: the
+pin makes GitHub refuse the merge if anything was pushed after the oracle vetted that head.)
 
 Do NOT run it as an in-session `! ...` bang: in an IDE-hosted session the bang
 shell can fail outright and the merge silently will not happen. Then tell me it
