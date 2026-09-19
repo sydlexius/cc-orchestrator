@@ -47,6 +47,37 @@ dependent PRs via rebase.
 
 ---
 
+## Step 0 -- Resolve helper paths (once, before any other step)
+
+This command calls several bundled helpers many times, so instead of a per-call detection chain
+it resolves them ONCE here. The block only TESTS and PRINTS - it executes nothing:
+
+```bash
+for h in pr-read-comments.sh pr-unreplied-comments.sh reply-comment.sh; do
+  if [ -f "scripts/$h" ]; then echo "$h -> scripts/$h"
+  elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/'"$h" ]; then echo "$h -> "'${CLAUDE_PLUGIN_ROOT}/scripts/'"$h"
+  elif [ -f ~/.claude/scripts/"$h" ]; then echo "$h -> ~/.claude/scripts/$h"
+  else echo "$h -> NOT FOUND"; fi
+done
+```
+
+Every later block writes a helper as `HELPER_DIR/<name>`. **Before running any such block, replace
+`HELPER_DIR/<name>` with the LITERAL path printed above for that name** (e.g.
+`bash ~/.claude/scripts/reply-comment.sh ...`). Never store the path in a variable and execute the
+variable, and never wrap the call in `sh -c`/`eval`: a PreToolUse safety hook denies an
+interpreter whose script path it cannot read statically (the "Helper exec paths" rule in
+`prep-pr.md`). The same literal paths go into any subagent prompt this command spawns - a prompt
+is never substituted. A helper printed as `NOT FOUND` means that step cannot run: say so, and do
+not improvise a replacement. A hook DENYING a helper call is `NOT RUN (denied by hook: <reason>)`,
+never an empty result (the **Hook-denied gate command** rule in `prep-pr.md`); a gate step
+(the merge-readiness or unreplied-count checks) STOPS on it.
+
+Why not `${CLAUDE_PLUGIN_ROOT}` directly: Claude Code substitutes that token only when this
+command loads as `/orchestrate:*`. Loaded through a `~/.claude/commands/<name>.md` symlink (a
+supported install) it stays literal, and the safety hook denies it.
+
+---
+
 ## Step 1 -- Identify the stack
 
 This step runs first because all subsequent parallel work depends on knowing the PR list.
@@ -140,8 +171,8 @@ Each agent receives this task:
 > Poll at 15s, 30s, 60s, 120s intervals. At each interval check:
 >
 > ```bash
-> pending=$(bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh --pending-only <number>)
-> unreplied=$(bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh --count-only <number>)
+> pending=$(bash HELPER_DIR/pr-unreplied-comments.sh --pending-only <number>)
+> unreplied=$(bash HELPER_DIR/pr-unreplied-comments.sh --count-only <number>)
 > ```
 >
 > Ready when `pending == 0` AND `unreplied` count matches the previous check.
@@ -150,15 +181,15 @@ Each agent receives this task:
 > **Step C -- Fetch all unreplied bot comments (overview then full bodies):**
 >
 > ```bash
-> bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh <number>
-> bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-read-comments.sh <number>
-> bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-read-comments.sh --reviews <number>
+> bash HELPER_DIR/pr-unreplied-comments.sh <number>
+> bash HELPER_DIR/pr-read-comments.sh <number>
+> bash HELPER_DIR/pr-read-comments.sh --reviews <number>
 > ```
 >
 > For specific comment IDs only:
 >
 > ```bash
-> bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-read-comments.sh <number> <id1> <id2> ...
+> bash HELPER_DIR/pr-read-comments.sh <number> <id1> <id2> ...
 > ```
 >
 > **Return format:**
@@ -185,7 +216,7 @@ Each agent receives this task:
   Instead, capture the coverage advisory separately:
 
   ```bash
-  bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh --coverage-only <number> <repo>
+  bash HELPER_DIR/pr-unreplied-comments.sh --coverage-only <number> <repo>
   ```
 
   Returns a JSON object with `status`, `patch_pct`, `patch_pct_source`,
@@ -410,7 +441,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - `reply_type: "inline"` comments (inline diff annotations) -- use the **3-arg form**:
 
   ```bash
-  bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh <PR> <comment_id> '<text>'
+  bash HELPER_DIR/reply-comment.sh <PR> <comment_id> '<text>'
   ```
 
   This posts a threaded reply under the code annotation.
@@ -424,25 +455,25 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 Fix now:
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh <PR> <comment_id> 'Fixed in <short-sha>.'
+bash HELPER_DIR/reply-comment.sh <PR> <comment_id> 'Fixed in <short-sha>.'
 ```
 
 Rebut:
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh <PR> <comment_id> '<evidence-based rebuttal>'
+bash HELPER_DIR/reply-comment.sh <PR> <comment_id> '<evidence-based rebuttal>'
 ```
 
 Stacked-PR repeat:
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh <PR> <comment_id> 'This is wired in PR #<later_pr>. Per-PR review limitation on stacked PRs.'
+bash HELPER_DIR/reply-comment.sh <PR> <comment_id> 'This is wired in PR #<later_pr>. Per-PR review limitation on stacked PRs.'
 ```
 
 Defer:
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh <PR> <comment_id> 'Tracked in #<issue-number>. Requires <brief justification for deferral>.'
+bash HELPER_DIR/reply-comment.sh <PR> <comment_id> 'Tracked in #<issue-number>. Requires <brief justification for deferral>.'
 ```
 
 **For review body IDs (reply_type: "top-level") -- use the 4-arg form:**
@@ -456,7 +487,7 @@ no-toplevel-summaries hook and produces Conversation-tab noise anyway.
 fix touched (or a nearby in-diff line for rebuttals) using the 4-arg form:
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh <PR> \
+bash HELPER_DIR/reply-comment.sh <PR> \
   --file <path> --line <n> \
   '<reply text>'
 ```

@@ -2,6 +2,8 @@
 
 Placeholders: <REPO> (the `owner/name` slug, e.g. `sydlexius/stillwater` -- NEVER a filesystem path; a path makes pr-watch exit 2 setup-error), <OUTDIR> (default /tmp/<team>/pr-triage), <TIMEOUT> (pr-watch seconds; default 600 = 10 min. HINT: CR latency is ~6 min, so the old 120s timed out before CR posted (dogfood #1886) and triage never fired -- never go below ~600 for a CR-bearing PR).
 
+HELPER PATHS (LEAD, before spawning): `${CLAUDE_PLUGIN_ROOT}` is NOT substituted inside charter/teammate prompts - resolve every `${CLAUDE_PLUGIN_ROOT}/scripts/<x>` below to a concrete LITERAL scripts path before spawning the teammate (the plugin cache dir, the repo's `scripts/`, or the deployed `~/.claude/scripts/`; never `$HOME/...` or a variable, which a PreToolUse safety hook denies as an interpreter's script path). Teammate: run each helper by that literal path; never through a variable, `sh -c`, or `eval`. A hook DENYING a helper call means it DID NOT RUN - report that to the lead, never an empty or clean result, and never retry a variant.
+
 You are READ-ONLY and DRAFT-ONLY. Your mental model: you are the `/handle-review`
 skill workflow MINUS every mutation. You do the thinking half; the maintainer/lead
 does the acting half.

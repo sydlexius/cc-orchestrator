@@ -285,10 +285,15 @@ that build). So this step is a single cheap `df` check that prints at most one a
 cleans nothing. Reclaiming is on-demand via `/reclaim-cache`.
 
 ```bash
-if [ -f scripts/cache-reclaim.sh ]; then PL=scripts/cache-reclaim.sh
-elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/cache-reclaim.sh" ]; then PL="${CLAUDE_PLUGIN_ROOT}/scripts/cache-reclaim.sh"
-else PL=""; fi
-[ -n "$PL" ] && bash "$PL" --nudge || true
+# Literal helper path in every leg (the "Helper exec paths" rule in prep-pr.md). cache-reclaim.sh
+# is NOT deployed to ~/.claude/scripts/, so there is no stable leg.
+if [ -f scripts/cache-reclaim.sh ]; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/cache-reclaim.sh' ]; then leg=plugin
+else leg=none; fi
+[ "$leg" = repo ]   && { bash scripts/cache-reclaim.sh --nudge || true; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/cache-reclaim.sh' --nudge || true; }
+[ "$leg" = none ]   && echo "disk nudge skipped (cache-reclaim.sh not found; load via /orchestrate:post-merge-cleanup)"
+true
 ```
 
 `--nudge` reads `df` only (no `du` scan, no clean), prints "Disk N% full - run /reclaim-cache ..."
@@ -305,10 +310,15 @@ BEHIND. Surface that now, while the merge is fresh, rather than discovering it a
 gate. The sweep EXCLUDES the PR that just merged.
 
 ```bash
-if [ -f scripts/open-pr-staleness-sweep.sh ]; then SW=scripts/open-pr-staleness-sweep.sh
-elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/open-pr-staleness-sweep.sh" ]; then SW="${CLAUDE_PLUGIN_ROOT}/scripts/open-pr-staleness-sweep.sh"
-else SW=""; fi
-[ -n "$SW" ] && bash "$SW" "$pr_number" "$repo" || true
+# Literal helper path in every leg (the "Helper exec paths" rule in prep-pr.md).
+# open-pr-staleness-sweep.sh is NOT deployed to ~/.claude/scripts/, so there is no stable leg.
+if [ -f scripts/open-pr-staleness-sweep.sh ]; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/open-pr-staleness-sweep.sh' ]; then leg=plugin
+else leg=none; fi
+[ "$leg" = repo ]   && { bash scripts/open-pr-staleness-sweep.sh "$pr_number" "$repo" || true; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/open-pr-staleness-sweep.sh' "$pr_number" "$repo" || true; }
+[ "$leg" = none ]   && echo "staleness sweep skipped (open-pr-staleness-sweep.sh not found; load via /orchestrate:post-merge-cleanup)"
+true
 ```
 
 The sweep is ADVISORY and FAIL-OPEN by contract: it exits 0 on every operational path (including a

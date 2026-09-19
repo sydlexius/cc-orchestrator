@@ -10,6 +10,28 @@ Run every pre-push check in order. Gate on failures. Squash and push only when c
 
 **Optional context:** "$ARGUMENTS"
 
+**Helper exec paths (#433/#434).** Every block below that runs a bundled helper names it by a
+LITERAL path, never through a variable (`bash "$X"`, `bash "$HOME/..."`): a PreToolUse safety
+hook denies an interpreter whose script path it cannot read statically. The block first picks a
+leg with `[ -f ]` tests only, in this order - repo-local `scripts/<helper>`, then the plugin copy
+`'${CLAUDE_PLUGIN_ROOT}/scripts/<helper>'`, then the deployed `~/.claude/scripts/<helper>` (only
+for helpers `orchestrate-setup.py configure` deploys) - and then runs the ONE matching
+`[ "$leg" = ... ] && { ...; }` line. Two load-path facts force this shape. Claude Code substitutes
+only the exact token `${CLAUDE_PLUGIN_ROOT}`, and only when the command loads as `/orchestrate:*`;
+loaded through a `~/.claude/commands/<name>.md` symlink (a supported install), the token stays
+literal. The plugin path is SINGLE-QUOTED so that unsubstituted it is a literal string the
+`[ -f ]` test simply fails, and it is executed outside any `if` body because the safety hook
+reads an `if`-body `bash "${...}"` as an unverifiable expansion even in a branch that cannot run.
+Data arguments may stay variables.
+
+**Hook-denied gate command.** A PreToolUse hook DENYING a step's own command is neither "unknown"
+nor "passed": the gate DID NOT RUN. Never retry it through an evasion variant (`sh -c`, `eval`, a
+bare `"$X"` as the command word) - the hook's own message says not to brute-force variants, and a
+variant that slips past it runs a gate nobody can read. Report `<step>: NOT RUN (denied by hook:
+<reason>)`. For a BLOCKING gate (Step 1c base freshness, Step 2b patch coverage, Step 7 push) STOP
+until the command is fixed or the human runs it; for an ADVISORY step (Step 8b prose-lint) report
+it skipped and continue. Other commands with gate steps point here.
+
 ---
 
 ## Step 1 -- Orient
@@ -119,21 +141,23 @@ fi
 # invisible to the step that reads it. Both degraded paths NORMALISE to 0 (non-blocking):
 # an unresolvable base and a missing helper are "cannot determine", never "behind", and a
 # missing helper would otherwise surface as 127, which matches no documented branch.
+# Literal helper path in every leg - see "Helper exec paths" at the top of this file.
+if [ -z "$base_name" ]; then leg=nobase
+elif [ -f scripts/base-freshness.sh ]; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/base-freshness.sh' ]; then leg=plugin
+elif [ -f ~/.claude/scripts/base-freshness.sh ]; then leg=stable
+else leg=none; fi
 fresh_rc=0
-if [ -z "$base_name" ]; then
-  echo "freshness: unknown -- no base could be resolved; skipping the check."
-else
-  if [ -f scripts/base-freshness.sh ]; then BF=scripts/base-freshness.sh
-  else BF="${CLAUDE_PLUGIN_ROOT:-}/scripts/base-freshness.sh"; fi
-  if [ -f "$BF" ]; then
-    bash "$BF" "$base_name" HEAD
-    fresh_rc=$?
-  else
-    echo "freshness: unknown -- base-freshness.sh not found; skipping the check."
-  fi
-fi
+[ "$leg" = repo ]   && { bash scripts/base-freshness.sh "$base_name" HEAD; fresh_rc=$?; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/base-freshness.sh' "$base_name" HEAD; fresh_rc=$?; }
+[ "$leg" = stable ] && { bash ~/.claude/scripts/base-freshness.sh "$base_name" HEAD; fresh_rc=$?; }
+[ "$leg" = nobase ] && echo "freshness: unknown -- no base could be resolved; skipping the check."
+[ "$leg" = none ]   && echo "freshness: unknown -- base-freshness.sh not found; skipping the check."
 echo "fresh_rc=$fresh_rc"
 ```
+
+A PreToolUse hook DENYING this block is not `fresh_rc=0`: the check did not run. See
+**Hook-denied gate command** at the top of this file.
 
 **Interpret `fresh_rc`:**
 
@@ -316,10 +340,19 @@ benchmark matches exactly what Codecov enforces -- no threshold parsing or
 hard-coded excludes needed here:
 
 ```bash
-COVER_OUT="${COVER_PROFILE:-/tmp/patch-cover.out}" \
-  bash "${CLAUDE_PLUGIN_ROOT}/scripts/patch-coverage.sh"
-gate_status=$?
-rm -f "${COVER_PROFILE:-/tmp/patch-cover.out}"
+# Literal helper path in every leg - see "Helper exec paths" at the top of this file.
+if [ -f scripts/patch-coverage.sh ]; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/patch-coverage.sh' ]; then leg=plugin
+elif [ -f ~/.claude/scripts/patch-coverage.sh ]; then leg=stable
+else leg=none; fi
+export COVER_OUT="${COVER_PROFILE:-/tmp/patch-cover.out}"
+gate_status=2
+[ "$leg" = repo ]   && { bash scripts/patch-coverage.sh; gate_status=$?; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/patch-coverage.sh'; gate_status=$?; }
+[ "$leg" = stable ] && { bash ~/.claude/scripts/patch-coverage.sh; gate_status=$?; }
+[ "$leg" = none ]   && echo "patch-coverage.sh not found (repo-local, plugin, or ~/.claude/scripts/)" >&2
+rm -f "$COVER_OUT"
+echo "gate_status=$gate_status leg=$leg"
 ```
 
 Point `COVER_PROFILE` at whatever coverage profile the Step 2 gate run
@@ -375,12 +408,14 @@ description. An explicit env var always wins over the `codecov.yml` value.
     > readable, and that no other git process holds a lock. Repair git access,
     > then re-run prep-pr."
 
-**If the script is missing** (`${CLAUDE_PLUGIN_ROOT}/scripts/patch-coverage.sh` not found),
-treat as a `2` configuration error: stop and tell the user to reinstall or update
-the plugin so the bundled, versioned helper is present at that path (do not source
-it from anywhere else -- an out-of-band copy risks drifting from the running
-release). Do NOT fall back to the old 0%-function check -- that gate is what let
-this regress in the first place.
+**If the script is missing** (`leg=none`: no repo-local, plugin, or deployed
+`~/.claude/scripts/patch-coverage.sh`), treat as a `2` configuration error: stop and tell
+the user to reinstall or update the plugin, or re-run `orchestrate-setup.py configure
+--apply` to refresh the deployed copy. Do not source it from any other location -- an
+out-of-band copy risks drifting from the running release. Do NOT fall back to the old
+0%-function check -- that gate is what let this regress in the first place. A hook
+DENYING the block is `Step 2b: NOT RUN`, a blocking stop (see **Hook-denied gate
+command** at the top of this file), never a skip.
 
 **Union contract (#288).** `patch-coverage.sh` UNIONS duplicate coverage blocks
 internally before measuring, so an integrating repo's gate does **not** need to
@@ -736,11 +771,34 @@ the pipe-swallow silent-failure mode), so the "no upstream yet" case needs no
 separate command:
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh" "$(git branch --show-current)"
+# Literal helper path in every leg - see "Helper exec paths" at the top of this file.
+if [ -f scripts/safe-push.sh ]; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh' ]; then leg=plugin
+elif [ -f ~/.claude/scripts/safe-push.sh ]; then leg=stable
+else leg=none; fi
+push_rc=2
+[ "$leg" = repo ]   && { bash scripts/safe-push.sh "$(git branch --show-current)"; push_rc=$?; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh' "$(git branch --show-current)"; push_rc=$?; }
+[ "$leg" = stable ] && { bash ~/.claude/scripts/safe-push.sh "$(git branch --show-current)"; push_rc=$?; }
+[ "$leg" = none ]   && echo "safe-push.sh not found (repo-local, plugin, or ~/.claude/scripts/); NOT pushing" >&2
+echo "push_rc=$push_rc"
+(exit "$push_rc")  # prep-pr-ok
 ```
 
+The trailing `# prep-pr-ok` is the floor guard's advisory override, and it is earned here:
+Step 7 is reached only after Steps 1-6 passed. Never add it to a push that skipped them.
+
+**Never pipe safe-push** (`| tail -N`, `| head`, `| tee` ...), foreground or backgrounded.
+Without `pipefail` a pipeline returns the LAST command's exit code, so a refusal (exit 1 or
+2) reads as 0 and the caller proceeds while the remote never moved - the exact pipe-swallow
+failure safe-push exists to remove, rebuilt one layer out (#432). Its own exit code IS the
+verdict (`push_rc` above: 0 pushed and verified, 1 refused/failed, 2 bad invocation), and
+its output is already short, so there is nothing to trim.
+
 Report the push result. If it fails (non-fast-forward, auth error, the remote
-ref did not move, etc.), stop and explain -- do not retry automatically.
+ref did not move, `push_rc` non-zero, etc.), stop and explain -- do not retry
+automatically. A hook DENYING the block is `Step 7: NOT RUN`, a blocking stop (see
+**Hook-denied gate command** at the top of this file).
 
 ---
 
@@ -856,21 +914,19 @@ committed Markdown. This is **advisory** -- it prints findings but never blocks
 the PR:
 
 ```bash
-# Locate the helper without assuming ${CLAUDE_PLUGIN_ROOT} is set (an unset var would expand
-# to "/scripts/prose-lint.sh"). Capture the exit code with `|| pl_rc=$?` so a non-zero result
-# can NEVER abort the caller under `set -e` -- this check is strictly advisory.
-PL=""
-if [ -f scripts/prose-lint.sh ]; then
-  PL=scripts/prose-lint.sh
-elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/prose-lint.sh" ]; then
-  PL="${CLAUDE_PLUGIN_ROOT}/scripts/prose-lint.sh"
-fi
+# Literal helper path in every leg - see "Helper exec paths" at the top of this file.
+# prose-lint.sh is NOT deployed to ~/.claude/scripts/, so there is no stable leg: loaded
+# through a ~/.claude/commands symlink outside this repo it reports skipped. Capture the
+# exit code with `|| pl_rc=$?` so a non-zero result can NEVER abort the caller under
+# `set -e` -- this check is strictly advisory.
+if [ -f scripts/prose-lint.sh ]; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/prose-lint.sh' ]; then leg=plugin
+else leg=none; fi
 pl_rc=0
-if [ -n "$PL" ]; then
-  printf '%s' "$body" | bash "$PL" --profile docs --label "(pr-body)" || pl_rc=$?
-else
-  echo "prose-lint skipped (helper not found)"; pl_rc=2
-fi
+[ "$leg" = repo ]   && { printf '%s' "$body" | bash scripts/prose-lint.sh --profile docs --label "(pr-body)" || pl_rc=$?; }
+[ "$leg" = plugin ] && { printf '%s' "$body" | bash '${CLAUDE_PLUGIN_ROOT}/scripts/prose-lint.sh' --profile docs --label "(pr-body)" || pl_rc=$?; }
+[ "$leg" = none ]   && { echo "prose-lint skipped (helper not found; load via /orchestrate:prep-pr)"; pl_rc=2; }
+echo "pl_rc=$pl_rc"
 ```
 
 (If the body was written to a file, pass that path instead of piping.) Interpret

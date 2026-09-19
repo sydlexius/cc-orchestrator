@@ -38,27 +38,62 @@ block (any red/incomplete check, unaddressed finding, or lookup error), 1 = usag
 
 Run these in parallel:
 
-```bash
-repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+Each block names its helper by a LITERAL path in every leg, never a variable (the "Helper exec
+paths" rule in `prep-pr.md`: repo-local, then the plugin copy, then the deployed
+`~/.claude/scripts/` copy). A hook DENYING the oracle block is `NOT RUN`, a STOP - never a pass
+(the **Hook-denied gate command** rule in `prep-pr.md`).
 
+```bash
 # Deterministic merge-readiness oracle (CI rollup + unreplied review-body findings
 # + reviewDecision). Exit 0 = ready; exit 2 = block (stderr names the failing gate).
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/ship-gate-preflight.sh "$pr_number" "$repo"
+repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+if [ -f scripts/ship-gate-preflight.sh ]; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/ship-gate-preflight.sh' ]; then leg=plugin
+elif [ -f ~/.claude/scripts/ship-gate-preflight.sh ]; then leg=stable
+else leg=none; fi
+sg_rc=2
+[ "$leg" = repo ]   && { bash scripts/ship-gate-preflight.sh "$pr_number" "$repo"; sg_rc=$?; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/ship-gate-preflight.sh' "$pr_number" "$repo"; sg_rc=$?; }
+[ "$leg" = stable ] && { bash ~/.claude/scripts/ship-gate-preflight.sh "$pr_number" "$repo"; sg_rc=$?; }
+[ "$leg" = none ]   && echo "ship-gate-preflight.sh not found; readiness NOT verified -- STOP" >&2
+echo "ship-gate rc=$sg_rc"
+```
 
+```bash
 # Coverage advisory (informational; outside the oracle's scope). This is only
 # meaningful on repos that run a coverage service (e.g. codecov). When the repo
 # has no coverage integration, the script returns {"status":"none"} -- treat that
 # as SKIP / "N/A", not a failure and not a merge block (there is simply no
 # coverage comment yet). Only a returned threshold-fail is worth surfacing, and
 # even then it is advisory.
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh --coverage-only $pr_number
-
-# Code-scanning (GHAS / CodeQL) alerts -- a SEPARATE API surface the oracle and the
-# comment scripts can't see. Do not merge with open, untriaged code-scanning alerts.
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-codeql-autofixes.sh $pr_number
+if [ -f scripts/pr-unreplied-comments.sh ]; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh' ]; then leg=plugin
+elif [ -f ~/.claude/scripts/pr-unreplied-comments.sh ]; then leg=stable
+else leg=none; fi
+[ "$leg" = repo ]   && bash scripts/pr-unreplied-comments.sh --coverage-only "$pr_number"
+[ "$leg" = plugin ] && bash '${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh' --coverage-only "$pr_number"
+[ "$leg" = stable ] && bash ~/.claude/scripts/pr-unreplied-comments.sh --coverage-only "$pr_number"
+[ "$leg" = none ]   && echo "pr-unreplied-comments.sh not found; coverage advisory skipped" >&2
+true
 ```
 
-If `ship-gate-preflight.sh` exits non-zero, STOP and report its stderr message
+```bash
+# Code-scanning (GHAS / CodeQL) alerts -- a SEPARATE API surface the oracle and the
+# comment scripts can't see. Do not merge with open, untriaged code-scanning alerts.
+if [ -f scripts/pr-codeql-autofixes.sh ]; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/pr-codeql-autofixes.sh' ]; then leg=plugin
+elif [ -f ~/.claude/scripts/pr-codeql-autofixes.sh ]; then leg=stable
+else leg=none; fi
+cq_rc=2
+[ "$leg" = repo ]   && { bash scripts/pr-codeql-autofixes.sh "$pr_number"; cq_rc=$?; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/pr-codeql-autofixes.sh' "$pr_number"; cq_rc=$?; }
+[ "$leg" = stable ] && { bash ~/.claude/scripts/pr-codeql-autofixes.sh "$pr_number"; cq_rc=$?; }
+[ "$leg" = none ]   && echo "pr-codeql-autofixes.sh not found; code-scanning alerts NOT checked" >&2
+echo "codeql rc=$cq_rc"
+```
+
+If `ship-gate-preflight.sh` was not found (`leg=none`) or its block was denied, the readiness
+check did NOT run: STOP. If `ship-gate-preflight.sh` exits non-zero, STOP and report its stderr message
 (which names the failing gate -- a red/incomplete check, an unaddressed
 review-body finding, or an unrecognized reviewDecision). For unaddressed review
 findings, suggest running `/handle-review $pr_number` first. Only proceed to
@@ -281,10 +316,29 @@ merge. `orchestrate-authorize-merge.sh` runs the readiness oracle itself and arm
 ONLY on PASS, so a not-ready PR cannot be merged this way:
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/orchestrate-authorize-merge.sh" "$pr_number"
-# On PASS it prints the head SHA it pinned the token to. Merge with that EXACT sha:
+# Literal helper path in every leg (the "Helper exec paths" rule in prep-pr.md).
+# orchestrate-authorize-merge.sh is NOT deployed to ~/.claude/scripts/, so there is no
+# stable leg: loaded via a ~/.claude/commands symlink outside this repo, leg=none -> use
+# /orchestrate:merge-pr, or the FALLBACK below.
+if [ -f scripts/orchestrate-authorize-merge.sh ]; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/orchestrate-authorize-merge.sh' ]; then leg=plugin
+else leg=none; fi
+auth_rc=2
+[ "$leg" = repo ]   && { bash scripts/orchestrate-authorize-merge.sh "$pr_number"; auth_rc=$?; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/orchestrate-authorize-merge.sh' "$pr_number"; auth_rc=$?; }
+[ "$leg" = none ]   && echo "orchestrate-authorize-merge.sh not found (load via /orchestrate:merge-pr); NO token armed" >&2
+echo "authorize rc=$auth_rc"
+```
+
+On PASS (`authorize rc=0`) it prints the head SHA it pinned the token to. Merge with that
+EXACT sha, as a separate command:
+
+```bash
 gh pr merge "$pr_number" --squash --match-head-commit <sha>
 ```
+
+`leg=none` or a hook-denied authorize block means NO token was armed: take the FALLBACK
+below, never a variable-path or `sh -c` retry.
 
 The `--match-head-commit` pin is load-bearing, not ceremony: the token binds to one head
 SHA, so a push landing between the arm and the merge invalidates it rather than merging

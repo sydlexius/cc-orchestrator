@@ -699,9 +699,26 @@ commands + scripts are auto-discovered from the plugin layout; no symlinks neede
 floor stays a `settings.json` PreToolUse hook at the stable `~/.claude/scripts/orchestrate-guard.sh`
 path (Option A; never plugin-gated), and `orchestrate-setup.py configure --apply` deploys that guard
 + wires the hook with consent. The repo's `main` is the canonical history; the old claude-kit gist no
-longer carries these files. (CUTOVER from a legacy symlink install: install the plugin, run
-`configure --apply`, then retire the old `~/.claude/skills/orchestrate` + `~/.claude/scripts/orchestrate-*`
-symlinks; the settings.json floor hook + stable-path guard stay.)
+longer carries these files. (CUTOVER from the old claude-kit symlink install: install the plugin,
+run `configure --apply`, then retire the old `~/.claude/skills/orchestrate` +
+`~/.claude/scripts/orchestrate-*` symlinks; the settings.json floor hook + stable-path guard stay.
+That retirement is about those two claude-kit paths ONLY.)
+
+SUPPORTED LOAD PATH, not legacy (#434): unnamespaced `~/.claude/commands/<name>.md` symlinks into
+the plugin's `commands/` (so `/prep-pr`, `/merge-pr`, ... load without the `orchestrate:` prefix)
+are a maintained install shape. Never advise retiring them and never add a doctor warning for them.
+Under that load path Claude Code does NOT substitute `${CLAUDE_PLUGIN_ROOT}` (it substitutes only
+the exact token, only for `/orchestrate:*` loads, verified 2026-09-19 on #434), and the variable is
+unset in the Bash tool. Hence the rule for every command body: HELPER EXEC PATHS ARE ALWAYS LITERAL
+(never `bash "$VAR"`, `bash "$HOME/..."`, `sh -c`, or `eval` - a PreToolUse safety hook denies an
+interpreter script path it cannot read statically). A block tests `[ -f ]` legs in the order
+repo-local `scripts/<x>` -> plugin `'${CLAUDE_PLUGIN_ROOT}/scripts/<x>'` (single-quoted, so an
+unsubstituted token is a literal string the test simply fails) -> deployed `~/.claude/scripts/<x>`
+(literal `~/`, and only for helpers in HELPER_NAMES) -> the step's own not-found/degraded message,
+then runs the one matching `[ "$leg" = ... ] && { ...; }` line, never inside an `if` body (the hook
+reads an `if`-body exec of the token as unverifiable even in a dead branch). The elmer commands check
+the deployed leg before the plugin leg on purpose (the wrapper grant). Full rule: `commands/prep-pr.md`
+"Helper exec paths" (#433).
 
 Deploying a merged floor/guard change to OTHER sessions: a merged guard change does NOT
 auto-propagate to already-running sessions or other machines. Three steps: (1) update the plugin

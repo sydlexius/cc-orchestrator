@@ -52,6 +52,37 @@ and the `pr-watch.sh` quiet-period gate. Its inline threads resolve via GraphQL
 
 ---
 
+## Step 0 -- Resolve helper paths (once, before any other step)
+
+This command calls several bundled helpers many times, so instead of a per-call detection chain
+it resolves them ONCE here. The block only TESTS and PRINTS - it executes nothing:
+
+```bash
+for h in patch-coverage.sh pr-codeql-autofixes.sh pr-read-comments.sh pr-unreplied-comments.sh reply-comment.sh resolve-threads.sh; do
+  if [ -f "scripts/$h" ]; then echo "$h -> scripts/$h"
+  elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/'"$h" ]; then echo "$h -> "'${CLAUDE_PLUGIN_ROOT}/scripts/'"$h"
+  elif [ -f ~/.claude/scripts/"$h" ]; then echo "$h -> ~/.claude/scripts/$h"
+  else echo "$h -> NOT FOUND"; fi
+done
+```
+
+Every later block writes a helper as `HELPER_DIR/<name>`. **Before running any such block, replace
+`HELPER_DIR/<name>` with the LITERAL path printed above for that name** (e.g.
+`bash ~/.claude/scripts/reply-comment.sh ...`). Never store the path in a variable and execute the
+variable, and never wrap the call in `sh -c`/`eval`: a PreToolUse safety hook denies an
+interpreter whose script path it cannot read statically (the "Helper exec paths" rule in
+`prep-pr.md`). The same literal paths go into any subagent prompt this command spawns - a prompt
+is never substituted. A helper printed as `NOT FOUND` means that step cannot run: say so, and do
+not improvise a replacement. A hook DENYING a helper call is `NOT RUN (denied by hook: <reason>)`,
+never an empty result (the **Hook-denied gate command** rule in `prep-pr.md`); a gate step
+(the merge-readiness or unreplied-count checks) STOPS on it.
+
+Why not `${CLAUDE_PLUGIN_ROOT}` directly: Claude Code substitutes that token only when this
+command loads as `/orchestrate:*`. Loaded through a `~/.claude/commands/<name>.md` symlink (a
+supported install) it stays literal, and the safety hook denies it.
+
+---
+
 ## Step 1 -- Identify the PR
 
 Resolve `pr_number` and `repo`:
@@ -144,8 +175,8 @@ this loop only *waits* for reviews already in flight. Poll with increasing
 intervals: **15s → 30s → 60s → 120s**. At each interval:
 
 ```bash
-pending=$(bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh --pending-only "$pr_number")
-unreplied=$(bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh --count-only "$pr_number")
+pending=$(bash HELPER_DIR/pr-unreplied-comments.sh --pending-only "$pr_number")
+unreplied=$(bash HELPER_DIR/pr-unreplied-comments.sh --count-only "$pr_number")
 ```
 
 If `pending == 0` AND `unreplied` count matches the previous check → ready.
@@ -166,7 +197,7 @@ actionable comments), so no class can be dropped by an inline-only glance. Triag
 against THIS complete list, never against a glance at inline comments alone:
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh --itemized "$pr_number"
+bash HELPER_DIR/pr-unreplied-comments.sh --itemized "$pr_number"
 ```
 
 Each line is `<class> | <user> | <loc> | <excerpt> | replied:<..> resolved:<..>`.
@@ -194,21 +225,21 @@ Then pull the full bodies per class for the actual fixes:
 # codecov[bot] has posted a coverage summary on the PR. That advisory is
 # informational only -- codecov comments are coverage reports, not review
 # threads, and require no reply.
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh "$pr_number"
+bash HELPER_DIR/pr-unreplied-comments.sh "$pr_number"
 
 # Full bodies of all unreplied inline comments
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-read-comments.sh "$pr_number"
+bash HELPER_DIR/pr-read-comments.sh "$pr_number"
 
 # Full bodies of review-body comments (actionable findings in review summaries)
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-read-comments.sh --reviews "$pr_number"
+bash HELPER_DIR/pr-read-comments.sh --reviews "$pr_number"
 
 # Full bodies of issue-level bot comments (e.g. github-actions docs-drift
 # advisories that workflows post on the PR conversation tab, not on the diff).
 # These have no threaded-reply surface but often carry actionable signals.
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-read-comments.sh --issue "$pr_number"
+bash HELPER_DIR/pr-read-comments.sh --issue "$pr_number"
 
 # Full bodies of specific comment IDs only
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-read-comments.sh "$pr_number" 123456 789012
+bash HELPER_DIR/pr-read-comments.sh "$pr_number" 123456 789012
 ```
 
 ### Code-scanning (GHAS / CodeQL) alerts -- separate API surface
@@ -220,7 +251,7 @@ alert, and a committable autofix, otherwise sails right past this flow. Always
 surface them:
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-codeql-autofixes.sh "$pr_number"
+bash HELPER_DIR/pr-codeql-autofixes.sh "$pr_number"
 ```
 
 For each open alert it prints the location, message, alert URL, and whether a
@@ -450,7 +481,7 @@ command:
 go test -count=1 -coverprofile=/tmp/cover.out ./...
 COVER_OUT=/tmp/cover.out PATCH_COVERAGE_THRESHOLD=<repo target> \
   PATCH_COVERAGE_EXCLUDE="<codecov.yml ignore globs>" \
-  bash ${CLAUDE_PLUGIN_ROOT}/scripts/patch-coverage.sh   # or repo-local scripts/patch-coverage.sh
+  bash HELPER_DIR/patch-coverage.sh   # the literal path Step 0 printed
 ```
 
 Self-skip on the absent-signal cases: if `patch-coverage.sh` exits 0 reporting
@@ -621,7 +652,7 @@ Now substitute the real SHA into all "Fixed in <sha>" reply drafts from step 6.
 Post threaded replies for **inline** comments only (do not wait between them):
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh "$pr_number" {COMMENT_ID} '<reply text>'
+bash HELPER_DIR/reply-comment.sh "$pr_number" {COMMENT_ID} '<reply text>'
 ```
 
 Run one call per inline comment. Log each one as it completes.
@@ -638,7 +669,7 @@ noise in the Conversation tab anyway.
 fix touched (or a nearby in-diff line) using the 4th form of the helper:
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh "$pr_number" \
+bash HELPER_DIR/reply-comment.sh "$pr_number" \
   --file path/to/file.go --line 663 \
   "Fixed in <sha>. <one-line rationale>."
 ```
@@ -655,7 +686,7 @@ already-fixed pointer to an earlier SHA).
 - **bug / spec-drift / test-gap**: anchor to the line your fix changed.
 
   ```bash
-  bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh "$pr_number" \
+  bash HELPER_DIR/reply-comment.sh "$pr_number" \
     --file internal/foo/bar.go --line 42 \
     "Fixed in <sha>. <one-line>."
   ```
@@ -664,7 +695,7 @@ already-fixed pointer to an earlier SHA).
   in the same file) with the rebuttal:
 
   ```bash
-  bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh "$pr_number" \
+  bash HELPER_DIR/reply-comment.sh "$pr_number" \
     --file internal/foo/bar.go --line 42 \
     "<evidence-based rebuttal, one or two sentences>."
   ```
@@ -673,7 +704,7 @@ already-fixed pointer to an earlier SHA).
   earlier SHA:
 
   ```bash
-  bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh "$pr_number" \
+  bash HELPER_DIR/reply-comment.sh "$pr_number" \
     --file internal/foo/bar.go --line 42 \
     "Fixed in <earlier-sha>."
   ```
@@ -681,7 +712,7 @@ already-fixed pointer to an earlier SHA).
 - **wont-fix**: anchor to the referenced line with the tracking issue:
 
   ```bash
-  bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh "$pr_number" \
+  bash HELPER_DIR/reply-comment.sh "$pr_number" \
     --file internal/foo/bar.go --line 42 \
     "Tracking in #<issue>. <one-line justification>."
   ```
@@ -715,7 +746,7 @@ runs before the push instead; it acts on already-replied threads either way.)
 Post a single PR-level comment to resolve all addressed CR threads at once:
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/reply-comment.sh "$pr_number" '@coderabbitai resolve'
+bash HELPER_DIR/reply-comment.sh "$pr_number" '@coderabbitai resolve'
 ```
 
 This tells CodeRabbit to mark all of its threads that have been replied to as
@@ -745,15 +776,15 @@ The default
 call covers all three bots when the IDs span them:
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/resolve-threads.sh "$pr_number" <comment_id> [<comment_id>...]
+bash HELPER_DIR/resolve-threads.sh "$pr_number" <comment_id> [<comment_id>...]
 ```
 
 If you need to scope to a single bot (e.g. you triaged only Greptile in this
 round), pass `--bot`:
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/resolve-threads.sh --bot greptile "$pr_number" <id...>
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/resolve-threads.sh --bot copilot  "$pr_number" <id...>
+bash HELPER_DIR/resolve-threads.sh --bot greptile "$pr_number" <id...>
+bash HELPER_DIR/resolve-threads.sh --bot copilot  "$pr_number" <id...>
 ```
 
 The script fetches all review threads, matches each ID to a thread whose first

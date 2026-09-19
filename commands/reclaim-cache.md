@@ -18,13 +18,18 @@ self-trims; there is no surgical modcache reclaim).
 ## Step 1 -- Locate the helper
 
 ```bash
-PL=""
-if [ -f scripts/cache-reclaim.sh ]; then PL=scripts/cache-reclaim.sh
-elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/cache-reclaim.sh" ]; then PL="${CLAUDE_PLUGIN_ROOT}/scripts/cache-reclaim.sh"
-else echo "cache-reclaim.sh not found (reinstall/update the plugin)"; fi
+if [ -f scripts/cache-reclaim.sh ]; then echo "cache-reclaim: leg=repo"
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/cache-reclaim.sh' ]; then echo "cache-reclaim: leg=plugin"
+else echo "cache-reclaim: leg=none -- cache-reclaim.sh not found (load via /orchestrate:reclaim-cache, or reinstall/update the plugin)"; fi
 ```
 
-If `PL` is empty, stop here (the helper is not available). Every command below is guarded on it.
+If `leg=none`, stop here (the helper is not available). `cache-reclaim.sh` is NOT deployed to
+`~/.claude/scripts/`, so loaded through a `~/.claude/commands` symlink outside this repo the
+helper is not reachable; use `/orchestrate:reclaim-cache`.
+
+Every block below re-runs the same `[ -f ]` detection and then runs the ONE matching literal
+path - each Bash call is a fresh shell, and a helper path is never executed through a variable
+(the "Helper exec paths" rule in `prep-pr.md`).
 
 ---
 
@@ -51,9 +56,16 @@ registry, and prints the exact toolchain command to reclaim each - it does NOT c
 ```bash
 # Pass --root only when a scan root was requested; build the args explicitly (a
 # `${root:+--root "$root"}` one-liner collapses "--root <path>" into a single arg).
-if [ -n "$PL" ]; then
-  if [ -n "${root:-}" ]; then bash "$PL" --report --root "$root"; else bash "$PL" --report; fi
-fi
+if [ -f scripts/cache-reclaim.sh ]; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/cache-reclaim.sh' ]; then leg=plugin
+else leg=none; fi
+args=(--report)
+[ -n "${root:-}" ] && args+=(--root "$root")
+rc=2
+[ "$leg" = repo ]   && { bash scripts/cache-reclaim.sh "${args[@]}"; rc=$?; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/cache-reclaim.sh' "${args[@]}"; rc=$?; }
+[ "$leg" = none ]   && echo "cache-reclaim.sh not found (load via /orchestrate:reclaim-cache)"
+echo "report rc=$rc"
 ```
 
 Present the report to the user. Point out the biggest reclaimable items and note that npm and
@@ -75,7 +87,16 @@ When they name targets, pass them to `--yes` as a comma-separated list. Each is 
   `cargo install cargo-cache`)
 
 ```bash
-bash "$PL" --yes "<name-or-path>[,<name-or-path>...]"
+# Substitute the user's named targets for the value of TARGETS.
+TARGETS='<name-or-path>[,<name-or-path>...]'
+if [ -f scripts/cache-reclaim.sh ]; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/cache-reclaim.sh' ]; then leg=plugin
+else leg=none; fi
+rc=2
+[ "$leg" = repo ]   && { bash scripts/cache-reclaim.sh --yes "$TARGETS"; rc=$?; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/cache-reclaim.sh' --yes "$TARGETS"; rc=$?; }
+[ "$leg" = none ]   && echo "cache-reclaim.sh not found (load via /orchestrate:reclaim-cache)"
+echo "reclaim rc=$rc"
 ```
 
 The helper only ever runs the toolchain's own clean command (never a hand-rolled `rm`) and

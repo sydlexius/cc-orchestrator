@@ -42,8 +42,7 @@ literal path is unwritable exactly where this workflow normally runs.
 
 ## Step 2 -- Enqueue
 
-Resolve the helper in the SAME Bash call that uses it - each tool call is a fresh shell, so the
-variable does not survive across calls.
+Detect and run the helper in the SAME Bash call - each tool call is a fresh shell.
 
 Set `PR_TO_ENQUEUE` to the real PR number before running the block. It is written as a `:?`
 guard rather than a `<PR#>` placeholder deliberately: a bare `<PR#>` is a shell REDIRECTION, so
@@ -53,22 +52,25 @@ message if the value was never set. The receipt path must match the one `/orches
 writes (`<git-dir>/prep-pr-receipt.json`) - a mismatch makes enqueue refuse every request.
 
 ```bash
-EQ=""
-if [ -f scripts/elmer-enqueue.sh ]; then EQ=scripts/elmer-enqueue.sh
-elif [ -f "$HOME/.claude/scripts/elmer-enqueue.sh" ]; then EQ="$HOME/.claude/scripts/elmer-enqueue.sh"
-elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/elmer-enqueue.sh" ]; then
-  EQ="${CLAUDE_PLUGIN_ROOT}/scripts/elmer-enqueue.sh"
-fi
-[ -n "$EQ" ] || { echo "elmer-enqueue.sh not found (repo-local, deployed, or plugin)" >&2; exit 2; }
-
 PR_TO_ENQUEUE="${PR_TO_ENQUEUE:?set to the PR number from the arguments above}"
-bash "$EQ" "$PR_TO_ENQUEUE" --receipt "$(git rev-parse --git-dir)/prep-pr-receipt.json"
+RECEIPT="$(git rev-parse --git-dir)/prep-pr-receipt.json"
+if [ -f scripts/elmer-enqueue.sh ]; then leg=repo
+elif [ -f ~/.claude/scripts/elmer-enqueue.sh ]; then leg=stable
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/elmer-enqueue.sh' ]; then leg=plugin
+else leg=none; fi
+eq_rc=2
+[ "$leg" = repo ]   && { bash scripts/elmer-enqueue.sh "$PR_TO_ENQUEUE" --receipt "$RECEIPT"; eq_rc=$?; }
+[ "$leg" = stable ] && { bash ~/.claude/scripts/elmer-enqueue.sh "$PR_TO_ENQUEUE" --receipt "$RECEIPT"; eq_rc=$?; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/elmer-enqueue.sh' "$PR_TO_ENQUEUE" --receipt "$RECEIPT"; eq_rc=$?; }
+[ "$leg" = none ]   && echo "elmer-enqueue.sh not found (repo-local, deployed, or plugin)" >&2
+echo "eq_rc=$eq_rc"
 ```
 
-The deployed `~/.claude/scripts/` path is checked before the plugin path deliberately: that stable
-location is what keeps the whole loop inside the existing
-`Bash(bash ~/.claude/scripts/*.sh *)` wrapper grant, so nothing here needs a broad `gh` grant or
-raises a permission prompt.
+The helper path is LITERAL in every leg, never a variable (the "Helper exec paths" rule in
+`prep-pr.md`). The deployed `~/.claude/scripts/` leg is checked BEFORE the plugin leg
+deliberately - the one exception to that rule's order: that stable location is what keeps the
+whole loop inside the existing `Bash(bash ~/.claude/scripts/*.sh *)` wrapper grant, so nothing
+here needs a broad `gh` grant or raises a permission prompt.
 
 ### Reading the exit code
 

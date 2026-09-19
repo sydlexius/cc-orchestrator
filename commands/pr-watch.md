@@ -59,12 +59,24 @@ fi
 Invoke the Monitor tool with the watch script. The script is silent until done; the single terminal stdout line becomes the only Monitor event. Wait for it without polling.
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/pr-watch.sh $pr_number "" $timeout_secs
+if [ -f scripts/pr-watch.sh ]; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/pr-watch.sh' ]; then leg=plugin
+elif [ -f ~/.claude/scripts/pr-watch.sh ]; then leg=stable
+else leg=none; fi
+rc=2
+[ "$leg" = repo ]   && { bash scripts/pr-watch.sh $pr_number "" $timeout_secs; rc=$?; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/pr-watch.sh' $pr_number "" $timeout_secs; rc=$?; }
+[ "$leg" = stable ] && { bash ~/.claude/scripts/pr-watch.sh $pr_number "" $timeout_secs; rc=$?; }
+[ "$leg" = none ]   && echo "pr-watch.sh not found (repo-local, plugin, or ~/.claude/scripts/)" >&2
+(exit "$rc")
 ```
 
-(The empty second arg lets the script auto-detect the repo via `gh repo view`.)
+(The empty second arg lets the script auto-detect the repo via `gh repo view`.) The helper path
+is LITERAL in every leg, never a variable (the "Helper exec paths" rule in `prep-pr.md`); the
+detection prints nothing on stdout, so the watcher's terminal line stays the only stdout event,
+and `(exit "$rc")` hands the watcher's own exit code back as the block's.
 
-PASS THAT LINE DIRECTLY as the backgrounded command. NO `nohup`, NO trailing `&`, NO output
+PASS THAT BLOCK DIRECTLY as the backgrounded command. NO `nohup`, NO trailing `&`, NO output
 redirect (#331):
 
 ```bash

@@ -46,18 +46,22 @@ amending CLAUDE.md FIRST.
 
 ## Step 1 -- One tick
 
-Resolve the helper in the SAME Bash call that uses it - each tool call is a fresh shell.
+Detect and run the helper in the SAME Bash call - each tool call is a fresh shell. Every helper
+path in this command is LITERAL, never a variable (the "Helper exec paths" rule in `prep-pr.md`),
+and the deployed `~/.claude/scripts/` leg is checked before the plugin leg on purpose: that is what
+keeps the unattended loop inside the existing wrapper grant (see Notes).
 
 ```bash
-TK=""
-if [ -f scripts/elmer-tick.sh ]; then TK=scripts/elmer-tick.sh
-elif [ -f "$HOME/.claude/scripts/elmer-tick.sh" ]; then TK="$HOME/.claude/scripts/elmer-tick.sh"
-elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/elmer-tick.sh" ]; then
-  TK="${CLAUDE_PLUGIN_ROOT}/scripts/elmer-tick.sh"
-fi
-[ -n "$TK" ] || { echo "elmer-tick.sh not found (repo-local, deployed, or plugin)" >&2; exit 2; }
-
-bash "$TK"
+if [ -f scripts/elmer-tick.sh ]; then leg=repo
+elif [ -f ~/.claude/scripts/elmer-tick.sh ]; then leg=stable
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/elmer-tick.sh' ]; then leg=plugin
+else leg=none; fi
+tick_rc=2
+[ "$leg" = repo ]   && { bash scripts/elmer-tick.sh; tick_rc=$?; }
+[ "$leg" = stable ] && { bash ~/.claude/scripts/elmer-tick.sh; tick_rc=$?; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/elmer-tick.sh'; tick_rc=$?; }
+[ "$leg" = none ]   && echo "elmer-tick.sh not found (repo-local, deployed, or plugin)" >&2
+echo "tick_rc=$tick_rc"
 ```
 
 On `--dry-run`, set `ELMER_DRY_RUN=1` in front of the command: it does everything except the post
@@ -65,7 +69,7 @@ and prints the exact command it would have run. Use this the first time you run 
 environment - it exercises the lock, the cap, the quota read, and the queue pick without spending a
 review slot.
 
-### Reading the exit code
+### Reading the exit code (`tick_rc`)
 
 | Exit | Meaning | Next |
 |---|---|---|
@@ -84,14 +88,17 @@ A fixed hourly tick drifts out of phase with the real window and wastes slots. A
 when the current limit expires and wake then:
 
 ```bash
-QW=""
-if [ -f scripts/cr-quota-watch.sh ]; then QW=scripts/cr-quota-watch.sh
-elif [ -f "$HOME/.claude/scripts/cr-quota-watch.sh" ]; then QW="$HOME/.claude/scripts/cr-quota-watch.sh"
-fi
 PR_FOR_QUOTA="${PR_FOR_QUOTA:?set to a PR number from the queue (ls the inbox; entries are named <repo-slug>--<pr>--<sha12>.json)}"
+if [ -f scripts/cr-quota-watch.sh ]; then leg=repo
+elif [ -f ~/.claude/scripts/cr-quota-watch.sh ]; then leg=stable
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/cr-quota-watch.sh' ]; then leg=plugin
+else leg=none; fi
 QUOTA_RC=0
-if [ -n "$QW" ]; then bash "$QW" "$PR_FOR_QUOTA" || QUOTA_RC=$?; fi
-echo "quota rc=$QUOTA_RC"
+[ "$leg" = repo ]   && { bash scripts/cr-quota-watch.sh "$PR_FOR_QUOTA" || QUOTA_RC=$?; }
+[ "$leg" = stable ] && { bash ~/.claude/scripts/cr-quota-watch.sh "$PR_FOR_QUOTA" || QUOTA_RC=$?; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/cr-quota-watch.sh' "$PR_FOR_QUOTA" || QUOTA_RC=$?; }
+[ "$leg" = none ]   && echo "cr-quota-watch.sh not found (repo-local, deployed, or plugin); no quota reading"
+echo "quota rc=$QUOTA_RC leg=$leg"
 ```
 
 `PR_FOR_QUOTA` is a `:?` guard, not a `<a-PR#>` placeholder: a bare `<...>` is a shell
@@ -137,11 +144,15 @@ Overnight the loop triggers reviews and CR posts findings. `elmer-triage.sh` com
 per-PR maildir digest so a TL wakes to a readable queue instead of a raw comment dump:
 
 ```bash
-TR=""
-if [ -f scripts/elmer-triage.sh ]; then TR=scripts/elmer-triage.sh
-elif [ -f "$HOME/.claude/scripts/elmer-triage.sh" ]; then TR="$HOME/.claude/scripts/elmer-triage.sh"
-fi
-[ -n "$TR" ] && bash "$TR" || true
+if [ -f scripts/elmer-triage.sh ]; then leg=repo
+elif [ -f ~/.claude/scripts/elmer-triage.sh ]; then leg=stable
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/elmer-triage.sh' ]; then leg=plugin
+else leg=none; fi
+[ "$leg" = repo ]   && { bash scripts/elmer-triage.sh || true; }
+[ "$leg" = stable ] && { bash ~/.claude/scripts/elmer-triage.sh || true; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/elmer-triage.sh' || true; }
+[ "$leg" = none ]   && echo "elmer-triage.sh not found (repo-local, deployed, or plugin); no triage drop"
+true
 ```
 
 No model is involved, which is what keeps this a dumb pipe: every field is a read-only helper's

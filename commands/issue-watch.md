@@ -45,12 +45,21 @@ The poll interval is not configurable in normal use -- the script polls every 30
 The script is silent until done; the single terminal stdout line becomes the only event. Wait for it without polling.
 
 ```bash
-bash ${CLAUDE_PLUGIN_ROOT}/scripts/issue-watch.sh $ARGUMENTS
+if [ -f scripts/issue-watch.sh ]; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/issue-watch.sh' ]; then leg=plugin
+elif [ -f ~/.claude/scripts/issue-watch.sh ]; then leg=stable
+else leg=none; fi
+rc=2
+[ "$leg" = repo ]   && { bash scripts/issue-watch.sh $ARGUMENTS; rc=$?; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/issue-watch.sh' $ARGUMENTS; rc=$?; }
+[ "$leg" = stable ] && { bash ~/.claude/scripts/issue-watch.sh $ARGUMENTS; rc=$?; }
+[ "$leg" = none ]   && echo "issue-watch.sh not found (repo-local, plugin, or ~/.claude/scripts/)" >&2
+(exit "$rc")
 ```
 
-(Pass the repo explicitly as the positional after the issue number to target a repo other than the current one; otherwise the script auto-detects it via `gh repo view`.)
+(Pass the repo explicitly as the positional after the issue number to target a repo other than the current one; otherwise the script auto-detects it via `gh repo view`.) The helper path is LITERAL in every leg, never a variable (the "Helper exec paths" rule in `prep-pr.md`): loaded through the `~/.claude/commands/issue-watch.md` symlink, `${CLAUDE_PLUGIN_ROOT}` is not substituted and the deployed leg runs instead. The detection prints nothing on stdout, and `(exit "$rc")` returns the watcher's own exit code.
 
-Pass that line DIRECTLY as the backgrounded command - no `nohup`, no trailing `&`, no output
+Pass that block DIRECTLY as the backgrounded command - no `nohup`, no trailing `&`, no output
 redirect. Wrapping a watcher that way inside a `run_in_background: true` task fires the
 completion notification on the WRAPPER and orphans the watcher's verdict in a logfile nobody
 reads, silently (#331). Same reasoning and the same measured incident as `/orchestrate:pr-watch`

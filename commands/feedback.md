@@ -26,18 +26,22 @@ a command that could only run Bash could not perform its own primary step.
 Substitute your own slug and body path:
 
 ```bash
-FB=""
-if [ -f scripts/orchestrate-feedback.sh ]; then FB=scripts/orchestrate-feedback.sh
-elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/orchestrate-feedback.sh" ]; then
-  FB="${CLAUDE_PLUGIN_ROOT}/scripts/orchestrate-feedback.sh"
-fi
-[ -n "$FB" ] || { echo "orchestrate-feedback.sh not found (repo-local or plugin)" >&2; exit 2; }
-
-bash "$FB" add my-slug < /tmp/fb-body.md
+if [ -f scripts/orchestrate-feedback.sh ]; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/orchestrate-feedback.sh' ]; then leg=plugin
+elif [ -f ~/.claude/scripts/orchestrate-feedback.sh ]; then leg=stable
+else leg=none; fi
+fb_rc=2
+[ "$leg" = repo ]   && { bash scripts/orchestrate-feedback.sh add my-slug < /tmp/fb-body.md; fb_rc=$?; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/orchestrate-feedback.sh' add my-slug < /tmp/fb-body.md; fb_rc=$?; }
+[ "$leg" = stable ] && { bash ~/.claude/scripts/orchestrate-feedback.sh add my-slug < /tmp/fb-body.md; fb_rc=$?; }
+[ "$leg" = none ]   && echo "orchestrate-feedback.sh not found (repo-local, plugin, or ~/.claude/scripts/)" >&2
+echo "fb_rc=$fb_rc"
 ```
 
-Resolve the helper in the SAME Bash call that uses it - each tool call is a fresh shell, so `$FB`
-does not survive across calls.
+Detect and run in the SAME Bash call - each tool call is a fresh shell. The helper path is
+LITERAL in every leg, never a variable (the "Helper exec paths" rule in `prep-pr.md`: a
+PreToolUse safety hook denies a variable exec path, and `${CLAUDE_PLUGIN_ROOT}` is left
+unsubstituted when this command loads through a `~/.claude/commands` symlink).
 
 The STDIN redirect is load-bearing, not style. NEVER pass the body as a positional argument, and
 NEVER use a `cat >> ... <<EOF` heredoc. The Bash guard hook inspects COMMAND LINES, so an entry whose
@@ -52,14 +56,16 @@ The helper prints the created filename.
 ## Step 2 -- `list` (read-only)
 
 ```bash
-FB=""
-if [ -f scripts/orchestrate-feedback.sh ]; then FB=scripts/orchestrate-feedback.sh
-elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/orchestrate-feedback.sh" ]; then
-  FB="${CLAUDE_PLUGIN_ROOT}/scripts/orchestrate-feedback.sh"
-fi
-[ -n "$FB" ] || { echo "orchestrate-feedback.sh not found (repo-local or plugin)" >&2; exit 2; }
-
-bash "$FB" list
+if [ -f scripts/orchestrate-feedback.sh ]; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/orchestrate-feedback.sh' ]; then leg=plugin
+elif [ -f ~/.claude/scripts/orchestrate-feedback.sh ]; then leg=stable
+else leg=none; fi
+fb_rc=2
+[ "$leg" = repo ]   && { bash scripts/orchestrate-feedback.sh list; fb_rc=$?; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/orchestrate-feedback.sh' list; fb_rc=$?; }
+[ "$leg" = stable ] && { bash ~/.claude/scripts/orchestrate-feedback.sh list; fb_rc=$?; }
+[ "$leg" = none ]   && echo "orchestrate-feedback.sh not found (repo-local, plugin, or ~/.claude/scripts/)" >&2
+echo "fb_rc=$fb_rc"
 ```
 
 Shows the undrained entries in the inbox. Read-only; changes nothing.

@@ -33,13 +33,14 @@ third = per-round watch timeout in seconds (default 1800 = 30 min).
   `feedback_cap_cr_rounds`) is the precedent for offering an early exit
   ramp rather than grinding to convergence.
 - **Push is via the safe-push wrapper.** Per `feedback-use-safe-push`,
-  every push must go through `${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh` (the
-  repo-agnostic gist version) so the pipe-swallow exit-code bug can't
-  silently mask a failed push. This stub itself never pushes directly --
+  every push must go through `safe-push.sh` (repo-local `scripts/`, the plugin copy, or the
+  deployed `~/.claude/scripts/safe-push.sh`) so the pipe-swallow exit-code bug can't
+  silently mask a failed push -- and never pipe it (`| tail`), which rebuilds that same bug
+  one layer out (#432). This stub itself never pushes directly --
   it delegates to `/handle-review` -- but the FIX branch below verifies
   the remote ref moved after handle-review returns. Any future
   enhancement to this skill that adds a direct push step MUST use
-  `bash ${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh`, not `git push`.
+  `safe-push.sh` by a LITERAL path (prep-pr Step 7's shape), not `git push`.
 - **Stale-base awareness.** Between rounds, another merge can land on
   the PR's base branch (whatever `baseRefName` says -- never assume
   `main`) and leave this PR behind base. mergeStateStatus reports BEHIND
@@ -124,7 +125,16 @@ if [ "$state_pre" = "BEHIND" ]; then
   # A HEAD-moving update-branch dismisses a bot's prior approval and disturbs the
   # incremental-review delta, so it must NOT run while triage is still pending --
   # this contradicts the BEHIND-BASE ROUTING rule in SKILL.md otherwise.
-  unreplied=$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh" --count-only "$pr_number" 2>/dev/null || echo 1)
+  # Literal helper path in every leg (the "Helper exec paths" rule in prep-pr.md). A missing
+  # helper or a failed read leaves unreplied=1, which SKIPS the refresh (fail toward not acting).
+  if [ -f scripts/pr-unreplied-comments.sh ]; then leg=repo
+  elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh' ]; then leg=plugin
+  elif [ -f ~/.claude/scripts/pr-unreplied-comments.sh ]; then leg=stable
+  else leg=none; fi
+  unreplied=1
+  [ "$leg" = repo ]   && unreplied=$(bash scripts/pr-unreplied-comments.sh --count-only "$pr_number" 2>/dev/null || echo 1)
+  [ "$leg" = plugin ] && unreplied=$(bash '${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh' --count-only "$pr_number" 2>/dev/null || echo 1)
+  [ "$leg" = stable ] && unreplied=$(bash ~/.claude/scripts/pr-unreplied-comments.sh --count-only "$pr_number" 2>/dev/null || echo 1)
   if [ "$unreplied" = "0" ]; then
     echo "round <round>: PR #$pr_number is BEHIND $base_ref and review is complete; running update-branch (default merge-commit mode)"
     gh pr update-branch "$pr_number"
@@ -213,7 +223,7 @@ remote_head=$(git -C "$worktree" ls-remote origin "refs/heads/$head_ref" | cut -
   committed locally but did NOT reach origin. Print:
   > "round <round>: local HEAD advanced to `<post_head>` but origin/<head_ref>
   > is still `<remote_head>`. This is the pipe-swallow silent-failure mode.
-  > Retry the push manually via `cd <worktree> && bash ${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh`,
+  > Retry the push manually via `cd <worktree> && bash ~/.claude/scripts/safe-push.sh <head_ref>`,
   > then re-run `/autofix-pr <pr>`."
   > Exit with status **ABORT**.
 - `post_head != pre_head` AND `remote_head == post_head` -> fix pushed
@@ -285,7 +295,7 @@ with status **CAP**:
 
 > "Hit round cap of <max_rounds>. CR is still flagging findings; this PR
 > may be in a sticky pattern (e.g. a fix introduces a new finding next
-> round). Manual triage recommended: `gh pr view <pr>` + `${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh <pr>`."
+> round). Manual triage recommended: `gh pr view <pr>` + `bash ~/.claude/scripts/pr-unreplied-comments.sh <pr>`."
 
 Per `feedback_cap_cr_rounds`, do NOT silently continue past the cap.
 Offer the user an explicit "bump cap" path: "Re-run with

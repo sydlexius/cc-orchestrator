@@ -75,22 +75,21 @@ the same grammar/style checking as committed Markdown. This is **advisory** -- i
 prints findings but never blocks issue creation.
 
 ```bash
-# Locate the helper without assuming ${CLAUDE_PLUGIN_ROOT} is set (an unset var would expand
-# to "/scripts/prose-lint.sh"). Capture the exit code with `|| pl_rc=$?` so a non-zero result
-# can NEVER abort the caller under `set -e` -- this check is strictly advisory.
-PL=""
-if [ -f scripts/prose-lint.sh ]; then
-  PL=scripts/prose-lint.sh
-elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "${CLAUDE_PLUGIN_ROOT}/scripts/prose-lint.sh" ]; then
-  PL="${CLAUDE_PLUGIN_ROOT}/scripts/prose-lint.sh"
-fi
+# Literal helper path in every leg (the "Helper exec paths" rule in prep-pr.md). prose-lint.sh
+# is NOT deployed to ~/.claude/scripts/, so there is no stable leg. Capture the exit code with
+# `|| pl_rc=$?` so a non-zero result can NEVER abort the caller under `set -e` -- advisory only.
+if [ -f scripts/prose-lint.sh ]; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/prose-lint.sh' ]; then leg=plugin
+else leg=none; fi
 pl_rc=0
-if [ -n "$PL" ]; then
-  bash "$PL" --profile docs --label "(issue-body)" /tmp/gh-issue-body.md || pl_rc=$?
-else
-  echo "prose-lint skipped (helper not found)"; pl_rc=2
-fi
+[ "$leg" = repo ]   && { bash scripts/prose-lint.sh --profile docs --label "(issue-body)" /tmp/gh-issue-body.md || pl_rc=$?; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/prose-lint.sh' --profile docs --label "(issue-body)" /tmp/gh-issue-body.md || pl_rc=$?; }
+[ "$leg" = none ]   && { echo "prose-lint skipped (helper not found; load via /orchestrate:new-issue)"; pl_rc=2; }
+echo "pl_rc=$pl_rc"
 ```
+
+A hook DENYING this block means prose-lint did not run: report it skipped and continue (the
+**Hook-denied gate command** rule in `prep-pr.md`; this step is advisory).
 
 Interpret `pl_rc`:
 - `0` -- clean or advisory-only. Continue.
