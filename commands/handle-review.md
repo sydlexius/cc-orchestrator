@@ -59,7 +59,7 @@ it resolves them ONCE here. The block only TESTS and PRINTS - it executes nothin
 
 ```bash
 for h in patch-coverage.sh pr-codeql-autofixes.sh pr-read-comments.sh pr-unreplied-comments.sh reply-comment.sh resolve-threads.sh; do
-  if [ -f "scripts/$h" ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then echo "$h -> scripts/$h"
+  if [ -f "scripts/$h" ] && jq -e '.name == "orchestrate"' .claude-plugin/plugin.json >/dev/null 2>&1; then echo "$h -> scripts/$h"
   elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/'"$h" ]; then echo "$h -> "'${CLAUDE_PLUGIN_ROOT}/scripts/'"$h"
   elif [ -f ~/.claude/scripts/"$h" ]; then echo "$h -> ~/.claude/scripts/$h"
   else echo "$h -> NOT FOUND"; fi
@@ -186,7 +186,7 @@ intervals: **15s → 30s → 60s → 120s**. At each interval:
 ```bash
 # Full per-leg block (not HELPER_DIR/): this is a GATE. A missing/unsubstituted helper exits
 # 127 with an EMPTY capture, and an empty capture must never read as 0 / "stable".
-if [ -f scripts/pr-unreplied-comments.sh ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
+if [ -f scripts/pr-unreplied-comments.sh ] && jq -e '.name == "orchestrate"' .claude-plugin/plugin.json >/dev/null 2>&1; then leg=repo
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh' ]; then leg=plugin
 elif [ -f ~/.claude/scripts/pr-unreplied-comments.sh ]; then leg=stable
 else leg=none; fi
@@ -482,7 +482,7 @@ git diff --name-only   # identify changed files
 # Literal helper path in every leg (the "Helper exec paths" rule in prep-pr.md): repo-local ONLY
 # inside cc-orchestrator itself, else the plugin copy, else the deployed copy. No runner on any
 # leg = `gate: NOT RUN`, gate_rc=2, treated as a FAILED gate (fail closed, never a pass).
-if [ -f scripts/gate-runner.py ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
+if [ -f scripts/gate-runner.py ] && jq -e '.name == "orchestrate"' .claude-plugin/plugin.json >/dev/null 2>&1; then leg=repo
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/gate-runner.py' ]; then leg=plugin
 elif [ -f ~/.claude/scripts/gate-runner.py ]; then leg=stable
 else leg=none; fi

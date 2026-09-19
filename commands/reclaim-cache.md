@@ -18,7 +18,7 @@ self-trims; there is no surgical modcache reclaim).
 ## Step 1 -- Locate the helper
 
 ```bash
-if [ -f scripts/cache-reclaim.sh ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then echo "cache-reclaim: leg=repo"
+if [ -f scripts/cache-reclaim.sh ] && jq -e '.name == "orchestrate"' .claude-plugin/plugin.json >/dev/null 2>&1; then echo "cache-reclaim: leg=repo"
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/cache-reclaim.sh' ]; then echo "cache-reclaim: leg=plugin"
 else echo "cache-reclaim: leg=none -- cache-reclaim.sh not found (load via /orchestrate:reclaim-cache, or reinstall/update the plugin)"; fi
 ```
@@ -56,7 +56,7 @@ registry, and prints the exact toolchain command to reclaim each - it does NOT c
 ```bash
 # Pass --root only when a scan root was requested; build the args explicitly (a
 # `${root:+--root "$root"}` one-liner collapses "--root <path>" into a single arg).
-if [ -f scripts/cache-reclaim.sh ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
+if [ -f scripts/cache-reclaim.sh ] && jq -e '.name == "orchestrate"' .claude-plugin/plugin.json >/dev/null 2>&1; then leg=repo
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/cache-reclaim.sh' ]; then leg=plugin
 else leg=none; fi
 args=(--report)
@@ -90,7 +90,7 @@ When they name targets, pass them to `--yes` as a comma-separated list. Each is 
 ```bash
 # Substitute the user's named targets for the value of TARGETS.
 TARGETS='<name-or-path>[,<name-or-path>...]'
-if [ -f scripts/cache-reclaim.sh ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
+if [ -f scripts/cache-reclaim.sh ] && jq -e '.name == "orchestrate"' .claude-plugin/plugin.json >/dev/null 2>&1; then leg=repo
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/cache-reclaim.sh' ]; then leg=plugin
 else leg=none; fi
 rc=2

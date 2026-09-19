@@ -52,7 +52,7 @@ and the deployed `~/.claude/scripts/` leg is checked before the plugin leg on pu
 keeps the unattended loop inside the existing wrapper grant (see Notes).
 
 ```bash
-if [ -f scripts/elmer-tick.sh ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
+if [ -f scripts/elmer-tick.sh ] && jq -e '.name == "orchestrate"' .claude-plugin/plugin.json >/dev/null 2>&1; then leg=repo
 elif [ -f ~/.claude/scripts/elmer-tick.sh ]; then leg=stable
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/elmer-tick.sh' ]; then leg=plugin
 else leg=none; fi
@@ -90,7 +90,7 @@ when the current limit expires and wake then:
 
 ```bash
 PR_FOR_QUOTA="${PR_FOR_QUOTA:?set to a PR number from the queue (ls the inbox; entries are named <repo-slug>--<pr>--<sha12>.json)}"
-if [ -f scripts/cr-quota-watch.sh ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
+if [ -f scripts/cr-quota-watch.sh ] && jq -e '.name == "orchestrate"' .claude-plugin/plugin.json >/dev/null 2>&1; then leg=repo
 elif [ -f ~/.claude/scripts/cr-quota-watch.sh ]; then leg=stable
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/cr-quota-watch.sh' ]; then leg=plugin
 else leg=none; fi
@@ -167,7 +167,7 @@ if [ "${#triage_prs[@]}" -eq 0 ]; then
   echo "triage: NOT RUN -- TRIAGE_PRS is unset or empty; set it to the PR numbers to triage" >&2
   exit 2
 fi
-if [ -f scripts/elmer-triage.sh ] && grep -Eq '"name"[[:space:]]*:[[:space:]]*"orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
+if [ -f scripts/elmer-triage.sh ] && jq -e '.name == "orchestrate"' .claude-plugin/plugin.json >/dev/null 2>&1; then leg=repo
 elif [ -f ~/.claude/scripts/elmer-triage.sh ]; then leg=stable
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/elmer-triage.sh' ]; then leg=plugin
 else leg=none; fi

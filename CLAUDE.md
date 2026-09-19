@@ -720,7 +720,9 @@ open-pr-staleness-sweep, orchestrate-authorize-merge) then do not run. Never adv
 shape; no doctor warning. The rule for every command body: HELPER EXEC PATHS ARE ALWAYS LITERAL
 (never `bash "$VAR"`, `bash "$HOME/..."`, `sh -c`, or `eval` - a PreToolUse safety hook denies an
 interpreter script path it cannot read statically). A block tests `[ -f ]` legs: repo-local
-`scripts/<x>` ONLY when `.claude-plugin/plugin.json` names `orchestrate` (whitespace-tolerant `grep -Eq`; i.e. inside
+`scripts/<x>` ONLY when `.claude-plugin/plugin.json` names `orchestrate` (`jq -e '.name == "orchestrate"'`
+- STRUCTURAL, never a line match: a text grep also fires on a NESTED `name` field in a consumer's
+manifest, and any unreadable/invalid/jq-less case correctly selects a non-repo leg; i.e. inside
 this repo; in a consumer repo a same-named `scripts/<x>` is THEIR script and must never substitute
 for a gate - a consumer's older safe-push pushed a BEHIND branch, #433 review) -> plugin
 `'${CLAUDE_PLUGIN_ROOT}/scripts/<x>'` -> deployed `~/.claude/scripts/<x>` (HELPER_NAMES only) ->
