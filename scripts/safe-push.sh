@@ -34,6 +34,10 @@
 #   bash safe-push.sh <branch> --base release/1.2   # measure freshness against a NON-DEFAULT base
 #   bash safe-push.sh <branch> --stale-ok           # DECLARE an intentional behind-base upload
 #
+#   NEVER pipe safe-push (`| tail`, `| head`, `| tee` ...): without `pipefail` a
+#   pipeline returns the LAST command's exit code, so a refusal reads as 0 (#432).
+#   Its own exit code is the verdict.
+#
 # ADDITIVE vs REWRITE (#148): before pushing, the wrapper classifies the push
 # against a FRESH `git ls-remote` SHA (not the stale local tracking ref):
 #   - first push (no remote ref) or fast-forward (remote is an ancestor of local)

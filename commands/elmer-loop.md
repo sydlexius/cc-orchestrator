@@ -52,7 +52,7 @@ and the deployed `~/.claude/scripts/` leg is checked before the plugin leg on pu
 keeps the unattended loop inside the existing wrapper grant (see Notes).
 
 ```bash
-if [ -f scripts/elmer-tick.sh ]; then leg=repo
+if [ -f scripts/elmer-tick.sh ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
 elif [ -f ~/.claude/scripts/elmer-tick.sh ]; then leg=stable
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/elmer-tick.sh' ]; then leg=plugin
 else leg=none; fi
@@ -89,7 +89,7 @@ when the current limit expires and wake then:
 
 ```bash
 PR_FOR_QUOTA="${PR_FOR_QUOTA:?set to a PR number from the queue (ls the inbox; entries are named <repo-slug>--<pr>--<sha12>.json)}"
-if [ -f scripts/cr-quota-watch.sh ]; then leg=repo
+if [ -f scripts/cr-quota-watch.sh ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
 elif [ -f ~/.claude/scripts/cr-quota-watch.sh ]; then leg=stable
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/cr-quota-watch.sh' ]; then leg=plugin
 else leg=none; fi
@@ -144,7 +144,7 @@ Overnight the loop triggers reviews and CR posts findings. `elmer-triage.sh` com
 per-PR maildir digest so a TL wakes to a readable queue instead of a raw comment dump:
 
 ```bash
-if [ -f scripts/elmer-triage.sh ]; then leg=repo
+if [ -f scripts/elmer-triage.sh ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
 elif [ -f ~/.claude/scripts/elmer-triage.sh ]; then leg=stable
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/elmer-triage.sh' ]; then leg=plugin
 else leg=none; fi

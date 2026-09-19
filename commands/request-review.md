@@ -54,7 +54,7 @@ writes (`<git-dir>/prep-pr-receipt.json`) - a mismatch makes enqueue refuse ever
 ```bash
 PR_TO_ENQUEUE="${PR_TO_ENQUEUE:?set to the PR number from the arguments above}"
 RECEIPT="$(git rev-parse --git-dir)/prep-pr-receipt.json"
-if [ -f scripts/elmer-enqueue.sh ]; then leg=repo
+if [ -f scripts/elmer-enqueue.sh ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
 elif [ -f ~/.claude/scripts/elmer-enqueue.sh ]; then leg=stable
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/elmer-enqueue.sh' ]; then leg=plugin
 else leg=none; fi

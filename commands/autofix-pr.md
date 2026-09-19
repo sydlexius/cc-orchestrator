@@ -33,7 +33,8 @@ third = per-round watch timeout in seconds (default 1800 = 30 min).
   `feedback_cap_cr_rounds`) is the precedent for offering an early exit
   ramp rather than grinding to convergence.
 - **Push is via the safe-push wrapper.** Per `feedback-use-safe-push`,
-  every push must go through `safe-push.sh` (repo-local `scripts/`, the plugin copy, or the
+  every push must go through `safe-push.sh` (repo-local `scripts/` only inside cc-orchestrator
+  itself, else the plugin copy or the
   deployed `~/.claude/scripts/safe-push.sh`) so the pipe-swallow exit-code bug can't
   silently mask a failed push -- and never pipe it (`| tail`), which rebuilds that same bug
   one layer out (#432). This stub itself never pushes directly --
@@ -127,7 +128,7 @@ if [ "$state_pre" = "BEHIND" ]; then
   # this contradicts the BEHIND-BASE ROUTING rule in SKILL.md otherwise.
   # Literal helper path in every leg (the "Helper exec paths" rule in prep-pr.md). A missing
   # helper or a failed read leaves unreplied=1, which SKIPS the refresh (fail toward not acting).
-  if [ -f scripts/pr-unreplied-comments.sh ]; then leg=repo
+  if [ -f scripts/pr-unreplied-comments.sh ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
   elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh' ]; then leg=plugin
   elif [ -f ~/.claude/scripts/pr-unreplied-comments.sh ]; then leg=stable
   else leg=none; fi
@@ -223,8 +224,9 @@ remote_head=$(git -C "$worktree" ls-remote origin "refs/heads/$head_ref" | cut -
   committed locally but did NOT reach origin. Print:
   > "round <round>: local HEAD advanced to `<post_head>` but origin/<head_ref>
   > is still `<remote_head>`. This is the pipe-swallow silent-failure mode.
-  > Retry the push manually via `cd <worktree> && bash ~/.claude/scripts/safe-push.sh <head_ref>`,
-  > then re-run `/autofix-pr <pr>`."
+  > Retry the push manually via `cd <worktree> && bash <safe-push.sh> <head_ref>`, where
+  > `<safe-push.sh>` is the LITERAL path of the leg `/prep-pr` Step 7 resolves (plugin copy or
+  > deployed `~/.claude/scripts/` copy), then re-run `/autofix-pr <pr>`."
   > Exit with status **ABORT**.
 - `post_head != pre_head` AND `remote_head == post_head` -> fix pushed
   and verified. Increment round counter and loop back to 2a.
@@ -295,7 +297,9 @@ with status **CAP**:
 
 > "Hit round cap of <max_rounds>. CR is still flagging findings; this PR
 > may be in a sticky pattern (e.g. a fix introduces a new finding next
-> round). Manual triage recommended: `gh pr view <pr>` + `bash ~/.claude/scripts/pr-unreplied-comments.sh <pr>`."
+> round). Manual triage recommended: `gh pr view <pr>` +
+> `bash <pr-unreplied-comments.sh> <pr>` (the LITERAL path of the resolved leg: plugin copy
+> or deployed `~/.claude/scripts/` copy)."
 
 Per `feedback_cap_cr_rounds`, do NOT silently continue past the cap.
 Offer the user an explicit "bump cap" path: "Re-run with

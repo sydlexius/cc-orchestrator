@@ -704,21 +704,26 @@ run `configure --apply`, then retire the old `~/.claude/skills/orchestrate` +
 `~/.claude/scripts/orchestrate-*` symlinks; the settings.json floor hook + stable-path guard stay.
 That retirement is about those two claude-kit paths ONLY.)
 
-SUPPORTED LOAD PATH, not legacy (#434): unnamespaced `~/.claude/commands/<name>.md` symlinks into
-the plugin's `commands/` (so `/prep-pr`, `/merge-pr`, ... load without the `orchestrate:` prefix)
-are a maintained install shape. Never advise retiring them and never add a doctor warning for them.
-Under that load path Claude Code does NOT substitute `${CLAUDE_PLUGIN_ROOT}` (it substitutes only
-the exact token, only for `/orchestrate:*` loads, verified 2026-09-19 on #434), and the variable is
-unset in the Bash tool. Hence the rule for every command body: HELPER EXEC PATHS ARE ALWAYS LITERAL
+UNNAMESPACED LOAD PATHS (#434). RECOMMENDED shape: an alias WRAPPER `~/.claude/commands/<name>.md`
+whose body invokes `orchestrate:<name>` via the Skill tool. It loads the command namespaced, so
+`${CLAUDE_PLUGIN_ROOT}` IS substituted (verified 2026-09-19, #434). A symlink into the plugin's
+`commands/` still works but is second-best: Claude Code substitutes only the exact token, only for
+`/orchestrate:*` loads, so under a symlink it stays literal and blocks fall back to the deployed
+`~/.claude/scripts` copy - helpers not in HELPER_NAMES (prose-lint, cache-reclaim,
+open-pr-staleness-sweep, orchestrate-authorize-merge) then do not run. Never advise retiring either
+shape; no doctor warning. The rule for every command body: HELPER EXEC PATHS ARE ALWAYS LITERAL
 (never `bash "$VAR"`, `bash "$HOME/..."`, `sh -c`, or `eval` - a PreToolUse safety hook denies an
-interpreter script path it cannot read statically). A block tests `[ -f ]` legs in the order
-repo-local `scripts/<x>` -> plugin `'${CLAUDE_PLUGIN_ROOT}/scripts/<x>'` (single-quoted, so an
-unsubstituted token is a literal string the test simply fails) -> deployed `~/.claude/scripts/<x>`
-(literal `~/`, and only for helpers in HELPER_NAMES) -> the step's own not-found/degraded message,
-then runs the one matching `[ "$leg" = ... ] && { ...; }` line, never inside an `if` body (the hook
-reads an `if`-body exec of the token as unverifiable even in a dead branch). The elmer commands check
-the deployed leg before the plugin leg on purpose (the wrapper grant). Full rule: `commands/prep-pr.md`
-"Helper exec paths" (#433).
+interpreter script path it cannot read statically). A block tests `[ -f ]` legs: repo-local
+`scripts/<x>` ONLY when `.claude-plugin/plugin.json` carries `"name": "orchestrate"` (i.e. inside
+this repo; in a consumer repo a same-named `scripts/<x>` is THEIR script and must never substitute
+for a gate - a consumer's older safe-push pushed a BEHIND branch, #433 review) -> plugin
+`'${CLAUDE_PLUGIN_ROOT}/scripts/<x>'` -> deployed `~/.claude/scripts/<x>` (HELPER_NAMES only) ->
+the step's not-found message, then runs the one matching `[ "$leg" = ... ] && { ...; }` line.
+SINGLE-QUOTE the token and never put the exec on the same line as `then`/`elif`: the hook denies
+the double-quoted token or a same-line exec, not a single-quoted exec on its own line in an `if`
+body (measured, cc-safety-net 2.3.4-2.4.3). Known limit: a plugin path containing a single quote
+breaks the single-quoted tests. The elmer commands check the deployed leg before the plugin leg on
+purpose (the wrapper grant). Full rule: `commands/prep-pr.md` "Helper exec paths" (#433).
 
 Deploying a merged floor/guard change to OTHER sessions: a merged guard change does NOT
 auto-propagate to already-running sessions or other machines. Three steps: (1) update the plugin

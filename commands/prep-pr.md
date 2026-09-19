@@ -13,16 +13,31 @@ Run every pre-push check in order. Gate on failures. Squash and push only when c
 **Helper exec paths (#433/#434).** Every block below that runs a bundled helper names it by a
 LITERAL path, never through a variable (`bash "$X"`, `bash "$HOME/..."`): a PreToolUse safety
 hook denies an interpreter whose script path it cannot read statically. The block first picks a
-leg with `[ -f ]` tests only, in this order - repo-local `scripts/<helper>`, then the plugin copy
-`'${CLAUDE_PLUGIN_ROOT}/scripts/<helper>'`, then the deployed `~/.claude/scripts/<helper>` (only
-for helpers `orchestrate-setup.py configure` deploys) - and then runs the ONE matching
-`[ "$leg" = ... ] && { ...; }` line. Two load-path facts force this shape. Claude Code substitutes
-only the exact token `${CLAUDE_PLUGIN_ROOT}`, and only when the command loads as `/orchestrate:*`;
-loaded through a `~/.claude/commands/<name>.md` symlink (a supported install), the token stays
-literal. The plugin path is SINGLE-QUOTED so that unsubstituted it is a literal string the
-`[ -f ]` test simply fails, and it is executed outside any `if` body because the safety hook
-reads an `if`-body `bash "${...}"` as an unverifiable expansion even in a branch that cannot run.
-Data arguments may stay variables.
+leg with `[ -f ]` tests only, in this order - repo-local `scripts/<helper>` (ONLY inside
+cc-orchestrator itself, see below), then the plugin copy `'${CLAUDE_PLUGIN_ROOT}/scripts/<helper>'`,
+then the deployed `~/.claude/scripts/<helper>` (only for helpers `orchestrate-setup.py configure`
+deploys) - and then runs the ONE matching `[ "$leg" = ... ] && { ...; }` line.
+
+The repo leg is `[ -f scripts/<helper> ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json`:
+it is taken ONLY when the working repo IS cc-orchestrator (dogfooding the working-tree copy). In
+any other repo a same-named `scripts/<helper>` is that CONSUMER's own script, and it must never
+substitute for a gate: a consumer's older `scripts/safe-push.sh` with no freshness refusal pushed
+a BEHIND branch that the plugin copy refuses (#433 review, reproduced).
+
+Claude Code substitutes only the exact token `${CLAUDE_PLUGIN_ROOT}`, and only when the command
+loads as `/orchestrate:*`; loaded through an unnamespaced `~/.claude/commands/<name>.md` symlink
+the token stays literal. The plugin path is SINGLE-QUOTED so that unsubstituted it is a literal
+string the `[ -f ]` test simply fails - and so the safety hook reads it as a static path. What the
+hook denies is the DOUBLE-quoted token (`bash "${CLAUDE_PLUGIN_ROOT}/..."`, an expansion it cannot
+verify) or an exec on the SAME line as `then`/`elif`; a single-quoted exec on its own line inside
+an `if` body is allowed (measured on cc-safety-net 2.3.4/2.4.1/2.4.3). The one-line
+`[ "$leg" = ... ] && { ...; }` shape is kept because it works and reads uniformly, not because the
+`if`-body form is impossible. Rule: single-quote the token; never put the exec on the same line
+as `then`/`elif`. Data arguments may stay variables.
+
+Known limit: a plugin install path that itself contains a single quote breaks the single-quoted
+`[ -f ]` test and exec (the substituted text closes the quote). Claude Code's plugin cache paths
+do not contain one; if yours does, run the helper from the deployed `~/.claude/scripts/` copy.
 
 **Hook-denied gate command.** A PreToolUse hook DENYING a step's own command is neither "unknown"
 nor "passed": the gate DID NOT RUN. Never retry it through an evasion variant (`sh -c`, `eval`, a
@@ -143,7 +158,7 @@ fi
 # missing helper would otherwise surface as 127, which matches no documented branch.
 # Literal helper path in every leg - see "Helper exec paths" at the top of this file.
 if [ -z "$base_name" ]; then leg=nobase
-elif [ -f scripts/base-freshness.sh ]; then leg=repo
+elif [ -f scripts/base-freshness.sh ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/base-freshness.sh' ]; then leg=plugin
 elif [ -f ~/.claude/scripts/base-freshness.sh ]; then leg=stable
 else leg=none; fi
@@ -216,7 +231,8 @@ block in `CLAUDE.md` -> language-agnostic basics -> warn-and-proceed). Delegate
 to it:
 
 ```bash
-# Prefer the repo-local copy (dev / --plugin-dir installs); else the deployed
+# Prefer the repo-local copy ONLY inside cc-orchestrator itself (a consumer's own
+# scripts/gate-runner.py must never substitute for the gate); else the deployed
 # copy at the stable path. The runner finds the repo root itself and reads
 # .gates.toml or falls back; it exits non-zero on the first required-gate
 # failure, 0 when everything passed/skipped/fell open.
@@ -231,7 +247,7 @@ to it:
 # there -- and worktrees are the normal case for this workflow. --git-dir resolves
 # correctly in both, and is per-worktree, so receipts never leak between them.
 RECEIPT_PATH="$(git rev-parse --git-dir)/prep-pr-receipt.json"
-if [ -f scripts/gate-runner.py ]; then
+if [ -f scripts/gate-runner.py ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then
   python3 scripts/gate-runner.py --receipt "$RECEIPT_PATH"
 else
   python3 ~/.claude/scripts/gate-runner.py --receipt "$RECEIPT_PATH"
@@ -341,7 +357,7 @@ hard-coded excludes needed here:
 
 ```bash
 # Literal helper path in every leg - see "Helper exec paths" at the top of this file.
-if [ -f scripts/patch-coverage.sh ]; then leg=repo
+if [ -f scripts/patch-coverage.sh ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/patch-coverage.sh' ]; then leg=plugin
 elif [ -f ~/.claude/scripts/patch-coverage.sh ]; then leg=stable
 else leg=none; fi
@@ -354,6 +370,10 @@ gate_status=2
 rm -f "$COVER_OUT"
 echo "gate_status=$gate_status leg=$leg"
 ```
+
+`leg=stable` runs the DEPLOYED `~/.claude/scripts/patch-coverage.sh`, which can lag the plugin's
+copy until `orchestrate-setup.py configure --apply` is re-run after a plugin update; the
+`leg=` value in the output says which copy ran.
 
 Point `COVER_PROFILE` at whatever coverage profile the Step 2 gate run
 produced (the detected gate block's `-coverprofile` output). If the detected
@@ -772,7 +792,7 @@ separate command:
 
 ```bash
 # Literal helper path in every leg - see "Helper exec paths" at the top of this file.
-if [ -f scripts/safe-push.sh ]; then leg=repo
+if [ -f scripts/safe-push.sh ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh' ]; then leg=plugin
 elif [ -f ~/.claude/scripts/safe-push.sh ]; then leg=stable
 else leg=none; fi
@@ -785,8 +805,10 @@ echo "push_rc=$push_rc"
 (exit "$push_rc")  # prep-pr-ok
 ```
 
-The trailing `# prep-pr-ok` is the floor guard's advisory override, and it is earned here:
-Step 7 is reached only after Steps 1-6 passed. Never add it to a push that skipped them.
+The trailing `# prep-pr-ok` is the floor guard's advisory override. It is an
+INSTRUCTION-LEVEL assertion, not a mechanism: nothing checks that Steps 1-6 actually ran, the
+token simply travels with this block. So run this block ONLY after Steps 1-6 passed in this
+run, and never add the token to a push that skipped them.
 
 **Never pipe safe-push** (`| tail -N`, `| head`, `| tee` ...), foreground or backgrounded.
 Without `pipefail` a pipeline returns the LAST command's exit code, so a refusal (exit 1 or
@@ -919,7 +941,7 @@ the PR:
 # through a ~/.claude/commands symlink outside this repo it reports skipped. Capture the
 # exit code with `|| pl_rc=$?` so a non-zero result can NEVER abort the caller under
 # `set -e` -- this check is strictly advisory.
-if [ -f scripts/prose-lint.sh ]; then leg=repo
+if [ -f scripts/prose-lint.sh ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/prose-lint.sh' ]; then leg=plugin
 else leg=none; fi
 pl_rc=0

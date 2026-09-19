@@ -59,7 +59,7 @@ fi
 Invoke the Monitor tool with the watch script. The script is silent until done; the single terminal stdout line becomes the only Monitor event. Wait for it without polling.
 
 ```bash
-if [ -f scripts/pr-watch.sh ]; then leg=repo
+if [ -f scripts/pr-watch.sh ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/pr-watch.sh' ]; then leg=plugin
 elif [ -f ~/.claude/scripts/pr-watch.sh ]; then leg=stable
 else leg=none; fi

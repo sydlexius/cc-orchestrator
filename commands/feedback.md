@@ -26,7 +26,7 @@ a command that could only run Bash could not perform its own primary step.
 Substitute your own slug and body path:
 
 ```bash
-if [ -f scripts/orchestrate-feedback.sh ]; then leg=repo
+if [ -f scripts/orchestrate-feedback.sh ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/orchestrate-feedback.sh' ]; then leg=plugin
 elif [ -f ~/.claude/scripts/orchestrate-feedback.sh ]; then leg=stable
 else leg=none; fi
@@ -56,7 +56,7 @@ The helper prints the created filename.
 ## Step 2 -- `list` (read-only)
 
 ```bash
-if [ -f scripts/orchestrate-feedback.sh ]; then leg=repo
+if [ -f scripts/orchestrate-feedback.sh ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
 elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/orchestrate-feedback.sh' ]; then leg=plugin
 elif [ -f ~/.claude/scripts/orchestrate-feedback.sh ]; then leg=stable
 else leg=none; fi

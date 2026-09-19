@@ -59,7 +59,7 @@ it resolves them ONCE here. The block only TESTS and PRINTS - it executes nothin
 
 ```bash
 for h in patch-coverage.sh pr-codeql-autofixes.sh pr-read-comments.sh pr-unreplied-comments.sh reply-comment.sh resolve-threads.sh; do
-  if [ -f "scripts/$h" ]; then echo "$h -> scripts/$h"
+  if [ -f "scripts/$h" ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then echo "$h -> scripts/$h"
   elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/'"$h" ]; then echo "$h -> "'${CLAUDE_PLUGIN_ROOT}/scripts/'"$h"
   elif [ -f ~/.claude/scripts/"$h" ]; then echo "$h -> ~/.claude/scripts/$h"
   else echo "$h -> NOT FOUND"; fi
@@ -79,7 +79,9 @@ never an empty result (the **Hook-denied gate command** rule in `prep-pr.md`); a
 
 Why not `${CLAUDE_PLUGIN_ROOT}` directly: Claude Code substitutes that token only when this
 command loads as `/orchestrate:*`. Loaded through a `~/.claude/commands/<name>.md` symlink (a
-supported install) it stays literal, and the safety hook denies it.
+supported install) it stays literal, and the safety hook denies it unquoted or double-quoted.
+The `scripts/<name>` leg is printed only inside cc-orchestrator itself (the `plugin.json` name
+check); in any other repo a same-named `scripts/<name>` is that repo's own script and is never used.
 
 ---
 
@@ -175,9 +177,29 @@ this loop only *waits* for reviews already in flight. Poll with increasing
 intervals: **15s → 30s → 60s → 120s**. At each interval:
 
 ```bash
-pending=$(bash HELPER_DIR/pr-unreplied-comments.sh --pending-only "$pr_number")
-unreplied=$(bash HELPER_DIR/pr-unreplied-comments.sh --count-only "$pr_number")
+# Full per-leg block (not HELPER_DIR/): this is a GATE. A missing/unsubstituted helper exits
+# 127 with an EMPTY capture, and an empty capture must never read as 0 / "stable".
+if [ -f scripts/pr-unreplied-comments.sh ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh' ]; then leg=plugin
+elif [ -f ~/.claude/scripts/pr-unreplied-comments.sh ]; then leg=stable
+else leg=none; fi
+pending=""; unreplied=""; p_rc=127; u_rc=127
+[ "$leg" = repo ]   && { pending=$(bash scripts/pr-unreplied-comments.sh --pending-only "$pr_number"); p_rc=$?; }
+[ "$leg" = repo ]   && { unreplied=$(bash scripts/pr-unreplied-comments.sh --count-only "$pr_number"); u_rc=$?; }
+[ "$leg" = plugin ] && { pending=$(bash '${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh' --pending-only "$pr_number"); p_rc=$?; }
+[ "$leg" = plugin ] && { unreplied=$(bash '${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh' --count-only "$pr_number"); u_rc=$?; }
+[ "$leg" = stable ] && { pending=$(bash ~/.claude/scripts/pr-unreplied-comments.sh --pending-only "$pr_number"); p_rc=$?; }
+[ "$leg" = stable ] && { unreplied=$(bash ~/.claude/scripts/pr-unreplied-comments.sh --count-only "$pr_number"); u_rc=$?; }
+if [ "$p_rc" -ne 0 ] || [ "$u_rc" -ne 0 ] || [ -z "$pending" ] || [ -z "$unreplied" ]; then
+  echo "readiness: NOT RUN (leg=$leg p_rc=$p_rc u_rc=$u_rc pending='$pending' unreplied='$unreplied') -> NOT ready"
+else
+  echo "readiness: pending=$pending unreplied=$unreplied"
+fi
 ```
+
+An empty count means NOT RUN, never 0: a `readiness: NOT RUN` line (helper missing, non-zero
+exit, hook-denied, or an empty capture) is NOT ready - fail toward not-ready, never toward
+"stable". It does not count as one of the consecutive polls.
 
 If `pending == 0` AND `unreplied` count matches the previous check → ready.
 If not stable after 4 polls (~3.75 minutes), tell the user which bots are still
@@ -447,7 +469,7 @@ re-implementing per-stack test commands here:
 
 ```bash
 git diff --name-only   # identify changed files
-if [ -f scripts/gate-runner.py ]; then
+if [ -f scripts/gate-runner.py ] && grep -q '"name": "orchestrate"' .claude-plugin/plugin.json 2>/dev/null; then
   python3 scripts/gate-runner.py
 else
   python3 ~/.claude/scripts/gate-runner.py
