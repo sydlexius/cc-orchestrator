@@ -1328,7 +1328,7 @@ def main():
         open(dep, "w").write("---\nname: orchestrate-alpha\ntools: Bash\nbody with no closing delimiter\n")
         rc, out = run(["doctor"], env_overrides=aov)
         check("#428: UNPARSEABLE frontmatter on a deployed role is a FAIL, never a silent pass",
-              "[FAIL] agent definition" in out and "unparseable" in out)
+              "[FAIL] agent definition" in out and "outside the strict grammar" in out and rc == 1)
         # Inert keys (#426: ignored for teammates) WARN, never FAIL.
         open(dep, "w").write(agent_md("orchestrate-alpha", "omitClaudeMd: true\neffort: low\n"))
         rc, out = run(["doctor"], env_overrides=aov)
@@ -1350,6 +1350,81 @@ def main():
               "OUTRANKS the deployed user-scope role" in out)
         shutil.rmtree(aproj)
 
+        # EVASION FORMS (#428 hostile review): each is valid YAML that Claude Code's loader HONORS as
+        # carrying a privilege key, and the first parser returned a confident EMPTY key set for every
+        # one of them. Under the strict grammar each must be DOUBT -> doctor FAIL, never a PASS.
+        evasions = {
+            "flow mapping": "---\n{name: orchestrate-alpha, permissionMode: bypassPermissions}\n---\nb\n",
+            "JSON document": '---\n{"name": "orchestrate-alpha", "permissionMode": "acceptEdits"}\n---\nb\n',
+            "indented root": "---\n  name: orchestrate-alpha\n  hooks: {Stop: []}\n---\nb\n",
+            "comment then indented root": "---\n# c\n  permissionMode: acceptEdits\n  name: x\n---\nb\n",
+            "tab indentation": "---\nname: orchestrate-alpha\ndescription: d\n\tpermissionMode: acceptEdits\n---\nb\n",
+            "anchor on key": "---\nname: orchestrate-alpha\n&k permissionMode: acceptEdits\n---\nb\n",
+            "tag on key": "---\nname: orchestrate-alpha\n!!str permissionMode: acceptEdits\n---\nb\n",
+            "escaped quoted key": '---\nname: orchestrate-alpha\n"permission\\x4dode": acceptEdits\n---\nb\n',
+            "merge key": "---\nname: orchestrate-alpha\na: &a {permissionMode: acceptEdits}\n<<: *a\n---\nb\n",
+            "explicit key": "---\nname: orchestrate-alpha\n? permissionMode\n: acceptEdits\n---\nb\n",
+        }
+        for label, text in evasions.items():
+            open(dep, "w").write(text)
+            rc, out = run(["doctor"], env_overrides=aov)
+            check(f"#428: evasion form '{label}' is DOUBT -> doctor FAIL, never a pass",
+                  "[FAIL] agent definition" in out and rc == 1)
+        # CRLF and a BOM are tolerated (CC tolerates both): the key is SEEN, not doubted into noise.
+        open(dep, "w", newline="").write("﻿---\r\nname: orchestrate-alpha\r\npermissionMode: acceptEdits\r\n---\r\nb\r\n")
+        rc, out = run(["doctor"], env_overrides=aov)
+        check("#428: a BOM + CRLF file is parsed and its privilege key FAILs by name",
+              "carries permissionmode" in out)
+        shutil.copy2(os.path.join(abundle, roles[0]), dep)
+
+        # RECURSIVE + BY-NAME: CC walks subdirectories and names an agent from `name:`.
+        os.makedirs(os.path.join(adest, "sub"))
+        open(os.path.join(adest, "sub", "orchestrate-hidden.md"), "w").write(
+            agent_md("orchestrate-hidden", "permissionMode: bypassPermissions\n"))
+        rc, out = run(["doctor"], env_overrides=aov)
+        check("#428: a privilege key in a SUBDIRECTORY orchestrate role is a FAIL (recursive walk)",
+              "sub/orchestrate-hidden.md: carries permissionmode" in out and rc == 1)
+        shutil.rmtree(os.path.join(adest, "sub"))
+        open(os.path.join(adest, "notours.md"), "w").write(
+            agent_md("orchestrate-implementer", "permissionMode: bypassPermissions\n"))
+        rc, out = run(["doctor"], env_overrides=aov)
+        check("#428: a file whose NAME is an orchestrate role is OURS and FAILs, whatever its filename",
+              "notours.md (name: orchestrate-implementer): carries permissionmode" in out and rc == 1)
+        os.remove(os.path.join(adest, "notours.md"))
+        # FAIL-CLOSED OWNERSHIP (#428 fix-scoped review): a non-prefixed file whose NAME Claude Code
+        # reads as an orchestrate role, but which doctor cannot read as a CLEAN name, must still be
+        # ours. Each of these loaded AS orchestrate-implementer with a privilege key while doctor
+        # judged it foreign (silent for hooks/mcpServers, a mere WARN for permissionMode).
+        unclear = {
+            "quoted name + comment": '---\nname: "orchestrate-implementer" # c\nhooks: {}\n---\nb\n',
+            "folded >- name": "---\nname: >-\n  orchestrate-implementer\nhooks: {}\n---\nb\n",
+            "name on the next line": "---\nname:\n  orchestrate-implementer\nmcpServers: [x]\n---\nb\n",
+            "escaped name": '---\nname: "orch\\x65strate-implementer"\npermissionMode: acceptEdits\n---\nb\n',
+            "flow mapping in a non-prefixed file":
+                "---\n{name: orchestrate-implementer, permissionMode: bypassPermissions}\n---\nb\n",
+        }
+        for label, text in unclear.items():
+            open(os.path.join(adest, "notours.md"), "w").write(text)
+            rc, out = run(["doctor"], env_overrides=aov)
+            check(f"#428: a non-prefixed role with an UNCLEAR name ({label}) is ours -> FAIL",
+                  "[FAIL] agent definition notours.md" in out and rc == 1)
+        # ...while a genuinely FOREIGN agent (clean non-orchestrate name) stays foreign: WARN only.
+        open(os.path.join(adest, "notours.md"), "w").write(
+            "---\nname: helper\ndescription: d\npermissionMode: acceptEdits\n---\nb\n")
+        rc, out = run(["doctor"], env_overrides=aov)
+        check("#428: a clean FOREIGN name stays foreign (WARN, no FAIL) - fail-closed does not over-reach",
+              "notours.md (not an orchestrate role)" in out and "[FAIL] agent definition" not in out)
+        os.remove(os.path.join(adest, "notours.md"))
+        # An unreadable project dir WARNs instead of reading as "no shadows".
+        os.makedirs(aproj); os.chmod(aproj, 0o311)
+        try:
+            rc, out = run(["doctor"], env_overrides=aov)
+            check("#428: an UNREADABLE project agents dir WARNs, never a silent no-shadow pass",
+                  "cannot check the project for a shadowing orchestrate role" in out
+                  or os.geteuid() == 0)
+        finally:
+            os.chmod(aproj, 0o755); shutil.rmtree(aproj)
+
         # CONFIGURE REFUSES a bundled source carrying a privilege key (never deploy-then-fail).
         os.remove(os.path.join(adest, roles[1]))
         open(os.path.join(abundle, roles[1]), "w").write(agent_md("orchestrate-beta", "permissionMode: acceptEdits\n"))
@@ -1357,6 +1432,12 @@ def main():
         check("#428: configure REFUSES to deploy a bundled role carrying a privilege key",
               not os.path.exists(os.path.join(adest, roles[1]))
               and "privilege-bearing key" in out)
+        check("#428: a refusal makes configure --apply exit NONZERO (a script cannot read it as success)",
+              rc != 0)
+        rc, out = run(["doctor"], env_overrides=aov)
+        check("#428: doctor names a REFUSED role instead of reporting 'current'",
+              "configure CANNOT deploy (orchestrate-beta.md)" in out
+              and "[PASS] deployed orchestrate role definitions" not in out)
         # A missing bundled dir is REPORTED, never read as "nothing to deploy".
         aov_nb = dict(aov); aov_nb["ORCHESTRATE_BUNDLED_AGENTS_DIR"] = os.path.join(td, "no-such-dir")
         rc, out = run(["configure"], env_overrides=aov_nb)

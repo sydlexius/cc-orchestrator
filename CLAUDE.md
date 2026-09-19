@@ -115,12 +115,19 @@ Runtime (`scripts/`; canonical source is this repo):
   unattended loop inside the existing wrapper grant instead of needing a broad `gh` one; retiring
   any claude-kit symlink, backed up to `<dest>.bak`), DEPLOYS the orchestrate ROLE DEFINITIONS
   (#428: every `skills/orchestrate/agent-definitions/orchestrate-*.md`, discovered by GLOB so a new
-  role cannot be silently left out) to USER scope `~/.claude/agents/` - not executable, same verified
-  backup-first contract - and REFUSES a bundled source carrying `permissionMode`/`hooks`/`mcpServers`.
+  role cannot be silently left out) to USER scope `~/.claude/agents/` - not executable, a differing
+  regular file backed up to `<dest>.bak` (VERIFIED) before replacement, a symlink dest moved aside the
+  same way `_deploy_helper` does - and REFUSES (nonzero exit) a bundled source carrying
+  `permissionMode`/`hooks`/`mcpServers` or frontmatter outside the STRICT GRAMMAR `_frontmatter` accepts.
+  WHITELIST, NOT A KEY MATCHER: CC parses frontmatter with full YAML, so a flow mapping, an indented
+  root, an anchor/tag, an escaped key or tab indentation can each carry a privilege key a line matcher
+  never sees; anything outside the one shape a role needs is DOUBT, and doubt FAILS.
   A user-scope agent file is a PRIVILEGE SURFACE the merge-gate shadow scan never reads (a deployed
   `permissionMode` measurably escalated a default-mode parent in every repo, #426), so doctor HARD-FAILS
-  those keys - and UNREADABLE frontmatter, because doubt must never read as "carries none" - on any
-  deployed `orchestrate-*.md`, WARNs on another tool's agent setting `permissionMode`, on the
+  those keys - and UNREADABLE/out-of-grammar frontmatter, because doubt must never read as "carries
+  none" - on any deployed agent that is OURS by filename OR by frontmatter `name:`, found by a RECURSIVE
+  walk (CC names an agent from `name:` and descends into subdirectories, so a prefix-only top-level
+  scan missed both), WARNs on another tool's agent setting `permissionMode`, on the
   teammate-ignored `omitClaudeMd`/`effort`, and on a project `.claude/agents/orchestrate-*.md`
   (project scope outranks user scope). And (unless `--no-steer`) DEPLOYS + wires the advisory
   steering hook `orchestrate-steer.sh` for Edit/Write/Bash/Read/Agent (#95/#226/#231; doctor only ever WARNs about it),
