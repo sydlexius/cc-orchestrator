@@ -176,8 +176,15 @@ Invoke `/pr-watch` via the Skill tool with arguments `<pr_number>
 |---|---|
 | exit 0 + stdout `settled head=...` | **SUCCESS** |
 | exit 0 + stdout `review-blocked head=...` | **FIX** |
+| exit 0 + stdout `thread-blocked head=...` | **THREAD** (#441) |
+| exit 0 + stdout `merged head=...` | **MERGED** (#435) |
+| exit 0 + stdout `closed head=...` | **CLOSED** (#435) |
 | exit 1 + stderr `timeout: ...` | **STALL** |
 | exit 2 + stderr `setup error: ...` | **ABORT** |
+
+Branch on the stdout line, not the exit code alone: five different terminals
+share exit 0. The stderr `pr-watch: pending=<list>` progress lines (#399) are
+informational only and never select a branch.
 
 ### 2b. Dispatch on outcome
 
@@ -233,10 +240,68 @@ remote_head=$(git -C "$worktree" ls-remote origin "refs/heads/$head_ref" | cut -
 - `post_head != pre_head` AND `remote_head == post_head` -> fix pushed
   and verified. Increment round counter and loop back to 2a.
 
+#### THREAD
+
+CI is green and nobody requested changes, but at least one review thread is
+unresolved and GitHub reports the PR `blocked` (#441). The `by=` field names who
+opened the threads. This is DISTINCT from FIX in one way that matters: a thread
+round is often closed by reply-and-resolve alone, so handle-review may
+legitimately make NO commit. A no-commit THREAD round is NOT a stall; the FIX
+branch's "no commits -> STALL" rule must NOT be applied here.
+
+Capture `pre_head` exactly as in FIX, invoke `/handle-review <pr_number>` via
+Skill, then read `post_head` and `remote_head` the same way.
+
+- `post_head != pre_head` -> the round committed a fix. Apply the FIX branch's
+  push verification unchanged (ABORT on `remote_head != post_head`, else
+  increment the round and loop back to 2a).
+- `post_head == pre_head` -> verify progress from the comment state instead of
+  from a commit:
+
+  ```bash
+  # Literal helper path in every leg (the "Helper exec paths" rule in prep-pr.md). A missing
+  # helper or a failed read leaves unreplied=unknown, which is NOT progress (fail toward STALL).
+  if [ -f scripts/pr-unreplied-comments.sh ] && jq -e '.name == "orchestrate"' .claude-plugin/plugin.json >/dev/null 2>&1; then leg=repo
+  elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh' ]; then leg=plugin
+  elif [ -f ~/.claude/scripts/pr-unreplied-comments.sh ]; then leg=stable
+  else leg=none; fi
+  unreplied=unknown
+  [ "$leg" = repo ]   && unreplied=$(bash scripts/pr-unreplied-comments.sh --count-only "$pr_number" 2>/dev/null || echo unknown)
+  [ "$leg" = plugin ] && unreplied=$(bash '${CLAUDE_PLUGIN_ROOT}/scripts/pr-unreplied-comments.sh' --count-only "$pr_number" 2>/dev/null || echo unknown)
+  [ "$leg" = stable ] && unreplied=$(bash ~/.claude/scripts/pr-unreplied-comments.sh --count-only "$pr_number" 2>/dev/null || echo unknown)
+  ```
+
+  - `unreplied == 0` -> every finding is replied. Print "round <round>: thread
+    round replied without a commit; re-watching to confirm resolution." and
+    increment the round and loop back to 2a. The next `/pr-watch` IS the
+    resolution check: if the threads are now resolved it moves on to `settled`
+    (or another terminal); if they are still open it emits `thread-blocked`
+    again, and the round cap (2c) bounds that repetition (for example, a thread
+    waiting for a bot to resolve it itself).
+  - anything else (a non-zero count, or `unknown`) -> handle-review neither
+    committed nor replied. Print "round <round>: thread-blocked by <by>, but
+    handle-review made no commit and <unreplied> finding(s) remain unreplied."
+    and exit the loop with status **STALL** (the "Inspect the open threads" row
+    of the Step 3 matrix).
+
+#### MERGED
+
+The PR merged while the loop was running (#435). Print "round <round>: PR #<pr>
+is already merged. Next: /post-merge-cleanup <pr>." and exit the loop with
+status **MERGED**. Do NOT invoke `/post-merge-cleanup` yourself.
+
+#### CLOSED
+
+The PR was closed without merging (#435). Print "round <round>: PR #<pr> was
+closed without merging; nothing to fix." and exit the loop with status
+**CLOSED**.
+
 #### STALL
 
-`/pr-watch` timed out, OR handle-review made no commits. Distinguish
-sub-cases so we report something useful.
+`/pr-watch` timed out, OR a FIX-round handle-review made no commits, OR a
+THREAD round neither committed nor replied. Distinguish sub-cases so we report
+something useful. Before timing out, the watch's stderr `pr-watch: pending=<list>`
+lines (#399) name what it was holding on; quote the last one in the report.
 
 **Important: do NOT use review.commit_id to decide "has CR reviewed
 HEAD".** GitHub silently rewrites the `commit_id` field on every
@@ -294,7 +359,7 @@ exit with status **ABORT**.
 
 ### 2c. Round cap check
 
-If `round >= max_rounds` after a FIX iteration completes, exit the loop
+If `round >= max_rounds` after a FIX or THREAD iteration completes, exit the loop
 with status **CAP**:
 
 > "Hit round cap of <max_rounds>. CR is still flagging findings; this PR
@@ -319,7 +384,7 @@ Always print at the end:
 PR:        #<pr_number>
 Worktree:  <worktree>
 Rounds:    <consumed>/<max_rounds>
-Exit:      <SUCCESS | STALL | CAP | ABORT | USER-ABORT>
+Exit:      <SUCCESS | MERGED | CLOSED | STALL | CAP | ABORT | USER-ABORT>
 Final state:
   state=<gh pr view state>
   reviewDecision=<gh pr view reviewDecision>
@@ -332,8 +397,11 @@ Suggested next-step matrix:
 | Exit | Suggested next |
 |------|----------------|
 | SUCCESS | `/merge-pr <pr>` |
+| MERGED | `/post-merge-cleanup <pr>` |
+| CLOSED | (no suggestion -- the PR was closed without merging) |
 | STALL (case 1 or 2) | Wait 15-30 min, then re-run `/autofix-pr <pr>` |
 | STALL (case 3) | Inspect `gh pr checks <pr>`; resolve the holdout |
+| STALL (thread round, no commit and no reply) | Inspect the open threads with the unreplied-comments script, then `/handle-review <pr>` |
 | CAP | Manual triage via `gh pr view <pr>` + unreplied-comments script |
 | ABORT | Fix the setup issue surfaced by pr-watch, re-run |
 | USER-ABORT | (no suggestion -- user explicitly stopped) |

@@ -72,7 +72,26 @@ LABELS = os.environ.get("LABELS_JSON", "[]")
 COMMENTS = os.environ.get("COMMENTS_JSON", "[]")
 ISSUE = os.environ.get("ISSUE_JSON", "[]")
 REQUESTED = os.environ.get("REQUESTED_REVIEWERS_JSON", '{"users":[]}')
-PULL = '{"head":{"sha":"%s"},"mergeable_state":"%s"}' % (HEAD_SHA, MERGEABLE)
+PR_STATE = os.environ.get("PR_STATE", "open")
+MERGED = os.environ.get("MERGED", "false")
+THREADS = os.environ.get("THREADS_JSON", '{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":0,"nodes":[]}}}}}')
+THREADS_RC = int(os.environ.get("THREADS_RC", "0"))
+STATE_DIR = os.environ.get("STUB_STATE_DIR", "")
+
+def bump(name):
+    # Per-endpoint call counter (file-backed; each gh call is a fresh process).
+    path = os.path.join(STATE_DIR, name)
+    n = int(open(path).read()) if os.path.exists(path) else 0
+    open(path, "w").write(str(n + 1))
+    return n
+
+# MERGEABLE_SEQ ("blocked,blocked,clean") steps mergeable_state per pulls/<n> read,
+# holding the last value, so a test can drive a pending-set TRANSITION (#399).
+seq = os.environ.get("MERGEABLE_SEQ", "")
+if seq and args[:1] == ["api"] and any(a.endswith("/pulls/123") for a in args):
+    vals = seq.split(","); MERGEABLE = vals[min(bump("pull"), len(vals) - 1)]
+PULL = ('{"head":{"sha":"%s"},"mergeable_state":"%s","state":"%s","merged":%s}'
+        % (HEAD_SHA, MERGEABLE, PR_STATE, MERGED))
 COMMIT = '{"commit":{"committer":{"date":"%s"}}}' % COMMITTER_DATE
 
 def emit(data):
@@ -88,6 +107,14 @@ if args[:2] == ["pr", "checks"]:
     emit(CHECKS)
 if args[:2] == ["pr", "view"]:
     emit('{"labels":%s}' % LABELS)
+# GraphQL reviewThreads read (#441). Record the query so a test can assert it is a
+# `query`, never a mutation. THREADS_RC != 0 simulates a gh/GraphQL failure.
+if args[:2] == ["api", "graphql"]:
+    if STATE_DIR:
+        open(os.path.join(STATE_DIR, "graphql-args"), "a").write(" ".join(args) + "\n")
+    if THREADS_RC:
+        sys.stderr.write("graphql error\n"); sys.exit(THREADS_RC)
+    emit(THREADS)
 
 # gh api ... : find the endpoint token (contains "repos/").
 endpoint = ""
@@ -97,6 +124,12 @@ for a in args:
 if endpoint.endswith("/reviews"):
     emit(REVIEWS)
 if endpoint.endswith("/comments") and "/pulls/" in endpoint:
+    # GROW_INLINE=<login>: every read returns one MORE inline comment by <login>, so
+    # the quiet-period bot count never stabilizes (#441 AC f deferral case).
+    grow = os.environ.get("GROW_INLINE", "")
+    if grow:
+        n = bump("inline") + 1
+        emit("[" + ",".join('{"user":{"login":"%s"}}' % grow for _ in range(n)) + "]")
     emit(COMMENTS)
 if endpoint.endswith("/comments") and "/issues/" in endpoint:
     emit(ISSUE)
@@ -111,8 +144,11 @@ emit(PULL)
 
 def run(*, labels="[]", checks="[]", reviews="[]", codoki_rc=0,
         requested_reviewers='{"users":[]}', comments="[]", issue_comments="[]",
-        timeout_secs=SETTLE_TIMEOUT, blocking_reviewers=None):
+        timeout_secs=SETTLE_TIMEOUT, blocking_reviewers=None, mergeable="clean",
+        pr_state="open", merged="false", threads=None, threads_rc=0,
+        mergeable_seq="", grow_inline="", want_graphql_args=False):
     with tempfile.TemporaryDirectory() as td:
+        state_dir = os.path.join(td, "state"); os.makedirs(state_dir)
         bindir = os.path.join(td, "bin"); os.makedirs(bindir)
         home = os.path.join(td, "home")
         oracle_dir = os.path.join(home, ".claude", "scripts"); os.makedirs(oracle_dir)
@@ -132,7 +168,15 @@ def run(*, labels="[]", checks="[]", reviews="[]", codoki_rc=0,
         env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
         env["HOME"] = home
         env["HEAD_SHA"] = HEAD_SHA
-        env["MERGEABLE"] = "clean"
+        env["MERGEABLE"] = mergeable
+        env["PR_STATE"] = pr_state
+        env["MERGED"] = merged
+        if threads is not None:
+            env["THREADS_JSON"] = threads
+        env["THREADS_RC"] = str(threads_rc)
+        env["MERGEABLE_SEQ"] = mergeable_seq
+        env["GROW_INLINE"] = grow_inline
+        env["STUB_STATE_DIR"] = state_dir
         env["COMMITTER_DATE"] = COMMITTER_DATE
         env["LABELS_JSON"] = labels
         env["CHECKS_JSON"] = checks
@@ -147,6 +191,10 @@ def run(*, labels="[]", checks="[]", reviews="[]", codoki_rc=0,
 
         p = subprocess.run(["bash", SCRIPT, "123", "owner/repo", str(timeout_secs)],
                            env=env, capture_output=True, text=True, timeout=30)
+        if want_graphql_args:
+            gpath = os.path.join(state_dir, "graphql-args")
+            gargs = open(gpath).read() if os.path.exists(gpath) else ""
+            return p.returncode, p.stdout, p.stderr, gargs
         return p.returncode, p.stdout, p.stderr
 
 
@@ -181,6 +229,42 @@ INTERLEAVED_SUPERSEDED = ('[{"user":{"login":"octocat"},"state":"CHANGES_REQUEST
 INTERLEAVED_STILL_BLOCKED = ('[{"user":{"login":"octocat"},"state":"CHANGES_REQUESTED","submitted_at":"2026-06-18T01:00:00Z"},'
                              '{"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED","submitted_at":"2026-06-18T01:15:00Z"},'
                              '{"user":{"login":"octocat"},"state":"CHANGES_REQUESTED","submitted_at":"2026-06-18T02:00:00Z"}]')
+
+PENDING_CHECK = '[{"name":"ci","state":"IN_PROGRESS","description":""}]'
+
+# #441 reviewThreads fixtures (GraphQL shape pr-watch.sh queries).
+COPILOT = "copilot-pull-request-reviewer[bot]"
+CR_APPROVED_COPILOT_COMMENTED = (
+    '[{"user":{"login":"coderabbitai[bot]"},"state":"APPROVED","submitted_at":"2026-06-18T01:00:00Z"},'
+    '{"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-18T01:10:00Z"}]' % COPILOT)
+
+
+def _thread(resolved, login):
+    # Live GraphQL shape (measured on a real PR): a Bot actor's login carries NO
+    # `[bot]` suffix and __typename is "Bot"; pr-watch.sh re-appends the suffix.
+    if login.endswith("[bot]"):
+        author = {"__typename": "Bot", "login": login[:-len("[bot]")]}
+    else:
+        author = {"__typename": "User", "login": login}
+    return {"isResolved": resolved, "comments": {"nodes": [{"author": author}]}}
+
+
+def _threads(nodes, total=None):
+    import json
+    return json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": {
+        "totalCount": len(nodes) if total is None else total, "nodes": nodes}}}}})
+
+
+THREADS_ONE_OPEN = _threads([_thread(True, "coderabbitai[bot]"), _thread(False, COPILOT)])
+THREADS_DUP_AUTHORS = _threads([_thread(False, COPILOT), _thread(False, "octocat"),
+                                _thread(False, COPILOT), _thread(True, "octocat")])
+THREADS_ALL_RESOLVED = _threads([_thread(True, COPILOT), _thread(True, "octocat")])
+THREADS_ERRORS = ('{"errors":[{"message":"Something went wrong"}],'
+                  '"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"nodes":[]}}}}}')
+THREADS_NULL_NODE = _threads([None, _thread(True, COPILOT)])
+THREADS_NULL_RESOLVED = _threads([{"isResolved": None, "comments": {"nodes": []}}])
+THREADS_TRUNC_OPEN = _threads([_thread(False, COPILOT)] + [_thread(True, COPILOT)] * 99, total=150)
+THREADS_TRUNC_RESOLVED = _threads([_thread(True, COPILOT)] * 100, total=150)
 
 CR_REQUESTED = '{"users":[{"login":"coderabbitai[bot]"}]}'
 TRIGGER_COMMENT = '[{"body":"please @coderabbitai review this PR"}]'
@@ -327,6 +411,121 @@ def main():
         check(f"separator-only {junk!r} -> exit 0 (no hang)", rc == 0)
         check(f"separator-only {junk!r} -> emits 'review-blocked'", "review-blocked head=" in out)
         check(f"separator-only {junk!r} -> not a timeout", "timeout" not in err)
+
+    # ---------------------------------------------------------------------
+    # #435: a MERGED / CLOSED PR is terminal immediately.
+    # ---------------------------------------------------------------------
+    print("== #435: MERGED PR (mergeable_state unknown) -> 'merged' terminal, exit 0 ==")
+    rc, out, err = run(checks=GREEN_CHECK, reviews=CR_APPROVED, mergeable="unknown",
+                       pr_state="closed", merged="true")
+    check("merged -> exit 0 (not a timeout)", rc == 0)
+    check("emits 'merged head=<sha8>'", out.strip() == "merged head=" + HEAD_SHA[:8])
+
+    print("== #435: merged beats review-blocked (checked before the rest of the loop) ==")
+    rc, out, err = run(checks=GREEN_CHECK, reviews=CR_CHANGES, mergeable="unknown",
+                       pr_state="closed", merged="true")
+    check("merged + stale CHANGES_REQUESTED -> 'merged', not review-blocked",
+          rc == 0 and out.strip() == "merged head=" + HEAD_SHA[:8])
+
+    print("== #435: CLOSED-unmerged PR -> 'closed' terminal, exit 0 ==")
+    rc, out, err = run(checks=GREEN_CHECK, reviews=CR_APPROVED, mergeable="unknown",
+                       pr_state="closed", merged="false")
+    check("closed -> exit 0", rc == 0)
+    check("emits 'closed head=<sha8>'", out.strip() == "closed head=" + HEAD_SHA[:8])
+
+    # ---------------------------------------------------------------------
+    # #441: thread-blocked. CI green, CR APPROVED, Copilot COMMENTED, blocked.
+    # ---------------------------------------------------------------------
+    print("== #441 (a): blocked + 1 unresolved thread + CI green -> thread-blocked ==")
+    rc, out, err, gargs = run(checks=GREEN_CHECK, reviews=CR_APPROVED_COPILOT_COMMENTED,
+                              mergeable="blocked", threads=THREADS_ONE_OPEN,
+                              want_graphql_args=True)
+    check("(a) exit 0", rc == 0)
+    check("(a) emits 'thread-blocked ... unresolved=1 by=<login>'",
+          out.strip() == "thread-blocked head=%s unresolved=1 by=%s" % (HEAD_SHA[:8], COPILOT))
+    check("(a) the GraphQL call is a `query`, never a mutation",
+          "query=query(" in gargs and "mutation" not in gargs)
+
+    print("== #441 (a'): by= de-duplicates the first-comment authors ==")
+    rc, out, err = run(checks=GREEN_CHECK, reviews=CR_APPROVED, mergeable="blocked",
+                       threads=THREADS_DUP_AUTHORS)
+    check("(a') unresolved=3 by= lists each login once",
+          out.strip() == "thread-blocked head=%s unresolved=3 by=%s,octocat" % (HEAD_SHA[:8], COPILOT))
+
+    print("== #441 (b): all threads resolved -> no thread-blocked (stays pending) ==")
+    rc, out, err = run(checks=GREEN_CHECK, reviews=CR_APPROVED, mergeable="blocked",
+                       threads=THREADS_ALL_RESOLVED, timeout_secs=PENDING_TIMEOUT)
+    check("(b) exit 1 (timeout)", rc == 1)
+    check("(b) no thread-blocked / settled on stdout", "thread-blocked" not in out and "settled" not in out)
+    check("(b) pending is merge(blocked) only", "pending=merge(blocked)\n" in err)
+
+    print("== #441 (c): GraphQL failure / malformed body -> neither thread-blocked nor settled ==")
+    for label, kw in (("gh failure", {"threads_rc": 1}),
+                      ("top-level errors", {"threads": THREADS_ERRORS}),
+                      ("null data", {"threads": '{"data":null}'}),
+                      ("non-JSON body", {"threads": "not json"}),
+                      ("null node", {"threads": THREADS_NULL_NODE}),
+                      ("non-boolean isResolved", {"threads": THREADS_NULL_RESOLVED})):
+        rc, out, err = run(checks=GREEN_CHECK, reviews=CR_APPROVED, mergeable="blocked",
+                           timeout_secs=PENDING_TIMEOUT, **kw)
+        check(f"(c) {label}: exit 1, no terminal on stdout",
+              rc == 1 and "thread-blocked" not in out and "settled" not in out)
+        check(f"(c) {label}: pending names threads(unreadable)", "threads(unreadable)" in err)
+
+    print("== #441 (d): CHANGES_REQUESTED + an open thread -> review-blocked wins ==")
+    rc, out, err = run(checks=GREEN_CHECK, reviews=CR_CHANGES, mergeable="blocked",
+                       threads=THREADS_ONE_OPEN)
+    check("(d) exit 0 + review-blocked", rc == 0 and "review-blocked head=" in out)
+    check("(d) no thread-blocked", "thread-blocked" not in out)
+
+    print("== #441 (e): CI pending -> no terminal ==")
+    rc, out, err = run(checks=PENDING_CHECK, reviews=CR_APPROVED, mergeable="blocked",
+                       threads=THREADS_ONE_OPEN, timeout_secs=PENDING_TIMEOUT)
+    check("(e) exit 1 (timeout)", rc == 1)
+    check("(e) no thread-blocked", "thread-blocked" not in out)
+    check("(e) pending names ci(1)", "ci(1)" in err)
+
+    print("== #441 (f): quiet-gate deferral -- Copilot still posting -> thread-blocked withheld ==")
+    # Copilot inline comments keep arriving, so the bot count never stabilizes. This
+    # also proves copilot-pull-request-reviewer[bot] is in QUIET_AUTHORS_JQ: without
+    # it the growing count is invisible and thread-blocked fires prematurely.
+    rc, out, err = run(checks=GREEN_CHECK, reviews=CR_APPROVED, mergeable="blocked",
+                       threads=THREADS_ONE_OPEN, grow_inline=COPILOT,
+                       timeout_secs=PENDING_TIMEOUT)
+    check("(f) exit 1 (timeout, deferred)", rc == 1)
+    check("(f) no thread-blocked while Copilot is still posting", "thread-blocked" not in out)
+    check("(f) pending names threads(quiet-confirm)", "threads(quiet-confirm)" in err)
+
+    print("== #441 (g): totalCount > nodes is REPORTED, not silently truncated ==")
+    rc, out, err = run(checks=GREEN_CHECK, reviews=CR_APPROVED, mergeable="blocked",
+                       threads=THREADS_TRUNC_OPEN)
+    check("(g) thread-blocked still fires on the fetched unresolved thread",
+          rc == 0 and "thread-blocked head=" in out and "unresolved=1" in out)
+    check("(g) stderr reports 100 of 150 fetched, a lower bound",
+          "100/150" in err and "lower bound" in err)
+    rc, out, err = run(checks=GREEN_CHECK, reviews=CR_APPROVED, mergeable="blocked",
+                       threads=THREADS_TRUNC_RESOLVED, timeout_secs=PENDING_TIMEOUT)
+    check("(g) truncated + every fetched thread resolved -> no terminal, pends threads(truncated)",
+          rc == 1 and "thread-blocked" not in out and "threads(truncated)" in err)
+
+    # ---------------------------------------------------------------------
+    # #399: one stderr line per pending-set CHANGE, silence when unchanged.
+    # ---------------------------------------------------------------------
+    print("== #399: pending-set transition emits one stderr line per change ==")
+    rc, out, err = run(checks=GREEN_CHECK, reviews=CR_APPROVED,
+                       mergeable_seq="behind,behind,behind,clean")
+    check("#399 settles after the transition", rc == 0 and "settled head=" in out)
+    check("#399 merge(behind) announced exactly once across 3 identical polls",
+          err.count("pr-watch: pending=merge(behind)\n") == 1)
+    check("#399 the change to quiet-confirm is announced",
+          "pr-watch: pending=quiet-confirm\n" in err)
+    check("#399 stdout carries only the terminal line", out.strip().count("\n") == 0)
+
+    print("== #399: unchanged pending set across many polls -> exactly one stderr line ==")
+    rc, out, err = run(checks=GREEN_CHECK, reviews=CR_APPROVED, mergeable="dirty",
+                       timeout_secs=PENDING_TIMEOUT)
+    check("#399 unchanged merge(dirty) -> one transition line only",
+          err.count("pr-watch: pending=") == 1 and "pr-watch: pending=merge(dirty)\n" in err)
 
     print()
     if FAILS:
