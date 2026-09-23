@@ -88,14 +88,17 @@ def _real_homes():
 
 
 # The real-home surfaces this harness's code paths can write AND that nothing else writes during
-# a gate run: the deploy targets (scripts, agents) and settings.json + its configure backup.
+# a gate run: the deploy targets (scripts, agents) and the settings files the configure narrow
+# step can rewrite (settings.json, settings.local.json, and each one's .bak backup).
 # DELIBERATELY NOT WATCHED: ~/.claude/orchestrate-floor.d and ~/.claude/orchestrate-resources.json.
 # The harness's up/down paths could write them, but OTHER live sessions legitimately write them
 # concurrently (per-session floor markers, merge-auth tokens, UAT port leases), so watching them
 # would redden the gate whenever another session is active - a flaky backstop gets ignored. They
 # stay protected by the HOME pin alone (isolated_env + main()'s process HOME).
 _PROTECTED = (os.path.join(".claude", "scripts"), os.path.join(".claude", "agents"),
-              os.path.join(".claude", "settings.json"), os.path.join(".claude", "settings.json.bak"))
+              os.path.join(".claude", "settings.json"), os.path.join(".claude", "settings.json.bak"),
+              os.path.join(".claude", "settings.local.json"),
+              os.path.join(".claude", "settings.local.json.bak"))
 
 
 def _snapshot_real_home():
@@ -2607,7 +2610,12 @@ def check_default_deploy_path_follows_home():
     with tempfile.TemporaryDirectory() as td:
         s = os.path.join(td, "settings.json")
         json.dump({"permissions": {"allow": []}}, open(s, "w"))
+        # A FRESH home, not the shared _ISO_HOME: earlier cases already deployed the guard and
+        # helpers into _ISO_HOME/.claude/scripts, so asserting there passes before configure runs
+        # (hostile review: a setup.py default mutated to a wrong dir still read [ok]).
+        fresh_home = os.path.join(td, "home"); os.makedirs(fresh_home)
         env = isolated_env()
+        env["HOME"] = fresh_home
         for k in ("ORCHESTRATE_SCRIPTS_DIR", "ORCHESTRATE_GUARD", "TOOL_INPUT"):
             env.pop(k, None)
         env.update({"ORCHESTRATE_SETTINGS": s, "ORCHESTRATE_SETTINGS_FILES": s,
@@ -2622,12 +2630,12 @@ def check_default_deploy_path_follows_home():
                     "ORCHESTRATE_PROJECT_AGENTS_DIR": "/nonexistent/project-agents"})
         p = subprocess.run([sys.executable, SCRIPT, "configure", "--apply", "--yes"], env=env,
                            capture_output=True, text=True, timeout=30)
-        iso_scripts = os.path.join(_ISO_HOME, ".claude", "scripts")
+        fresh_scripts = os.path.join(fresh_home, ".claude", "scripts")
         check("HOME isolation: configure's DEFAULT deploy targets follow $HOME (guard + pr-watch.sh "
-              f"land in the temp home; rc={p.returncode})",
+              f"land in a fresh temp home; rc={p.returncode})",
               p.returncode == 0
-              and os.path.isfile(os.path.join(iso_scripts, "orchestrate-guard.sh"))
-              and os.path.isfile(os.path.join(iso_scripts, "pr-watch.sh")))
+              and os.path.isfile(os.path.join(fresh_scripts, "orchestrate-guard.sh"))
+              and os.path.isfile(os.path.join(fresh_scripts, "pr-watch.sh")))
 
 
 def main():
