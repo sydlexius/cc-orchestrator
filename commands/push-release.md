@@ -49,9 +49,11 @@ The user may provide:
     elif [ -f ~/.claude/scripts/base-freshness.sh ]; then leg=stable
     else leg=none; fi
     out=""
-    [ "$leg" = repo ]   && out=$(bash scripts/base-freshness.sh main HEAD)
-    [ "$leg" = plugin ] && out=$(bash '${CLAUDE_PLUGIN_ROOT}/scripts/base-freshness.sh' main HEAD)
-    [ "$leg" = stable ] && out=$(bash ~/.claude/scripts/base-freshness.sh main HEAD)
+    # `|| true`: the helper exits 1 on behind. Under `set -e` a bare assignment would abort
+    # here, before the lines below print, and lose the release-specific STOP message.
+    [ "$leg" = repo ]   && out=$(bash scripts/base-freshness.sh main HEAD || true)
+    [ "$leg" = plugin ] && out=$(bash '${CLAUDE_PLUGIN_ROOT}/scripts/base-freshness.sh' main HEAD || true)
+    [ "$leg" = stable ] && out=$(bash ~/.claude/scripts/base-freshness.sh main HEAD || true)
     [ "$leg" = none ]   && out="freshness: NOT RUN -- base-freshness.sh not found on any leg (repo/plugin/deployed)"
     branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
     ahead=$(git rev-list --count origin/main..HEAD 2>/dev/null || echo "?")
@@ -111,8 +113,11 @@ The user may provide:
    #    rather than the last rc (stillwater carries v1.6.0-rc1..rc13, which all match "v").
    # The prefix is compared and stripped by LENGTH in awk, never as a pattern, so a prefix
    # holding '-' ("release-") or a glob character cannot distort the test.
-   tag_prefix="{tag_prefix}"      # from [release] in .claude/release.toml; may be empty
-   target_version="{version}"     # the version determined in Step 3
+   # Fill both in as SINGLE-QUOTED literals (config is data, never shell source: inside double
+   # quotes a `$(...)` in the prefix would execute). A value containing `'` -> STOP.
+   tag_prefix='{tag_prefix}'      # from [release] in .claude/release.toml; may be empty
+   target_version='{version}'     # the version determined in Step 3
+   case "$tag_prefix" in *[!A-Za-z0-9._/+-]*) echo "STOP: tag_prefix '$tag_prefix' has characters outside [A-Za-z0-9._/+-]"; exit 1 ;; esac
    case "$target_version" in *-*) stable=0 ;; *) stable=1 ;; esac
    last_tag=$(git tag --list "${tag_prefix}*" --sort=-creatordate --merged origin/main \
      | awk -v p="$tag_prefix" -v stable="$stable" '
@@ -219,17 +224,39 @@ The user may provide:
    searches for. A hardcoded `v` here would make a non-`v` project's next release find no
    prior tag and range over the whole history (#419).
 
+   `tag_prefix` comes from repository config, so the tag name is built ONCE as data, validated,
+   and then passed as a single quoted variable -- never pasted into the command text, where a
+   `;` or `$(...)` in the prefix would run as shell. Fill in both values as SINGLE-QUOTED
+   literals; if either contains a `'`, STOP (it cannot be a valid tag anyway):
+
    ```bash
+   tag_prefix='{tag_prefix}'; version='{version}'
+   tag="${tag_prefix}${version}"
+   case "$tag" in
+     *[!A-Za-z0-9._/+-]*|'') echo "STOP: tag name '$tag' has characters outside [A-Za-z0-9._/+-]"; exit 1 ;;
+   esac
+   git check-ref-format "refs/tags/$tag" || { echo "STOP: '$tag' is not a valid git tag name"; exit 1; }
    git add -A
-   git commit -m "release: {tag_prefix}{version}"
-   git tag -s {tag_prefix}{version} -m "{tag_prefix}{version}"
+   git commit -m "release: $tag"
+   git tag -s "$tag" -m "$tag"
+   echo "tag=$tag"
    ```
 
-10. **Push.** `git push && git push origin {tag_prefix}{version}` -- push only this release's
-    tag, never `--tags`, which would also publish any stray local tag (a nightly or test tag).
+10. **Push** the release commit, then ONLY this release's tag (never `--tags`, which would
+    also publish any stray local tag such as a nightly or test tag). Re-set `tag` the same
+    way; this block runs in a fresh shell:
 
-11. **Monitor.** Run `gh run list --branch {tag_prefix}{version} --limit 1` to show the release
-    workflow status. Provide the URL so the user can watch it.
+    ```bash
+    tag='<the tag= value Step 9 printed>'
+    git push && git push origin "refs/tags/$tag"
+    ```
+
+11. **Monitor.** Show the release workflow status and give the user the URL to watch:
+
+    ```bash
+    tag='<the tag= value Step 9 printed>'
+    gh run list --branch "$tag" --limit 1
+    ```
 
 ### Important
 
