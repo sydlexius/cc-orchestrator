@@ -686,7 +686,9 @@ drives `/plugin marketplace` update-detection, so they must never diverge. The C
      least-privilege check that the proposed change never weakens the deterministic floor or broadens an
      allow-list. No tasked hostile review -> no issue, no drain.
   2. THEN FILE THE ISSUE (only after step 1). A verified entry becomes a normal issue (template + agent
-     hints + immediate CR steering per the SKILL.md DRAIN PROCEDURE); an unreproducible claim is still filed,
+     hints, per the SKILL.md DRAIN PROCEDURE - supersedes closed #19's atomic-CR-steering mandate; never post
+     an `@coderabbitai` steer on the resulting Coding Plan, per the user-global NEVER STEER A CR
+     CODING PLAN rule, which has no carve-out); an unreproducible claim is still filed,
      framed as a KNOWLEDGE-GAP issue (never lose the signal); an entry the hostile review KILLS is drained
      via `drain <entry> --killed --verdict "KILLED: <reason>"` (the `--killed` flag makes `--issue`
      OPTIONAL - without it `drain` requires a numeric `--issue N` and rejects the killed form), so the
@@ -695,6 +697,19 @@ drives `/plugin marketplace` update-detection, so they must never diverge. The C
      KILLED drop reason) is recorded against it via `drain`. NEVER drain before the issue exists; NEVER file before the
      hostile review. This GATES the SKILL.md "TRIAGE RIGOR / DRAIN PROCEDURE"; if the two ever disagree, this
      ordering wins.
+- SHOW-YOUR-WORK EVIDENCE GATE (BINDING; #314). A measurement used to justify a BINDING rule change
+  (global or repo CLAUDE.md, SKILL.md, a charter, or a memory rule) MUST persist, alongside its
+  conclusion: the exact queries run, the operational definition of every metric, and the raw or
+  re-derivable data. Absent those, the claim is a PRIOR, not evidence, and must be labeled as such
+  everywhere it is cited. NAME THE FAILURE MODE: dispatching a report-writing/measurement task to an
+  agent with NO WRITE TOOLS, then treating its prose as a result - the data dies with the subagent's
+  context and only the conclusion survives. Give a measurement agent a SCOPED WRITE PATH, or run the
+  measurement yourself. This covers a LEAD-PRODUCED measurement, not only a feedback-log entry: an
+  entry already passes through the DRAIN GATE's hostile-review reproduction step above, but a lead's
+  own measurement does not, and that asymmetry is exactly how an unreproducible statistic (the "0/30
+  CR review bodies cite the Coding Plan" claim once offered for the global NEVER-STEER rule, reported in #314 and now marked UNREPRODUCIBLE - do not cite it
+  as evidence) became a binding rule with no surviving query or data. Prose/process rule only - no
+  floor/guard/allow-list impact.
 
 ## Deployment
 

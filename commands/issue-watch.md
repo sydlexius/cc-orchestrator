@@ -14,7 +14,7 @@ The script is silent during the wait and emits exactly one line on stdout when d
 
 1. **`closed issue=<n>`** -- the issue was closed (e.g. by a merged PR's closing keyword). Exit 0. Next action: post-merge verification.
 2. **`new-comment issue=<n> author=<login> id=<cid>`** (+ the full body on the following lines) -- a new comment appeared (default mode, any author). Exit 0. Next action: read / reply.
-3. **`plan-ready issue=<n> author=<login> id=<cid>`** (+ body) -- in `--author` mode, a comment from that author appeared AND stabilized (see below). Exit 0. Next action: steer the CodeRabbit Coding Plan.
+3. **`plan-ready issue=<n> author=<login> id=<cid>`** (+ body) -- in `--author` mode, a comment from that author appeared AND stabilized (see below). Exit 0. Next action: read the comment; a CodeRabbit Coding Plan is optional input for the implementer's brief, never a gate (never steer it).
 4. **`labeled issue=<n> +<label>... -<label>...`** -- labels added/removed. Exit 0.
 5. **`assigned issue=<n> +<login>... -<login>...`** -- assignees changed. Exit 0.
 6. **`reopened issue=<n>`** -- a CLOSED issue reopened. Exit 0.
@@ -29,7 +29,7 @@ A CR issue Coding Plan lands as ONE comment that self-edits over ~10-15 min, so 
 
 `--author` tolerates the GitHub App `[bot]` suffix: pass the bare name (`--author coderabbitai`) and it matches the actual REST login `coderabbitai[bot]` as well.
 
-Note (2026-07 org state): with CR auto-review OFF org-wide (#214), CodeRabbit does NOT auto-post an issue Coding Plan; a plan appears only when the maintainer explicitly requests a CR pass. So `--author coderabbitai` is for watching a MAINTAINER-triggered plan, not an auto-arriving one.
+Note: CodeRabbit issue Coding Plans are no longer offered freely and are never a dispatch gate, so orchestrate never waits for one. `--author <login>` remains a general "wait for a comment from this author" mode.
 
 ## Args
 
@@ -67,7 +67,7 @@ Step 2, which carries the full explanation.
 
 ## Step 2 -- Dispatch on the terminal line
 
-- **`plan-ready ...`** + Exit 0 -> vet + steer the CR Coding Plan (a consolidated `@coderabbitai <feedback>` reply on the issue), per the BINDING GATE.
+- **`plan-ready ...`** + Exit 0 -> read the comment; if it is a CR Coding Plan, fold what holds up into the implementer's brief (optional input, never a gate, per SKILL.md); never post a `@coderabbitai <feedback>` steer on the plan.
 - **`new-comment ...`** + Exit 0 -> read the body; reply if it needs action.
 - **`closed ...`** + Exit 0 -> run post-merge verification (linked issue closed as expected).
 - **`labeled ...` / `assigned ...` / `reopened ...`** + Exit 0 -> triage per the change.
