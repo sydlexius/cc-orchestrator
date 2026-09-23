@@ -2,8 +2,10 @@
 """Proof harness for orchestrate-setup.py. Drives the CLI against temp fixtures
 (temp settings/marker/guard/templates/artifact dirs) so the real env is never touched.
 Run: python3 test-orchestrate-setup.py"""
+import atexit
 import json
 import os
+import pwd
 import re
 import shutil
 import subprocess
@@ -57,10 +59,76 @@ def write_stub_guard(path, selftest_rc=0):
 # main()'s tempdir and used as run()'s DEFAULT ORCHESTRATE_SETTINGS_FILES. See run().
 _CLEAN_CASCADE = None
 
+# HOME ISOLATION. orchestrate-setup.py derives EVERY default path from expanduser("~"): the
+# deployed guard (GUARD), the helper deploy dir (SCRIPTS_DIR), settings.json, the floor marker
+# dir, the agents dir. Before this, run() isolated steer/ctxmeter/setup/agents/cascade but left
+# HOME real and ORCHESTRATE_GUARD / ORCHESTRATE_SCRIPTS_DIR undefaulted, so every `configure
+# --apply` whose overrides omitted them (the #71 narrowing tests via nov()/unparse_ov, and env5)
+# ran _deploy_guard + _deploy_helper against the REAL ~/.claude/scripts - installing the
+# CHECKOUT's guard and helpers as the live floor. On 2026-09-22 that deployed an unmerged branch's
+# pr-watch.sh, and a branch editing the guard would have installed its unreviewed deny floor at
+# the next session restart. _ISO_HOME is one per-run temp home that EVERY subprocess (and this
+# process, for the in-process module imports) sees as HOME; main() creates and removes it.
+_ISO_HOME = None
+
+
+def _real_home():
+    """The home the self-check protects. Resolved from the passwd database, NOT $HOME, so no HOME
+    override (ours or the caller's) can point the check somewhere harmless. ORCHESTRATE_TEST_REAL_HOME
+    is a TEST-ONLY seam for mutation-proving the self-check against a throwaway dir - never set it
+    in a real run, since it redirects what the check protects."""
+    return os.environ.get("ORCHESTRATE_TEST_REAL_HOME") or pwd.getpwuid(os.getuid()).pw_dir
+
+
+_PROTECTED = (os.path.join(".claude", "scripts"), os.path.join(".claude", "agents"),
+              os.path.join(".claude", "settings.json"))
+
+
+def _snapshot_real_home():
+    """{path: (ctime, size)} over the protected real-home surfaces, read-only (lstat only). An
+    absent path is recorded as ABSENT so a CREATE is detected as a change, not just a modify."""
+    snap = {}
+    home = _real_home()
+    for rel in _PROTECTED:
+        top = os.path.join(home, rel)
+        if not os.path.lexists(top):
+            snap[top] = ("ABSENT", 0); continue
+        st = os.lstat(top); snap[top] = (st.st_ctime, st.st_size)
+        if os.path.isdir(top) and not os.path.islink(top):
+            for root, dirs, files in os.walk(top):
+                for n in dirs + files:
+                    p = os.path.join(root, n)
+                    try:
+                        st = os.lstat(p); snap[p] = (st.st_ctime, st.st_size)
+                    except OSError:
+                        snap[p] = ("UNREADABLE", 0)
+    return snap
+
+
+def isolated_env(base=None):
+    """The env every setup/guard subprocess gets: `base` (default os.environ) with HOME pinned to
+    the per-run temp home and the deploy-path vars pointed INSIDE it. They are ASSIGNED, not
+    setdefault'ed: an ambient ORCHESTRATE_GUARD / _SCRIPTS_DIR exported in the developer's shell
+    must not leak a real path back in. A test's explicit fixture still wins because callers apply
+    their overrides AFTER this (run()'s env_overrides, env5's nov()). The BUNDLED sources point at
+    the checkout's own scripts/ - exactly setup.py's own default, made explicit so a future change
+    to that default cannot quietly redirect a deploy SOURCE; they are only ever READ."""
+    if not _ISO_HOME:
+        raise RuntimeError("isolated_env() called before main() created the isolated HOME")
+    env = dict(os.environ if base is None else base)
+    env["HOME"] = _ISO_HOME
+    iso_scripts = os.path.join(_ISO_HOME, ".claude", "scripts")
+    here = os.path.dirname(os.path.abspath(SCRIPT))
+    env["ORCHESTRATE_SCRIPTS_DIR"] = iso_scripts
+    env["ORCHESTRATE_GUARD"] = os.path.join(iso_scripts, "orchestrate-guard.sh")
+    env["ORCHESTRATE_BUNDLED_SCRIPTS_DIR"] = here
+    env["ORCHESTRATE_BUNDLED_GUARD"] = os.path.join(here, "orchestrate-guard.sh")
+    return env
+
 
 def run(args, *, env_overrides=None, tmux=True):
     """Invoke the CLI. Returns (returncode, stdout+stderr)."""
-    env = dict(os.environ)
+    env = isolated_env()
     env.pop("TOOL_INPUT", None)
     # #305 CASCADE ISOLATION: default the settings CASCADE to a single clean fixture, the same
     # way the steer/ctxmeter/setup sources are defaulted to /nonexistent below. WHY: doctor's
@@ -200,7 +268,7 @@ def check_compound_shadow_matcher():
         check(f"#369: not a shadow - Bash({pat[:52]})", m._merge_rule_shadows(pat) is False)
 
 
-def main():
+def _run_checks():
     global _CLEAN_CASCADE
     with tempfile.TemporaryDirectory() as td:
         # #305: the clean cascade fixture backing run()'s ORCHESTRATE_SETTINGS_FILES default.
@@ -1793,7 +1861,7 @@ def main():
 
         # The deployed setup script is callable: `init` subcommand exits 0 against it.
         p = subprocess.run([sys.executable, sdest, "init"],
-                           env={**os.environ, "ORCHESTRATE_SETTINGS_FILES": i1},
+                           env={**isolated_env(), "ORCHESTRATE_SETTINGS_FILES": i1},
                            capture_output=True, text=True, timeout=30)
         check("#162: the deployed setup script is callable (init exits 0)", p.returncode == 0)
 
@@ -1981,7 +2049,9 @@ def main():
         d = dict(WIREDHOOK); d["permissions"] = {"allow": [blanket]}
         json.dump(d, open(ncfg5, "w"))
         # Drive an interactive (no --yes) --apply with 'n' on stdin via a subprocess wrapper.
-        env5 = dict(os.environ); env5["TMUX"] = TEST_TMUX; env5.update(nov(ncfg5))
+        # isolated_env(), NOT dict(os.environ): this interactive --apply runs the same deploy
+        # pass as run(), so a raw environ here deployed into the real ~/.claude/scripts.
+        env5 = isolated_env(); env5["TMUX"] = TEST_TMUX; env5.update(nov(ncfg5))
         env5["ORCHESTRATE_BUNDLED_STEER"] = "/nonexistent/steer-bundled.sh"  # steer isolation (#95)
         env5["ORCHESTRATE_STEER"] = "/nonexistent/steer-deployed.sh"
         p5 = subprocess.run([sys.executable, SCRIPT, "configure", "--apply"], env=env5,
@@ -2193,7 +2263,7 @@ def main():
         p_bad = subprocess.run(
             [sys.executable, SCRIPT, "up", "--team", "t112", "--repo", r112,
              "--slug", "notaslug"],
-            capture_output=True, text=True, env=dict(os.environ,
+            capture_output=True, text=True, env=dict(isolated_env(),
                 TMUX=TEST_TMUX,
                 ORCHESTRATE_FLOOR_DIR=td112,
             )
@@ -2507,6 +2577,28 @@ def main():
     # what surfaced it: the new cases "passed" against the KNOWN-BROKEN round-1 matcher,
     # which is only possible if they never ran.
     check_compound_shadow_matcher()
+
+
+def main():
+    global _ISO_HOME
+    # HOME ISOLATION + REAL-HOME SELF-CHECK. The snapshot is taken BEFORE anything runs and compared
+    # in a finally, so a run that dies mid-way still reports a real-home write instead of hiding it
+    # behind the traceback. HOME is also pinned in THIS process: several cases exec_module() setup.py
+    # in-process, and its module-level defaults read expanduser("~") at import time.
+    before = _snapshot_real_home()
+    _ISO_HOME = tempfile.mkdtemp(prefix="orch-setup-home-")
+    atexit.register(shutil.rmtree, _ISO_HOME, True)
+    os.environ["HOME"] = _ISO_HOME
+    try:
+        _run_checks()
+    finally:
+        after = _snapshot_real_home()
+        changed = sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
+        check("HOME isolation: the real ~/.claude/{scripts,agents,settings.json} is untouched "
+              f"by this harness ({len(changed)} path(s) changed under {_real_home()})", not changed)
+        for p in changed[:40]:
+            print(f"    REAL-HOME CHANGE: {p}: {before.get(p, 'ABSENT-AT-START')} -> "
+                  f"{after.get(p, 'REMOVED')}")
 
     print()
     if FAILS:
