@@ -57,7 +57,9 @@
 #     thread-blocked head=<sha8> unresolved=<n> failing=<n> by=<login[,login...]>
 #         (#441) CI is terminal (no pending check; failing=<n> may be nonzero, it
 #         counts checks in a FAILURE/ERROR/CANCELLED/TIMED_OUT/ACTION_REQUIRED/
-#         STARTUP_FAILURE state from the SAME checks read - so "CI terminal" is
+#         STARTUP_FAILURE/STALE state from the SAME checks read; classification
+#         is FAIL-CLOSED: only SUCCESS/NEUTRAL/SKIPPED are done, and every state
+#         outside those ten, known or not, PENDS - so "CI terminal" is
 #         NOT "CI green"; an unreadable checks read pends as ci(unknown) and never
 #         reaches this terminal, so failing is never a guessed zero), nothing else is pending
 #         (no CR / Codoki wait), review-blocked did NOT fire (it keeps priority),
@@ -205,10 +207,16 @@ fi
 # latency in the CR-only happy path and up to ~20 min when Greptile is enabled
 # on the repo. It defends against premature settle in both windows.
 #
-# To add a new bot reviewer (e.g. CodeQL, Copilot, custom org-level bot):
-# append its login to the disjunction. The script always reads the disjunction
-# in this single location so updates are one-edit.
-QUIET_AUTHORS_JQ='(.user.login == "coderabbitai[bot]" or .user.login == "github-actions[bot]" or .user.login == "greptile-apps[bot]" or .user.login == "codoki-pr-intelligence[bot]" or .user.login == "copilot-pull-request-reviewer[bot]")'
+# To add a new bot reviewer (e.g. CodeQL, custom org-level bot): append its
+# login to the disjunction. The script always reads the disjunction in this
+# single location so updates are one-edit.
+#
+# Copilot needs BOTH spellings (#441): its REVIEW object's REST login is
+# `copilot-pull-request-reviewer[bot]`, but its INLINE review comments carry the
+# REST login `Copilot` (measured live on PR #443; pr-unreplied-comments.sh lists
+# both for the same reason). Only the `[bot]` form left every Copilot inline
+# comment out of the count, so a Copilot review still trickling in read as quiet.
+QUIET_AUTHORS_JQ='(.user.login == "coderabbitai[bot]" or .user.login == "github-actions[bot]" or .user.login == "greptile-apps[bot]" or .user.login == "codoki-pr-intelligence[bot]" or .user.login == "copilot-pull-request-reviewer[bot]" or .user.login == "Copilot")'
 
 # count_bot_activity -- emit a single integer: total reviews + pull-comments +
 # issue-comments authored by an allow-listed bot. Stable count across two polls
@@ -479,7 +487,9 @@ while true; do
       | if ($allow | length) > 0 then map(select(. as $l | $allow | index($l))) else . end
       | join(",")' 2>/dev/null || echo "")
   if [ -n "$blocked_by" ]; then
-    cur_bot_count=$(count_bot_activity)
+    # Head-scoped baseline (see the thread-blocked comment): a count taken on an
+    # earlier head can never confirm this one.
+    cur_bot_count="${cur_head}:$(count_bot_activity)"
     if [ -n "$prev_bot_count" ] && [ "$cur_bot_count" = "$prev_bot_count" ]; then
       echo "review-blocked head=${cur_head:0:8} by=${blocked_by}"
       exit 0
@@ -551,10 +561,23 @@ while true; do
   # body) leaves BOTH unset -> "unknown". So failing_ci is a number exactly when
   # pending_ci is, and an unreadable failing count can never read as zero: it rides
   # the ci(unknown) pending item, which keeps thread-blocked unreachable.
+  #
+  # FAIL-CLOSED classification (#441 CR/Copilot round). Only three states are DONE
+  # and not failing: SUCCESS, NEUTRAL, SKIPPED. The seven FAILING states are
+  # FAILURE, ERROR, CANCELLED, TIMED_OUT, ACTION_REQUIRED, STARTUP_FAILURE, STALE
+  # (STALE never transitions on its own; ship-gate-preflight.sh and
+  # orchestrate-status.sh count it failing too). EVERY other state PENDS - the
+  # known ones (PENDING, QUEUED, IN_PROGRESS, EXPECTED, REQUESTED, WAITING) and
+  # any state GitHub adds later - so an unlisted state can never read as "done".
+  # A hand-picked pending set was the defect: EXPECTED/WAITING/REQUESTED fell into
+  # neither set, CI read terminal, and thread-blocked could fire mid-run.
+  # shellcheck disable=SC2016  # $fail/$done are jq variables, NOT shell expansions.
   ci_counts=$(gh pr checks "$pr" --repo "$repo" --json state \
-    --jq 'if type == "array" and all(.[]; type == "object" and (.state | type) == "string")
-          then "\([.[] | select(.state == "PENDING" or .state == "QUEUED" or .state == "IN_PROGRESS")] | length) \([.[] | select(.state == "FAILURE" or .state == "ERROR" or .state == "CANCELLED" or .state == "TIMED_OUT" or .state == "ACTION_REQUIRED" or .state == "STARTUP_FAILURE")] | length)"
-          else "unknown" end' \
+    --jq '["FAILURE","ERROR","CANCELLED","TIMED_OUT","ACTION_REQUIRED","STARTUP_FAILURE","STALE"] as $fail
+          | ["SUCCESS","NEUTRAL","SKIPPED"] as $done
+          | if type == "array" and all(.[]; type == "object" and (.state | type) == "string")
+            then "\([.[] | select((.state | IN($fail[])) or (.state | IN($done[])) | not)] | length) \([.[] | select(.state | IN($fail[]))] | length)"
+            else "unknown" end' \
     2>/dev/null || echo "unknown")
   pending_ci="unknown"; failing_ci="unknown"
   if [[ "$ci_counts" =~ ^([0-9]+)\ ([0-9]+)$ ]]; then
@@ -574,8 +597,9 @@ while true; do
   if [ ${#pending_list[@]} -eq 0 ]; then
     # All hard criteria pass. Apply the quiet-period gate: require bot-comment
     # count to be unchanged from the previous poll before declaring settled.
-    # The first time we land here we set the baseline and poll again.
-    cur_bot_count=$(count_bot_activity)
+    # The first time we land here we set the baseline and poll again. The
+    # baseline is head-scoped, so a count from an earlier head never confirms.
+    cur_bot_count="${cur_head}:$(count_bot_activity)"
     if [ -n "$prev_bot_count" ] && [ "$cur_bot_count" = "$prev_bot_count" ]; then
       echo "settled head=${cur_head:0:8} mergeable=${cur_mergeable_state}"
       exit 0
@@ -618,11 +642,16 @@ while true; do
         # is REACHABLE: a settle-path (or review-blocked) baseline survives into the
         # next poll, which `continue`s without resetting it, so a PR reading `clean`
         # then `blocked` would otherwise emit thread-blocked on a SINGLE thread read.
-        # What the tag buys is two consecutive polls on which THIS terminal's own
-        # predicate held (unresolved thread + sole merge(blocked)), matching what
-        # settled requires of its own; the bot-trickle defense itself is the count.
-        # Pinned by the harness case "#441 (h)".
-        cur_bot_count="thread:$(count_bot_activity)"
+        # It is also tagged with the HEAD sha: a push between two polls leaves the
+        # bot count unchanged (the new head has no activity yet), so an untagged
+        # baseline from the OLD head would confirm the NEW head on its first read.
+        # The settled and review-blocked baselines carry the same head tag for the
+        # same reason. What the tags buy is two consecutive polls on the SAME head
+        # on which THIS terminal's own predicate held (unresolved thread + sole
+        # merge(blocked)), matching what settled requires of its own; the
+        # bot-trickle defense itself is the count. Pinned by the harness cases
+        # "#441 (h)" (path tag) and "#441 (o)" (head tag).
+        cur_bot_count="thread:${cur_head}:$(count_bot_activity)"
         if [ -n "$prev_bot_count" ] && [ "$cur_bot_count" = "$prev_bot_count" ]; then
           # failing_ci is numeric here by construction (see the checks read):
           # this branch requires pending_ci == "0", and both come from one parse.

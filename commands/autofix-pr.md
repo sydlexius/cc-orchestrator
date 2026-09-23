@@ -304,7 +304,10 @@ elif [ "$tb_failing" -gt 0 ]; then thread_next=stall-ci
 elif ! printf '%s\n' "$tb_by" | tr ',' '\n' | grep -q '\[bot\]$'; then thread_next=stall-human
 elif [ -n "$prev_thread_unresolved" ] && [ "$tb_unresolved" -ge "$prev_thread_unresolved" ]; then thread_next=stall-noprogress
 else thread_next=handle-review; fi
-echo "thread_next=$thread_next unresolved=${tb_unresolved:-?} failing=${tb_failing:-?} by=${tb_by:-?}"
+# by= can MIX authors. Every login NOT ending in [bot] opened a human thread that
+# handle-review will not answer; list them so the handle-review leg surfaces them.
+tb_humans=$(printf '%s\n' "$tb_by" | tr ',' '\n' | grep -v '\[bot\]$' | paste -sd, -)
+echo "thread_next=$thread_next unresolved=${tb_unresolved:-?} failing=${tb_failing:-?} by=${tb_by:-?} humans=${tb_humans:-none}"
 ```
 
 Dispatch on `thread_next`, in this order (first match wins):
@@ -319,10 +322,10 @@ Dispatch on `thread_next`, in this order (first match wins):
   failing" row of the Step 3 matrix):
 
   ```bash
-  # Select on .state with EXACTLY the six-state set scripts/pr-watch.sh counts as
-  # failing=, never on .bucket: gh buckets STARTUP_FAILURE as "pending", so a bucket
-  # filter would return no names for a check pr-watch counted.
-  gh pr checks "$pr_number" --json name,state --jq '.[] | select(.state == "FAILURE" or .state == "ERROR" or .state == "CANCELLED" or .state == "TIMED_OUT" or .state == "ACTION_REQUIRED" or .state == "STARTUP_FAILURE") | .name'
+  # Select on .state with EXACTLY the seven-state set scripts/pr-watch.sh counts as
+  # failing=, never on .bucket: gh buckets STARTUP_FAILURE and STALE as "pending",
+  # so a bucket filter would return no names for a check pr-watch counted.
+  gh pr checks "$pr_number" --json name,state --jq '.[] | select(.state == "FAILURE" or .state == "ERROR" or .state == "CANCELLED" or .state == "TIMED_OUT" or .state == "ACTION_REQUIRED" or .state == "STARTUP_FAILURE" or .state == "STALE") | .name'
   ```
 
   Print "round <round>: thread-blocked with <failing> failing check(s): <names>.
@@ -341,7 +344,13 @@ Dispatch on `thread_next`, in this order (first match wins):
   auto-resolve after the reply, or a human-opened thread is among them. RAISE
   this to the maintainer; NEVER force-resolve a CodeRabbit thread." and exit
   with status **STALL** (the "thread round, no progress" row).
-- `handle-review` -> proceed below.
+- `handle-review` -> proceed below. At least one thread is bot-opened, but
+  `by=` may ALSO hold human logins. If the printed `humans=` is not `none`,
+  print "round <round>: thread-blocked also by human reviewer(s) <humans>; NEEDS
+  YOU - answer or resolve those threads (handle-review handles the bot threads
+  only)." BEFORE invoking handle-review, so the human share surfaces in THIS
+  round rather than only when the bot threads are gone and a later round lands
+  on `stall-human`. Then continue; the bot threads still get their round.
 
 Capture `pre_head` exactly as in FIX, invoke `/handle-review <pr_number>` via
 Skill, then read `post_head` and `remote_head` the same way.

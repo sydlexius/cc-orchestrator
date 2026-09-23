@@ -90,6 +90,11 @@ def bump(name):
 seq = os.environ.get("MERGEABLE_SEQ", "")
 if seq and args[:1] == ["api"] and any(a.endswith("/pulls/123") for a in args):
     vals = seq.split(","); MERGEABLE = vals[min(bump("pull"), len(vals) - 1)]
+# HEAD_SEQ ("<sha>,<sha>") steps the PR head per pulls/<n> read, holding the last
+# value, so a test can push between two polls (#441 head-scoped quiet baseline).
+hseq = os.environ.get("HEAD_SEQ", "")
+if hseq and args[:1] == ["api"] and any(a.endswith("/pulls/123") for a in args):
+    hv = hseq.split(","); HEAD_SHA = hv[min(bump("pullhead"), len(hv) - 1)]
 PULL = ('{"head":{"sha":"%s"},"mergeable_state":"%s","state":"%s","merged":%s}'
         % (HEAD_SHA, MERGEABLE, PR_STATE, MERGED))
 COMMIT = '{"commit":{"committer":{"date":"%s"}}}' % COMMITTER_DATE
@@ -104,6 +109,11 @@ def emit(data):
     sys.exit(0)
 
 if args[:2] == ["pr", "checks"]:
+    # CHECKS_RC != 0 reproduces gh's zero-checks path: gh (v2.30 through v2.101,
+    # measured) exits 1 with "no checks reported on the '<branch>' branch" on
+    # STDERR and writes nothing to stdout, even with --json.
+    if int(os.environ.get("CHECKS_RC", "0")):
+        sys.stderr.write("no checks reported on the 'x' branch\n"); sys.exit(1)
     emit(CHECKS)
 if args[:2] == ["pr", "view"]:
     emit('{"labels":%s}' % LABELS)
@@ -130,6 +140,8 @@ for a in args:
     if "repos/" in a:
         endpoint = a; break
 if endpoint.endswith("/reviews"):
+    if STATE_DIR:
+        bump("reviews")  # one reviews read per poll: counts the polls taken
     emit(REVIEWS)
 if endpoint.endswith("/comments") and "/pulls/" in endpoint:
     # GROW_INLINE=<login>: every read returns one MORE inline comment by <login>, so
@@ -154,7 +166,8 @@ def run(*, labels="[]", checks="[]", reviews="[]", codoki_rc=0,
         requested_reviewers='{"users":[]}', comments="[]", issue_comments="[]",
         timeout_secs=SETTLE_TIMEOUT, blocking_reviewers=None, mergeable="clean",
         pr_state="open", merged="false", threads=None, threads_rc=0,
-        mergeable_seq="", grow_inline="", want_graphql_args=False):
+        mergeable_seq="", grow_inline="", want_graphql_args=False,
+        head_seq="", checks_rc=0, want_polls=False):
     with tempfile.TemporaryDirectory() as td:
         state_dir = os.path.join(td, "state"); os.makedirs(state_dir)
         bindir = os.path.join(td, "bin"); os.makedirs(bindir)
@@ -183,6 +196,8 @@ def run(*, labels="[]", checks="[]", reviews="[]", codoki_rc=0,
             env["THREADS_JSON"] = threads
         env["THREADS_RC"] = str(threads_rc)
         env["MERGEABLE_SEQ"] = mergeable_seq
+        env["HEAD_SEQ"] = head_seq
+        env["CHECKS_RC"] = str(checks_rc)
         env["GROW_INLINE"] = grow_inline
         env["STUB_STATE_DIR"] = state_dir
         env["COMMITTER_DATE"] = COMMITTER_DATE
@@ -199,6 +214,10 @@ def run(*, labels="[]", checks="[]", reviews="[]", codoki_rc=0,
 
         p = subprocess.run(["bash", SCRIPT, "123", "owner/repo", str(timeout_secs)],
                            env=env, capture_output=True, text=True, timeout=30)
+        if want_polls:
+            rpath = os.path.join(state_dir, "reviews")
+            polls = int(open(rpath).read()) if os.path.exists(rpath) else 0
+            return p.returncode, p.stdout, p.stderr, polls
         if want_graphql_args:
             gpath = os.path.join(state_dir, "graphql-args")
             gargs = open(gpath).read() if os.path.exists(gpath) else ""
@@ -242,6 +261,7 @@ PENDING_CHECK = '[{"name":"ci","state":"IN_PROGRESS","description":""}]'
 
 # #441 reviewThreads fixtures (GraphQL shape pr-watch.sh queries).
 COPILOT = "copilot-pull-request-reviewer[bot]"
+COPILOT_INLINE = "Copilot"  # REST login on Copilot's INLINE review comments (measured, PR #443)
 CR_APPROVED_COPILOT_COMMENTED = (
     '[{"user":{"login":"coderabbitai[bot]"},"state":"APPROVED","submitted_at":"2026-06-18T01:00:00Z"},'
     '{"user":{"login":"%s"},"state":"COMMENTED","submitted_at":"2026-06-18T01:10:00Z"}]' % COPILOT)
@@ -502,15 +522,18 @@ def main():
     check("(e) pending names ci(1)", "ci(1)" in err)
 
     print("== #441 (f): quiet-gate deferral -- Copilot still posting -> thread-blocked withheld ==")
-    # Copilot inline comments keep arriving, so the bot count never stabilizes. This
-    # also proves copilot-pull-request-reviewer[bot] is in QUIET_AUTHORS_JQ: without
-    # it the growing count is invisible and thread-blocked fires prematurely.
-    rc, out, err = run(checks=GREEN_CHECK, reviews=CR_APPROVED, mergeable="blocked",
-                       threads=THREADS_ONE_OPEN, grow_inline=COPILOT,
-                       timeout_secs=PENDING_TIMEOUT)
-    check("(f) exit 1 (timeout, deferred)", rc == 1)
-    check("(f) no thread-blocked while Copilot is still posting", "thread-blocked" not in out)
-    check("(f) pending names threads(quiet-confirm)", "threads(quiet-confirm)" in err)
+    # Copilot inline comments keep arriving, so the bot count never stabilizes. Live on
+    # PR #443 every Copilot INLINE comment carries the REST login `Copilot`; only its
+    # review object is copilot-pull-request-reviewer[bot]. Both spellings are run, so
+    # dropping EITHER from QUIET_AUTHORS_JQ makes the growing count invisible and
+    # thread-blocked fires prematurely.
+    for login in (COPILOT_INLINE, COPILOT):
+        rc, out, err = run(checks=GREEN_CHECK, reviews=CR_APPROVED, mergeable="blocked",
+                           threads=THREADS_ONE_OPEN, grow_inline=login,
+                           timeout_secs=PENDING_TIMEOUT)
+        check("(f) %s: exit 1 (timeout, deferred)" % login, rc == 1)
+        check("(f) %s: no thread-blocked while Copilot is still posting" % login, "thread-blocked" not in out)
+        check("(f) %s: pending names threads(quiet-confirm)" % login, "threads(quiet-confirm)" in err)
 
     print("== #441 (g): totalCount > nodes is REPORTED, not silently truncated ==")
     rc, out, err = run(checks=GREEN_CHECK, reviews=CR_APPROVED, mergeable="blocked",
@@ -563,7 +586,7 @@ def main():
     print("== #441 (l): red CI + open thread -> thread-blocked names failing=1 ==")
     # Parametrized over EVERY failing state pr-watch.sh counts (its jq select), so dropping
     # any one of the six from that set reads failing=0 for its fixture and reddens here.
-    for fstate in ("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"):
+    for fstate in ("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"):
         ck = RED_AND_GREEN_CHECKS.replace('"state":"FAILURE"', '"state":"%s"' % fstate)
         rc, out, err = run(checks=ck, reviews=CR_APPROVED, mergeable="blocked",
                            threads=THREADS_ONE_OPEN)
@@ -580,6 +603,47 @@ def main():
                            threads=THREADS_ONE_OPEN, timeout_secs=PENDING_TIMEOUT)
         check(f"(m) {label}: exit 1, no thread-blocked", rc == 1 and "thread-blocked" not in out)
         check(f"(m) {label}: pending names ci(unknown)", "ci(unknown)" in err)
+
+    print("== #441 (n): fail-closed CI -- any state outside the done/failing sets PENDS ==")
+    # Only SUCCESS/NEUTRAL/SKIPPED are done. EXPECTED/WAITING/REQUESTED are real GitHub
+    # states the old hand-picked pending set missed, and FOO stands in for a state
+    # GitHub adds later: each must pend as ci(1), never read CI as terminal.
+    for pstate in ("EXPECTED", "WAITING", "REQUESTED", "FOO"):
+        ck = '[{"name":"ci","state":"SUCCESS"},{"name":"x","state":"%s"}]' % pstate
+        rc, out, err = run(checks=ck, reviews=CR_APPROVED, mergeable="blocked",
+                           threads=THREADS_ONE_OPEN, timeout_secs=PENDING_TIMEOUT)
+        check("(n) %s: exit 1 (timeout), no thread-blocked" % pstate,
+              rc == 1 and "thread-blocked" not in out)
+        check("(n) %s: pending names ci(1)" % pstate, "ci(1)" in err)
+    print("== #441 (n'): SUCCESS + NEUTRAL + SKIPPED all count as done -> settles ==")
+    rc, out, err = run(checks='[{"name":"a","state":"SUCCESS"},{"name":"b","state":"NEUTRAL"},'
+                              '{"name":"c","state":"SKIPPED"}]', reviews=CR_APPROVED)
+    check("(n') done states settle", rc == 0 and "settled head=" in out)
+
+    print("== #441 (o): the quiet baseline is head-scoped (a push between polls) ==")
+    # Poll 1 reads head A, poll 2 head B, with an UNCHANGED bot count. The baseline
+    # from A must not confirm B, so every terminal needs a THIRD poll (the second on
+    # B). Without the head tag each would fire on poll 2, the first read of B.
+    head_b = "b" * 40
+    for label, kw in (("thread-blocked", {"mergeable": "blocked", "threads": THREADS_ONE_OPEN}),
+                      ("settled", {}),
+                      ("review-blocked", {"reviews": CR_CHANGES})):
+        kw.setdefault("reviews", CR_APPROVED)
+        rc, out, err, polls = run(checks=GREEN_CHECK, head_seq=HEAD_SHA + "," + head_b,
+                                  want_polls=True, **kw)
+        check("(o) %s: fires on head B" % label,
+              rc == 0 and out.startswith(label + " head=" + head_b[:8]))
+        check("(o) %s: not on the first poll of head B (%d polls)" % (label, polls), polls >= 3)
+
+    print("== #441 (p): gh's zero-checks path (exit 1, empty stdout) -> ci(unknown), never 0 0 ==")
+    # Right after a push no check may be registered yet. gh then exits 1 with "no checks
+    # reported" and prints nothing to stdout, even with --json (checks.go returns the
+    # error before its JSON exporter runs), so an empty [] with exit 0 is not a shape
+    # gh emits. That path must pend as ci(unknown), never read as 0 pending / 0 failing.
+    rc, out, err = run(checks_rc=1, reviews=CR_APPROVED, mergeable="blocked",
+                       threads=THREADS_ONE_OPEN, timeout_secs=PENDING_TIMEOUT)
+    check("(p) exit 1, no thread-blocked", rc == 1 and "thread-blocked" not in out)
+    check("(p) pending names ci(unknown)", "ci(unknown)" in err)
 
     print("== #399: review-blocked quiet deferral is announced on stderr ==")
     rc, out, err = run(checks=GREEN_CHECK, reviews=CR_CHANGES, grow_inline="coderabbitai[bot]",
