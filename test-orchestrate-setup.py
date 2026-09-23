@@ -72,23 +72,42 @@ _CLEAN_CASCADE = None
 _ISO_HOME = None
 
 
-def _real_home():
-    """The home the self-check protects. Resolved from the passwd database, NOT $HOME, so no HOME
-    override (ours or the caller's) can point the check somewhere harmless. ORCHESTRATE_TEST_REAL_HOME
-    is a TEST-ONLY seam for mutation-proving the self-check against a throwaway dir - never set it
-    in a real run, since it redirects what the check protects."""
-    return os.environ.get("ORCHESTRATE_TEST_REAL_HOME") or pwd.getpwuid(os.getuid()).pw_dir
+def _real_homes():
+    """The homes the self-check protects. The passwd-database home is ALWAYS included - resolved
+    from pwd, NOT $HOME, so no HOME override (ours or the caller's) can point the check somewhere
+    harmless. ORCHESTRATE_TEST_REAL_HOME is a TEST-ONLY seam for mutation-proving the self-check
+    against a throwaway dir: it ADDS a protected home, it never REPLACES the true one, so a seam
+    left exported in a developer's shell cannot silently switch the backstop off."""
+    homes = [pwd.getpwuid(os.getuid()).pw_dir]
+    seam = os.environ.get("ORCHESTRATE_TEST_REAL_HOME")
+    if seam and seam not in homes:
+        print(f"  NOTE: ORCHESTRATE_TEST_REAL_HOME is set - the self-check ALSO protects {seam}",
+              file=sys.stderr)
+        homes.append(seam)
+    return homes
 
 
+# The real-home surfaces this harness's code paths can write AND that nothing else writes during
+# a gate run: the deploy targets (scripts, agents) and settings.json + its configure backup.
+# DELIBERATELY NOT WATCHED: ~/.claude/orchestrate-floor.d and ~/.claude/orchestrate-resources.json.
+# The harness's up/down paths could write them, but OTHER live sessions legitimately write them
+# concurrently (per-session floor markers, merge-auth tokens, UAT port leases), so watching them
+# would redden the gate whenever another session is active - a flaky backstop gets ignored. They
+# stay protected by the HOME pin alone (isolated_env + main()'s process HOME).
 _PROTECTED = (os.path.join(".claude", "scripts"), os.path.join(".claude", "agents"),
-              os.path.join(".claude", "settings.json"))
+              os.path.join(".claude", "settings.json"), os.path.join(".claude", "settings.json.bak"))
 
 
 def _snapshot_real_home():
     """{path: (ctime, size)} over the protected real-home surfaces, read-only (lstat only). An
     absent path is recorded as ABSENT so a CREATE is detected as a change, not just a modify."""
     snap = {}
-    home = _real_home()
+    for home in _real_homes():
+        _snapshot_one(home, snap)
+    return snap
+
+
+def _snapshot_one(home, snap):
     for rel in _PROTECTED:
         top = os.path.join(home, rel)
         if not os.path.lexists(top):
@@ -102,7 +121,6 @@ def _snapshot_real_home():
                         st = os.lstat(p); snap[p] = (st.st_ctime, st.st_size)
                     except OSError:
                         snap[p] = ("UNREADABLE", 0)
-    return snap
 
 
 def isolated_env(base=None):
@@ -2577,6 +2595,39 @@ def _run_checks():
     # what surfaced it: the new cases "passed" against the KNOWN-BROKEN round-1 matcher,
     # which is only possible if they never ran.
     check_compound_shadow_matcher()
+    check_default_deploy_path_follows_home()
+
+
+def check_default_deploy_path_follows_home():
+    """isolated_env() ASSIGNS ORCHESTRATE_SCRIPTS_DIR / ORCHESTRATE_GUARD, so no other case takes
+    setup.py's DEFAULT derivation of the deploy targets from $HOME. Exercise that default here,
+    safely: the two vars are popped and HOME is the per-run temp home, so configure must land the
+    guard and helpers under THAT home. (If the default ever stopped following $HOME it would reach
+    the real home instead - which the main() self-check then reports as a real-home change.)"""
+    with tempfile.TemporaryDirectory() as td:
+        s = os.path.join(td, "settings.json")
+        json.dump({"permissions": {"allow": []}}, open(s, "w"))
+        env = isolated_env()
+        for k in ("ORCHESTRATE_SCRIPTS_DIR", "ORCHESTRATE_GUARD", "TOOL_INPUT"):
+            env.pop(k, None)
+        env.update({"ORCHESTRATE_SETTINGS": s, "ORCHESTRATE_SETTINGS_FILES": s,
+                    "ORCHESTRATE_BUNDLED_STEER": "/nonexistent/steer",
+                    "ORCHESTRATE_STEER": "/nonexistent/steer-deployed",
+                    "ORCHESTRATE_BUNDLED_CTXMETER": "/nonexistent/ctxmeter",
+                    "ORCHESTRATE_CTXMETER": "/nonexistent/ctxmeter-deployed",
+                    "ORCHESTRATE_BUNDLED_SETUP": "/nonexistent/setup",
+                    "ORCHESTRATE_SETUP_DEST": "/nonexistent/setup-deployed",
+                    "ORCHESTRATE_BUNDLED_AGENTS_DIR": "/nonexistent/agents-bundled",
+                    "ORCHESTRATE_AGENTS_DIR": "/nonexistent/agents-deployed",
+                    "ORCHESTRATE_PROJECT_AGENTS_DIR": "/nonexistent/project-agents"})
+        p = subprocess.run([sys.executable, SCRIPT, "configure", "--apply", "--yes"], env=env,
+                           capture_output=True, text=True, timeout=30)
+        iso_scripts = os.path.join(_ISO_HOME, ".claude", "scripts")
+        check("HOME isolation: configure's DEFAULT deploy targets follow $HOME (guard + pr-watch.sh "
+              f"land in the temp home; rc={p.returncode})",
+              p.returncode == 0
+              and os.path.isfile(os.path.join(iso_scripts, "orchestrate-guard.sh"))
+              and os.path.isfile(os.path.join(iso_scripts, "pr-watch.sh")))
 
 
 def main():
@@ -2594,8 +2645,9 @@ def main():
     finally:
         after = _snapshot_real_home()
         changed = sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
-        check("HOME isolation: the real ~/.claude/{scripts,agents,settings.json} is untouched "
-              f"by this harness ({len(changed)} path(s) changed under {_real_home()})", not changed)
+        check("HOME isolation: the real ~/.claude deploy + settings surfaces are untouched "
+              f"by this harness ({len(changed)} path(s) changed under {', '.join(_real_homes())})",
+              not changed)
         for p in changed[:40]:
             print(f"    REAL-HOME CHANGE: {p}: {before.get(p, 'ABSENT-AT-START')} -> "
                   f"{after.get(p, 'REMOVED')}")
