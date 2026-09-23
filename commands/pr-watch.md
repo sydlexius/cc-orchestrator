@@ -6,7 +6,7 @@ allowed-tools: ["Bash"]
 
 # PR Watch
 
-Wait for a pull request to reach a TERMINAL state. The script is silent during the wait and emits exactly one line on stdout when done. Three possible outcomes:
+Wait for a pull request to reach a TERMINAL state. The script is silent on stdout during the wait and emits exactly one line on stdout when done. Its outcomes:
 
 1. **`settled head=<sha8> mergeable=<state>`** -- ready to merge. All of:
    - CodeRabbit has reviewed HEAD with a non-DISMISSED, non-CHANGES_REQUESTED review (APPROVED or COMMENTED).
@@ -17,9 +17,15 @@ Wait for a pull request to reach a TERMINAL state. The script is silent during t
 
 2. **`review-blocked head=<sha8> by=<login[,login...]>`** -- the latest HEAD review from ANY reviewer (bot or human) is CHANGES_REQUESTED. Reviewer-agnostic (#195): not just CodeRabbit; the `by=` field lists every such reviewer's login. Distinct terminal because the next action differs (address feedback, not merge). Exit 0. Next action: `/handle-review <pr>`. The blocking set defaults to "any reviewer"; set `PR_WATCH_BLOCKING_REVIEWERS` to a comma/space-separated login list to restrict which reviewers can trip this terminal. `settled` is unchanged (still green + merge-ready); the rejected "stop on comment-count increment / not-necessarily-green" alternative is documented in #195.
 
-3. **`timeout: waited <secs>s pending=<list>`** (stderr) -- timeout elapsed. Exit 1. Re-arm with a longer timeout or check `gh pr view <pr>` manually.
+3. **`thread-blocked head=<sha8> unresolved=<n> failing=<n> by=<login[,login...]>`** (#441) -- CI is terminal (failing=<n> may be nonzero: it counts checks in a FAILURE/ERROR/CANCELLED/TIMED_OUT/ACTION_REQUIRED/STARTUP_FAILURE/STALE state from the same checks read, so terminal is NOT green; classification is fail-closed: only SUCCESS/NEUTRAL/SKIPPED count as done, and every other state, including EXPECTED/REQUESTED/WAITING and any state GitHub adds later, pends as `ci(<n>)`; an unreadable checks read pends as `ci(unknown)` and never reaches this terminal), nothing else is pending, `review-blocked` did not fire (it keeps priority), `mergeable_state` is `blocked`, and a GraphQL `reviewThreads` read shows at least one thread with `isResolved: false`. `by=` lists the first-comment author of each unresolved thread, de-duplicated. The quiet-period gate applies. Exit 0. Next action: `/handle-review <pr>`. Positive evidence only: branch-protection settings are never read, and `blocked` by itself never terminates the watch. An UNREADABLE thread read (gh failure, GraphQL errors, malformed body) is NOT zero threads; the PR stays pending as `threads(unreadable)` and neither `thread-blocked` nor `settled` fires. Only 100 threads are fetched; a larger `totalCount` is reported on stderr (`unresolved` is then a lower bound), or pends as `threads(truncated)` when every fetched thread is resolved. Known limit: the CR-trigger check is not scoped to the head, so a historical `@coderabbitai review` plus a push after CR's last review leaves `cr-review` pending and this terminal unreachable; the stderr `pr-watch: pending=cr-review,merge(blocked)` line names it.
+
+4. **`merged head=<sha8>`** / **`closed head=<sha8>`** (#435) -- the PR is already MERGED, or CLOSED without merging. Checked first on every poll, with no quiet period (neither state reverts to in-progress). Exit 0. Next action: `merged` -> `/post-merge-cleanup <pr>`; `closed` -> report it, no action.
+
+5. **`timeout: waited <secs>s pending=<list>`** (stderr) -- timeout elapsed. Exit 1. Re-arm with a longer timeout or check `gh pr view <pr>` manually.
 
 Setup errors (bad PR number, can't resolve repo) print `setup error: ...` to stderr and exit 2.
+
+Progress (#399): stdout stays silent until a terminal, but stderr gets ONE `pr-watch: pending=<list>` line each time the pending set CHANGES (never on an unchanged poll). A watch held on a human gate, for example `merge(blocked)` after a push dismissed a required approval, therefore names what it is waiting on long before the timeout. This is information only: it is not a terminal and does not change the exit code.
 
 ## Why mergeable_state matters
 
@@ -31,7 +37,7 @@ GitHub's check `conclusion` field can be the empty string `""` mid-flight. jq's 
 
 ## Why the quiet-period gate
 
-CodeRabbit posts inline comments seconds AFTER its CI check transitions to SUCCESS. If `mergeable_state` happens to read `clean` in that window before CR's review-state actually lands, a strict snapshot would emit `settled` prematurely and hand the consumer a half-formed triage list. The script counts items from allow-listed bot authors (`coderabbitai[bot]`, `github-actions[bot]`, `greptile-apps[bot]`, and `codoki-pr-intelligence[bot]`) across reviews + pull-comments + issue-comments, and requires the count to be unchanged across two consecutive 30s polls before terminating. Adds ~30s of latency in the happy path; eliminates the trickle race. Applies to both `settled` and `review-blocked` terminals.
+CodeRabbit posts inline comments seconds AFTER its CI check transitions to SUCCESS. If `mergeable_state` happens to read `clean` in that window before CR's review-state actually lands, a strict snapshot would emit `settled` prematurely and hand the consumer a half-formed triage list. The script counts items from allow-listed bot authors (`coderabbitai[bot]`, `github-actions[bot]`, `greptile-apps[bot]`, `codoki-pr-intelligence[bot]`, and Copilot under BOTH of its REST logins: `copilot-pull-request-reviewer[bot]` on its review object and `Copilot` on its inline review comments) across reviews + pull-comments + issue-comments, and requires the count to be unchanged across two consecutive 30s polls before terminating. Adds ~30s of latency in the happy path; eliminates the trickle race. Applies to the `settled`, `review-blocked`, and `thread-blocked` terminals (not to `merged`/`closed`). The baseline is tagged with the HEAD sha, so a count taken before a push never confirms the new head.
 
 ## Args
 
@@ -104,5 +110,8 @@ the wrapper's, not the tool's, so confirm the tool's own terminal line before ac
 When the Monitor reports the script's exit, branch off the single stdout line:
 - **`settled head=...`** + Exit 0 -> invoke `/merge-pr <pr>`.
 - **`review-blocked head=...`** + Exit 0 -> invoke `/handle-review <pr>`.
+- **`thread-blocked head=...`** + Exit 0 -> if `failing=` is nonzero, fix CI first (handle-review's thread replies do not fix a red check). Otherwise route by `by=`, which may MIX authors: every login in it that does NOT end in `[bot]` opened a human thread, so name those logins and tell the maintainer those threads need them; if it also holds any `[bot]` login, invoke `/handle-review <pr>` for the bot threads in the same round (reply to and resolve them; a round that closes threads by reply-and-resolve may make no commit). A `by=` with only human logins goes to the maintainer alone; one with only `[bot]` logins goes to `/handle-review` alone.
+- **`merged head=...`** + Exit 0 -> invoke `/post-merge-cleanup <pr>`.
+- **`closed head=...`** + Exit 0 -> report that the PR was closed without merging; no further action.
 - Exit 1 (`timeout: ...` on stderr) -> re-arm with a longer timeout or check `gh pr view <pr>` manually for what is still in flight.
 - Exit 2 (`setup error: ...` on stderr) -> the script failed to query the PR. Check `gh` auth state.

@@ -54,8 +54,50 @@
 #         green" idea was evaluated and REJECTED (see #195) -- it would collapse the
 #         two terminals and hand /merge-pr a red PR.
 #
+#     thread-blocked head=<sha8> unresolved=<n> failing=<n> by=<login[,login...]>
+#         (#441) CI is terminal (no pending check; failing=<n> may be nonzero, it
+#         counts checks in a FAILURE/ERROR/CANCELLED/TIMED_OUT/ACTION_REQUIRED/
+#         STARTUP_FAILURE/STALE state from the SAME checks read; classification
+#         is FAIL-CLOSED: only SUCCESS/NEUTRAL/SKIPPED are done, and every state
+#         outside those ten, known or not, PENDS - so "CI terminal" is
+#         NOT "CI green"; an unreadable checks read pends as ci(unknown) and never
+#         reaches this terminal, so failing is never a guessed zero), nothing else is pending
+#         (no CR / Codoki wait), review-blocked did NOT fire (it keeps priority),
+#         mergeable_state is `blocked`, AND a GraphQL reviewThreads READ shows at
+#         least one thread with isResolved == false. `by=` is the de-duplicated
+#         first-comment author of each unresolved thread. The quiet-period gate
+#         applies. Exit 0. Consumer next action: /handle-review (a round that only
+#         replies + resolves threads makes NO commit; verify progress with
+#         pr-unreplied-comments.sh, not a new commit).
+#         POSITIVE EVIDENCE ONLY: branch-protection settings are never read, and
+#         `blocked` alone never terminates (it is an aggregate, #399/#334). An
+#         UNREADABLE thread read (gh failure, GraphQL errors, malformed body) is
+#         NOT zero threads: it emits neither thread-blocked nor settled and the PR
+#         stays pending as `threads(unreadable)`. Only 100 threads are fetched; a
+#         totalCount above that is REPORTED on stderr (unresolved is then a lower
+#         bound), or pends as `threads(truncated)` when every fetched thread is
+#         resolved.
+#         KNOWN LIMIT: cr_was_triggered is NOT scoped to the current head. A
+#         historical `@coderabbitai review` comment plus a push AFTER CR's last
+#         review leaves `cr-review` pending (CR is "expected" but has not reviewed
+#         the new head), so the sole-pending rule is never met and thread-blocked
+#         is unreachable; the watch times out. The #399 stderr line names it
+#         (`pending=cr-review,merge(blocked)`). Tracked separately, not fixed here.
+#
+#     merged head=<sha8>
+#     closed head=<sha8>
+#         (#435) The PR is already MERGED (merged == true) or CLOSED without merge.
+#         Checked first on every poll, before any other gate; no quiet period (the
+#         state cannot revert to in-progress). Exit 0. Consumer next action:
+#         merged -> /post-merge-cleanup; closed -> report it, no action.
+#
 #     timeout: waited <secs>s pending=<list>      [stderr]   Exit 1.
 #     setup error: <message>                      [stderr]   Exit 2.
+#
+#   Progress (#399): stdout stays silent until a terminal, but ONE stderr line
+#   `pr-watch: pending=<list>` is emitted each time the composed pending set
+#   CHANGES (never on an unchanged poll), so a watch held on a human gate (e.g.
+#   `merge(blocked)` after a push dismissed an approval) names what it holds on.
 #
 # Why mergeable_state matters:
 #   `gh pr checks` only returns checks GitHub has been told about so far. Late-
@@ -165,10 +207,16 @@ fi
 # latency in the CR-only happy path and up to ~20 min when Greptile is enabled
 # on the repo. It defends against premature settle in both windows.
 #
-# To add a new bot reviewer (e.g. CodeQL, Copilot, custom org-level bot):
-# append its login to the disjunction. The script always reads the disjunction
-# in this single location so updates are one-edit.
-QUIET_AUTHORS_JQ='(.user.login == "coderabbitai[bot]" or .user.login == "github-actions[bot]" or .user.login == "greptile-apps[bot]" or .user.login == "codoki-pr-intelligence[bot]")'
+# To add a new bot reviewer (e.g. CodeQL, custom org-level bot): append its
+# login to the disjunction. The script always reads the disjunction in this
+# single location so updates are one-edit.
+#
+# Copilot needs BOTH spellings (#441): its REVIEW object's REST login is
+# `copilot-pull-request-reviewer[bot]`, but its INLINE review comments carry the
+# REST login `Copilot` (measured live on PR #443; pr-unreplied-comments.sh lists
+# both for the same reason). Only the `[bot]` form left every Copilot inline
+# comment out of the count, so a Copilot review still trickling in read as quiet.
+QUIET_AUTHORS_JQ='(.user.login == "coderabbitai[bot]" or .user.login == "github-actions[bot]" or .user.login == "greptile-apps[bot]" or .user.login == "codoki-pr-intelligence[bot]" or .user.login == "copilot-pull-request-reviewer[bot]" or .user.login == "Copilot")'
 
 # count_bot_activity -- emit a single integer: total reviews + pull-comments +
 # issue-comments authored by an allow-listed bot. Stable count across two polls
@@ -267,7 +315,73 @@ fi
 # skipped entirely when it is absent (fail-open to CR + CI + mergeable gates).
 CODOKI_ORACLE="${HOME}/.claude/scripts/ship-gate-preflight.sh"
 
+# read_thread_verdict -- ONE GraphQL `query` (never a mutation) over the PR's
+# reviewThreads (#441), reusing ship-gate-preflight.sh's
+# reviewThreads(first:100){totalCount nodes{isResolved}} shape plus each thread's
+# first-comment author for the `by=` field. GraphQL reports a Bot actor's login
+# WITHOUT the REST `[bot]` suffix (measured live: `copilot-pull-request-reviewer`),
+# so a Bot author gets `[bot]` appended, keeping `by=` in the same login vocabulary
+# as review-blocked and QUIET_AUTHORS_JQ. Prints exactly one verdict:
+#   UNRESOLVED:<n>:<login,...>[:TRUNC:<nodes>/<total>]  >=1 node with isResolved == false
+#   OK          every node resolved and none left unfetched
+#   TRUNC       every FETCHED node resolved, but totalCount > nodes (rest unknown)
+#   UNREADABLE  gh failure, top-level .errors, malformed body or field, a null
+#               node, or a non-boolean isResolved
+# UNREADABLE is NOT zero threads (the #375 "unreadable reads as nothing" class):
+# the caller keeps the PR pending and emits neither thread-blocked nor settled.
+read_thread_verdict() {
+  local owner name tj v
+  owner="${repo%%/*}"; name="${repo##*/}"
+  # shellcheck disable=SC2016  # GraphQL $owner/$name/$number are query variables, NOT shell expansions.
+  tj=$(gh api graphql \
+    -f query='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100){totalCount nodes{isResolved comments(first:1){nodes{author{__typename login}}}}}}}}' \
+    -f owner="$owner" -f name="$name" -F number="$pr" 2>/dev/null) || { echo UNREADABLE; return 0; }
+  v=$(jq -r '
+    if (((.errors // []) | length) != 0)
+       or ((.data.repository.pullRequest.reviewThreads | type) != "object")
+    then "UNREADABLE"
+    else
+      .data.repository.pullRequest.reviewThreads as $rt
+      | if ($rt.totalCount | type) != "number" or ($rt.nodes | type) != "array"
+           or $rt.totalCount < 0 or $rt.totalCount != ($rt.totalCount | floor)
+           or $rt.totalCount < ($rt.nodes | length)
+           or ([$rt.nodes[] | select((type != "object") or ((.isResolved | type) != "boolean"))] | length) > 0
+        then "UNREADABLE"
+        else
+          ($rt.totalCount) as $tc | ($rt.nodes | length) as $n
+          | [$rt.nodes[] | select(.isResolved == false)] as $open
+          | if ($open | length) > 0 then
+              "UNRESOLVED:\($open | length):"
+              + ([$open[] | (.comments.nodes[0].author? // {}) as $a
+                  | ($a.login // "unknown") as $l
+                  | if ($a.__typename == "Bot") and ($l | endswith("[bot]") | not)
+                    then $l + "[bot]" else $l end]
+                 | unique | join(","))
+              + (if $tc > $n then ":TRUNC:\($n)/\($tc)" else "" end)
+            elif $tc > $n then "TRUNC"
+            else "OK" end
+        end
+    end' <<<"$tj" 2>/dev/null) || { echo UNREADABLE; return 0; }
+  case "$v" in
+    UNRESOLVED:*|OK|TRUNC) echo "$v" ;;
+    *) echo UNREADABLE ;;
+  esac
+}
+
+# note_pending -- #399: emit ONE stderr line whenever the composed pending set
+# CHANGES (never on an unchanged poll), so a watch held on a human gate names what
+# it holds on instead of sitting byte-identical to one waiting on CI. stdout keeps
+# its "silent until done" contract; only stderr gains the transition line.
+prev_pending=""
+note_pending() {
+  if [ "$pending" != "$prev_pending" ]; then
+    echo "pr-watch: pending=${pending}" >&2
+    prev_pending="$pending"
+  fi
+}
+
 prev_bot_count=""
+pending=""
 start=$(date +%s)
 
 while true; do
@@ -281,9 +395,13 @@ while true; do
   # branch-protection-aware merge-readiness aggregate -- see header for why.
   # Use `gh api` with explicit error suppression: a 404 (PR doesn't exist) prints
   # the error body to stdout, so validate the SHA shape before trusting it.
-  pr_meta=$(gh api "repos/$repo/pulls/$pr" --jq '[.head.sha, (.mergeable_state // "unknown")] | join("|")' 2>/dev/null || true)
-  cur_head="${pr_meta%%|*}"
-  cur_mergeable_state="${pr_meta##*|}"
+  # The same read carries `state` + `merged` for the MERGED/CLOSED terminal (#435):
+  # GitHub reports mergeable_state `unknown` on a merged PR, which is never in the
+  # merge-ready set, so without this the watch polled a finished PR to timeout.
+  pr_meta=$(gh api "repos/$repo/pulls/$pr" --jq '[.head.sha, (.mergeable_state // "unknown"), (.state // ""), ((.merged // false) | tostring)] | join("|")' 2>/dev/null || true)
+  cur_head=""; cur_mergeable_state=""; cur_pr_state=""; cur_merged=""
+  IFS='|' read -r cur_head cur_mergeable_state cur_pr_state cur_merged <<<"$pr_meta" || true
+  cur_mergeable_state="${cur_mergeable_state:-unknown}"
   if ! [[ "$cur_head" =~ ^[0-9a-f]{40}$ ]]; then
     # No valid HEAD sha -> 404 or transient API error. After 3 consecutive
     # failures (~90s) bail out as a setup error rather than spin to timeout.
@@ -296,6 +414,19 @@ while true; do
     continue
   fi
   api_fail_count=0
+
+  # MERGED / CLOSED is terminal immediately (#435). Checked BEFORE the rest of the
+  # loop body: a merged PR cannot revert to in-progress, so no quiet-period gate and
+  # no further reads. Only the EXACT values count (`merged` == "true", state ==
+  # "closed"); an absent or unrecognized state keeps polling, never terminates.
+  if [ "$cur_merged" = "true" ]; then
+    echo "merged head=${cur_head:0:8}"
+    exit 0
+  fi
+  if [ "$cur_pr_state" = "closed" ]; then
+    echo "closed head=${cur_head:0:8}"
+    exit 0
+  fi
 
   reviews_json=$(gh api --paginate "repos/$repo/pulls/$pr/reviews" 2>/dev/null | jq -s 'add // []' || echo '[]')
 
@@ -323,6 +454,7 @@ while true; do
       exit 2
     fi
     pending="head-date-fetch"
+    note_pending
     sleep "$poll_interval"
     continue
   fi
@@ -355,12 +487,16 @@ while true; do
       | if ($allow | length) > 0 then map(select(. as $l | $allow | index($l))) else . end
       | join(",")' 2>/dev/null || echo "")
   if [ -n "$blocked_by" ]; then
-    cur_bot_count=$(count_bot_activity)
+    # Head-scoped baseline (see the thread-blocked comment): a count taken on an
+    # earlier head can never confirm this one.
+    cur_bot_count="${cur_head}:$(count_bot_activity)"
     if [ -n "$prev_bot_count" ] && [ "$cur_bot_count" = "$prev_bot_count" ]; then
       echo "review-blocked head=${cur_head:0:8} by=${blocked_by}"
       exit 0
     fi
     prev_bot_count="$cur_bot_count"
+    pending="review-blocked(quiet-confirm)"
+    note_pending
     sleep "$poll_interval"
     continue
   fi
@@ -418,9 +554,35 @@ while true; do
   # Every CI check must be in a terminal state. Use `state` not `conclusion` --
   # state goes through gh's bucket mapping (SUCCESS|FAILURE|...|PENDING|...) and
   # never returns the empty string that traps hand-rolled jq fallbacks.
-  pending_ci=$(gh pr checks "$pr" --repo "$repo" --json state \
-    --jq '[.[] | select(.state == "PENDING" or .state == "QUEUED" or .state == "IN_PROGRESS")] | length' \
+  # The SAME read also yields failing_ci (#441 round 1): the count of checks in a
+  # failed terminal state, reported on the thread-blocked line as `failing=<n>`.
+  # ONE jq pass emits "<pending> <failing>" ONLY when the body is an array of
+  # objects each carrying a string state; anything else (gh failure, malformed
+  # body) leaves BOTH unset -> "unknown". So failing_ci is a number exactly when
+  # pending_ci is, and an unreadable failing count can never read as zero: it rides
+  # the ci(unknown) pending item, which keeps thread-blocked unreachable.
+  #
+  # FAIL-CLOSED classification (#441 CR/Copilot round). Only three states are DONE
+  # and not failing: SUCCESS, NEUTRAL, SKIPPED. The seven FAILING states are
+  # FAILURE, ERROR, CANCELLED, TIMED_OUT, ACTION_REQUIRED, STARTUP_FAILURE, STALE
+  # (STALE never transitions on its own; ship-gate-preflight.sh and
+  # orchestrate-status.sh count it failing too). EVERY other state PENDS - the
+  # known ones (PENDING, QUEUED, IN_PROGRESS, EXPECTED, REQUESTED, WAITING) and
+  # any state GitHub adds later - so an unlisted state can never read as "done".
+  # A hand-picked pending set was the defect: EXPECTED/WAITING/REQUESTED fell into
+  # neither set, CI read terminal, and thread-blocked could fire mid-run.
+  # shellcheck disable=SC2016  # $fail/$done are jq variables, NOT shell expansions.
+  ci_counts=$(gh pr checks "$pr" --repo "$repo" --json state \
+    --jq '["FAILURE","ERROR","CANCELLED","TIMED_OUT","ACTION_REQUIRED","STARTUP_FAILURE","STALE"] as $fail
+          | ["SUCCESS","NEUTRAL","SKIPPED"] as $done
+          | if type == "array" and all(.[]; type == "object" and (.state | type) == "string")
+            then "\([.[] | select((.state | IN($fail[])) or (.state | IN($done[])) | not)] | length) \([.[] | select(.state | IN($fail[]))] | length)"
+            else "unknown" end' \
     2>/dev/null || echo "unknown")
+  pending_ci="unknown"; failing_ci="unknown"
+  if [[ "$ci_counts" =~ ^([0-9]+)\ ([0-9]+)$ ]]; then
+    pending_ci="${BASH_REMATCH[1]}"; failing_ci="${BASH_REMATCH[2]}"
+  fi
   if [ "$pending_ci" != "0" ]; then
     pending_list+=("ci(${pending_ci})")
   fi
@@ -435,21 +597,83 @@ while true; do
   if [ ${#pending_list[@]} -eq 0 ]; then
     # All hard criteria pass. Apply the quiet-period gate: require bot-comment
     # count to be unchanged from the previous poll before declaring settled.
-    # The first time we land here we set the baseline and poll again.
-    cur_bot_count=$(count_bot_activity)
+    # The first time we land here we set the baseline and poll again. The
+    # baseline is head-scoped, so a count from an earlier head never confirms.
+    cur_bot_count="${cur_head}:$(count_bot_activity)"
     if [ -n "$prev_bot_count" ] && [ "$cur_bot_count" = "$prev_bot_count" ]; then
       echo "settled head=${cur_head:0:8} mergeable=${cur_mergeable_state}"
       exit 0
     fi
     prev_bot_count="$cur_bot_count"
     pending="quiet-confirm"
+    note_pending
     sleep "$poll_interval"
     continue
+  fi
+
+  # thread-blocked (#441). Evaluated only when the SOLE pending item is
+  # merge(blocked). That single test carries three of #441's conditions: CI is
+  # terminal (any non-"0" pending_ci, including "unknown", adds a ci(...) item),
+  # mergeable_state is `blocked`, and no CR/Codoki wait remains. Separate
+  # pending_ci / mergeable tests would be implied by it, i.e. dead guards no test
+  # could tell from absent, so they are deliberately not repeated. review-blocked
+  # did not fire (it returned above, so it keeps priority). Then a
+  # reviewThreads READ must show POSITIVE evidence of an unresolved thread.
+  # Branch-protection settings are deliberately NEVER read (the legacy and ruleset
+  # APIs disagree on the conversation-resolution requirement, the #375 split); an
+  # unresolved thread is itself the evidence, and house policy requires every
+  # thread resolved before merge anyway. `blocked` ALONE is an aggregate
+  # (#399/#334) and never terminates the watch.
+  if [ ${#pending_list[@]} -eq 1 ] && [ "${pending_list[0]}" = "merge(blocked)" ]; then
+    thread_verdict=$(read_thread_verdict)
+    case "$thread_verdict" in
+      UNRESOLVED:*)
+        # UNRESOLVED:<n>:<by>[:TRUNC:<nodes>/<total>]
+        tv_rest="${thread_verdict#UNRESOLVED:}"
+        tv_n="${tv_rest%%:*}"; tv_rest="${tv_rest#*:}"
+        tv_by="${tv_rest%%:TRUNC:*}"
+        if [ "$tv_rest" != "$tv_by" ]; then
+          # Truncation is REPORTED, never silent (#441 AC g): only the first 100
+          # threads were fetched, so <n> is a lower bound.
+          echo "pr-watch: NOTE: only ${tv_rest##*:TRUNC:} review threads fetched (first:100); unresolved=${tv_n} is a lower bound" >&2
+        fi
+        # Quiet-period gate, same as settled/review-blocked. The baseline is tagged
+        # `thread:` so a count taken on ANOTHER path cannot confirm this one. That
+        # is REACHABLE: a settle-path (or review-blocked) baseline survives into the
+        # next poll, which `continue`s without resetting it, so a PR reading `clean`
+        # then `blocked` would otherwise emit thread-blocked on a SINGLE thread read.
+        # It is also tagged with the HEAD sha: a push between two polls leaves the
+        # bot count unchanged (the new head has no activity yet), so an untagged
+        # baseline from the OLD head would confirm the NEW head on its first read.
+        # The settled and review-blocked baselines carry the same head tag for the
+        # same reason. What the tags buy is two consecutive polls on the SAME head
+        # on which THIS terminal's own predicate held (unresolved thread + sole
+        # merge(blocked)), matching what settled requires of its own; the
+        # bot-trickle defense itself is the count. Pinned by the harness cases
+        # "#441 (h)" (path tag) and "#441 (o)" (head tag).
+        cur_bot_count="thread:${cur_head}:$(count_bot_activity)"
+        if [ -n "$prev_bot_count" ] && [ "$cur_bot_count" = "$prev_bot_count" ]; then
+          # failing_ci is numeric here by construction (see the checks read):
+          # this branch requires pending_ci == "0", and both come from one parse.
+          echo "thread-blocked head=${cur_head:0:8} unresolved=${tv_n} failing=${failing_ci} by=${tv_by}"
+          exit 0
+        fi
+        prev_bot_count="$cur_bot_count"
+        pending="merge(blocked),threads(quiet-confirm)"
+        note_pending
+        sleep "$poll_interval"
+        continue
+        ;;
+      OK) : ;;                                         # all resolved -> blocked for another reason
+      TRUNC) pending_list+=("threads(truncated)") ;;   # fetched all resolved, remainder unknown
+      *) pending_list+=("threads(unreadable)") ;;      # an unreadable read is NOT zero threads
+    esac
   fi
 
   # Hard criteria not met -- discard any pending bot-count baseline; if we land
   # back in the all-pass branch later we want to re-measure from scratch.
   prev_bot_count=""
   pending=$(IFS=,; echo "${pending_list[*]}")
+  note_pending
   sleep "$poll_interval"
 done
