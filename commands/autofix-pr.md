@@ -108,8 +108,11 @@ If anything other than `go`, exit with USER-ABORT.
 
 ## Step 2 -- Loop (round 1..max_rounds)
 
-Before round 1, set `prev_thread_unresolved=` (empty) and `last_outcome=` (empty);
-each round records its 2b branch in `last_outcome` (FIX / THREAD / ...), which the
+Before round 1, the agent running this loop starts two pieces of AGENT-HELD state
+(values it remembers between steps, NOT shell variables - each fenced block below
+runs in its own shell, so nothing assigned in one block survives into another):
+`prev_thread_unresolved` (empty) and `last_outcome` (empty). Each round the agent
+records its 2b branch name (FIX / THREAD / ...) as `last_outcome`, which the
 round-cap message in 2c reads.
 
 For each `round` from 1:
@@ -258,15 +261,36 @@ NO commit. A no-commit THREAD round is NOT by itself a stall; the FIX branch's
 "no commits -> STALL" rule must NOT be applied here. What IS a stall is a
 no-commit round that changed nothing, which the pre-dispatch check below catches.
 
-`prev_thread_unresolved` (initialized empty before round 1) holds the
-`unresolved` count recorded by the PREVIOUS round's no-commit THREAD leg. Every
-other outcome (SUCCESS, FIX, a THREAD round that committed, and every exit)
-clears it, so it only ever compares two CONSECUTIVE no-commit thread rounds.
+**State crosses blocks ONLY as pasted literals.** Each fenced bash block in this
+command runs in its OWN shell (the same rule `/prep-pr` documents), and the
+pr-watch line arrives from a Skill call, not from any shell. So no variable set
+in one block (or by a previous round) exists in the next. Every value a block
+needs from outside itself is written into that block, by the agent, as a literal
+assignment at its top; every value a later step needs is read by the agent off a
+block's PRINTED output and remembered as agent-held state.
 
-Pre-dispatch check (run BEFORE invoking handle-review; `$watch_line` is the
-pr-watch stdout line). No helper is executed here, only text tests:
+`prev_thread_unresolved` is such agent-held state (initialized empty before round
+1). It holds the `unresolved` count recorded by the PREVIOUS round's no-commit
+THREAD leg. Every other outcome (SUCCESS, FIX, a THREAD round that committed, and
+every exit) clears it, so it only ever compares two CONSECUTIVE no-commit thread
+rounds.
+
+Pre-dispatch check (run BEFORE invoking handle-review). No helper is executed
+here, only text tests. Fill in the two literal assignments at the top before
+running it:
 
 ```bash
+# FILL IN BOTH LITERALS (this block's shell inherits nothing from earlier steps):
+# - watch_line: this round's pr-watch stdout line, pasted VERBATIM.
+# - prev_thread_unresolved: the unresolved= number this loop recorded after the LAST
+#   no-commit THREAD round, or empty ('') if none was recorded / it was cleared.
+# Single quotes are safe here ONLY because a pr-watch line carries just a hex sha,
+# digits, and GitHub logins (no quote character can occur). A line that somehow
+# contained one is not the documented shape: do not paste it, treat it as abort-parse.
+# An unfilled placeholder is caught, not guessed: a placeholder watch_line fails the
+# anchored parse, and a non-numeric prev_thread_unresolved routes to abort-parse.
+watch_line='<paste the pr-watch stdout line verbatim>'
+prev_thread_unresolved='<the unresolved= number recorded last THREAD round, or empty>'
 # ONE anchored parse of the whole documented shape: it yields all three fields or
 # nothing, so a single emptiness test covers every missing/garbled field.
 tb=$(printf '%s\n' "$watch_line" | sed -n 's/^thread-blocked head=[0-9a-f]\{8\} unresolved=\([0-9][0-9]*\) failing=\([0-9][0-9]*\) by=\([^ ][^ ]*\)$/\1 \2 \3/p')
@@ -274,7 +298,8 @@ tb_unresolved=""; tb_failing=""; tb_by=""
 [ -n "$tb" ] && read -r tb_unresolved tb_failing tb_by <<EOT
 $tb
 EOT
-if [ -z "$tb" ]; then thread_next=abort-parse
+case "$prev_thread_unresolved" in *[!0-9]*) prev_ok=no ;; *) prev_ok=yes ;; esac
+if [ -z "$tb" ] || [ "$prev_ok" = no ]; then thread_next=abort-parse
 elif [ "$tb_failing" -gt 0 ]; then thread_next=stall-ci
 elif ! printf '%s\n' "$tb_by" | tr ',' '\n' | grep -q '\[bot\]$'; then thread_next=stall-human
 elif [ -n "$prev_thread_unresolved" ] && [ "$tb_unresolved" -ge "$prev_thread_unresolved" ]; then thread_next=stall-noprogress
@@ -285,15 +310,19 @@ echo "thread_next=$thread_next unresolved=${tb_unresolved:-?} failing=${tb_faili
 Dispatch on `thread_next`, in this order (first match wins):
 
 - `abort-parse` -> the line does not match the documented shape (an older
-  pr-watch without `failing=`, or a truncated line). Print it verbatim and exit
-  with status **ABORT**; never guess the missing fields.
+  pr-watch without `failing=`, a truncated line, or an unfilled placeholder), or
+  the pasted `prev_thread_unresolved` is neither empty nor a number. Print the
+  line verbatim and exit with status **ABORT**; never guess the missing fields.
 - `stall-ci` -> `failing > 0`: a check FAILED. handle-review answers bot
   comments; it does not fix a red CI, so looping would only re-spend rounds.
   Name the failing checks and exit with status **STALL** (the "thread round, CI
   failing" row of the Step 3 matrix):
 
   ```bash
-  gh pr checks "$pr_number" --json name,bucket --jq '.[] | select(.bucket == "fail" or .bucket == "cancel") | .name'
+  # Select on .state with EXACTLY the six-state set scripts/pr-watch.sh counts as
+  # failing=, never on .bucket: gh buckets STARTUP_FAILURE as "pending", so a bucket
+  # filter would return no names for a check pr-watch counted.
+  gh pr checks "$pr_number" --json name,state --jq '.[] | select(.state == "FAILURE" or .state == "ERROR" or .state == "CANCELLED" or .state == "TIMED_OUT" or .state == "ACTION_REQUIRED" or .state == "STARTUP_FAILURE") | .name'
   ```
 
   Print "round <round>: thread-blocked with <failing> failing check(s): <names>.
@@ -337,8 +366,12 @@ Skill, then read `post_head` and `remote_head` the same way.
   [ "$leg" = stable ] && unreplied=$(bash ~/.claude/scripts/pr-unreplied-comments.sh --count-only "$pr_number" 2>/dev/null || echo unknown)
   ```
 
-  - `unreplied == 0` -> every finding is replied. Record
-    `prev_thread_unresolved=$tb_unresolved`, print "round <round>: thread
+  - `unreplied == 0` -> every finding is replied. Record, as agent-held state,
+    `prev_thread_unresolved` = the `unresolved=` value printed on THIS round's
+    `thread_next=` output line (read off the printed line; the pre-dispatch
+    block's shell and its `tb_unresolved` are gone by now). Next THREAD round,
+    paste that number into the pre-dispatch block's `prev_thread_unresolved`
+    literal. Print "round <round>: thread
     round replied without a commit; re-watching to confirm resolution.", and
     increment the round and loop back to 2a. The next `/pr-watch` IS the
     resolution check: if the threads are now resolved it moves on to `settled`
@@ -430,7 +463,8 @@ exit with status **ABORT**.
 ### 2c. Round cap check
 
 If `round >= max_rounds` after a FIX or THREAD iteration completes, exit the loop
-with status **CAP**. The message depends on `last_outcome`:
+with status **CAP**. The message depends on `last_outcome` (the agent-held branch
+name recorded in 2b, not a shell variable):
 
 - `last_outcome == FIX`:
 

@@ -561,14 +561,21 @@ def main():
           "-f owner=owner" in gargs and "-f name=repo" in gargs and "-F number=123" in gargs)
 
     print("== #441 (l): red CI + open thread -> thread-blocked names failing=1 ==")
-    rc, out, err = run(checks=RED_AND_GREEN_CHECKS, reviews=CR_APPROVED, mergeable="blocked",
-                       threads=THREADS_ONE_OPEN)
-    check("(l) exit 0 + failing=1 on the line",
-          rc == 0 and out.strip() == "thread-blocked head=%s unresolved=1 failing=1 by=%s" % (HEAD_SHA[:8], COPILOT))
+    # Parametrized over EVERY failing state pr-watch.sh counts (its jq select), so dropping
+    # any one of the six from that set reads failing=0 for its fixture and reddens here.
+    for fstate in ("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"):
+        ck = RED_AND_GREEN_CHECKS.replace('"state":"FAILURE"', '"state":"%s"' % fstate)
+        rc, out, err = run(checks=ck, reviews=CR_APPROVED, mergeable="blocked",
+                           threads=THREADS_ONE_OPEN)
+        check("(l) %s: exit 0 + failing=1 on the line" % fstate,
+              rc == 0 and out.strip() == "thread-blocked head=%s unresolved=1 failing=1 by=%s" % (HEAD_SHA[:8], COPILOT))
 
     print("== #441 (m): unreadable checks read -> no terminal (failing never a guessed zero) ==")
+    # The object fixture's VALUE is a well-formed check entry, so the per-entry shape guard
+    # passes it (jq's .[] iterates object values too): only the `type == "array"` test
+    # rejects it, which makes that test the deciding one here.
     for label, ck in (("entries without state", CHECKS_NO_STATE), ("non-JSON body", "not json"),
-                      ("object, not array", '{"state":"SUCCESS"}')):
+                      ("object, not array", '{"a":{"state":"SUCCESS"}}')):
         rc, out, err = run(checks=ck, reviews=CR_APPROVED, mergeable="blocked",
                            threads=THREADS_ONE_OPEN, timeout_secs=PENDING_TIMEOUT)
         check(f"(m) {label}: exit 1, no thread-blocked", rc == 1 and "thread-blocked" not in out)
