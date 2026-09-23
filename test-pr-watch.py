@@ -114,6 +114,14 @@ if args[:2] == ["api", "graphql"]:
         open(os.path.join(STATE_DIR, "graphql-args"), "a").write(" ".join(args) + "\n")
     if THREADS_RC:
         sys.stderr.write("graphql error\n"); sys.exit(THREADS_RC)
+    # Validate the query VARIABLES the way GitHub would: each must be present with
+    # the right value AND the right type flag (-f = String, -F = typed/Int). A
+    # missing or mistyped variable gets GitHub's error body, which pr-watch must
+    # read as UNREADABLE (#441 round 1: dropping `-F number=` used to pass).
+    pairs = set(zip(args, args[1:]))
+    need = {("-f", "owner=owner"), ("-f", "name=repo"), ("-F", "number=123")}
+    if not need <= pairs:
+        emit('{"errors":[{"message":"missing variable"}]}')
     emit(THREADS)
 
 # gh api ... : find the endpoint token (contains "repos/").
@@ -265,6 +273,14 @@ THREADS_NULL_NODE = _threads([None, _thread(True, COPILOT)])
 THREADS_NULL_RESOLVED = _threads([{"isResolved": None, "comments": {"nodes": []}}])
 THREADS_TRUNC_OPEN = _threads([_thread(False, COPILOT)] + [_thread(True, COPILOT)] * 99, total=150)
 THREADS_TRUNC_RESOLVED = _threads([_thread(True, COPILOT)] * 100, total=150)
+# totalCount BELOW the node count is self-contradictory -> UNREADABLE, never a count.
+THREADS_TOTAL_BELOW_NODES = _threads([_thread(False, COPILOT)], total=0)
+# CR reviewed an OLDER head (submitted before the stub COMMITTER_DATE).
+CR_APPROVED_OLD_HEAD = '[{"user":{"login":"coderabbitai[bot]"},"state":"APPROVED","submitted_at":"2026-06-17T01:00:00Z"}]'
+RED_AND_GREEN_CHECKS = ('[{"name":"ci","state":"SUCCESS","description":"ok"},'
+                        '{"name":"lint","state":"FAILURE","description":"Lint failed"}]')
+# A checks body whose entries carry no `state`: pending AND failing are unreadable.
+CHECKS_NO_STATE = '[{"name":"ci","description":"?"}]'
 
 CR_REQUESTED = '{"users":[{"login":"coderabbitai[bot]"}]}'
 TRIGGER_COMMENT = '[{"body":"please @coderabbitai review this PR"}]'
@@ -441,8 +457,8 @@ def main():
                               mergeable="blocked", threads=THREADS_ONE_OPEN,
                               want_graphql_args=True)
     check("(a) exit 0", rc == 0)
-    check("(a) emits 'thread-blocked ... unresolved=1 by=<login>'",
-          out.strip() == "thread-blocked head=%s unresolved=1 by=%s" % (HEAD_SHA[:8], COPILOT))
+    check("(a) emits 'thread-blocked ... unresolved=1 failing=0 by=<login>'",
+          out.strip() == "thread-blocked head=%s unresolved=1 failing=0 by=%s" % (HEAD_SHA[:8], COPILOT))
     check("(a) the GraphQL call is a `query`, never a mutation",
           "query=query(" in gargs and "mutation" not in gargs)
 
@@ -450,7 +466,7 @@ def main():
     rc, out, err = run(checks=GREEN_CHECK, reviews=CR_APPROVED, mergeable="blocked",
                        threads=THREADS_DUP_AUTHORS)
     check("(a') unresolved=3 by= lists each login once",
-          out.strip() == "thread-blocked head=%s unresolved=3 by=%s,octocat" % (HEAD_SHA[:8], COPILOT))
+          out.strip() == "thread-blocked head=%s unresolved=3 failing=0 by=%s,octocat" % (HEAD_SHA[:8], COPILOT))
 
     print("== #441 (b): all threads resolved -> no thread-blocked (stays pending) ==")
     rc, out, err = run(checks=GREEN_CHECK, reviews=CR_APPROVED, mergeable="blocked",
@@ -507,6 +523,63 @@ def main():
                        threads=THREADS_TRUNC_RESOLVED, timeout_secs=PENDING_TIMEOUT)
     check("(g) truncated + every fetched thread resolved -> no terminal, pends threads(truncated)",
           rc == 1 and "thread-blocked" not in out and "threads(truncated)" in err)
+
+    print("== #441 (h): a settle-path baseline does NOT confirm thread-blocked ==")
+    # Poll 1 reads `clean` (settle path sets the quiet baseline and continues without
+    # resetting it); poll 2 reads `blocked` with an open thread. The `thread:` tag on
+    # the baseline forces a SECOND poll on which thread-blocked's own predicate holds,
+    # so the terminal never fires on a single thread read. Without the tag, poll 2
+    # would emit at once (never announcing threads(quiet-confirm), one graphql call).
+    rc, out, err, gargs = run(checks=GREEN_CHECK, reviews=CR_APPROVED, threads=THREADS_ONE_OPEN,
+                              mergeable_seq="clean,blocked", want_graphql_args=True)
+    check("(h) still reaches thread-blocked", rc == 0 and "thread-blocked head=" in out)
+    check("(h) passed through threads(quiet-confirm) first", "threads(quiet-confirm)" in err)
+    check("(h) the thread predicate was read on >= 2 polls", gargs.count("query=query(") >= 2)
+
+    print("== #441 (i): CR triggered, CR review older than head, blocked, open thread -> pends ==")
+    # thread-blocked needs merge(blocked) to be the SOLE pending item; a CR review still
+    # owed on the new head keeps cr-review pending, so the watch times out instead.
+    rc, out, err = run(checks=GREEN_CHECK, reviews=CR_APPROVED_OLD_HEAD, mergeable="blocked",
+                       threads=THREADS_ONE_OPEN, issue_comments=TRIGGER_COMMENT,
+                       timeout_secs=PENDING_TIMEOUT)
+    check("(i) exit 1 (timeout), no thread-blocked", rc == 1 and "thread-blocked" not in out)
+    check("(i) pending is cr-review,merge(blocked)", "pr-watch: pending=cr-review,merge(blocked)\n" in err)
+
+    print("== #441 (j): totalCount below the node count -> threads(unreadable) ==")
+    rc, out, err = run(checks=GREEN_CHECK, reviews=CR_APPROVED, mergeable="blocked",
+                       threads=THREADS_TOTAL_BELOW_NODES, timeout_secs=PENDING_TIMEOUT)
+    check("(j) exit 1, no terminal", rc == 1 and "thread-blocked" not in out and "settled" not in out)
+    check("(j) pending names threads(unreadable)", "threads(unreadable)" in err)
+
+    print("== #441 (k): GraphQL variables are sent with the right types ==")
+    # The stub answers a missing/mistyped variable with GitHub's error body, so an open
+    # thread still reaching thread-blocked (case a) proves all three were sent. Here the
+    # argument shape is asserted directly as well.
+    rc, out, err, gargs = run(checks=GREEN_CHECK, reviews=CR_APPROVED, mergeable="blocked",
+                              threads=THREADS_ONE_OPEN, want_graphql_args=True)
+    check("(k) -f owner / -f name (String), -F number (Int)",
+          "-f owner=owner" in gargs and "-f name=repo" in gargs and "-F number=123" in gargs)
+
+    print("== #441 (l): red CI + open thread -> thread-blocked names failing=1 ==")
+    rc, out, err = run(checks=RED_AND_GREEN_CHECKS, reviews=CR_APPROVED, mergeable="blocked",
+                       threads=THREADS_ONE_OPEN)
+    check("(l) exit 0 + failing=1 on the line",
+          rc == 0 and out.strip() == "thread-blocked head=%s unresolved=1 failing=1 by=%s" % (HEAD_SHA[:8], COPILOT))
+
+    print("== #441 (m): unreadable checks read -> no terminal (failing never a guessed zero) ==")
+    for label, ck in (("entries without state", CHECKS_NO_STATE), ("non-JSON body", "not json"),
+                      ("object, not array", '{"state":"SUCCESS"}')):
+        rc, out, err = run(checks=ck, reviews=CR_APPROVED, mergeable="blocked",
+                           threads=THREADS_ONE_OPEN, timeout_secs=PENDING_TIMEOUT)
+        check(f"(m) {label}: exit 1, no thread-blocked", rc == 1 and "thread-blocked" not in out)
+        check(f"(m) {label}: pending names ci(unknown)", "ci(unknown)" in err)
+
+    print("== #399: review-blocked quiet deferral is announced on stderr ==")
+    rc, out, err = run(checks=GREEN_CHECK, reviews=CR_CHANGES, grow_inline="coderabbitai[bot]",
+                       timeout_secs=PENDING_TIMEOUT)
+    check("#399 review-blocked deferral -> exit 1, no terminal", rc == 1 and out.strip() == "")
+    check("#399 names review-blocked(quiet-confirm)",
+          err.count("pr-watch: pending=review-blocked(quiet-confirm)\n") == 1)
 
     # ---------------------------------------------------------------------
     # #399: one stderr line per pending-set CHANGE, silence when unchanged.

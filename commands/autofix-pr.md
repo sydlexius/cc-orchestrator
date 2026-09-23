@@ -108,6 +108,10 @@ If anything other than `go`, exit with USER-ABORT.
 
 ## Step 2 -- Loop (round 1..max_rounds)
 
+Before round 1, set `prev_thread_unresolved=` (empty) and `last_outcome=` (empty);
+each round records its 2b branch in `last_outcome` (FIX / THREAD / ...), which the
+round-cap message in 2c reads.
+
 For each `round` from 1:
 
 ### 2a-pre. Bring PR forward if behind base
@@ -238,23 +242,85 @@ remote_head=$(git -C "$worktree" ls-remote origin "refs/heads/$head_ref" | cut -
   > `~/.claude/scripts/` copy. Then re-run `/autofix-pr <pr>`."
   > Exit with status **ABORT**.
 - `post_head != pre_head` AND `remote_head == post_head` -> fix pushed
-  and verified. Increment round counter and loop back to 2a.
+  and verified. Clear `prev_thread_unresolved` (a commit resets the THREAD
+  no-progress comparison), increment round counter and loop back to 2a.
 
 #### THREAD
 
-CI is green and nobody requested changes, but at least one review thread is
-unresolved and GitHub reports the PR `blocked` (#441). The `by=` field names who
-opened the threads. This is DISTINCT from FIX in one way that matters: a thread
-round is often closed by reply-and-resolve alone, so handle-review may
-legitimately make NO commit. A no-commit THREAD round is NOT a stall; the FIX
-branch's "no commits -> STALL" rule must NOT be applied here.
+CI is terminal, nobody requested changes, at least one review thread is
+unresolved, and GitHub reports the PR `blocked` (#441). The line is
+`thread-blocked head=<sha8> unresolved=<n> failing=<n> by=<logins>`. `by=` names
+who opened the unresolved threads; `failing=` counts checks in a failed terminal
+state from the same read (CI terminal is NOT CI green, so `failing` may be
+nonzero). This is DISTINCT from FIX in one way that matters: a thread round is
+often closed by reply-and-resolve alone, so handle-review may legitimately make
+NO commit. A no-commit THREAD round is NOT by itself a stall; the FIX branch's
+"no commits -> STALL" rule must NOT be applied here. What IS a stall is a
+no-commit round that changed nothing, which the pre-dispatch check below catches.
+
+`prev_thread_unresolved` (initialized empty before round 1) holds the
+`unresolved` count recorded by the PREVIOUS round's no-commit THREAD leg. Every
+other outcome (SUCCESS, FIX, a THREAD round that committed, and every exit)
+clears it, so it only ever compares two CONSECUTIVE no-commit thread rounds.
+
+Pre-dispatch check (run BEFORE invoking handle-review; `$watch_line` is the
+pr-watch stdout line). No helper is executed here, only text tests:
+
+```bash
+# ONE anchored parse of the whole documented shape: it yields all three fields or
+# nothing, so a single emptiness test covers every missing/garbled field.
+tb=$(printf '%s\n' "$watch_line" | sed -n 's/^thread-blocked head=[0-9a-f]\{8\} unresolved=\([0-9][0-9]*\) failing=\([0-9][0-9]*\) by=\([^ ][^ ]*\)$/\1 \2 \3/p')
+tb_unresolved=""; tb_failing=""; tb_by=""
+[ -n "$tb" ] && read -r tb_unresolved tb_failing tb_by <<EOT
+$tb
+EOT
+if [ -z "$tb" ]; then thread_next=abort-parse
+elif [ "$tb_failing" -gt 0 ]; then thread_next=stall-ci
+elif ! printf '%s\n' "$tb_by" | tr ',' '\n' | grep -q '\[bot\]$'; then thread_next=stall-human
+elif [ -n "$prev_thread_unresolved" ] && [ "$tb_unresolved" -ge "$prev_thread_unresolved" ]; then thread_next=stall-noprogress
+else thread_next=handle-review; fi
+echo "thread_next=$thread_next unresolved=${tb_unresolved:-?} failing=${tb_failing:-?} by=${tb_by:-?}"
+```
+
+Dispatch on `thread_next`, in this order (first match wins):
+
+- `abort-parse` -> the line does not match the documented shape (an older
+  pr-watch without `failing=`, or a truncated line). Print it verbatim and exit
+  with status **ABORT**; never guess the missing fields.
+- `stall-ci` -> `failing > 0`: a check FAILED. handle-review answers bot
+  comments; it does not fix a red CI, so looping would only re-spend rounds.
+  Name the failing checks and exit with status **STALL** (the "thread round, CI
+  failing" row of the Step 3 matrix):
+
+  ```bash
+  gh pr checks "$pr_number" --json name,bucket --jq '.[] | select(.bucket == "fail" or .bucket == "cancel") | .name'
+  ```
+
+  Print "round <round>: thread-blocked with <failing> failing check(s): <names>.
+  CI failure is not something handle-review's thread replies fix; fix CI first."
+- `stall-human` -> no login in `by=` ends in `[bot]`, so every unresolved thread
+  was opened by a human. handle-review only triages bot comments, so it cannot
+  make progress here. Print "round <round>: thread-blocked by human reviewer(s)
+  <by> only; NEEDS YOU - answer or resolve those threads (handle-review handles
+  bot comments only)." and exit with status **STALL** (the "thread round, human
+  threads" row).
+- `stall-noprogress` -> the previous round was a no-commit THREAD round whose
+  replies all landed, and the watch still reports the same or MORE unresolved
+  threads. Another handle-review round would reply to nothing new. Print
+  "round <round>: <unresolved> thread(s) still unresolved after last round's
+  replies (was <prev_thread_unresolved>). Likely CodeRabbit declined to
+  auto-resolve after the reply, or a human-opened thread is among them. RAISE
+  this to the maintainer; NEVER force-resolve a CodeRabbit thread." and exit
+  with status **STALL** (the "thread round, no progress" row).
+- `handle-review` -> proceed below.
 
 Capture `pre_head` exactly as in FIX, invoke `/handle-review <pr_number>` via
 Skill, then read `post_head` and `remote_head` the same way.
 
-- `post_head != pre_head` -> the round committed a fix. Apply the FIX branch's
-  push verification unchanged (ABORT on `remote_head != post_head`, else
-  increment the round and loop back to 2a).
+- `post_head != pre_head` -> the round committed a fix. Clear
+  `prev_thread_unresolved`, then apply the FIX branch's push verification
+  unchanged (ABORT on `remote_head != post_head`, else increment the round and
+  loop back to 2a).
 - `post_head == pre_head` -> verify progress from the comment state instead of
   from a commit:
 
@@ -271,13 +337,14 @@ Skill, then read `post_head` and `remote_head` the same way.
   [ "$leg" = stable ] && unreplied=$(bash ~/.claude/scripts/pr-unreplied-comments.sh --count-only "$pr_number" 2>/dev/null || echo unknown)
   ```
 
-  - `unreplied == 0` -> every finding is replied. Print "round <round>: thread
-    round replied without a commit; re-watching to confirm resolution." and
+  - `unreplied == 0` -> every finding is replied. Record
+    `prev_thread_unresolved=$tb_unresolved`, print "round <round>: thread
+    round replied without a commit; re-watching to confirm resolution.", and
     increment the round and loop back to 2a. The next `/pr-watch` IS the
     resolution check: if the threads are now resolved it moves on to `settled`
-    (or another terminal); if they are still open it emits `thread-blocked`
-    again, and the round cap (2c) bounds that repetition (for example, a thread
-    waiting for a bot to resolve it itself).
+    (or another terminal); if it emits `thread-blocked` again with the same or
+    higher `unresolved`, the `stall-noprogress` check above exits at once rather
+    than burning rounds to the cap.
   - anything else (a non-zero count, or `unknown`) -> handle-review neither
     committed nor replied. Print "round <round>: thread-blocked by <by>, but
     handle-review made no commit and <unreplied> finding(s) remain unreplied."
@@ -299,7 +366,10 @@ closed without merging; nothing to fix." and exit the loop with status
 #### STALL
 
 `/pr-watch` timed out, OR a FIX-round handle-review made no commits, OR a
-THREAD round neither committed nor replied. Distinguish sub-cases so we report
+THREAD round stalled (a failing check, human-only threads, no progress after a
+replied round, or neither committed nor replied - each prints its own line and
+maps to its own Step 3 row; the CR-state case analysis below is for the timeout
+and FIX sub-cases). Distinguish sub-cases so we report
 something useful. Before timing out, the watch's stderr `pr-watch: pending=<list>`
 lines (#399) name what it was holding on; quote the last one in the report.
 
@@ -360,14 +430,24 @@ exit with status **ABORT**.
 ### 2c. Round cap check
 
 If `round >= max_rounds` after a FIX or THREAD iteration completes, exit the loop
-with status **CAP**:
+with status **CAP**. The message depends on `last_outcome`:
 
-> "Hit round cap of <max_rounds>. CR is still flagging findings; this PR
-> may be in a sticky pattern (e.g. a fix introduces a new finding next
-> round). Manual triage recommended: `gh pr view <pr>` +
-> `bash <pr-unreplied-comments.sh> <pr>` (the LITERAL path of the resolved leg: repo-local
-> `scripts/pr-unreplied-comments.sh` first, but ONLY inside cc-orchestrator itself; else the
-> plugin copy; else the deployed `~/.claude/scripts/` copy)."
+- `last_outcome == FIX`:
+
+  > "Hit round cap of <max_rounds>. CR is still flagging findings; this PR
+  > may be in a sticky pattern (e.g. a fix introduces a new finding next
+  > round). Manual triage recommended: `gh pr view <pr>` +
+  > `bash <pr-unreplied-comments.sh> <pr>` (the LITERAL path of the resolved leg: repo-local
+  > `scripts/pr-unreplied-comments.sh` first, but ONLY inside cc-orchestrator itself; else the
+  > plugin copy; else the deployed `~/.claude/scripts/` copy)."
+
+- `last_outcome == THREAD`:
+
+  > "Hit round cap of <max_rounds> on a thread-blocked PR. Review threads kept
+  > re-opening or staying unresolved across rounds (last watch: unresolved=<n>
+  > by=<by>). Inspect the open threads with `bash <pr-unreplied-comments.sh> <pr>`
+  > (same LITERAL-leg rule as above). If CodeRabbit declined to auto-resolve a
+  > thread, RAISE it to the maintainer; NEVER force-resolve a CodeRabbit thread."
 
 Per `feedback_cap_cr_rounds`, do NOT silently continue past the cap.
 Offer the user an explicit "bump cap" path: "Re-run with
@@ -402,6 +482,9 @@ Suggested next-step matrix:
 | STALL (case 1 or 2) | Wait 15-30 min, then re-run `/autofix-pr <pr>` |
 | STALL (case 3) | Inspect `gh pr checks <pr>`; resolve the holdout |
 | STALL (thread round, no commit and no reply) | Inspect the open threads with the unreplied-comments script, then `/handle-review <pr>` |
+| STALL (thread round, CI failing) | Fix the failing check(s) the report names; handle-review does not fix CI |
+| STALL (thread round, human threads) | NEEDS YOU: answer or resolve the human-opened threads |
+| STALL (thread round, no progress) | RAISE to the maintainer (CR declined to auto-resolve, or a human thread); never force-resolve a CR thread |
 | CAP | Manual triage via `gh pr view <pr>` + unreplied-comments script |
 | ABORT | Fix the setup issue surfaced by pr-watch, re-run |
 | USER-ABORT | (no suggestion -- user explicitly stopped) |
