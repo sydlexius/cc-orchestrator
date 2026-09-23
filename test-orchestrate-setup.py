@@ -72,17 +72,24 @@ _CLEAN_CASCADE = None
 _ISO_HOME = None
 
 
+# The caller's HOME as the harness was LAUNCHED, captured at import - before main() pins
+# os.environ["HOME"] to the temp home. A gate run with HOME pointed somewhere other than the
+# passwd home has its OWN ~/.claude, and setup.py's defaults (expanduser("~")) would target THAT.
+_CALLER_HOME = os.environ.get("HOME")
+
+
 def _real_homes():
-    """The homes the self-check protects. The passwd-database home is ALWAYS included - resolved
-    from pwd, NOT $HOME, so no HOME override (ours or the caller's) can point the check somewhere
-    harmless. ORCHESTRATE_TEST_REAL_HOME is a TEST-ONLY seam for mutation-proving the self-check
-    against a throwaway dir: it ADDS a protected home, it never REPLACES the true one, so a seam
-    left exported in a developer's shell cannot silently switch the backstop off."""
+    """The homes the self-check protects: the passwd-database home (resolved from pwd, so no HOME
+    override can point the check somewhere harmless) PLUS the caller's launch-time HOME when it
+    differs (a leak lands wherever expanduser("~") resolved in the caller's shell).
+    ORCHESTRATE_TEST_REAL_HOME is a TEST-ONLY seam for mutation-proving the self-check against a
+    throwaway dir: it ADDS a protected home, it never REPLACES the true one, so a seam left exported
+    in a developer's shell cannot silently switch the backstop off."""
     homes = [pwd.getpwuid(os.getuid()).pw_dir]
+    if _CALLER_HOME and _CALLER_HOME not in homes:
+        homes.append(_CALLER_HOME)
     seam = os.environ.get("ORCHESTRATE_TEST_REAL_HOME")
     if seam and seam not in homes:
-        print(f"  NOTE: ORCHESTRATE_TEST_REAL_HOME is set - the self-check ALSO protects {seam}",
-              file=sys.stderr)
         homes.append(seam)
     return homes
 
@@ -116,7 +123,12 @@ def _snapshot_one(home, snap):
         if not os.path.lexists(top):
             snap[top] = ("ABSENT", 0); continue
         st = os.lstat(top); snap[top] = (st.st_ctime, st.st_size)
-        if os.path.isdir(top) and not os.path.islink(top):
+        # A SYMLINKED protected dir (e.g. ~/.claude/scripts -> a dotfiles repo) is WALKED through:
+        # configure's makedirs/mkstemp follow the link and deploy into the target, so recording
+        # only the link's own lstat would leave a real leak green. The link entry above is kept, so
+        # a retarget is caught too. os.walk does not descend into symlinked CHILD dirs
+        # (followlinks=False), so the walk cannot cycle.
+        if os.path.isdir(top):
             for root, dirs, files in os.walk(top):
                 for n in dirs + files:
                     p = os.path.join(root, n)
