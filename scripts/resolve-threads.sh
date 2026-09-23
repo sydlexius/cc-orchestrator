@@ -8,9 +8,13 @@
 # comment database IDs. The optional --bot flag restricts resolution to
 # threads whose first comment's author.login matches the given case-insensitive
 # regex (default: "copilot|greptile|codoki" -- the bots that lack a slash-command
-# resolve). CodeRabbit threads are NOT in the default pattern because they
-# resolve via "@coderabbitai resolve", not GraphQL; pass --bot coderabbit if
-# you specifically need to force-resolve a CR thread via this path.
+# resolve). CodeRabbit threads are NOT in the default pattern: a CodeRabbit
+# thread is resolved by a SHA-citing reply that mentions CodeRabbit, or by
+# "@coderabbitai resolve" -- not by this script. --bot coderabbit (GraphQL
+# force-resolve) is for EXIGENT circumstances only, such as a CodeRabbit
+# outage, and needs the maintainer's explicit approval each time. If
+# CodeRabbit does not resolve a thread, check thread state and raise it;
+# never force it via this flag.
 #
 # Examples:
 #   # Default: copilot OR greptile OR codoki (the GraphQL-resolve bots):
@@ -19,8 +23,10 @@
 #   # Copilot only:
 #   bash resolve-threads.sh --bot copilot 851 1234567 2345678
 #
-#   # Any bot (escape hatch):
-#   bash resolve-threads.sh --bot 'bot' 1695 1111 2222
+#   # Any non-CodeRabbit bot, e.g. Greptile:
+#   bash resolve-threads.sh --bot greptile 1695 1111 2222
+#   # (A broad pattern such as 'bot' ALSO matches coderabbitai[bot]; never pass it
+#   # CodeRabbit comment IDs without the maintainer's approval - see above.)
 #
 # Prints "Resolved <thread-id> (comment <db-id>)" per thread, or
 # "Skipped <db-id> (already resolved, not found, or author mismatch)"
