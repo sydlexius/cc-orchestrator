@@ -157,28 +157,48 @@ if [ "${1:-}" = "--self-test" ]; then
 fi
 
 # --- read the payload: stdin JSON first, then $TOOL_INPUT env, else fail OPEN (exit 0, no warn) ---
-tool_input_json=""
-stdin_json=""
-if [ ! -t 0 ]; then
-  stdin_json=$(cat 2>/dev/null)
-fi
 # tool_name + session_id live at the stdin TOP LEVEL (not inside tool_input), so they are available
 # only via the real PreToolUse stdin payload - the $TOOL_INPUT env fallback carries neither, which is
 # fine: the read-dedup rule (which needs both) simply cannot fire on that channel (fail-open).
-tool_name=""
-session_id=""
-if [ -n "$stdin_json" ]; then
-  tool_input_json=$(printf '%s' "$stdin_json" | jq -c '.tool_input // empty' 2>/dev/null)
-  tool_name=$(printf '%s' "$stdin_json" | jq -r '.tool_name // empty' 2>/dev/null)
-  session_id=$(printf '%s' "$stdin_json" | jq -r '.session_id // empty' 2>/dev/null)
-fi
-if [ -z "$tool_input_json" ] && [ -n "${TOOL_INPUT:-}" ]; then
-  tool_input_json="$TOOL_INPUT"
-fi
-[ -z "$tool_input_json" ] && exit 0
-
-file_path=$(printf '%s' "$tool_input_json" | jq -r '.file_path // empty' 2>/dev/null)
-cmd=$(printf '%s' "$tool_input_json" | jq -r '.command // empty' 2>/dev/null)
+#
+# ONE jq FORK (#414). This used to fork jq five times (plus cat) on EVERY call, ~14ms of ~20ms.
+# One program now reads stdin, falls back to $TOOL_INPUT (read via jq's own `env`), and emits every
+# field NUL-TERMINATED, followed by an END sentinel. NUL is the one byte that cannot collide: a bash
+# variable cannot hold it, so each value has its NULs removed in jq first - exactly what the old
+# `$(jq -r ...)` did to them, only without bash's "ignored null byte" warning. Each field keeps the
+# old per-field semantics: `// empty` (absent/null/false -> ""), a per-field error (non-object
+# input) -> "" without costing the other fields, trailing newlines stripped as `$(...)` stripped
+# them. Two deliberate differences: a NON-STRING container value renders as compact JSON where `jq -r`
+# pretty-printed it (whitespace only; no rule can match either form), and a multi-document stdin
+# now yields only its FIRST document (Claude Code sends exactly one). base64 per field was measured
+# and rejected: bash has no builtin decoder, so it trades the jq forks for base64 forks.
+# fg is rule (5)'s `.run_in_background == false`, computed here instead of in a sixth fork: TYPE-EXACT
+# (see is_foreground_agent) - absent / true / "false" / 0 / non-object all yield "".
+# A missing jq, empty stdin, or malformed JSON yields no END sentinel (or empty fields) -> exit 0.
+# shellcheck disable=SC2016  # a jq program: its $vars are jq's, never the shell's
+_EXTRACT='
+def s: (if type == "string" then . else tojson end) | split("\u0000") | join("")
+  | if endswith("\n") then (explode) as $e
+      | .[:(first(range(($e | length) - 1; -1; -1) | select($e[.] != 10)) // -1) + 1]
+    else . end;
+def f(p): (first(try (p | select(. != null and . != false)) catch empty) | s) // "";
+(try input catch null) as $p
+| [try ($p | .tool_input | select(. != null and . != false)) catch empty] as $a
+| (if ($a | length) > 0 then {ok: true, v: $a[0]}
+   elif ((env.TOOL_INPUT // "") | length) > 0 then {ok: true, v: (try (env.TOOL_INPUT | fromjson) catch null)}
+   else {ok: false, v: null} end) as $t
+| ($p | f(.tool_name)), "\u0000", ($p | f(.session_id)), "\u0000",
+  (if $t.ok then "1" else "" end), "\u0000",
+  ($t.v | f(.file_path)), "\u0000", ($t.v | f(.command)), "\u0000",
+  (if (try ($t.v.run_in_background == false) catch false) then "1" else "" end), "\u0000",
+  "END", "\u0000"'
+# Never let jq wait on a terminal (the old code skipped reading a TTY stdin for the same reason).
+if [ -t 0 ]; then exec </dev/null; fi
+tool_name="" session_id="" has_input="" file_path="" cmd="" fg_agent="" x_end=""
+{ IFS= read -r -d '' tool_name; IFS= read -r -d '' session_id; IFS= read -r -d '' has_input
+  IFS= read -r -d '' file_path; IFS= read -r -d '' cmd; IFS= read -r -d '' fg_agent
+  IFS= read -r -d '' x_end; } < <(jq -nj "$_EXTRACT" 2>/dev/null)
+[ "$x_end" = END ] && [ -n "$has_input" ] || exit 0
 
 # --- rule helpers ----------------------------------------------------------
 # A canonical file: the skill playbook, any per-role template, or a floor/steer hook script. Resolve
@@ -272,16 +292,17 @@ is_canonical_path() {
 # This is the floor-matcher lesson applied to an advisory rule: deny-on-doubt becomes silent-on-doubt.
 is_foreground_agent() {
   # TYPE-EXACT by construction: `== false` matches ONLY a JSON boolean false. An absent key is null
-  # (not false), the string "false" is not false, 0 is not false, and a non-object input makes jq -e
-  # exit nonzero. So absent / true / "false" / 0 / malformed / missing-jq all fall to SILENT, and only
-  # the one sanctioned shape warns.
+  # (not false), the string "false" is not false, 0 is not false, and a non-object input is caught
+  # to false. So absent / true / "false" / 0 / malformed / missing-jq all fall to SILENT, and only
+  # the one sanctioned shape warns. The test itself runs in the ONE payload jq (_EXTRACT, #414),
+  # which hands its verdict here as $1 = "1" or "".
   #
   # NOTE the trap this avoids: `// empty` is UNUSABLE here (jq's alternative operator treats a literal
   # `false` as empty and would erase the very value we test for), and a shell falsy check would be
   # WORSE - `run_in_background` is ABSENT, not false, when omitted, and an Agent DEFAULTS TO BACKGROUND,
   # so 13 of the 45 live spawns the #221 spike captured were legal background agents with no field at
   # all. A falsy check would have warned on all of them.
-  printf '%s' "$1" | jq -e '.run_in_background == false' >/dev/null 2>&1
+  [ "${1:-}" = 1 ]
 }
 
 # --- shared command scanner for rules (2) and (3) -------------------------------
@@ -862,7 +883,7 @@ fi
 #      foreground Agent also sees this WARN, where "blocks the LEAD console" is imprecise (it blocks
 #      that teammate). Deliberately NOT special-cased: a nesting check would add a fragile inference
 #      for an advisory nudge whose advice ("do not block yourself on a foreground agent") still holds.
-if [ "$tool_name" = "Agent" ] && is_foreground_agent "$tool_input_json" && marker_active; then
+if [ "$tool_name" = "Agent" ] && is_foreground_agent "$fg_agent" && marker_active; then
   # ONE LINE, and deliberately so (#406). This fires on EVERY foreground spawn in a marker
   # session and blocks nothing, so its body is re-read by someone who has already seen it.
   # The full argument -- why BOTH halves are required, the nested-spawn imprecision, the
