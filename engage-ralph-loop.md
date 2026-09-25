@@ -1,7 +1,8 @@
 # Adversarial critic loop (reusable brief)
 
-A target-agnostic brief for running a BOUNDED adversarial critic loop to converge an
-artifact (a guard/hook, a parser, a state machine, a spec, an API, a migration) to "dry."
+A target-agnostic brief for running a BOUNDED adversarial critic loop over an artifact
+(a guard/hook, a parser, a state machine, a spec, an API, a migration) until a round ends
+with a SHIP or SHIP WITH FIXES verdict.
 Point a `/ralph-loop` (or any iterate-until-done harness) at this file, or paste it, with
 the INSTANTIATION block below filled in. Use `--max-iterations N` + a `--completion-promise`
 so it terminates.
@@ -26,9 +27,13 @@ can actually DO:
 
 | Tier | The diff can... | Protocol |
 |---|---|---|
-| **DENY-AUTHORITY** | deny/permit an action: the floor guard, the merge-auth token issuer, anything whose exit code gates a tool call or a merge | **FULL loop, K=2 convergence.** A defect here permits a bad push or merge. |
-| **ADVISORY** | only emit a nudge: a hook that provably `exit 0`s on every path and cannot block anything | **ONE multi-lens pass + ONE fix-scoped verify round.** No K loop. |
-| **STANDARD** | everything else (prose, docs, ordinary scripts) | **ONE multi-lens pass.** |
+| **DENY-AUTHORITY** | deny/permit an action: the floor guard, the merge-auth token issuer, anything whose exit code gates a tool call or a merge | **FULL multi-lens pass per round, through the ISOLATION harness, including an old-vs-new permit/deny differential.** A defect here permits a bad push or merge. |
+| **ADVISORY** | only emit a nudge: a hook that provably `exit 0`s on every path and cannot block anything | **Verify the advisory property on the POST-diff file, then ONE multi-lens pass per round.** |
+| **STANDARD** | everything else (prose, docs, ordinary scripts) | **ONE multi-lens pass per round.** |
+
+The tier decides the DEPTH and LENSES of each round, never a round COUNT. The round count is
+decided by the VERDICT (see "Verdict + honesty" below): every round ends with SHIP, SHIP WITH
+FIXES, or DO NOT SHIP, and only DO NOT SHIP earns another round.
 
 The ADVISORY tier is earned by a VERIFIED PROPERTY, never by a filename: "advisory" is a property
 of the CURRENT file, and the moment a diff adds an `exit 2` or a stdout write, that same diff is
@@ -37,12 +42,13 @@ stdout write on any live path, and the hook wiring still swallows failure. **Can
 DENY-AUTHORITY tier.** (This is why cc-orchestrator's `orchestrate-steer.sh` is advisory and
 `orchestrate-guard.sh` is not, despite sitting side by side in the same "floor" directory.)
 
-ESCALATION HATCH (the reason the fast tiers are safe): a **CRITICAL or IMPORTANT** finding in a
-single-pass tier PROMOTES that diff to the FULL loop. The speed win is therefore taken ONLY on
+ESCALATION HATCH (the reason the fast tiers are safe): a **CRITICAL or IMPORTANT** finding means
+the round's verdict is DO NOT SHIP, unless the fix is trivially mechanical and already applied
+(the reviewer's call, which the lead may overrule). The speed win is therefore taken ONLY on
 diffs that come back clean - which is exactly where it is free. A diff that deserved ten rounds
 still gets them; it just has to earn them.
 
-STATE THE BUDGET BEFORE ROUND 1 (tier, expected rounds, rough token/wall-clock cost), so the cost
+STATE THE BUDGET BEFORE ROUND 1 (tier, round cap, rough token/wall-clock cost), so the cost
 is visible up front instead of discovered at round 10.
 
 ## Per round - run the LENSES IN PARALLEL, then report
@@ -76,37 +82,37 @@ Standing lenses (adapt per target; each is a separate critic):
 5. **Capture method lessons.** Any "right gate / right method" learned (a new isolation trick,
    a verify step that caught a false claim) goes into the design doc so the next pass inherits it.
 
-## THE VERIFY ROUND IS HOSTILE AND FIX-SCOPED (#287)
-The fixes are NEW, UNREVIEWED CODE. In practice they are where the longest-surviving defects come
+## THE DO NOT SHIP FOLLOW-UP ROUND IS HOSTILE AND FIX-SCOPED (#287)
+A follow-up round happens ONLY after a DO NOT SHIP verdict. The fixes are NEW, UNREVIEWED CODE. In practice they are where the longest-surviving defects come
 from: a fix writes a comment that is false, or a message string whose advice is causally wrong, or
-it silently breaks a guard that an earlier round installed. A verify round that merely re-runs the
+it silently breaks a guard that an earlier round installed. A follow-up round that merely re-runs the
 gates and confirms "the reported finding is fixed" is STRUCTURALLY BLIND to all of that.
 
-So the verify round takes the FIX DIFF as its target (`HEAD_at_pass_1..HEAD_after_fixes`) and its
-brief is: *"these fixes are unreviewed code; the comments and message strings they wrote are CLAIMS
+So the follow-up round takes the FIX DIFF as its target (`<pre-fix HEAD>..HEAD`), widening scope
+only where the fix reaches beyond its diff (it changes a shared helper, or a contract other code
+relies on), and its brief is: *"these fixes are unreviewed code; the comments and message strings they wrote are CLAIMS
 to be falsified."* Real examples this caught: a canonical-file list that a fix left 4 entries short;
 a lockstep test whose regex silently captured 12 of 15 names, so it could not fail on the very files
 it guarded; a WARN whose remedy was causally FALSE ("name it" does not make an agent async).
 
-## Convergence + honesty
-- Converge when **K consecutive iterations (default 2) find nothing new AND all gates are
-  green.** A single quiet round is not convergence; the tail of a defect distribution hides in
-  the second dry round. (K=2 applies to the DENY-AUTHORITY tier; the fast tiers converge on their
-  one pass + verify, escalating to the full loop on any CRITICAL/IMPORTANT.)
+## Verdict + honesty
+- **Every round ends with ONE verdict: SHIP, SHIP WITH FIXES, or DO NOT SHIP.**
+  - **SHIP / SHIP WITH FIXES END REVIEW:** apply the listed fixes, re-run ALL gates green, and no
+    further review round is owed.
+  - **DO NOT SHIP earns ANOTHER round**, run as the fix-scoped follow-up above.
+  - A reviewer MUST NOT return SHIP or SHIP WITH FIXES while an unfixed finding would make the diff
+    unsafe or wrong on merge; that is DO NOT SHIP.
+  - **The reviewer proposes the verdict; the LEAD may UPGRADE it to DO NOT SHIP, never downgrade
+    it.** A reviewer that wants the loop to end has an incentive to soften.
+  - **A finding in a user-facing message string, a behavior-asserting comment, or a doc that
+    describes shipped behavior is NEVER cosmetic.** Only pure typography/whitespace/formatting is.
+    (A causally-false remedy string reads like a "wording nit" and is not one.)
 - **MAX_ROUNDS (default 6). The cap is a BUDGET ALARM, not a quality bound.** A cap does not reduce
   defects; it stops looking for them. So hitting it NEVER means "ship anyway." STOP and hand the
   owner: (a) rounds run, (b) findings fixed, (c) **the lens classes NOT yet probed** - the honest
   statement of what is still unreviewed - and (d) the choice: continue / ship-with-known-risk /
   **split the diff**. A diff that needs more than ~6 rounds is usually telling you it is too big;
   decomposition, not more rounds, is the remedy.
-- **SEVERITY-AWARE K.** A CRITICAL/IMPORTANT finding resets K. A purely cosmetic one is FIXED but
-  does NOT reset it - otherwise a missing space costs two more full rounds (it has). TWO GUARDRAILS,
-  because this rule is the easiest one to abuse:
-  - **The LEAD assigns severity, not the finding critic.** A critic that wants the loop to end has
-    an incentive to downgrade.
-  - **A finding in a user-facing message string, a behavior-asserting comment, or a doc that
-    describes shipped behavior is NEVER cosmetic.** Only pure typography/whitespace/formatting is.
-    (A causally-false remedy string reads like a "wording nit" and is not one.)
 - The completion promise must be **genuinely true** - do NOT emit it to escape the loop. If the
   loop's own completion detection misfires (tooling bug) while the work is genuinely done, use
   the harness's sanctioned cancel/off-switch; that is not the same as lying a false promise.
@@ -119,4 +125,5 @@ it guarded; a WARN whose remedy was causally FALSE ("name it" does not make an a
   guardrail that is, by design, a guardrail-not-a-sandbox).
 - Fixing a false-positive in one matcher while leaving its twin (sweep the whole CLASS, not the
   one reported instance).
-- Declaring dry after one quiet round; silently capping coverage without logging what was skipped.
+- Returning SHIP / SHIP WITH FIXES over an unfixed merge-unsafe finding; silently capping coverage
+  without logging what was skipped.
