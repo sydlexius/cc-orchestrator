@@ -44,7 +44,9 @@ try:
 except ModuleNotFoundError:  # Python < 3.11
     sys.exit("FAIL: tomllib unavailable (needs Python 3.11+)")
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+# LOCKSTEP_ROOT points the checks at a fixture tree; only the mutation self-test at the end of
+# this file sets it, to prove each harness-step check fails when its invariant breaks.
+ROOT = os.environ.get("LOCKSTEP_ROOT") or os.path.dirname(os.path.abspath(__file__))
 GATES = os.path.join(ROOT, ".gates.toml")
 CI = os.path.join(ROOT, ".github", "workflows", "ci.yml")
 
@@ -62,6 +64,14 @@ CI_EXEMPT: dict[str, str] = {}
 
 def fail(msg):
     sys.exit(f"FAIL: {msg}")
+
+
+# An exemption is only as good as its written reason: an empty or whitespace-only one would
+# silently drop coverage while this guard still passed, so reject it before any set math.
+for _label, _exempt in (("FS_EXEMPT", FS_EXEMPT), ("CI_EXEMPT", CI_EXEMPT)):
+    _blank = sorted(k for k, v in _exempt.items() if not isinstance(v, str) or not v.strip())
+    if _blank:
+        fail(f"{_label} entries without a written reason -> {_blank}")
 
 
 def expand(tokens):
@@ -167,7 +177,10 @@ print("  [ok  ] no shellcheck target is missing from disk")
 # (the merge-auth token writer the floor reads) among them, and the elmer stat-order defect
 # shipped CI-green for exactly that reason. Same three-part shape as above: parse floor first,
 # set equality both directions (minus written exemptions), then a filesystem cross-check.
-HARNESS_RE = re.compile(r"(?<![\w./-])python3\s+(test-[\w.-]+\.py)\b")
+# A harness counts only when its step RUNS it: the whole run string must be exactly
+# `python3 test-<name>.py`. A text match would count `echo python3 test-x.py`, which runs
+# nothing; any other run string mentioning a harness is an unsupported shape and fails.
+HARNESS_STEP_RE = re.compile(r"python3\s+(test-[\w.-]+\.py)")
 
 
 def gates_harnesses():
@@ -178,7 +191,13 @@ def gates_harnesses():
         fail(f"cannot read/parse .gates.toml: {e}")
     out = set()
     for step in data.get("prep_pr", {}).get("steps", []):
-        out.update(HARNESS_RE.findall(step.get("run", "")))
+        run = step.get("run", "").strip()
+        m = HARNESS_STEP_RE.fullmatch(run)
+        if m:
+            out.add(m.group(1))
+        elif re.search(r"python3\s+test-", run):
+            fail(f".gates.toml step '{step.get('name')}' names a harness in an unsupported shape "
+                 f"(only a bare `python3 test-<name>.py` counts as running it): {run!r}")
     return out
 
 
@@ -220,5 +239,62 @@ missing = sorted(gates_h - h_on_disk)
 if missing:
     fail(f"harness steps that no longer exist on disk: {missing}")
 print(f"  [ok  ] every test-*.py is a gate step ({len(h_on_disk)} on disk)")
+
+
+# --- mutation self-test: each harness-step check must be able to FAIL -----------------------
+# A drift guard that cannot fail is decorative. Re-run this file against a fixture copy of the
+# repo with ONE invariant broken, and require a non-zero exit carrying that check's message.
+# Skipped inside a fixture run (LOCKSTEP_ROOT set) so it never recurses.
+def _mutation_selftest():
+    import shutil
+    import subprocess
+    import tempfile
+
+    victim = sorted(gates_h)[0]
+    step_line = f'run = "python3 {victim}"'
+    ci_line = f"run: python3 {victim}"
+    cases = [
+        # (label, file to mutate, old text, new text, message the failure must carry).
+        # "gates step removed" also drops the harness file from the fixture, or the filesystem
+        # cross-check would fire first and the case would prove the wrong check.
+        ("gates step removed", ".gates.toml", step_line, 'run = "true"', "in ci.yml but NOT in .gates.toml"),
+        ("ci step removed", ".github/workflows/ci.yml", ci_line, "run: true", "in .gates.toml but NOT run by CI"),
+        ("echo'd harness", ".gates.toml", step_line, f'run = "echo python3 {victim}"', "unsupported shape"),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        for label, rel, old, new, want in [(None, None, None, None, None)] + cases:
+            fx = os.path.join(tmp, label.replace(" ", "-").replace("'", "") if label else "clean")
+            os.makedirs(os.path.join(fx, ".github", "workflows"))
+            os.makedirs(os.path.join(fx, "scripts"))
+            for f in (".gates.toml", os.path.join(".github", "workflows", "ci.yml")):
+                shutil.copy(os.path.join(ROOT, f), os.path.join(fx, f))
+            for p in glob.glob(os.path.join(ROOT, "scripts", "*.sh")) + glob.glob(os.path.join(ROOT, "test-*.py")):
+                dst = os.path.join(fx, os.path.relpath(p, ROOT))
+                open(dst, "w").close()   # presence is all the filesystem checks read
+            if rel:
+                path = os.path.join(fx, rel)
+                with open(path, encoding="utf-8") as fh:
+                    text = fh.read()
+                if text.count(old) != 1:
+                    fail(f"mutation self-test: '{old}' is not a single line in {rel}; update the case")
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(text.replace(old, new))
+                if label == "gates step removed":
+                    os.remove(os.path.join(fx, victim))
+            r = subprocess.run([sys.executable, os.path.abspath(__file__)], capture_output=True,
+                               text=True, env={**os.environ, "LOCKSTEP_ROOT": fx})
+            out = r.stdout + r.stderr
+            if label is None:
+                if r.returncode != 0:
+                    fail(f"mutation self-test: the UNMUTATED fixture failed, so the fixture is "
+                         f"broken and no mutation result means anything:\n{out}")
+            elif r.returncode == 0 or want not in out:
+                fail(f"mutation self-test: '{label}' did not fail with '{want}' "
+                     f"(rc={r.returncode}); the check it targets has no teeth:\n{out}")
+    print(f"  [ok  ] mutation self-test: {len(cases)} broken fixtures each fail, clean passes")
+
+
+if not os.environ.get("LOCKSTEP_ROOT"):
+    _mutation_selftest()
 
 print("\nok: the CI and .gates.toml lint + harness enumerations are in lockstep")

@@ -55,11 +55,16 @@ if [ "${#prs[@]}" -eq 0 ]; then
   # Do NOT suppress gh's stderr on this loud-fail path: its diagnostic (auth /
   # missing repo context / rate limit) is the actual root cause, and swallowing it
   # behind the generic message below makes the exit-2 undebuggable. Let it bubble.
-  if ! pr_list_out=$(gh pr list "${repo_flag[@]}" --state open --json number --jq '.[].number'); then
+  if ! pr_list_out=$(gh pr list ${repo_flag[@]+"${repo_flag[@]}"} --state open --json number --jq '.[].number'); then
     echo "orchestrate-status: could not determine the in-flight PR set (gh pr list failed)" >&2
     exit 2
   fi
-  [ -n "$pr_list_out" ] && mapfile -t prs <<<"$pr_list_out"
+  # NOT mapfile: it is a bash 4 builtin, and macOS /bin/bash is 3.2 (exit 127).
+  if [ -n "$pr_list_out" ]; then
+    while IFS= read -r _n; do
+      if [ -n "$_n" ]; then prs+=("$_n"); fi
+    done <<<"$pr_list_out"
+  fi
 fi
 
 if [ "${#prs[@]}" -eq 0 ]; then
@@ -93,7 +98,7 @@ JQEOF
 repo_flag=(); [ -n "$repo" ] && repo_flag=(--repo "$repo")
 
 for n in "${prs[@]}"; do
-  if ! row=$(gh pr view "$n" "${repo_flag[@]}" \
+  if ! row=$(gh pr view "$n" ${repo_flag[@]+"${repo_flag[@]}"} \
                --json state,title,mergeStateStatus,reviewDecision,statusCheckRollup \
                --jq "$JQ" 2>/dev/null); then
     echo "#$n ERROR (gh pr view failed)"
