@@ -579,7 +579,7 @@ hook_hits=$(git diff -M --name-status "$base"..HEAD | \
 #
 # Deliberately NOT keyed on "touches orchestrate-setup.py": that was tried and it is TOO BROAD --
 # setup.py carries the hook WIRING but is edited by plenty of benign changes (PR #286 touched it only
-# to add a matcher), so keying on it re-tiers an advisory diff back to K=2 and re-creates the exact
+# to add a matcher), so keying on it re-tiers an advisory diff to deny-authority depth, the over-strictness behind the
 # 50-minute loop this tiering exists to prevent. Over-strictness that defeats the feature is still a bug.
 new_hook=$(git diff -M --name-status "$base"..HEAD | \
   grep -E '^A.*scripts/orchestrate-.*\.(sh|py)$' || true)
