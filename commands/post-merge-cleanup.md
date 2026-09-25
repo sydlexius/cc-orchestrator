@@ -102,6 +102,13 @@ git worktree list --porcelain \
 ```
 
 If a worktree path is found:
+- FIRST `cd` to the MAIN checkout (the first `worktree` line of `git worktree list
+  --porcelain`) before removing anything (#448). If this shell's cwd is the worktree being
+  removed, or anywhere under it, the removal deletes the shell's own cwd: every later
+  command fails and the Claude session is locked out. Compare physical paths (`pwd -P`
+  on both sides; macOS `/tmp` is `/private/tmp`), and treat a sibling that merely shares a
+  name prefix (`/a/wt2` vs `/a/wt`) as NOT inside. `scripts/cleanup-worktree.sh` enforces
+  this and refuses with a non-zero exit, but the inline path here has no such guard.
 - Check for uncommitted changes: `git -C "$wt_path" status --porcelain`
 - If dirty, stop and warn: "Worktree at $wt_path has uncommitted changes. Clean up manually or pass --force."
 - If clean: `git worktree remove "$wt_path"`

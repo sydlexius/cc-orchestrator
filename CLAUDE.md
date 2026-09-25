@@ -158,8 +158,14 @@ Runtime (`scripts/`; canonical source is this repo):
   running configure, or an emergency deny applied straight to the deployed guard (#327) which a
   refresh would silently drop from the floor. The check is still not direction-AWARE (mtime is
   preserved by copy2 and so cannot order them; a real fix needs version/provenance), so the
-  mitigation is RECOVERABILITY - `_deploy_helper` now backs the overwritten regular file up to
-  `<dest>.bak` before replacing it, and REFUSES the overwrite if that backup cannot be made.
+  mitigation is RECOVERABILITY - EVERY deploy path (guard, helpers, agents, and since #425 steer,
+  context-meter and the setup.py self-deploy) routes through the one `_backup_before_overwrite`,
+  backing the overwritten regular file up to `<dest>.bak` (a symlink dest is moved aside) before
+  replacing it, and REFUSES the overwrite (configure exits 1, loudly) if that backup cannot be made.
+  A SYMLINK already at `<dest>.bak` is unlinked first, never followed: moving a symlinked dest aside
+  leaves exactly such a link into the plugin source, and `copy2` through it would clobber the source.
+  Steer/context-meter/setup deploy through one `_stage_backup_install`: stage the temp copy FIRST,
+  back up, then one atomic `os.replace`, so a failed copy never leaves the stable path empty.
   The backup is VERIFIED to exist rather than inferred from the call succeeding: `shutil.copy2`
   onto a DIRECTORY does not raise, it copies INTO it, so a bare try/except reports a backup that
   is not there and then clobbers the original.
@@ -451,7 +457,15 @@ Runtime (`scripts/`; canonical source is this repo):
   with auto-delete-branch, whose DELETE returns 422 - aborted above it and neither step ever ran.
   A failed worktree removal is the one case that deliberately KEEPS the run dir: the worktree is
   still live and its run dir may hold an in-flight gate's lock, so reclaiming it there would be a
-  concurrency wipe (a worse bug than the leak). (2) VERIFY, DO NOT CLASSIFY (#337): the remote-branch delete decides
+  concurrency wipe (a worse bug than the leak). It also KEEPS the branch, local AND remote (#421):
+  the surviving worktree still has it checked out, so `git branch -d/-D` refused and `set -e`
+  aborted above the prune; the branch deletes are now gated on removal success, the prune still
+  runs, and the script exits 1 ON PURPOSE (an incomplete cleanup must not read as done).
+  It REFUSES (exit 1, nothing touched) to remove the worktree holding the caller's cwd (#448): a
+  vanished cwd locks the session out. `pwd -P` on both sides, trailing-slash match so a sibling
+  sharing a name prefix is not caught; if EITHER path cannot be resolved it also refuses (fail
+  closed: containment unknown is not containment ruled out).
+  (2) VERIFY, DO NOT CLASSIFY (#337): the remote-branch delete decides
   success with `git ls-remote --exit-code`, not by grepping the HTTP status. Ref absent = success
   whatever the API said; ref present = a real failure that surfaces the captured stderr and exits 1.
   This is immune to every status-code variation (a widened `404|422` grep would swallow genuine

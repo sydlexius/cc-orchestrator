@@ -1635,6 +1635,92 @@ def _run_checks():
         rc, out = run(["configure", "--apply", "--yes"], env_overrides=sov(s1))
         check("#95: configure is idempotent once steering is wired (no new steer hook line)",
               rc == 0 and "advisory WARN-level steering" not in out)
+        # #425: refreshing a differing deployed steer BACKS IT UP to <dest>.bak (byte-identical to
+        # the old copy), mirroring the #292 guard/helper cases. Direction-blind refresh -> recoverable.
+        _sold = b"#!/usr/bin/env bash\n# drifted steer\nexit 0\n"
+        open(sdest, "wb").write(_sold)
+        _sbak = sdest + ".bak"
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=sov(s1))
+        check("#425: refreshing the deployed steer BACKS UP the old copy byte-identically to <dest>.bak",
+              rc == 0 and os.path.isfile(_sbak) and open(_sbak, "rb").read() == _sold
+              and open(sdest, "rb").read() == open(sbundle, "rb").read())
+        # A DIRECTORY at <dest>.bak: the backup cannot be made -> REFUSE, old copy intact, loud rc1.
+        open(sdest, "wb").write(b"#!/usr/bin/env bash\n# drifted steer again\n")
+        os.remove(_sbak); os.makedirs(_sbak)
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=sov(s1))
+        check("#425: a failed steer backup REFUSES the refresh (old copy intact)",
+              "drifted steer again" in open(sdest).read())
+        check("#425: the steer-backup refusal is REPORTED (rc1 + refusal message)",
+              rc == 1 and "refusing to replace it unbacked" in out)
+        shutil.rmtree(_sbak)
+        # A SYMLINK at <dest>.bak (what moving a symlinked dest aside leaves behind): copy2
+        # FOLLOWS it, so the backup would overwrite the link's TARGET (e.g. the plugin's own
+        # source) with the old deployed copy. The link must be replaced, its target untouched.
+        _starget = os.path.join(td, "steer-bak-target.sh")
+        _starget_bytes = b"#!/usr/bin/env bash\n# the link target, must survive\n"
+        open(_starget, "wb").write(_starget_bytes)
+        os.symlink(_starget, _sbak)
+        _sold2 = b"#!/usr/bin/env bash\n# drifted steer, symlinked bak\n"
+        open(sdest, "wb").write(_sold2)
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=sov(s1))
+        check("#425 (Copilot #451): a symlinked <dest>.bak is NOT followed - its target is untouched",
+              open(_starget, "rb").read() == _starget_bytes)
+        check("#425 (Copilot #451): the backup replaces the link with a regular file holding the old copy",
+              rc == 0 and not os.path.islink(_sbak) and os.path.isfile(_sbak)
+              and open(_sbak, "rb").read() == _sold2)
+        # CR on #451: a SYMLINK dest whose replacement then FAILS must survive. The old order moved
+        # the link to .bak first, so a failed copy left the stable path EMPTY. Lever: an unreadable
+        # bundled source makes the copy fail (skipped as root, where mode 000 does not deny a read).
+        if os.geteuid() != 0:
+            _slink_target = os.path.join(td, "steer-link-target.sh")
+            open(_slink_target, "wb").write(b"#!/usr/bin/env bash\n# linked steer\nexit 0\n")
+            if os.path.lexists(sdest):
+                os.remove(sdest)
+            if os.path.lexists(_sbak):
+                os.remove(_sbak)
+            os.symlink(_slink_target, sdest)
+            _smode = os.stat(sbundle).st_mode
+            os.chmod(sbundle, 0)
+            try:
+                rc, out = run(["configure", "--apply", "--yes"], env_overrides=sov(s1))
+            finally:
+                os.chmod(sbundle, _smode)
+            check("#425 (CR #451): a failed replacement leaves a SYMLINK dest in place (never empty)",
+                  os.path.islink(sdest) and os.readlink(sdest) == _slink_target)
+            check("#425 (CR #451): ...and nothing was moved to .bak for a replace that never happened",
+                  not os.path.lexists(_sbak))
+            check("#425 (CR #451): the failed deploy is REPORTED nonzero", rc != 0)
+            os.remove(sdest)
+        # CR on #451 (round 2): the FINAL os.replace failing, AFTER the link was moved to .bak.
+        # Driven in-process with os.replace patched to fail only for the temp -> dest swap, since
+        # no filesystem lever fails a same-dir rename yet lets the earlier link move succeed.
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location("orch_setup_mod", SCRIPT)
+        _mod = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_mod)
+        _d = os.path.join(td, "final-replace"); os.makedirs(_d)
+        _src = os.path.join(_d, "bundle.sh"); open(_src, "wb").write(b"#!/bin/sh\n# new\n")
+        _tgt = os.path.join(_d, "link-target.sh"); open(_tgt, "wb").write(b"#!/bin/sh\n# old\n")
+        _dst = os.path.join(_d, "deployed.sh"); os.symlink(_tgt, _dst)
+        _real_replace = _mod.os.replace
+        def _fail_final(a, b):
+            if os.path.basename(a).startswith(".orch-test-") and b == _dst:
+                raise OSError("injected final-replace failure")
+            return _real_replace(a, b)
+        _mod.os.replace = _fail_final
+        try:
+            try:
+                _res = _mod._stage_backup_install(_src, _dst, ".orch-test-", "test script")
+            except OSError:
+                _res = (False, "raised")
+        finally:
+            _mod.os.replace = _real_replace
+        check("#425 (CR #451 r2): a failed FINAL replace restores the symlink dest (never empty)",
+              os.path.islink(_dst) and os.readlink(_dst) == _tgt)
+        check("#425 (CR #451 r2): ...the restored link leaves no stray .bak, and the failure surfaces",
+              not os.path.lexists(_dst + ".bak") and _res[0] is False)
+        check("#425 (CR #451 r2): ...and no staged temp file is left behind",
+              not [f for f in os.listdir(_d) if f.startswith(".orch-test-")])
+        run(["configure", "--apply", "--yes"], env_overrides=sov(s1))  # restore to current
         # --no-steer omits the steer hooks AND does not deploy the steer script.
         s2 = fresh_settings("s2.json")
         sdest2 = os.path.join(td, "deployed2", "orchestrate-steer.sh")
@@ -1770,6 +1856,24 @@ def _run_checks():
         rc, out = run(["configure", "--apply", "--yes"], env_overrides=cmov(c1))
         check("#228: configure is idempotent once the meter is wired (no new meter hook line)",
               rc == 0 and "context-budget meter" not in out)
+        # #425: refreshing a differing deployed meter BACKS IT UP byte-identically to <dest>.bak.
+        _cold = b"#!/usr/bin/env bash\n# drifted meter\nexit 0\n"
+        open(cmdest, "wb").write(_cold)
+        _cbak = cmdest + ".bak"
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=cmov(c1))
+        check("#425: refreshing the deployed meter BACKS UP the old copy byte-identically to <dest>.bak",
+              rc == 0 and os.path.isfile(_cbak) and open(_cbak, "rb").read() == _cold
+              and open(cmdest, "rb").read() == open(cmbundle, "rb").read())
+        # A DIRECTORY at <dest>.bak: REFUSE, old copy intact, loud rc1.
+        open(cmdest, "wb").write(b"#!/usr/bin/env bash\n# drifted meter again\n")
+        os.remove(_cbak); os.makedirs(_cbak)
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=cmov(c1))
+        check("#425: a failed meter backup REFUSES the refresh (old copy intact)",
+              "drifted meter again" in open(cmdest).read())
+        check("#425: the meter-backup refusal is REPORTED (rc1 + refusal message)",
+              rc == 1 and "refusing to replace it unbacked" in out)
+        shutil.rmtree(_cbak)
+        run(["configure", "--apply", "--yes"], env_overrides=cmov(c1))  # restore to current
         # --no-ctxmeter omits the meter hook AND does not deploy the meter script.
         c2 = cm_fresh("c2.json")
         cmdest2 = os.path.join(td, "deployed2", "orchestrate-context-meter.sh")
@@ -1902,6 +2006,25 @@ def _run_checks():
         rc, out = run(["configure", "--apply", "--yes"], env_overrides=iov(i1))
         check("#162: configure is idempotent once SessionStart is wired (no duplicate entry)",
               rc == 0 and session_init_commands(i1) == [EXPECT_CMD])
+
+        # #425: refreshing a differing deployed setup script BACKS IT UP byte-identically to <dest>.bak.
+        _iold = b"#!/usr/bin/env python3\n# drifted setup\n"
+        open(sdest, "wb").write(_iold)
+        _ibak = sdest + ".bak"
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=iov(i1))
+        check("#425: refreshing the deployed setup script BACKS UP the old copy byte-identically to <dest>.bak",
+              rc == 0 and os.path.isfile(_ibak) and open(_ibak, "rb").read() == _iold
+              and open(sdest, "rb").read() == open(sbundle, "rb").read())
+        # A DIRECTORY at <dest>.bak: REFUSE, old copy intact, loud rc1.
+        open(sdest, "wb").write(b"#!/usr/bin/env python3\n# drifted setup again\n")
+        os.remove(_ibak); os.makedirs(_ibak)
+        rc, out = run(["configure", "--apply", "--yes"], env_overrides=iov(i1))
+        check("#425: a failed setup-script backup REFUSES the refresh (old copy intact)",
+              "drifted setup again" in open(sdest).read())
+        check("#425: the setup-script-backup refusal is REPORTED (rc1 + refusal message)",
+              rc == 1 and "refusing to replace it unbacked" in out)
+        shutil.rmtree(_ibak)
+        run(["configure", "--apply", "--yes"], env_overrides=iov(i1))  # restore to current
 
         # Missing bundled setup source: no deploy, NO SessionStart wiring (no crash).
         i2 = isettings("i2.json")
