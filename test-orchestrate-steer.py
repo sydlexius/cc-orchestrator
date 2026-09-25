@@ -668,9 +668,14 @@ def main():
     # Each size keeps its FASTEST of up to 3 runs (noise only ever adds time), and the 10s ceiling
     # stays as a sanity bound so a genuine hang still fails even if both sizes hang alike. The runs
     # are INTERLEAVED (q, f, q, f, ...) so a sustained slowdown lands on both sizes, not just one.
+    # The ceiling is ENFORCED, not just asserted: the subprocess timeout IS the ceiling. run_steer
+    # already turns a TimeoutExpired into rc 124 (a failing run, no traceback), so a hung scan fails
+    # THROUGH this check after 10s instead of burning a 30s timeout per run.
+    PERF_CEILING = 10.0
+
     def timed(c):
         t0 = time.time()
-        rc, err = run_steer({"command": c}, channel="stdin", timeout=30)
+        rc, err = run_steer({"command": c}, channel="stdin", timeout=PERF_CEILING)
         return time.time() - t0, rc == 0 and not warned(err)
     for label, build, n in (
             ("400KB of 'a' words", lambda k: "gh pr view 1 " + " ".join(["'a'"] * k) + " && echo create", 100000),
@@ -683,12 +688,12 @@ def main():
             t_base = dt if t_base is None else min(t_base, dt)
             dt, ok = timed(c_full); ok_full = ok_full and ok
             t_full = dt if t_full is None else min(t_full, dt)
-            if dt >= 10.0:
+            if dt >= PERF_CEILING:
                 break  # already over the ceiling: more runs only burn CI time
         ratio = t_full / max(t_base, 1e-3)
         check(f"perf: {label} scales linearly, silent (4x input -> {ratio:.1f}x time, < 8x; "
-              f"{t_base:.2f}s -> {t_full:.2f}s, < 10s)",
-              ok_base and ok_full and ratio < 8.0 and t_full < 10.0)
+              f"{t_base:.2f}s -> {t_full:.2f}s, < {PERF_CEILING:.0f}s)",
+              ok_base and ok_full and ratio < 8.0 and t_full < PERF_CEILING)
 
     # PERF: a long read chain never reaches awk (the prefilter), and one that does (every clause
     # carries `comment`) is scanned in ONE pass, not one fork per clause.
