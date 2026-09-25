@@ -589,11 +589,14 @@ def main():
                                     channel="stdin")
     _need = ["/orchestrate:prep-pr", "tag", "refs/tags/<name>", "# prep-pr-ok"]
     _miss = [n for n in _need if n not in stderr]
-    if rc != 2 or _miss:
-        FAILS.append(f"#345: bare tag-name push want block + {_need}, got rc={rc} missing={_miss}")
-        print(f"  [FAIL] #345: bare tag-name push rc={rc} missing={_miss}")
+    _leak = "--tags" in stderr
+    if rc != 2 or _miss or _leak:
+        FAILS.append(f"#345: bare tag-name push want block + {_need} and no --tags, "
+                     f"got rc={rc} missing={_miss} advertises_tags={_leak}")
+        print(f"  [FAIL] #345: bare tag-name push rc={rc} missing={_miss} advertises_tags={_leak}")
     else:
-        print("  [ok] #345: bare tag-name push still blocked; message names refs/tags + --tags")
+        print("  [ok] #345: bare tag-name push still blocked; message names refs/tags/<name> "
+              "+ the # prep-pr-ok override, and does not advertise --tags")
     # the remedy the message names must itself be exempt (no override needed)
     for _cmd in ("git" + " push origin refs/tags/v1.30.0", "git" + " push origin --tags"):
         rc, _stdout, _stderr = run_guard(_cmd, marker_active=False, channel="stdin")
