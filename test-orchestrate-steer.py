@@ -23,6 +23,7 @@ Run: python3 test-orchestrate-steer.py
 import importlib.util
 import json
 import os
+import pty
 import re
 import subprocess
 import sys
@@ -613,19 +614,86 @@ def main():
         check(f"robustness: malformed payload exits 0, no stdout ({raw[:30]!r})",
               p.returncode == 0 and p.stdout == "")
 
+    # #414: every field now comes out of ONE jq call as NUL-terminated values. A newline-bearing
+    # command must arrive whole (a line-based split would hand the rule only the first line), and a
+    # command carrying a NUL or separator-LOOKING text must not shift the fields after it: the NUL
+    # is dropped (what `$(jq -r)` always did), so a LEADING NUL still leaves the rule its command.
+    for c in ("cd /tmp &&\ngh pr create --fill\n",
+              "cat <<'EOF'\nnot a command\nEOF\ngh pr comment 5 -b hi",
+              "\u0000gh pr create --fill",
+              "gh pr create --fill\u0000\u0000\u0000\u0000\u0000END\u0000",
+              "echo '\\u0000END\\u0000' ; gh pr create --fill"):
+        rc_ok, warned_all, _ = both_channels({"command": c})
+        check(f"#414: newline / NUL / separator-like command reaches the rule whole ({c[:36]!r})",
+              rc_ok and warned_all)
+    for c in ("gh pr view 1\nls\n", "echo 'gh pr create'\u0000\n"):
+        rc_ok, _, silent_all = both_channels({"command": c})
+        check(f"#414: multi-line / NUL-bearing READ stays silent ({c[:36]!r})", rc_ok and silent_all)
+    # a NUL in an EARLY field (session_id) must not shift the later ones: the re-Read still warns.
+    with tempfile.TemporaryDirectory() as ntd:
+        nf = os.path.join(ntd, "f"); open(nf, "w").close()
+        for _ in range(2):
+            rc, err = run_steer({"file_path": nf}, channel="stdin", tool_name="Read",
+                                session_id="s\u0000x", read_state_dir=os.path.join(ntd, "st"))
+        check("#414: NUL in session_id never shifts the later fields (2nd Read still warns)",
+              rc == 0 and warned(err))
+        # the per-field trailing-newline strip (as `$(...)` did) is observable: `f\n` fingerprints
+        # as `f`, so the 2nd Read of a newline-suffixed path still warns.
+        for _ in range(2):
+            rc, err = run_steer({"file_path": nf + "\n"}, channel="stdin", tool_name="Read",
+                                session_id="s-nl", read_state_dir=os.path.join(ntd, "st"))
+        check("#414: trailing newline in file_path is stripped (2nd Read of 'f\\n' still warns)",
+              rc == 0 and warned(err))
+    # A TTY stdin must never make jq wait on the terminal: the `[ -t 0 ]` guard redirects it, and the
+    # $TOOL_INPUT fallback still steers. Without the guard the hook HANGS, the one way it could block.
+    tty_env = {k: v for k, v in os.environ.items()
+               if k not in ("TMUX", "CLAUDE_CODE_SESSION_ID", "TOOL_INPUT")}
+    tty_env["TOOL_INPUT"] = json.dumps({"command": "gh pr create --fill"})
+    pty_master, pty_slave = pty.openpty()
+    try:
+        p = subprocess.run([STEER], stdin=pty_slave, capture_output=True, env=tty_env, timeout=10)
+        tty_rc, tty_err, tty_out = p.returncode, p.stderr.decode(errors="replace"), p.stdout
+    except subprocess.TimeoutExpired:
+        tty_rc, tty_err, tty_out = 124, "TIMEOUT", b""
+    finally:
+        os.close(pty_master); os.close(pty_slave)
+    check(f"#414: TTY stdin + $TOOL_INPUT -> no hang, warns, exit 0, no stdout (rc {tty_rc})",
+          tty_rc == 0 and warned(tty_err) and tty_out == b"")
+
     # PERF (M-1): the scan is linear. 400KB of quoted words took 7.5s at a7f6a9f (quadratic tail).
-    for label, c, limit in (
-            ("400KB of 'a' words", "gh pr view 1 " + " ".join(["'a'"] * 100000) + " && echo create", 3.0),
-            ("50k $(a) substitutions", "gh pr view 1 " + "$(a) " * 50000 + "# create", 3.0),
-            ("100k-line heredoc", "cat > f <<'EOF'\n" + "line x\n" * 100000 + "EOF\ngh pr view 1 # create", 3.0)):
+    # #453: asserted as a RATIO, not a wall-clock ceiling. A fixed 3s bound flaked on macOS CI
+    # (1.65s-3.14s spread for the SAME linear scan), because it measured the runner as much as the
+    # code. Timing the full input against a quarter-size baseline in the same process cancels the
+    # runner's speed: linear is ~4x (less, since process start is a fixed cost), quadratic ~16x.
+    # Each size keeps its FASTEST of up to 3 runs (noise only ever adds time), and the 10s ceiling
+    # stays as a sanity bound so a genuine hang still fails even if both sizes hang alike. The runs
+    # are INTERLEAVED (q, f, q, f, ...) so a sustained slowdown lands on both sizes, not just one.
+    # The ceiling is ENFORCED, not just asserted: the subprocess timeout IS the ceiling. run_steer
+    # already turns a TimeoutExpired into rc 124 (a failing run, no traceback), so a hung scan fails
+    # THROUGH this check after 10s instead of burning a 30s timeout per run.
+    PERF_CEILING = 10.0
+
+    def timed(c):
         t0 = time.time()
-        try:
-            rc, err = run_steer({"command": c}, channel="stdin", timeout=30)
-            ok = rc == 0 and not warned(err)
-        except subprocess.TimeoutExpired:
-            ok = False
-        dt = time.time() - t0
-        check(f"perf: {label} scans in < {limit:.0f}s, silent ({dt:.2f}s)", ok and dt < limit)
+        rc, err = run_steer({"command": c}, channel="stdin", timeout=PERF_CEILING)
+        return time.time() - t0, rc == 0 and not warned(err)
+    for label, build, n in (
+            ("400KB of 'a' words", lambda k: "gh pr view 1 " + " ".join(["'a'"] * k) + " && echo create", 100000),
+            ("50k $(a) substitutions", lambda k: "gh pr view 1 " + "$(a) " * k + "# create", 50000),
+            ("100k-line heredoc", lambda k: "cat > f <<'EOF'\n" + "line x\n" * k + "EOF\ngh pr view 1 # create", 100000)):
+        c_base, c_full = build(n // 4), build(n)
+        t_base = t_full = None; ok_base = ok_full = True
+        for _ in range(3):
+            dt, ok = timed(c_base); ok_base = ok_base and ok
+            t_base = dt if t_base is None else min(t_base, dt)
+            dt, ok = timed(c_full); ok_full = ok_full and ok
+            t_full = dt if t_full is None else min(t_full, dt)
+            if dt >= PERF_CEILING:
+                break  # already over the ceiling: more runs only burn CI time
+        ratio = t_full / max(t_base, 1e-3)
+        check(f"perf: {label} scales linearly, silent (4x input -> {ratio:.1f}x time, < 8x; "
+              f"{t_base:.2f}s -> {t_full:.2f}s, < {PERF_CEILING:.0f}s)",
+              ok_base and ok_full and ratio < 8.0 and t_full < PERF_CEILING)
 
     # PERF: a long read chain never reaches awk (the prefilter), and one that does (every clause
     # carries `comment`) is scanned in ONE pass, not one fork per clause.
@@ -933,7 +1001,7 @@ def main():
     # FAIL-SILENT-OPEN on the Agent path with jq unavailable: the hook must never block a spawn.
     #
     # The PATH must contain `cat` but NOT `jq`. An earlier version of this case symlinked ONLY bash --
-    # which meant `cat` was missing too, so the script's `stdin_json=$(cat)` returned nothing and it
+    # which meant `cat` was missing too, so the script's then-`stdin_json=$(cat)` returned nothing and it
     # early-exited on the empty-payload fail-open BEFORE ever reaching jq. It passed while proving
     # NOTHING about jq-absence (caught by Copilot on PR #286). Provide cat + the other coreutils the
     # hook may touch, and withhold ONLY jq, so the jq-missing branch is the one actually exercised.
