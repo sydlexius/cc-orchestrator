@@ -94,6 +94,11 @@ jobs:
       - name: steer self-test
         run: ./scripts/orchestrate-steer.sh --self-test
 
+      # HARNESS STEPS: test-ci-gates-lockstep.py (#379) reads these as one-line
+      # `run: python3 test-<name>.py` entries and requires the set to equal the
+      # .gates.toml harness steps. Keep that exact one-line form (no `./`, no `run: |`
+      # block), and do not gate a harness with `if:` or `continue-on-error` without
+      # recording why: the lockstep check cannot see either.
       - name: harness - guard
         run: python3 test-orchestrate-guard.py
 
@@ -215,3 +220,56 @@ jobs:
 
       - name: harness - elmer-tick
         run: python3 test-elmer-tick.py
+
+      # #379: gated harnesses CI never ran (16 of 42). The ci-gates-lockstep harness now
+      # fails on any gated harness missing here unless it carries a written CI_EXEMPT
+      # reason. Each stubs its externals (gh / git / preflight / npm / cargo / df /
+      # prose-tooling via PATH or env), so none needs network or machine-local tooling.
+      # authorize-merge arms the merge-auth token the security floor reads.
+      - name: harness - authorize-merge
+        run: python3 test-orchestrate-authorize-merge.py
+
+      - name: harness - context-meter
+        run: python3 test-orchestrate-context-meter.py
+
+      - name: harness - status
+        run: python3 test-orchestrate-status.py
+
+      - name: harness - schemas
+        run: python3 test-orchestrate-schemas.py
+
+      - name: harness - finding-channel
+        run: python3 test-finding-channel.py
+
+      - name: harness - gh-react
+        run: python3 test-gh-react.py
+
+      - name: harness - patch-coverage
+        run: python3 test-patch-coverage.py
+
+      - name: harness - run-paths
+        run: python3 test-run-paths.py
+
+      - name: harness - cleanup-worktree
+        run: python3 test-cleanup-worktree.py
+
+      - name: harness - issue-watch
+        run: python3 test-issue-watch.py
+
+      - name: harness - prefs-coverage
+        run: python3 test-prefs-coverage.py
+
+      - name: harness - prose-lint
+        run: python3 test-prose-lint.py
+
+      - name: harness - resolve-threads
+        run: python3 test-resolve-threads.py
+
+      - name: harness - cache-reclaim
+        run: python3 test-cache-reclaim.py
+
+      - name: harness - base-freshness
+        run: python3 test-base-freshness.py
+
+      - name: harness - open-pr-staleness-sweep
+        run: python3 test-open-pr-staleness-sweep.py
