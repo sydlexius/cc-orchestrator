@@ -441,6 +441,13 @@ Record the task ID alongside the comment ID -- you will mark it complete in Step
 
 ## Step 5 -- Implement all fixes
 
+Before the first fix edit, record the pre-round HEAD (Step 5.6 scopes its tier and its pass to
+`$pre_round_head..HEAD`):
+
+```bash
+pre_round_head=$(git rev-parse HEAD)
+```
+
 For every comment categorized as `bug`, `spec-drift`, or `test-gap`:
 
 - Read the relevant code
@@ -621,10 +628,12 @@ cover this. Decide HERE whether the round owes an independent, fix-scoped hostil
 `engage-ralph-loop.md`; the pass itself runs inside Step 7, after the round's commit and
 BEFORE any outward step (push, reply, resolve). It is OWED when ANY of these holds:
 
-- **(a)** the fix diff touches a deny-authority or advisory tier file. Use the tier `/prep-pr`
-  Step 4a computes; do not re-derive it here.
-- **(b)** a fix is not mechanical and falls on one of Step 5.5's "agents merited" axes: a
-  security or gating predicate, error handling, or logic the agent had to design.
+- **(a)** the fix diff touches a deny-authority or advisory tier file. Apply `/prep-pr` Step 4a's
+  tier logic to the FIX-ROUND diff `$pre_round_head..HEAD`, NOT to the whole-branch merge-base
+  range Step 4a uses at PR time, so a doc-only round on a PR that once touched the guard is not
+  inflated to deny-authority.
+- **(b)** a fix is not mechanical and falls on ANY axis in Step 5.5's "When agents are merited"
+  list (every bullet there applies, including concurrency, API contract, and >~100 lines).
 - **(c)** the round answers a hostile DO NOT SHIP verdict.
 
 **Depth follows the tier:** the FULL engage-ralph-loop to K=2 dry rounds for deny-authority;
@@ -634,11 +643,13 @@ Important finding is fixed and re-committed, and the pass re-runs on the new dif
 push.
 
 **Not owed** for a standard-tier round of purely mechanical fixes (Step 5.5's one-line skip
-note covers it), or for a round of replies with no code change.
+note covers it), for a round of replies with no code change, or for a standard-tier round whose
+non-mechanical fixes fall on NO "When agents are merited" axis and that does not answer a DO NOT
+SHIP verdict.
 
 **Pushed before its owed pass?** Say so plainly in the next report. The late pass must still
-clear before MERGE, and the merge-readiness summary names it. Never present it as having gated
-the push.
+clear before MERGE: record it as `LATE (pending)` in the Step 9 "Fix-scoped pass" field, which
+the SKILL.md MERGE-READY precondition checks. Never present it as having gated the push.
 
 ---
 
@@ -690,7 +701,9 @@ git commit -m "fix: address PR review findings
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ```
 
-Get the short SHA:
+Run any owed Step 5.6 pass now, on this commit. If it produces fixes, commit them as a
+follow-up commit (and re-run the pass on the new diff). Only then get the short SHA, so every
+reply cites the FINAL commit:
 
 ```bash
 git rev-parse --short HEAD
@@ -906,8 +919,9 @@ of the thread handling.
 Either way, "never ship with unhandled review" is enforced at the pre-MERGE ship-gate
 (`ship-gate-preflight` + `pr-unreplied-comments`), NOT by push order. If a push fails,
 explain why -- do not retry automatically. If a round was pushed before its owed pass,
-report that plainly (Step 5.6): the late pass must clear before MERGE and the
-merge-readiness summary names it; it never counts as having gated the push.
+report that plainly (Step 5.6): the late pass must clear before MERGE, recorded in the
+Step 9 "Fix-scoped pass" field and checked at the SKILL.md MERGE-READY precondition; it
+never counts as having gated the push.
 
 ---
 
@@ -926,6 +940,7 @@ freehand. Compute each field from the data already collected in earlier steps:
 | SHA | `git rev-parse --short HEAD` from Step 7 |
 | Branch | `git branch --show-current` |
 | Resolved | whether CR resolve was posted + Copilot/Greptile threads resolved |
+| Fix-scoped pass | Step 5.6: `not owed` / `cleared before push` / `LATE (pending)` |
 
 Assemble and print:
 
@@ -938,6 +953,7 @@ Assemble and print:
 - Replied: $replied_count total
 - Pushed: $sha to $branch
 - Resolved: CR resolve $cr_status; GraphQL threads (Copilot + Greptile + Codoki) $graphql_resolve_status
+- Fix-scoped pass: $fix_pass_status (not owed / cleared before push / LATE (pending))
 ```
 
 Codoki is not in service, so it does not review the push; Greptile (where
