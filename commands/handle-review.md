@@ -728,7 +728,7 @@ Report the result. If the push fails, explain why -- do not retry automatically.
 
 **EXCEPTION -- CR auto-review is ON for this repo** (CodeRabbit posts an unsolicited
 review with no trigger, i.e. it auto-dismisses + re-triggers on every push): use the
-REPLY-FIRST order instead -- commit -> pass -> reply -> resolve -> push (Step 8.5). The org default is
+REPLY-FIRST order instead -- commit -> pass -> reply -> push -> guard-slice -> resolve (Step 8.5). The org default is
 auto-review OFF, so push-first is the standing case; see Step 8.5 for the full rule.
 
 Now substitute the real SHA into all "Fixed in <sha>" reply drafts from step 6.
@@ -824,8 +824,8 @@ Step 9 summary so the reader knows it was handled but not threaded.
 After the replies are posted (Step 7, against the already-pushed SHA), resolve the
 threads that were replied to in this round. In the push-first default the commit is
 already on origin, so every cited "Fixed in <sha>" is reachable before the thread is
-resolved. (In the reply-first EXCEPTION -- Step 8.5, CR auto-review ON -- this resolve
-runs before the push instead; it acts on already-replied threads either way.)
+resolved. (In the reply-first EXCEPTION -- Step 8.5, CR auto-review ON -- the replies go
+out before the push, and this resolve runs after the push once guard-slice passes.)
 
 ### CodeRabbit threads -- `@coderabbitai resolve`
 
@@ -908,14 +908,18 @@ the cited commit is reachable, then reply-with-hash and resolve.
 posts an unsolicited review with no trigger, i.e. it auto-dismisses + re-triggers on
 every push). There a fix-round push races CR's automatic re-review and can auto-resolve
 fresh threads before they are replied to. In that case invert (commit -> pass -> reply ->
-resolve -> push): reply (Step 7 replies) and resolve (Step 8) FIRST, then push here --
+push -> guard-slice -> resolve): post the Step 7 replies FIRST, then push here --
 
 ```bash
 git push origin $(git branch --show-current) 2>&1
 ```
 
 -- annotating the replies "push in-flight" so the re-triggered review never runs ahead
-of the thread handling.
+of the thread handling. Then, now that the cited SHA is on origin, run the SKILL.md "Fix
+round" `finding_channel.py guard-slice` check and resolve (Step 8) ONLY on a zero exit;
+a non-zero exit means a reply cites an unpushed or unbound SHA, so correct those replies
+before resolving anything (#458: guard-slice needs a pushed SHA, so under this exception it
+gates the resolve rather than the replies).
 
 Either way, "never ship with unhandled review" is enforced at the pre-MERGE ship-gate
 (`ship-gate-preflight` + `pr-unreplied-comments`), NOT by push order. If a push fails,
