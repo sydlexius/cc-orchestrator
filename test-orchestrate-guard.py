@@ -424,6 +424,39 @@ CASES = [
      "git push origin feat # refs/tags/v1", False, "block"),
     ("feature push with --tags only in comment still advisory-blocks",
      "git push origin feat # use --tags", False, "block"),
+    # --- (#436) a QUOTED safe-push path is the same invocation once the shell strips the
+    # quotes. Command bodies emit exactly this shape (prep-pr Step 7's plugin leg), and the
+    # unquoted-only matcher let it skip the prep-pr advisory AND the main/force denies.
+    ("#436 single-quoted safe-push path hits the advisory",
+     "bash '/x/scripts/safe-push.sh' feat", False, "block"),
+    ("#436 double-quoted safe-push path hits the advisory",
+     'bash "/x/scripts/safe-push.sh" feat', False, "block"),
+    ("#436 quoted plugin-root token path hits the advisory",
+     "bash '${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh' feat", False, "block"),
+    ("#436 quoted path with a space hits the advisory",
+     "bash '/Users/a b/scripts/safe-push.sh' feat", False, "block"),
+    ("#436 bare quoted exec (no bash wrapper) hits the advisory",
+     "'./safe-push.sh' feat", False, "block"),
+    ("#436 quoted bare name hits the advisory",
+     "bash 'safe-push.sh' feat", False, "block"),
+    ("#436 prep-pr Step 7 plugin-leg shape hits the advisory",
+     "[ \"$leg\" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh' "
+     "\"$(git branch --show-current)\"; push_rc=$?; }", False, "block"),
+    ("#436 single-quoted safe-push + override allowed",
+     "bash '/x/scripts/safe-push.sh' feat # prep-pr-ok", False, "allow"),
+    ("#436 double-quoted safe-push + override allowed",
+     'bash "/x/scripts/safe-push.sh" feat # prep-pr-ok', False, "allow"),
+    ("#436 quoted safe-push to main blocks even with override",
+     "bash '/x/scripts/safe-push.sh' main # prep-pr-ok", False, "block"),
+    ("#436 double-quoted safe-push --force blocks even with override",
+     'bash "/x/scripts/safe-push.sh" feat --force # prep-pr-ok', False, "block"),
+    # stays silent: not at command position, or the quoted content is not the wrapper
+    ("#436 quoted safe-push path as a cat ARGUMENT allowed",
+     'cat "/x/scripts/safe-push.sh"', False, "allow"),
+    ("#436 quoted safe-push path in echo prose allowed",
+     "echo 'run /x/scripts/safe-push.sh'", False, "allow"),
+    ("#436 quoted safe-push.sh.bak is not the wrapper",
+     "bash '/x/scripts/safe-push.sh.bak' feat", False, "allow"),
 ]
 
 FAILS = []
@@ -546,6 +579,34 @@ def main():
             FAILS.append(f"regression: hard-deny message for '{cmd}' leaks the prep-pr-ok bypass token")
         else:
             print(f"  [ok] regression: '{cmd}' blocks without leaking a bypass token")
+
+    # #345: a bare tag-NAME push is indistinguishable from a branch push, so it stays BLOCKED
+    # by the advisory (the matcher is deliberately unchanged: no repo-state read on the hot
+    # path). What changes is the MESSAGE: it must name the tag case and point at the exempt
+    # refs/tags/<name> form, so the remedy is the exempt form, not the override. `--tags` is NOT
+    # advertised: it exempts ANY clause carrying it, so naming it would train a dismissal (round-1 review).
+    rc, _stdout, stderr = run_guard("git" + " push origin v1.30.0", marker_active=False,
+                                    channel="stdin")
+    _need = ["/orchestrate:prep-pr", "tag", "refs/tags/<name>", "# prep-pr-ok"]
+    _miss = [n for n in _need if n not in stderr]
+    _leak = "--tags" in stderr
+    if rc != 2 or _miss or _leak:
+        FAILS.append(f"#345: bare tag-name push want block + {_need} and no --tags, "
+                     f"got rc={rc} missing={_miss} advertises_tags={_leak}")
+        print(f"  [FAIL] #345: bare tag-name push rc={rc} missing={_miss} advertises_tags={_leak}")
+    else:
+        print("  [ok] #345: bare tag-name push still blocked; message names refs/tags/<name> "
+              "+ the # prep-pr-ok override, and does not advertise --tags")
+    # the remedy the message names must itself be exempt (no override needed)
+    for _cmd in ("git" + " push origin refs/tags/v1.30.0", "git" + " push origin --tags"):
+        rc, _stdout, _stderr = run_guard(_cmd, marker_active=False, channel="stdin")
+        expect(f"#345: named remedy '{_cmd}' is exempt", rc, "allow")
+    _sr = subprocess.run([GUARD, "--self-test"], capture_output=True, text=True, timeout=30)
+    if _sr.returncode != 0:
+        FAILS.append(f"#345: --self-test failed (rc={_sr.returncode}): {_sr.stderr.strip()[:300]}")
+        print(f"  [FAIL] #345: --self-test rc={_sr.returncode}")
+    else:
+        print("  [ok] #345: --self-test PASS")
 
     # Regression: the guard must NEVER emit a hook permissionDecision anymore (the `ask`
     # approach was rejected - this CC ignores it; emitting it is dead/misleading output).
