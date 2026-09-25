@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Proof harness for cleanup-worktree.sh (issues #302, #303, #337).
+"""Proof harness for cleanup-worktree.sh (issues #302, #303, #337, #421, #448).
 
 #302 -- cleanup ran the LEAST on the most common path. Under `set -euo pipefail` the
 remote-DELETE block tolerated ONLY a 404, so a squash-merge with auto-delete-branch
@@ -15,6 +15,18 @@ with `git ls-remote --exit-code`: ref absent = success whatever the API said; re
 present = a real failure that surfaces the captured stderr and exits 1. This is immune
 to every status-code variation and matches the house pattern (safe-push.sh verifies the
 remote ref moved rather than trusting an exit code).
+
+#421 -- a FAILED `git worktree remove` (an untracked file is enough) left the branch
+checked out in the surviving worktree, so the local branch delete refused and `set -e`
+aborted above the remote delete and `git fetch --prune`. Both branch deletes are now
+gated on removal success; a failed removal keeps the branch, still prunes, and exits
+non-zero on purpose.
+
+#448 -- removing the worktree that holds the caller's cwd locks the session out (its
+cwd vanishes). The script now refuses, before any destructive or network step, when the
+physical cwd (`pwd -P`) is the worktree or under it, and never for a sibling that merely
+shares a name prefix. Each case is mutation-proven: a copy of the script with the guard
+broken (refusal removed, prefix match, `pwd -L`) must flip that case's verdict.
 
 #303 -- the run dir comes SOLELY from the sourced run-paths.sh producer (via
 CC_RUN_WORKTREE), captured BEFORE `git worktree remove`. No path is reconstructed here
@@ -38,6 +50,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "scripts", "cleanup-worktree.sh")
 
 FAILS = []
+LAST = {}
+
+# #448 mutations. Each one breaks the cwd guard a different way; a case that still
+# passes under its mutant proves nothing.
+MUT_NO_REFUSE = ("exit 1  # cwd-guard-refuse", ":  # cwd-guard-refuse")
+MUT_PREFIX_MATCH = ('"$wt_real"/*)', '"$wt_real"*)')
+MUT_NO_REALPATH = ('cwd_real=$(pwd -P 2>/dev/null)', 'cwd_real=$(pwd -L 2>/dev/null)')
+MUT_UNRESOLVED_OPEN = ("exit 1  # cwd-guard-unresolved", ":  # cwd-guard-unresolved")
 
 
 def check(label, ok):
@@ -64,7 +84,7 @@ GIT_STUB = (
     '  "symbolic-ref --quiet") echo "origin/main"; exit 0 ;;\n'
     '  "show-ref --quiet") exit "${SHOW_REF_RC:-0}" ;;\n'
     '  "branch -d") exit "${BRANCH_D_RC:-0}" ;;\n'
-    '  "branch -D") exit 0 ;;\n'
+    '  "branch -D") exit "${BRANCH_BIG_D_RC:-0}" ;;\n'
     '  "ls-remote --exit-code") exit "${LS_REMOTE_RC:-1}" ;;\n'
     '  "fetch --prune") exit "${FETCH_RC:-0}" ;;\n'
     "esac\n"
@@ -115,9 +135,17 @@ def porcelain(main_wt, feature_wt):
 
 def run_cleanup(td, *, suffix="1234", delete_rc=0, delete_stderr="", ls_remote_rc=1,
                 fetch_rc=0, make_run_dir=True, worktree_exists=True,
-                extra_env=None, golangci=True, wt_remove_rc=0, producer=True):
+                extra_env=None, golangci=True, wt_remove_rc=0, producer=True,
+                cwd="main", mutate=None, wt_unreadable=False):
     """Set up a fake repo tree, create the run dir at the PRODUCER's exact path, and run
-    cleanup-worktree.sh. Returns (rc, stdout, stderr, run_dir, git_log, gh_log)."""
+    cleanup-worktree.sh. Returns (rc, stdout, stderr, run_dir, git_log, gh_log).
+
+    cwd selects where the script runs (#448): "main" (the main checkout), "worktree"
+    (the worktree being removed), "worktree_sub" (a subdirectory of it), "worktree_link"
+    (a symlink to it, so only `pwd -P` can see through), or "sibling" (a directory whose
+    name shares the worktree's prefix). mutate is (old, new): run a COPY of the script
+    with that one substitution, to prove an assertion has teeth. LAST records the
+    feature worktree path for the caller."""
     root = tempfile.mkdtemp(dir=td)
     bindir = os.path.join(root, "bin"); os.makedirs(bindir)
     for name, body in (("git", GIT_STUB), ("gh", GH_STUB), ("jq", JQ_STUB)):
@@ -191,9 +219,47 @@ def run_cleanup(td, *, suffix="1234", delete_rc=0, delete_stderr="", ls_remote_r
             dst.write(src.read())
         os.chmod(script_to_run, 0o755)
         env["HOME"] = os.path.join(root, "nohome")
+    if mutate is not None:
+        old, new = mutate
+        mdir = os.path.join(root, "mutant"); os.makedirs(mdir)
+        script_to_run = os.path.join(mdir, "cleanup-worktree.sh")
+        with open(SCRIPT) as src:
+            text = src.read()
+        assert old in text, f"mutation anchor not found: {old!r}"
+        with open(script_to_run, "w") as dst:
+            dst.write(text.replace(old, new))
+        # Keep the producer beside the mutant so only the mutated line differs.
+        with open(os.path.join(HERE, "scripts", "run-paths.sh")) as src, \
+                open(os.path.join(mdir, "run-paths.sh"), "w") as dst:
+            dst.write(src.read())
 
-    p = subprocess.run(["bash", script_to_run, suffix], cwd=main_wt, env=env,
-                       capture_output=True, text=True, timeout=120)
+    if cwd == "main":
+        run_cwd = main_wt
+    elif cwd == "worktree":
+        run_cwd = feature_wt
+    elif cwd == "worktree_sub":
+        run_cwd = os.path.join(feature_wt, "sub", "dir"); os.makedirs(run_cwd)
+    elif cwd == "worktree_link":
+        run_cwd = os.path.join(root, "link-to-wt"); os.symlink(feature_wt, run_cwd)
+    elif cwd == "sibling":
+        run_cwd = feature_wt + "2"; os.makedirs(run_cwd)
+    else:
+        raise ValueError(cwd)
+    LAST["feature_wt"] = feature_wt
+    # What a shell that `cd`-ed there would export; bash keeps an inherited PWD that names
+    # the real cwd, so the symlink case presents its LOGICAL path exactly as in real use.
+    env["PWD"] = run_cwd
+
+    # wt_unreadable (Copilot on #451): a mode-000 worktree makes `cd` fail, so the guard
+    # cannot resolve its physical path. It must fail CLOSED, not skip the containment check.
+    if wt_unreadable:
+        os.chmod(feature_wt, 0)
+    try:
+        p = subprocess.run(["bash", script_to_run, suffix], cwd=run_cwd, env=env,
+                           capture_output=True, text=True, timeout=120)
+    finally:
+        if wt_unreadable and os.path.isdir(feature_wt):
+            os.chmod(feature_wt, 0o755)
     with open(glog) as f:
         git_log = f.read()
     with open(ghlog) as f:
@@ -204,7 +270,7 @@ def run_cleanup(td, *, suffix="1234", delete_rc=0, delete_stderr="", ls_remote_r
 
 
 def main():
-    print("cleanup-worktree.sh harness (#302 / #303 / #337)")
+    print("cleanup-worktree.sh harness (#302 / #303 / #337 / #421 / #448)")
 
     # ---------------------------------------------------------------------
     # CASE A (#302 / #337): the 422 that aborted every squash-merge cleanup.
@@ -352,14 +418,35 @@ def main():
         rc, out, err, run_dir, _, _, lint = run_cleanup(
             td, delete_rc=1, delete_stderr=ERR_422_REF_GONE, ls_remote_rc=1,
             wt_remove_rc=1)
-        check("exit 0 (the failure is reported, the run continues)", rc == 0)
+        check("exit NON-zero on purpose (#421: the cleanup is incomplete)", rc != 0)
         check("the failure is surfaced with the force-remove remedy",
               "FAILED" in err and "--force" in err)
         check("the run dir is KEPT (the worktree is still live; may hold a gate lock)",
               run_dir != "" and os.path.isdir(run_dir))
         check("the keep is announced, not silent", "Keeping run dir" in out)
-        check("the rest of cleanup still ran (branch delete + lint cache)",
-              "cache clean" in lint)
+        check("the local cleanup still ran (lint cache)", "cache clean" in lint)
+
+    # ---------------------------------------------------------------------
+    # CASE K (#421): a failed removal (the untracked-file case) left the branch checked
+    # out in the surviving worktree, so `git branch -d/-D` refused and `set -e` aborted
+    # ABOVE the remote delete and `git fetch --prune`. The stub makes both branch deletes
+    # fail exactly as real git does in that state, so a regression aborts here.
+    # ---------------------------------------------------------------------
+    print("\nCASE K -- failed removal (untracked file): branches KEPT, prune still runs (#421)")
+    with tempfile.TemporaryDirectory() as td:
+        rc, out, err, run_dir, git_log, gh_log, _ = run_cleanup(
+            td, delete_rc=0, ls_remote_rc=1, wt_remove_rc=1,
+            extra_env={"BRANCH_D_RC": "1", "BRANCH_BIG_D_RC": "1"})
+        check("exit non-zero on purpose", rc != 0)
+        check("the local branch delete was SKIPPED",
+              "branch -d" not in git_log and "branch -D" not in git_log)
+        check("the remote branch delete was SKIPPED (no gh api DELETE)",
+              "-X DELETE" not in gh_log)
+        check("`git fetch --prune` STILL RAN", "fetch --prune" in git_log)
+        check("the keep is reported plainly ('kept')", "kept" in (out + err).lower()
+              and "Keeping branch" in err)
+        check("the untracked-file hint is still given",
+              "untracked" in err.lower())
 
     # ---------------------------------------------------------------------
     # CASE J: the producer is not deployed. Cleanup must degrade LOUDLY and still do
@@ -375,6 +462,71 @@ def main():
         check("the run dir is left alone (never reconstructed locally)",
               run_dir != "" and os.path.isdir(run_dir))
         check("the rest of cleanup still ran", "cache clean" in lint)
+
+    # ---------------------------------------------------------------------
+    # CASE L (#448): removing the worktree that holds the caller's cwd locks the session
+    # out (its cwd vanishes). Refuse BEFORE anything destructive or networked.
+    # ---------------------------------------------------------------------
+    def refused(label, cwd, mutate=None, wt_unreadable=False):
+        with tempfile.TemporaryDirectory() as td:
+            rc, out, err, run_dir, git_log, gh_log, lint = run_cleanup(
+                td, delete_rc=0, ls_remote_rc=1, cwd=cwd, mutate=mutate,
+                wt_unreadable=wt_unreadable)
+            return {
+                "rc": rc, "err": err,
+                "nothing_touched": (
+                    "worktree remove" not in git_log and "worktree prune" not in git_log
+                    and "branch -" not in git_log and "fetch" not in git_log
+                    and gh_log == "" and lint == ""
+                    and os.path.isdir(LAST["feature_wt"])
+                    and run_dir != "" and os.path.isdir(run_dir)),
+            }
+
+    for cwd, what in (("worktree", "cwd == the worktree"),
+                      ("worktree_sub", "cwd in a SUBDIRECTORY of the worktree"),
+                      ("worktree_link", "cwd reached through a SYMLINK to the worktree")):
+        print(f"\nCASE L -- {what} is REFUSED (#448)")
+        r = refused(what, cwd)
+        check(f"{what}: exit non-zero", r["rc"] != 0)
+        check(f"{what}: nothing removed, deleted, or fetched (refused before every step)",
+              r["nothing_touched"])
+        check(f"{what}: says to run from the main checkout",
+              "main checkout" in r["err"] and "refusing" in r["err"].lower())
+        # Mutation proof: with the refusal neutralized the same run proceeds and removes
+        # the worktree, so the assertions above are not passing by accident.
+        m = refused(what, cwd, mutate=MUT_NO_REFUSE)
+        check(f"{what}: MUTANT without the refusal proceeds (the case has teeth)",
+              not m["nothing_touched"])
+    m = refused("symlink", "worktree_link", mutate=MUT_NO_REALPATH)
+    check("symlinked cwd: MUTANT using `pwd -L` is NOT refused (pwd -P is load-bearing)",
+          not m["nothing_touched"])
+
+    print("\nCASE L -- an UNRESOLVABLE worktree path fails CLOSED (Copilot on #451)")
+    if os.geteuid() == 0:
+        # root ignores mode 000, so the lever cannot fire (a uid-0 run would invent a pass).
+        print("  [skip] running as root: chmod 000 does not make cd fail")
+    else:
+        r = refused("unresolvable", "main", wt_unreadable=True)
+        check("unresolvable worktree path: exit non-zero", r["rc"] != 0)
+        check("unresolvable worktree path: nothing removed, deleted, or fetched",
+              r["nothing_touched"])
+        check("unresolvable worktree path: says it could not resolve the path",
+              "could not resolve" in r["err"])
+        m = refused("unresolvable", "main", mutate=MUT_UNRESOLVED_OPEN, wt_unreadable=True)
+        check("unresolvable: MUTANT that skips the check proceeds (the case has teeth)",
+              not m["nothing_touched"])
+
+    print("\nCASE L -- a SIBLING dir sharing the worktree's name prefix is NOT refused (#448)")
+    with tempfile.TemporaryDirectory() as td:
+        rc, out, err, run_dir, git_log, _, _ = run_cleanup(
+            td, delete_rc=0, ls_remote_rc=1, cwd="sibling")
+        check("sibling (/a/wt2 vs /a/wt): exit 0", rc == 0)
+        check("sibling: the worktree WAS removed", "worktree remove" in git_log
+              and not os.path.isdir(LAST["feature_wt"]))
+        check("sibling: no refusal message", "refusing" not in err.lower())
+    m = refused("sibling", "sibling", mutate=MUT_PREFIX_MATCH)
+    check("sibling: MUTANT with a bare prefix match WRONGLY refuses (the case has teeth)",
+          m["rc"] != 0 and m["nothing_touched"])
 
     print("\nCASE I -- absent run dir is a silent no-op (idempotent)")
     with tempfile.TemporaryDirectory() as td:
