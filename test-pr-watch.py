@@ -13,6 +13,8 @@ are stubbed; never a real PR):
        (incl. DISMISSED), CR in requested_reviewers, or a `@coderabbitai review` /
        `@coderabbitai full review` trigger comment. A bare/`resolve`/`summary`
        mention does NOT count (guardrail). The idle-no-trigger PR settles.
+       #442: a trigger counts only when posted at/after the current head's
+       committer date; an unreadable date on either side counts it (conservative).
 
   #110 Codoki posts its verdict as a `Codoki PR Review` entry in statusCheckRollup,
        invisible to the reviews API. pr-watch defers Codoki settlement to the
@@ -167,8 +169,18 @@ def run(*, labels="[]", checks="[]", reviews="[]", codoki_rc=0,
         timeout_secs=SETTLE_TIMEOUT, blocking_reviewers=None, mergeable="clean",
         pr_state="open", merged="false", threads=None, threads_rc=0,
         mergeable_seq="", grow_inline="", want_graphql_args=False,
-        head_seq="", checks_rc=0, want_polls=False):
+        head_seq="", checks_rc=0, want_polls=False, committer_date=COMMITTER_DATE,
+        mutate=None):
     with tempfile.TemporaryDirectory() as td:
+        script = SCRIPT
+        if mutate is not None:
+            # (old, new): run a COPY of pr-watch.sh with one substitution, to prove a case has teeth.
+            old, new = mutate
+            text = open(SCRIPT).read()
+            assert old in text, "mutation anchor not found: %r" % old
+            script = os.path.join(td, "pr-watch.sh")
+            with open(script, "w") as f:
+                f.write(text.replace(old, new))
         state_dir = os.path.join(td, "state"); os.makedirs(state_dir)
         bindir = os.path.join(td, "bin"); os.makedirs(bindir)
         home = os.path.join(td, "home")
@@ -200,7 +212,7 @@ def run(*, labels="[]", checks="[]", reviews="[]", codoki_rc=0,
         env["CHECKS_RC"] = str(checks_rc)
         env["GROW_INLINE"] = grow_inline
         env["STUB_STATE_DIR"] = state_dir
-        env["COMMITTER_DATE"] = COMMITTER_DATE
+        env["COMMITTER_DATE"] = committer_date
         env["LABELS_JSON"] = labels
         env["CHECKS_JSON"] = checks
         env["REVIEWS_JSON"] = reviews
@@ -212,7 +224,7 @@ def run(*, labels="[]", checks="[]", reviews="[]", codoki_rc=0,
         if blocking_reviewers is not None:
             env["PR_WATCH_BLOCKING_REVIEWERS"] = blocking_reviewers
 
-        p = subprocess.run(["bash", SCRIPT, "123", "owner/repo", str(timeout_secs)],
+        p = subprocess.run(["bash", script, "123", "owner/repo", str(timeout_secs)],
                            env=env, capture_output=True, text=True, timeout=30)
         if want_polls:
             rpath = os.path.join(state_dir, "reviews")
@@ -306,6 +318,17 @@ CR_REQUESTED = '{"users":[{"login":"coderabbitai[bot]"}]}'
 TRIGGER_COMMENT = '[{"body":"please @coderabbitai review this PR"}]'
 TRIGGER_FULL_COMMENT = '[{"body":"@coderabbitai full review"}]'
 RESOLVE_COMMENT = '[{"body":"@coderabbitai resolve"}]'
+# #442: triggers carrying created_at on either side of the stub COMMITTER_DATE.
+# OLD targeted an earlier head (CR_APPROVED_OLD_HEAD answered it); NEW targets this one.
+TRIGGER_OLD = ('[{"user":{"login":"octocat"},"created_at":"2026-06-17T00:30:00Z",'
+               '"body":"@coderabbitai review"}]')
+TRIGGER_NEW = ('[{"user":{"login":"octocat"},"created_at":"2026-06-18T00:30:00Z",'
+               '"body":"@coderabbitai review"}]')
+# A trigger whose created_at is PRESENT but malformed (Copilot on #452): the value alone
+# cannot place it, so it must COUNT. "2026-06-17 00:30" sorts below the head date as a raw
+# string, so a scoping that compared it unvalidated would wrongly DROP it.
+TRIGGER_BAD_DATE = ('[{"user":{"login":"octocat"},"created_at":"2026-06-17 00:30",'
+                    '"body":"@coderabbitai review"}]')
 # CR's OWN auto-generated summary/walkthrough boilerplate quotes "@coderabbitai review"
 # as user instructions. It must NOT count as a trigger (the #173 live-UAT-caught bug:
 # every CR-touched PR would otherwise false-positive back into a cr-review hang).
@@ -559,14 +582,66 @@ def main():
     check("(h) passed through threads(quiet-confirm) first", "threads(quiet-confirm)" in err)
     check("(h) the thread predicate was read on >= 2 polls", gargs.count("query=query(") >= 2)
 
-    print("== #441 (i): CR triggered, CR review older than head, blocked, open thread -> pends ==")
+    print("== #441 (i): CR triggered (no readable created_at), CR review older than head -> pends ==")
     # thread-blocked needs merge(blocked) to be the SOLE pending item; a CR review still
     # owed on the new head keeps cr-review pending, so the watch times out instead.
+    # TRIGGER_COMMENT carries no created_at, so #442's head scoping cannot place it and
+    # the conservative leg counts it (a trigger this head may be owed a review for).
     rc, out, err = run(checks=GREEN_CHECK, reviews=CR_APPROVED_OLD_HEAD, mergeable="blocked",
                        threads=THREADS_ONE_OPEN, issue_comments=TRIGGER_COMMENT,
                        timeout_secs=PENDING_TIMEOUT)
     check("(i) exit 1 (timeout), no thread-blocked", rc == 1 and "thread-blocked" not in out)
     check("(i) pending is cr-review,merge(blocked)", "pr-watch: pending=cr-review,merge(blocked)\n" in err)
+
+    print("== #442 (a): trigger OLDER than head + CR reviewed the old head -> thread-blocked fires ==")
+    # The #442 bug: the historical trigger kept cr-review pending forever, so the
+    # sole-pending merge(blocked) rule never held and the watch timed out silently.
+    rc, out, err = run(checks=GREEN_CHECK, reviews=CR_APPROVED_OLD_HEAD, mergeable="blocked",
+                       threads=THREADS_ONE_OPEN, issue_comments=TRIGGER_OLD)
+    check("#442 (a) exit 0 + thread-blocked (no timeout)",
+          rc == 0 and out.strip() == "thread-blocked head=%s unresolved=1 failing=0 by=%s" % (HEAD_SHA[:8], COPILOT))
+    check("#442 (a) cr-review never pended", "cr-review" not in err)
+
+    print("== #442 (b): trigger NEWER than head, no CR review of this head yet -> cr-review pends ==")
+    for label, rv in (("no CR review at all", "[]"), ("CR review of the old head only", CR_APPROVED_OLD_HEAD)):
+        rc, out, err = run(checks=GREEN_CHECK, reviews=rv, mergeable="blocked",
+                           threads=THREADS_ONE_OPEN, issue_comments=TRIGGER_NEW,
+                           timeout_secs=PENDING_TIMEOUT)
+        check("#442 (b) %s: exit 1, no terminal" % label,
+              rc == 1 and "thread-blocked" not in out and "settled" not in out)
+        check("#442 (b) %s: pending is cr-review,merge(blocked)" % label,
+              "pr-watch: pending=cr-review,merge(blocked)\n" in err)
+
+    print("== #442 (c): unreadable head date -> conservative, an old trigger still pends cr-review ==")
+    # A malformed (non-ISO) head date cannot place the trigger, so it COUNTS, as before
+    # #442. Scoping against the raw string would read "2026-..." < "garbage" and drop it.
+    rc, out, err = run(checks=GREEN_CHECK, reviews="[]", mergeable="blocked",
+                       threads=THREADS_ONE_OPEN, issue_comments=TRIGGER_OLD,
+                       committer_date="garbage", timeout_secs=PENDING_TIMEOUT)
+    check("#442 (c) malformed head date: exit 1, no thread-blocked", rc == 1 and "thread-blocked" not in out)
+    check("#442 (c) malformed head date: pending names cr-review", "pending=cr-review" in err)
+    # A malformed TRIGGER timestamp (valid head date) cannot place the trigger either, so
+    # it COUNTS and cr-review pends; the mutant that compares the raw string drops it.
+    for label, mut in (("real", None),
+                       ("MUTANT (no ISO check on created_at)",
+                        ('| if type == "string"\n'
+                         '                            and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")',
+                         '| if type == "string"'))):
+        rc, out, err = run(checks=GREEN_CHECK, reviews="[]", mergeable="blocked",
+                           threads=THREADS_ONE_OPEN, issue_comments=TRIGGER_BAD_DATE,
+                           timeout_secs=PENDING_TIMEOUT, mutate=mut)
+        counted = rc == 1 and "thread-blocked" not in out and "pending=cr-review" in err
+        if mut is None:
+            check("#442 (c) malformed trigger created_at: counts, cr-review pends", counted)
+        else:
+            check("#442 (c) %s: drops the trigger (the case has teeth)" % label, not counted)
+    # An EMPTY head date never reaches the trigger check: the loop pends on
+    # head-date-fetch and bails as a setup error, never a verdict.
+    rc, out, err = run(checks=GREEN_CHECK, reviews="[]", mergeable="blocked",
+                       threads=THREADS_ONE_OPEN, issue_comments=TRIGGER_OLD,
+                       committer_date="", timeout_secs=PENDING_TIMEOUT)
+    check("#442 (c) empty head date: no terminal on stdout, pends head-date-fetch",
+          rc != 0 and out.strip() == "" and "head-date-fetch" in err)
 
     print("== #441 (j): totalCount below the node count -> threads(unreadable) ==")
     rc, out, err = run(checks=GREEN_CHECK, reviews=CR_APPROVED, mergeable="blocked",

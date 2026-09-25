@@ -83,6 +83,41 @@ def main():
         rc, out, err = run(md, ["add"])
         check("no-slug add -> non-zero", rc != 0)
 
+        print("== add: malformed invocations refused (#394) ==")
+        before = set(inbox_files(md))
+        rc, out, err = run(md, ["add", "--file", "/tmp/draft.txt", "--title", "some", "title"])
+        check("flag-as-slug add -> non-zero", rc != 0)
+        check("flag-as-slug names the stdin form", "add <slug> < file" in err)
+        rc, out, err = run(md, ["add", "-x", "body"])
+        check("short-flag slug add -> non-zero", rc != 0)
+        draft = os.path.join(td, "draft.txt")
+        with open(draft, "w") as fh:
+            fh.write("real draft content")
+        rc, out, err = run(md, ["add", "some-slug", draft])
+        check("existing-file argv body -> non-zero", rc != 0)
+        check("file-body refusal names the stdin form", "add <slug> < file" in err)
+        check("refused adds created no inbox entry", set(inbox_files(md)) == before)
+        # Valid forms still work (and are cleaned up so the list counts below hold).
+        accepted = []
+        # A DIRECTORY body is not refused: `add <slug> < dir` could not feed it, so the
+        # refusal's remedy would be wrong (hostile review of #394). Only a regular file is.
+        rc, out, err = run(md, ["add", "dir-slug", "."])
+        check("single-word body that is a DIRECTORY ('.') -> exit 0 (not a file)", rc == 0); accepted.append(out.strip())
+        rc, out, err = run(md, ["add", "regress", "scripts/pr-watch.sh --codoki-gate returns PASS when the check never ran"])
+        check("multi-word body starting with a path-like word -> exit 0", rc == 0); accepted.append(out.strip())
+        rc, out, err = run(md, ["add", "residual", draft + " is referenced here"])
+        check("multi-word body starting with an EXISTING path -> exit 0 (accepted residual)", rc == 0); accepted.append(out.strip())
+        rc, out, err = run(md, ["add", "oneword", "nonexistent-path-xyz.txt"])
+        check("single-word body that is not an existing path -> exit 0", rc == 0); accepted.append(out.strip())
+        rc, out, err = run(md, ["add", "fromfile"], stdin=open(draft).read())
+        check("stdin form (add <slug> < file) -> exit 0", rc == 0)
+        check("stdin form stores the file CONTENT",
+              rc == 0 and "real draft content" in open(os.path.join(md, "inbox", out.strip())).read())
+        accepted.append(out.strip())
+        for f in accepted:
+            if f:
+                os.remove(os.path.join(md, "inbox", f))
+
         print("== list: inbox entries, sorted, never drained/ ==")
         rc, out, err = run(md, ["list"])
         listed = [ln for ln in out.splitlines() if ln.strip()]

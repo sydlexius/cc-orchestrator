@@ -161,6 +161,24 @@ SUPPRESSED_RE='<summary>Suppressed comments \(([1-9][0-9]*)\)</summary>|(?:^|(?<
 # the phrase appears in NEITHER recognized shape.
 SUPPRESSED_SHAPE_RE='<summary>Suppressed comments \((?:0|[1-9][0-9]*)\)</summary>|(?:^|(?<=\n))[ ]{0,3}#{2,4}[ \t]+Suppressed comments \((?:0|[1-9][0-9]*)\)(?:[ \t]+(?:#+[ \t]*)?)?(?=\r?\n|$)'
 
+# The Copilot reviewer logins, EXACT (never a prefix: "Copilot-fan" is not the reviewer).
+# Shared by the format canary and the #422 verdict clause below. A value passed with --arg
+# needs SINGLE backslashes.
+COPILOT_LOGIN_RE='^(Copilot|copilot-pull-request-reviewer\[bot\])$'
+
+# #422: a Copilot body whose findings live ONLY in its prose. Copilot opens such a body with
+# a line-anchored h3 verdict, "### <emoji> Needs a closer look" or "### <emoji> Changes
+# recommended", states the defects in a sentence, reports "Comments generated: 0", and has
+# NO suppressed block -- so neither the CR vocabulary nor SUPPRESSED_RE admits it and a real
+# finding read as a clean 0. Only these two verdicts: "Approval recommended" (and every other
+# severity header) is not a finding. The emoji is 1-3 non-space tokens between the "### "
+# and the phrase, and the FIRST must contain at least one non-ASCII character (#452 review):
+# Copilot has changed glyphs before, so no literal codepoint list, but a plain ASCII word
+# ("### plainword Changes recommended") is not a glyph and not a Copilot verdict. Line
+# anchoring is spelled out exactly as in SUPPRESSED_RE, for the same oniguruma whole-string-^
+# reason.
+COPILOT_VERDICT_RE='(?:^|(?<=\n))[ ]{0,3}###[ \t]+\S*[^\x00-\x7F]\S*(?:[ \t]+\S+){0,2}[ \t]+(?:Changes recommended|Needs a closer look)(?:[ \t]+(?:#+[ \t]*)?)?(?=\r?\n|$)'
+
 # Single source of truth for bot login detection.
 # Used in jq select() expressions -- must be valid jq.
 BOT_LOGIN_FILTER='(
@@ -991,16 +1009,54 @@ fi
 # exact shape" technique the floor matchers use: a boilerplate "generated no new comments"
 # body carries neither shape and stays filtered, which keeps the 58-of-99 pure-boilerplate
 # majority out of the checklist.
-review_bodies_raw=$(echo "$all_reviews" | jq --arg sup_re "$SUPPRESSED_RE" '[.[] | select(
+#
+# #422 adds a THIRD clause, for a Copilot body whose findings are prose only (see
+# COPILOT_VERDICT_RE). It is deliberately the narrowest predicate that admits that shape:
+#   - authored by a Copilot login (exact match, COPILOT_LOGIN_RE),
+#   - carries the line-anchored "Changes recommended" / "Needs a closer look" verdict,
+#   - carries NO suppressed block at all, in either recognized shape and with ANY count
+#     (SUPPRESSED_SHAPE_RE, not SUPPRESSED_RE; #452 review). A positive block is already
+#     admitted by the clause above, so excluding it keeps the clauses disjoint and nobody
+#     later "sums" it twice; a "(0)" block is still a block, and SUPPRESSED_RE (positive
+#     counts only) let it slip into this prose-only clause, and
+#   - NO inline comment carries its review id. With an inline comment the verdict is the
+#     summary of that inline finding, which clears by reply; admitting the body too would
+#     make one finding unclearable by the reply that addresses it.
+# Admitted as ONE review-body finding, cleared by the existing ack-by-review-id channel.
+#
+# The same inline-review-id exclusion applies to a COPILOT body admitted by the CR keyword
+# clause (#452 review): a Copilot verdict without the "## Pull request overview" opener
+# whose prose happens to say "Potential issue" otherwise reached the report through the
+# first clause and surfaced one finding twice (inline + body). It is scoped to that clause
+# and to Copilot logins only: CR's own round summaries keep their existing behavior, and
+# a Copilot body with a POSITIVE suppressed block is still admitted by the second clause.
+inline_review_ids=$(echo "$all_comments" | jq '[.[] | .pull_request_review_id | select(. != null)] | unique')
+review_bodies_raw=$(echo "$all_reviews" | jq \
+  --arg sup_re "$SUPPRESSED_RE" \
+  --arg sup_shape_re "$SUPPRESSED_SHAPE_RE" \
+  --arg verdict_re "$COPILOT_VERDICT_RE" \
+  --arg copilot_re "$COPILOT_LOGIN_RE" \
+  --argjson inline_rids "$inline_review_ids" '[.[] |
+  (.id as $rid | $inline_rids | any(. == $rid)) as $has_inline |
+  ((.user.login // "") | test($copilot_re)) as $is_copilot |
+  select(
   .body != "" and .body != null and
   '"$BOT_LOGIN_FILTER"' and
   (
     (
       (.body | test("Outside diff range|Potential issue|Refactor suggestion|Actionable comments posted|Nitpick|CAUTION|Duplicate comments"; "i")) and
-      (.body | test("^## Pull request overview"; "") | not)
+      (.body | test("^## Pull request overview"; "") | not) and
+      (($is_copilot and $has_inline) | not)
     )
     or
     (.body | test($sup_re))
+    or
+    (
+      $is_copilot and
+      (.body | test($verdict_re)) and
+      (.body | test($sup_shape_re) | not) and
+      ($has_inline | not)
+    )
   )
 )]')
 
@@ -1013,8 +1069,8 @@ review_bodies_raw=$(echo "$all_reviews" | jq --arg sup_re "$SUPPRESSED_RE" '[.[]
 # Copilot logins and to the case-sensitive "Suppressed comments (" token: prose such as "I
 # suppressed comments on generated files" from any bot is not a format change, and a canary
 # that cries wolf is one nobody reads.
-echo "$all_reviews" | jq -r --arg shape_re "$SUPPRESSED_SHAPE_RE" '.[] | select(
-  (.user.login | test("^(Copilot|copilot-pull-request-reviewer\\[bot\\])$")) and
+echo "$all_reviews" | jq -r --arg shape_re "$SUPPRESSED_SHAPE_RE" --arg copilot_re "$COPILOT_LOGIN_RE" '.[] | select(
+  (.user.login | test($copilot_re)) and
   ((.body // "") | test("Suppressed comments \\(")) and
   ((.body // "") | test($shape_re) | not)
 ) | "SUPPRESSED-FORMAT-WARN: review \(.id) by \(.user.login) mentions Suppressed comments in an unrecognized shape; its findings are NOT counted. Read it by hand and update SUPPRESSED_RE."' >&2 || true

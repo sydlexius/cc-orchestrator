@@ -77,12 +77,21 @@
 #         totalCount above that is REPORTED on stderr (unresolved is then a lower
 #         bound), or pends as `threads(truncated)` when every fetched thread is
 #         resolved.
-#         KNOWN LIMIT: cr_was_triggered is NOT scoped to the current head. A
-#         historical `@coderabbitai review` comment plus a push AFTER CR's last
-#         review leaves `cr-review` pending (CR is "expected" but has not reviewed
-#         the new head), so the sole-pending rule is never met and thread-blocked
-#         is unreachable; the watch times out. The #399 stderr line names it
-#         (`pending=cr-review,merge(blocked)`). Tracked separately, not fixed here.
+#         CR TRIGGER IS HEAD-SCOPED (#442): #441 shipped with cr_was_triggered
+#         matching a trigger ANYWHERE in PR history, so a historical
+#         `@coderabbitai review` plus a push AFTER CR's last review left
+#         `cr-review` pending forever, the sole-pending rule was never met, and
+#         the watch timed out on exactly the PR this terminal exists for. A
+#         trigger now counts only when posted at or after the current head's
+#         committer date (the SAME date the CR-review filter already uses), i.e.
+#         when it targets this head. The sole-pending rule itself is unchanged.
+#         Fail direction stays conservative: an unreadable head date or trigger
+#         timestamp counts the trigger, so cr-review pends as it did before.
+#         KNOWN RESIDUAL: the committer date is a LOCAL clock. A committer clock
+#         ahead of GitHub's drops a real trigger posted inside that skew window,
+#         and pushing an old local commit (committer date before a later trigger)
+#         keeps the pre-#442 pending. Both are shared with the CR-review filter,
+#         so the two stay consistent; a push-event time would remove them.
 #
 #     merged head=<sha8>
 #     closed head=<sha8>
@@ -267,17 +276,38 @@ cr_is_requested() {
 # engages CR WITHOUT requesting a review, so those must NOT count as positive
 # evidence (matching them would re-introduce the false-wait bug, #173). Fails
 # CLOSED (returns 1 = not triggered) on any gh/jq error.
+#
+# HEAD-SCOPED (#442): only a trigger posted at or after the current head's
+# committer date ($head_committer_date, the same filter cr_latest_state uses)
+# targets THIS head. A historical trigger older than the head already got its
+# review (or asked for one of an earlier head) and must not keep cr-review
+# pending, which made #441's thread-blocked terminal unreachable after any push
+# that followed a triggered review. FAIL DIRECTION is conservative (pending),
+# matching the pre-#442 behavior: when the head date is empty or not the
+# ISO-8601 UTC shape GitHub emits, or a trigger's created_at is missing or
+# malformed, the trigger COUNTS. An unreadable date must never silently drop a
+# real trigger and let the watch settle early. (The main loop already refuses to
+# proceed on an EMPTY head date; the empty leg here is defense in depth.)
 cr_was_triggered() {
+  local hd="${head_committer_date:-}"
+  [[ "$hd" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || hd=""
   # A trigger is a NON-CR author posting `@coderabbitai review` / `full review`.
   # Exclude coderabbitai[bot]'s OWN comments: its auto-generated summary/walkthrough
   # boilerplate quotes the literal `@coderabbitai review` as user instructions, which
   # would otherwise false-positive every CR-touched PR back into a hang (the #173 bug).
   gh api --paginate "repos/$repo/issues/$pr/comments" 2>/dev/null \
     | jq -s 'add // []' 2>/dev/null \
-    | jq -e --arg cr "$CR_LOGIN" '[ .[]
+    | jq -e --arg cr "$CR_LOGIN" --arg hd "$hd" '[ .[]
         | select(((.user.login // "") != $cr)
                  and ((.body // "")
-                      | test("@coderabbitai[[:space:]]+(full[[:space:]]+)?review\\b"; "i"))) ]
+                      | test("@coderabbitai[[:space:]]+(full[[:space:]]+)?review\\b"; "i")))
+        | select(if $hd == "" then true
+                 else (.created_at
+                       | if type == "string"
+                            and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+                         then . >= $hd
+                         else true end)
+                 end) ]
              | length > 0' >/dev/null 2>&1
 }
 
@@ -287,7 +317,7 @@ cr_was_triggered() {
 #   - a CR review already exists for HEAD ($cr_latest_state non-empty, incl.
 #     DISMISSED -- CR engaged, may post again), OR
 #   - CR is in requested_reviewers, OR
-#   - a `@coderabbitai review` trigger comment is present.
+#   - a `@coderabbitai review` trigger comment targets the current head (#442).
 # When none hold (the default for an auto-review-off PR that was never triggered),
 # CR is NOT expected and the requirement is treated as satisfied -- the fix for
 # #173, where the old opt-out logic waited the full timeout for a review that
@@ -514,7 +544,7 @@ while true; do
   # the old opt-out logic waited the full timeout for a review that never lands -- the
   # bug this inversion fixes. cr_review_expected() is positive evidence: an existing
   # review (incl. DISMISSED), CR in requested_reviewers, or a `@coderabbitai review`
-  # trigger comment; its helpers fail CLOSED (assume not-expected) so an API blip
+  # trigger comment posted for the current head (#442); its helpers fail CLOSED (assume not-expected) so an API blip
   # never hangs, while a genuine in-flight review (non-empty $cr_latest_state) always
   # keeps us waiting.
   case "$cr_latest_state" in

@@ -1583,6 +1583,126 @@ def main():
     check("#417 canary: the exact 'Copilot' login still WARNs", "SUPPRESSED-FORMAT" in err and "438" in err)
 
     print()
+    print("== #422: a Copilot body whose findings are PROSE ONLY ==")
+    # Real shape: an h3 verdict with an emoji, one sentence naming concrete defects,
+    # "Comments generated: 0", and NO suppressed block. Neither the CR vocabulary nor
+    # SUPPRESSED_RE admitted it, so a real finding read as a clean 0.
+    def prose(verdict, extra=""):
+        return ("## Pull request overview\n\n### \U0001F7E1 " + verdict + "\n\n"
+                "The retry loop never resets its backoff and the error path leaks the fd.\n\n"
+                "<details>\n<summary>Review details</summary>\n\n"
+                "Comments generated: 0\n" + extra + "</details>")
+    PROSE_CLOSER = copilot(4221, prose("Needs a closer look"))
+    rc, out, err = run(["--allow-stale"], reviews=PROSE_CLOSER)
+    check("#422: a prose-only 'Needs a closer look' body is admitted as ONE finding",
+          findings_count(out) == 1)
+    rc, out, err = run(["--count-only", "--allow-stale"], reviews=PROSE_CLOSER)
+    check("#422: --count-only reports it (not 0)", out.strip() not in ("", "0"))
+    rc, out, err = run(["--itemized", "--allow-stale"], reviews=PROSE_CLOSER)
+    check("#422: --itemized lists it as a review-body row",
+          "review-body | copilot-pull-request-reviewer" in out)
+    rc, out, err = run(["--allow-stale"],
+                       reviews=copilot(4222, prose("Changes recommended"), login="Copilot"))
+    check("#422: 'Changes recommended' from the 'Copilot' login is admitted as ONE finding",
+          findings_count(out) == 1)
+
+    # An inline comment carrying the review id: the verdict summarizes THAT finding, which
+    # clears by reply, so the body is not a separate item. Replied inline -> nothing left.
+    INLINE_4221 = json.dumps([
+        {"id": 94221, "user": {"login": "copilot-pull-request-reviewer[bot]"},
+         "pull_request_review_id": 4221, "path": "a.sh", "original_line": 1,
+         "created_at": "2026-06-18T02:00:00Z", "commit_id": "abcdef1234",
+         "body": "an inline finding"},
+        {"id": 94222, "user": {"login": "testuser"}, "in_reply_to_id": 94221,
+         "path": "a.sh", "original_line": 1, "created_at": "2026-06-18T04:00:00Z",
+         "commit_id": "abcdef1234", "body": "fixed in abc1234"}])
+    rc, out, err = run(["--allow-stale"], reviews=PROSE_CLOSER, inline=INLINE_4221)
+    check("#422: with an inline comment carrying its review id, the body is NOT a body item",
+          findings_count(out) in (0, None))
+    # The load-bearing case for the admit-time exclusion: while the inline comment is
+    # still UNREPLIED, the downstream addressed-state machine would keep the review, so
+    # without the exclusion one finding would surface twice (inline + body).
+    INLINE_4221_OPEN = json.dumps(json.loads(INLINE_4221)[:1])
+    rc, out, err = run(["--allow-stale"], reviews=PROSE_CLOSER, inline=INLINE_4221_OPEN)
+    check("#422: inline UNREPLIED -> reported as the inline finding, NOT also as a body item",
+          findings_count(out) in (0, None) and "94221" in out)
+    rc, out, err = run(["--itemized", "--allow-stale"], reviews=PROSE_CLOSER, inline=INLINE_4221_OPEN)
+    check("#422: --itemized shows the inline row and no review-body row",
+          "inline | copilot-pull-request-reviewer" in out and "review-body |" not in out)
+    # An inline comment for a DIFFERENT review id must not exclude it.
+    INLINE_OTHER = INLINE_4221.replace('"pull_request_review_id": 4221', '"pull_request_review_id": 9999')
+    rc, out, err = run(["--allow-stale"], reviews=PROSE_CLOSER, inline=INLINE_OTHER)
+    check("#422: an inline comment for ANOTHER review does not exclude it",
+          findings_count(out) == 1)
+
+    # Excluded shapes: the non-finding verdict, a non-Copilot author, a non-h3 / mid-line
+    # mention, and trailing text after the phrase.
+    for label, rv in [
+        ("'Approval recommended'", copilot(4223, prose("Approval recommended"))),
+        ("a non-Copilot bot", copilot(4224, prose("Needs a closer look"), login="github-actions[bot]")),
+        ("a login that only PREFIXES Copilot", copilot(4225, prose("Needs a closer look"), login="Copilot-fan")),
+        ("an h2 verdict", copilot(4226, "## \U0001F7E1 Needs a closer look\nx")),
+        # These two carry a REAL glyph so they keep testing their own property (line
+        # anchoring, trailing text) now that an ASCII-only token is rejected on its own.
+        ("a mid-line mention", copilot(4227, "## Pull request overview\nsee ### \U0001F7E1 Needs a closer look\n")),
+        ("text after the phrase", copilot(4228, "### \U0001F7E1 Needs a closer look at tests\n")),
+        ("no emoji token", copilot(4229, "### Needs a closer look\n")),
+        # #452 review: the leading token must be glyph-ish (contain a non-ASCII char), so a
+        # plain ASCII word before the phrase is not a Copilot verdict.
+        ("an ASCII-only leading token", copilot(4231, "### plainword Changes recommended\nx\n")),
+    ]:
+        rc, out, err = run(["--allow-stale"], reviews=rv)
+        check(f"#422: {label} is NOT admitted", findings_count(out) in (0, None))
+
+    # #452 review: the real Copilot glyphs still match (both seen on live bodies).
+    rc, out, err = run(["--allow-stale"],
+                       reviews=copilot(4232, "## Pull request overview\n\n### \U0001F535 Needs a closer look\n\nx\n"))
+    check("#422: the real '### \U0001F535 Needs a closer look' shape is admitted", findings_count(out) == 1)
+
+    # #452 review: a recognized "(0)" suppressed block is still a suppressed block, so the
+    # prose-only clause (which requires NO block) must not admit the body.
+    rc, out, err = run(["--allow-stale"],
+                       reviews=copilot(4233, prose("Changes recommended",
+                                                   "### Suppressed comments (0)\n")))
+    check("#422: a verdict with a 'Suppressed comments (0)' block is NOT admitted as prose-only",
+          findings_count(out) in (0, None))
+
+    # #452 review: a Copilot verdict body admitted by the KEYWORD clause (no overview
+    # heading, prose saying "Potential issue") with an UNREPLIED inline comment on the same
+    # review id must surface once, as the inline finding -- not also as an unclearable body.
+    KW_BODY = ("### \U0001F7E1 Changes recommended\n\n"
+               "Potential issue: the retry loop never resets its backoff.\n")
+    rc, out, err = run(["--allow-stale"], reviews=copilot(4221, KW_BODY), inline=INLINE_4221_OPEN)
+    check("#422: a keyword-admitted Copilot body with an unreplied inline is NOT also a body item",
+          findings_count(out) in (0, None) and "94221" in out)
+    # ...but a Copilot body with a POSITIVE suppressed block still counts (1 + 2), inline or not.
+    rc, out, err = run(["--allow-stale"],
+                       reviews=copilot(4221, KW_BODY + "### Suppressed comments (2)\n* a\n* b\n"),
+                       inline=INLINE_4221_OPEN)
+    check("#422: a keyword+suppressed(2) Copilot body with an inline still counts 3",
+          findings_count(out) == 3)
+
+    # A verdict body that ALSO has a suppressed block: counted by the suppressed clause
+    # exactly as before (1 body + 2 suppressed = 3), never double-counted as a body.
+    WITH_SUP = copilot(4230, prose("Changes recommended",
+                                   "### Suppressed comments (2)\n\n* a\n* b\n"))
+    rc, out, err = run(["--allow-stale"], reviews=WITH_SUP)
+    check("#422: 'Changes recommended' + Suppressed comments (2) counts 3, not 4",
+          findings_count(out) == 3)
+    rc, out, err = run(["--itemized", "--allow-stale"], reviews=WITH_SUP)
+    check("#422: --itemized lists that body exactly once",
+          out.count("review-body |") == 1)
+
+    # The existing ack-by-review-id channel clears it (no wedge).
+    ACK_422 = ('[{"id":94230,"user":{"login":"testuser"},"created_at":"2026-06-18T04:00:00Z",'
+               '"body":"Addressed the closer-look findings in review 4221 (fix abc1234)."}]')
+    rc, out, err = run(["--allow-stale"], reviews=PROSE_CLOSER, issue=ACK_422)
+    check("#422: an ack referencing the review id clears the prose-only body",
+          findings_count(out) in (0, None))
+    rc, out, err = run(["--count-only", "--allow-stale"], reviews=PROSE_CLOSER, issue=ACK_422)
+    check("#422: --count-only is 0 once acked", out.strip() == "0")
+
+    print()
     if FAILS:
         print(f"FAILED ({len(FAILS)}):"); [print("  - " + f) for f in FAILS]; sys.exit(1)
     print("ALL PASSED")
