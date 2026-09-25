@@ -441,6 +441,13 @@ Record the task ID alongside the comment ID -- you will mark it complete in Step
 
 ## Step 5 -- Implement all fixes
 
+Before the first fix edit, record the pre-round HEAD (Step 5.6 scopes its tier and its pass to
+`$pre_round_head..HEAD`):
+
+```bash
+pre_round_head=$(git rev-parse HEAD)
+```
+
 For every comment categorized as `bug`, `spec-drift`, or `test-gap`:
 
 - Read the relevant code
@@ -614,6 +621,42 @@ wording): report and move on. Do not extend the fix scope for these.
 
 ---
 
+## Step 5.6 -- Fix-scoped hostile pass (gates the push)
+
+Fix rounds are new, unreviewed code. Step 5.5 is conditional and not hostile, so it does not
+cover this. Decide HERE whether the round owes an independent, fix-scoped hostile pass per
+`engage-ralph-loop.md`; the pass itself runs inside Step 7, after the round's commit and
+BEFORE any outward step (push, reply, resolve). It is OWED when ANY of these holds:
+
+- **(a)** the fix diff touches a deny-authority or advisory tier file. Apply `/prep-pr` Step 4a's
+  tier logic to the FIX-ROUND diff, NOT to the whole-branch merge-base range Step 4a uses at PR
+  time, so a doc-only round on a PR that once touched the guard is not inflated to
+  deny-authority. Because this decision is made BEFORE the Step 7 commit, diff the WORKING TREE
+  against the pre-round HEAD (`git diff -M --name-status "$pre_round_head"`, with no `..HEAD`):
+  `$pre_round_head..HEAD` holds only committed history and would miss every uncommitted Step 5
+  edit, tiering a deny-authority fix as standard.
+- **(b)** a fix is not mechanical and falls on ANY axis in Step 5.5's "When agents are merited"
+  list (every bullet there applies, including concurrency, API contract, and >~100 lines).
+- **(c)** the round answers a hostile DO NOT SHIP verdict.
+
+**Depth follows the tier:** the FULL engage-ralph-loop to K=2 dry rounds for deny-authority;
+ONE hostile, fix-scoped pass otherwise. The pass reviews the fix diff only,
+`<pre-round HEAD>..HEAD` (record the pre-round HEAD before Step 5 starts). The lead assigns each
+finding's severity. A Critical or Important finding in a single-pass tier PROMOTES the round to
+the FULL loop (the `engage-ralph-loop.md` escalation hatch): fix and re-commit it, then run the
+full loop on the new diff until it converges at K=2 dry rounds, all before the push.
+
+**Not owed** for a standard-tier round of purely mechanical fixes (Step 5.5's one-line skip
+note covers it), for a round of replies with no code change, or for a standard-tier round whose
+non-mechanical fixes fall on NO "When agents are merited" axis and that does not answer a DO NOT
+SHIP verdict.
+
+**Pushed before its owed pass?** Say so plainly in the next report. The late pass must still
+clear before MERGE: record it as `LATE (pending)` in the Step 9 "Fix-scoped pass" field, which
+the SKILL.md MERGE-READY precondition checks. Never present it as having gated the push.
+
+---
+
 ## Step 6 -- Compose replies
 
 For each open comment, draft a reply:
@@ -662,7 +705,9 @@ git commit -m "fix: address PR review findings
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ```
 
-Get the short SHA:
+Run any owed Step 5.6 pass now, on this commit. If it produces fixes, commit them as a
+follow-up commit (and re-run the pass on the new diff). Only then get the short SHA, so every
+reply cites the FINAL commit:
 
 ```bash
 git rev-parse --short HEAD
@@ -670,10 +715,13 @@ git rev-parse --short HEAD
 
 ### Push first (default order)
 
-The DEFAULT order is PUSH-FIRST: commit -> push -> reply-with-hash -> resolve.
-CR auto-review is OFF org-wide, so a push triggers no automatic re-review, and a
+The DEFAULT order is PUSH-FIRST: commit -> pass -> push -> reply-with-hash -> resolve,
+where "pass" is the Step 5.6 fix-scoped hostile pass when the round owes one. CR
+auto-review is OFF org-wide, so a push triggers no automatic re-review, and a
 SHA-citing reply to a not-yet-pushed commit 404s (the #2038 failure). Pushing first
-makes the cited commit reachable before any reply references it. Push now:
+makes the cited commit reachable before any reply references it. Push-first decides
+push-vs-reply ONLY; it never decides when the review runs, and an owed pass always
+precedes the push. Once any owed Step 5.6 pass has cleared, push:
 
 ```bash
 git push origin $(git branch --show-current) 2>&1
@@ -683,7 +731,7 @@ Report the result. If the push fails, explain why -- do not retry automatically.
 
 **EXCEPTION -- CR auto-review is ON for this repo** (CodeRabbit posts an unsolicited
 review with no trigger, i.e. it auto-dismisses + re-triggers on every push): use the
-REPLY-FIRST order instead -- reply + resolve, THEN push (Step 8.5). The org default is
+REPLY-FIRST order instead -- commit -> pass -> reply -> resolve -> push (Step 8.5). The org default is
 auto-review OFF, so push-first is the standing case; see Step 8.5 for the full rule.
 
 Now substitute the real SHA into all "Fixed in <sha>" reply drafts from step 6.
@@ -849,7 +897,11 @@ In the default flow the push already happened in Step 7. This section records WH
 and the single case where you invert it. It mirrors the push-order rule in the
 user-global CLAUDE.md; keep the two in agreement.
 
-**DEFAULT = PUSH-FIRST** (commit -> push -> reply-with-hash -> resolve). This is the
+Both orders put the Step 5.6 fix-scoped hostile pass, when owed, right after the commit
+and before ANY outward step. Push order decides push-vs-reply only, never when the review
+runs: a review that starts after the push can no longer stop anything.
+
+**DEFAULT = PUSH-FIRST** (commit -> pass -> push -> reply-with-hash -> resolve). This is the
 standing order because CR auto-review is OFF org-wide (`.coderabbit.yaml`
 `auto_review.enabled: false`): a push triggers no automatic re-review, and a
 SHA-citing reply to a not-yet-pushed commit 404s (the #2038 failure). Push first so
@@ -858,8 +910,8 @@ the cited commit is reachable, then reply-with-hash and resolve.
 **EXCEPTION = REPLY-FIRST** -- only when CR auto-review is ON for this repo (CodeRabbit
 posts an unsolicited review with no trigger, i.e. it auto-dismisses + re-triggers on
 every push). There a fix-round push races CR's automatic re-review and can auto-resolve
-fresh threads before they are replied to. In that case invert: reply (Step 7 replies)
-and resolve (Step 8) FIRST, then push here --
+fresh threads before they are replied to. In that case invert (commit -> pass -> reply ->
+resolve -> push): reply (Step 7 replies) and resolve (Step 8) FIRST, then push here --
 
 ```bash
 git push origin $(git branch --show-current) 2>&1
@@ -870,7 +922,10 @@ of the thread handling.
 
 Either way, "never ship with unhandled review" is enforced at the pre-MERGE ship-gate
 (`ship-gate-preflight` + `pr-unreplied-comments`), NOT by push order. If a push fails,
-explain why -- do not retry automatically.
+explain why -- do not retry automatically. If a round was pushed before its owed pass,
+report that plainly (Step 5.6): the late pass must clear before MERGE, recorded in the
+Step 9 "Fix-scoped pass" field and checked at the SKILL.md MERGE-READY precondition; it
+never counts as having gated the push.
 
 ---
 
@@ -889,6 +944,7 @@ freehand. Compute each field from the data already collected in earlier steps:
 | SHA | `git rev-parse --short HEAD` from Step 7 |
 | Branch | `git branch --show-current` |
 | Resolved | whether CR resolve was posted + Copilot/Greptile threads resolved |
+| Fix-scoped pass | Step 5.6: `not owed` / `cleared before push` / `LATE (pending)` |
 
 Assemble and print:
 
@@ -901,6 +957,7 @@ Assemble and print:
 - Replied: $replied_count total
 - Pushed: $sha to $branch
 - Resolved: CR resolve $cr_status; GraphQL threads (Copilot + Greptile + Codoki) $graphql_resolve_status
+- Fix-scoped pass: $fix_pass_status (not owed / cleared before push / LATE (pending))
 ```
 
 Codoki is not in service, so it does not review the push; Greptile (where

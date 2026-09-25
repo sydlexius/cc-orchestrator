@@ -496,6 +496,11 @@ Runtime (`scripts/`; canonical source is this repo):
   {} and passes - exactly how a drift guard becomes decorative, and the #330 lesson about a
   wrong pattern reading as a real defect); and a FILESYSTEM CROSS-CHECK, since the two lists
   can AGREE and both omit a script that exists. Stdlib only, no network.
+  #379 extends the same three checks to the `python3 test-*.py` HARNESS STEP lists, which had
+  drifted to 16 of 42 gated harnesses never run in CI (`test-orchestrate-authorize-merge.py`
+  among them). A harness kept out of CI needs a `CI_EXEMPT` entry with a WRITTEN REASON
+  (mirrors `FS_EXEMPT`); the default is a CI step, and the FS leg requires every `test-*.py`
+  on disk to be a `.gates.toml` step.
 - `test-orchestrate-{guard,resources,setup}.py`, `test-planner-classify.py`, `test-gh-wrappers.py` -
   the proof harnesses (kept at repo root; dev tooling, not shipped in the skill).
 
