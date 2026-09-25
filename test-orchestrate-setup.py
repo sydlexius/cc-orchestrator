@@ -2684,8 +2684,11 @@ def _run_checks():
 
     # (e) EXACT-SET pin on the REAL required-permissions.md: this is the durable guard - it
     # fails CI if any future prose mention re-introduces a phantom OR any real entry is dropped.
+    # #437: NO relative Bash(scripts/safe-push.sh ...) entry. The pr-shipper pushes with the
+    # DEPLOYED ~/.claude/scripts/safe-push.sh, covered by the deployed-helper glob below; the
+    # relative grant authorized a consumer repo's own same-named script. The pin below keeps
+    # it from coming back.
     EXPECTED_107 = {
-        "Bash(scripts/safe-push.sh *)", "Bash(scripts/safe-push.sh)",
         "Bash(gh pr view *)", "Bash(gh pr diff *)", "Bash(gh pr checks *)",
         "Bash(gh pr create *)", "Bash(gh pr list *)", "Bash(gh pr status *)",
         "Bash(gh pr edit *)", "Bash(gh pr ready *)", "Bash(gh pr comment *)",
@@ -2707,6 +2710,8 @@ def _run_checks():
               real_got == EXPECTED_107)
         check("#107 real required-permissions.md: no Bash(gh api *) phantom (the #24 least-privilege regression)",
               not any("gh api" in e for e in real_got))
+        check("#437 real required-permissions.md: no relative scripts/safe-push.sh grant (a consumer's own script)",
+              not any(e.startswith("Bash(scripts/safe-push") for e in real_got))
         # 10 = the 9 original non-merge subcommands + `update-branch` (#282). A blanket
         # `Bash(gh pr *)` would ALSO match this prefix, so the count doubles as a phantom guard.
         check("#107 real required-permissions.md: all 10 non-merge gh-pr subcommands present",
