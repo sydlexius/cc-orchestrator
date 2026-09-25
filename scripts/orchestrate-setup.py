@@ -517,14 +517,26 @@ def _stage_backup_install(src, dest, prefix, what):
     try:
         shutil.copy2(src, tmp)
         os.chmod(tmp, os.stat(tmp).st_mode | 0o111)
+        moved_link = False
         if os.path.islink(dest):
             os.replace(dest, dest + ".bak")
+            moved_link = True
         elif os.path.isfile(dest):
             ok, err = _backup_before_overwrite(dest)
             if not ok:
                 return False, (f"could not back up the deployed {what} at {dest} ({err}); "
                                f"refusing to replace it unbacked")
-        os.replace(tmp, dest)
+        try:
+            os.replace(tmp, dest)
+        except OSError:
+            # CR on #451: the link was already moved aside, so a failed final replace would leave
+            # the stable path EMPTY. Put it back (best effort) before reporting the failure.
+            if moved_link and not os.path.lexists(dest):
+                try:
+                    os.replace(dest + ".bak", dest)
+                except OSError:
+                    pass
+            raise
     finally:
         if os.path.lexists(tmp):
             try:

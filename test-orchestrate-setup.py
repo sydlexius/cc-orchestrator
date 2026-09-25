@@ -1691,6 +1691,35 @@ def _run_checks():
                   not os.path.lexists(_sbak))
             check("#425 (CR #451): the failed deploy is REPORTED nonzero", rc != 0)
             os.remove(sdest)
+        # CR on #451 (round 2): the FINAL os.replace failing, AFTER the link was moved to .bak.
+        # Driven in-process with os.replace patched to fail only for the temp -> dest swap, since
+        # no filesystem lever fails a same-dir rename yet lets the earlier link move succeed.
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location("orch_setup_mod", SCRIPT)
+        _mod = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_mod)
+        _d = os.path.join(td, "final-replace"); os.makedirs(_d)
+        _src = os.path.join(_d, "bundle.sh"); open(_src, "wb").write(b"#!/bin/sh\n# new\n")
+        _tgt = os.path.join(_d, "link-target.sh"); open(_tgt, "wb").write(b"#!/bin/sh\n# old\n")
+        _dst = os.path.join(_d, "deployed.sh"); os.symlink(_tgt, _dst)
+        _real_replace = _mod.os.replace
+        def _fail_final(a, b):
+            if os.path.basename(a).startswith(".orch-test-") and b == _dst:
+                raise OSError("injected final-replace failure")
+            return _real_replace(a, b)
+        _mod.os.replace = _fail_final
+        try:
+            try:
+                _res = _mod._stage_backup_install(_src, _dst, ".orch-test-", "test script")
+            except OSError:
+                _res = (False, "raised")
+        finally:
+            _mod.os.replace = _real_replace
+        check("#425 (CR #451 r2): a failed FINAL replace restores the symlink dest (never empty)",
+              os.path.islink(_dst) and os.readlink(_dst) == _tgt)
+        check("#425 (CR #451 r2): ...the restored link leaves no stray .bak, and the failure surfaces",
+              not os.path.lexists(_dst + ".bak") and _res[0] is False)
+        check("#425 (CR #451 r2): ...and no staged temp file is left behind",
+              not [f for f in os.listdir(_d) if f.startswith(".orch-test-")])
         run(["configure", "--apply", "--yes"], env_overrides=sov(s1))  # restore to current
         # --no-steer omits the steer hooks AND does not deploy the steer script.
         s2 = fresh_settings("s2.json")
