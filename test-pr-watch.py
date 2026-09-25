@@ -58,9 +58,12 @@ COMMITTER_DATE = "2026-06-18T00:00:00Z"
 #     settle work race its own deadline and time out to exit 1 -- the ubuntu-only flake.
 #   PENDING_TIMEOUT -- a timeout-EXPECTED case (asserts exit 1 + a `pending=` token)
 #     spins until the deadline, so here the timeout IS the wall-clock duration and must
-#     stay short. (PR_WATCH_POLL_INTERVAL=0 keeps the loop fast in both roles.)
+#     stay short. (PR_WATCH_POLL_INTERVAL=0 keeps the loop fast in both roles.) 1s is the
+#     floor, not 0: pr-watch.sh tests the deadline at the TOP of its loop in whole
+#     seconds, so 1 still guarantees one poll (a populated `pending=`), while 0 exits
+#     before any poll and reads `pending=unknown` (#464).
 SETTLE_TIMEOUT = 15
-PENDING_TIMEOUT = 2
+PENDING_TIMEOUT = 1
 
 GH_STUB = r'''#!/usr/bin/env python3
 import os, sys, subprocess
