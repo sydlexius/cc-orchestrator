@@ -11,6 +11,9 @@
 # Subcommands:
 #   add <slug> [body]      Create inbox/<ts>-<repo>-<slug>-<rand>.md. Body comes
 #                          from the trailing positional, or from STDIN if omitted.
+#                          To use a FILE as the body: add <slug> < file. Refuses a
+#                          flag-shaped slug (`-*`) and a single-word argv body
+#                          that is an existing path (#394).
 #                          Prints the created filename to stdout.
 #   drain <entry> --issue N --verdict <text>
 #                          Append a `DRAINED -> #N [verdict]` breadcrumb to the
@@ -80,6 +83,13 @@ case "$sub" in
   add)
     slug="${1:-}"
     [ -n "$slug" ] || die "add: usage: add <slug> [body]   (body from stdin if omitted)"
+    # #394: `add` takes a SLUG, never a flag. Without this, a malformed call like
+    # `add --file draft.txt --title x` silently became slug `file` with argv as
+    # the body (exit 0). There is no option parsing here, so refuse any leading
+    # `-` outright and name the real form.
+    case "$slug" in
+      -*) die "add: '$slug' looks like a flag; add takes a SLUG, not options. Use: add <slug> < file   (or: add <slug> \"body text\")" ;;
+    esac
     shift
     # Sanitize the slug to filename-safe chars (no newline/slash/space can reach
     # the filename); collapse runs and trim to a short prefix.
@@ -89,6 +99,18 @@ case "$sub" in
     # Body: trailing positional if present, else STDIN.
     if [ "$#" -gt 0 ]; then
       body="$*"
+      # #394: a whitespace-free argv body that STATS as an existing path is
+      # almost certainly a file the caller meant to feed as the body; storing
+      # its path string instead loses the content silently. Verify the fact
+      # (a regular FILE exists there), not a shape. A directory (`.`, `/`) is
+      # not refused: `< dir` could not feed it anyway. A multi-word body that merely starts
+      # with a path stays accepted (known, deliberate residual).
+      case "$body" in
+        *[[:space:]]*) ;;
+        *) if [ -f "$body" ]; then
+             die "add: body '$body' is an existing path, not feedback text. To use a file as the body: add $slug < $body   (form: add <slug> < file)"
+           fi ;;
+      esac
     else
       body=$(cat)
     fi
