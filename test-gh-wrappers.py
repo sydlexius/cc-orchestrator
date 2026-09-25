@@ -263,6 +263,47 @@ def main():
     check("PORTABLE: gh-resolve-thread rejects newline node id under always-true grep (rc2, no gh call)",
           rc == 2 and invoked == [])
 
+    # --- reply-comment.sh #398: --review refuses a caller-supplied @coderabbitai mention ---
+    # The helper appends its own possessive mention; a bare one in the caller's body is
+    # parsed by CR as a COMMAND (unauthorized review on PR #388). Refused rc2, NO gh call
+    # (not even `gh repo view`), never silently stripped. Non-review path is untouched.
+    for label, args in (
+            ("bare mention", ["12", "--review", "999", "Fixed. @coderabbitai please re-check"]),
+            ("mixed case", ["12", "--review", "999", "Fixed, @CodeRabbitAI thanks"]),
+            ("mention at start", ["12", "--review", "999", "@coderabbitai review"]),
+            ("inline thread form", ["12", "555", "--review", "999", "ok @coderabbitai"]),
+            ("file/line form", ["12", "--file", "a.sh", "--line", "3", "--review", "999",
+                                "done\n@coderabbitai"]),
+            ("possessive in body", ["12", "--review", "999", "per @coderabbitai's note"])):
+        rc, invoked = run_wrapper("reply-comment.sh", args)
+        check(f"#398 reply-comment --review refuses {label} (rc2, no gh call)",
+              rc == 2 and invoked == [])
+    # CR on #450: the mention could ride in the --review VALUE itself, which the body scan never
+    # saw. A review id is numeric, so ANY non-numeric --review value is refused rc2, no gh call.
+    for label, args in (
+            ("mention in the --review value", ["12", "--review", "@coderabbitai review", "Fixed."]),
+            ("non-numeric --review value", ["12", "--review", "abc", "Fixed."]),
+            ("empty --review value", ["12", "--review", "", "Fixed."]),
+            ("id with trailing text", ["12", "--review", "999 x", "Fixed."])):
+        rc, invoked = run_wrapper("reply-comment.sh", args)
+        check(f"#398 reply-comment refuses {label} (rc2, no gh call)",
+              rc == 2 and invoked == [])
+    rc, invoked = run_wrapper("reply-comment.sh", ["12", "--review", "999", "Fixed in abc123."])
+    joined = " ".join(invoked)
+    check("#398 reply-comment --review with a clean body still posts with the suffix",
+          rc == 0 and "issues/12/comments" in joined
+          and "body=Fixed in abc123.\n\n_(Addressing @coderabbitai's review 999.)_" in invoked)
+    # a longer handle is a different account, not the CR mention (complete-token match)
+    rc, invoked = run_wrapper("reply-comment.sh", ["12", "--review", "999", "cc @coderabbitai-fan"])
+    check("#398 reply-comment --review allows a longer non-CR handle (complete-token)",
+          rc == 0 and any(a.startswith("body=cc @coderabbitai-fan") for a in invoked))
+    rc, invoked = run_wrapper("reply-comment.sh", ["12", "@coderabbitai resolve"])
+    check("#398 non-review top-level '@coderabbitai resolve' still posts (unchanged)",
+          rc == 0 and "body=@coderabbitai resolve" in invoked)
+    rc, invoked = run_wrapper("reply-comment.sh", ["12", "@coderabbitai status"])
+    check("#398 non-review top-level '@coderabbitai status' still posts (unchanged)",
+          rc == 0 and "body=@coderabbitai status" in invoked)
+
     print()
     if FAILS:
         print(f"{len(FAILS)} FAILED:")

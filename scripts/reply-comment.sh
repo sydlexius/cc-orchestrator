@@ -21,6 +21,20 @@
 # pure outside-diff finding as addressed only when a later comment references
 # its review id, so pass --review when acking such a finding via a top-level
 # comment to make the ack detectable.
+#
+# --review BODY RULE (#398): with --review, the caller's body must NOT contain
+# its own @coderabbitai mention (case-insensitive, complete token). The review
+# id is already the ack token and this helper appends the only mention needed
+# (the possessive suffix below); a bare caller mention is parsed by CodeRabbit
+# as a COMMAND (it triggered an unauthorized review on PR #388). Such a body is
+# REFUSED, never silently stripped, and nothing is posted (no gh call at all).
+# This applies to the --review path ONLY: a plain top-level command such as
+# `reply-comment.sh <pr> '@coderabbitai resolve'` is unaffected.
+#
+# Exit codes:
+#   0  posted
+#   1  usage error, gh missing, repo/HEAD unresolvable, or the gh post failed
+#   2  refused: a --review body carries its own @coderabbitai mention (#398)
 set -euo pipefail
 
 # -h / --help: print this script's header comment block as usage, then exit.
@@ -56,10 +70,6 @@ if ! command -v gh &>/dev/null; then
   exit 1
 fi
 
-repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || {
-  echo "Error: could not determine repository. Run from inside a git repo with a GitHub remote." >&2
-  exit 1
-}
 pr="$1"
 shift
 
@@ -68,6 +78,7 @@ file=""
 line=""
 side="RIGHT"
 review_id=""
+review_seen=0
 positional=()
 while [ "${#}" -gt 0 ]; do
   case "$1" in
@@ -85,13 +96,50 @@ while [ "${#}" -gt 0 ]; do
       # pr-unreplied-comments.sh recognizes this comment as an ack of that
       # review's outside-diff finding (it greps the id in $me's later comments).
       [ "${#}" -ge 2 ] || { echo "Error: --review needs a review id" >&2; usage; }
-      review_id="$2"; shift 2;;
+      review_id="$2"; review_seen=1; shift 2;;
     --)
       shift; while [ "${#}" -gt 0 ]; do positional+=("$1"); shift; done;;
     *)
       positional+=("$1"); shift;;
   esac
 done
+
+# #398: on the --review path ONLY, refuse a caller-supplied body that carries its
+# own @coderabbitai mention. Checked BEFORE any gh call so a refusal posts nothing.
+# Complete-token, case-insensitive match against the one known literal (a longer
+# handle such as @coderabbitai-foo is a different account); deliberately NOT a
+# parser of CR's command grammar. The arg is lowercased with tr before the =~ match.
+# The --review VALUE is also caller data that lands in the body, and the scan below never read
+# it (CR on #450: `--review '@coderabbitai review'` posted the mention). A review id is numeric,
+# so REQUIRE that shape rather than scanning the value for one bad token: this also refuses an
+# empty or free-text id, and uses the same exit 2 (refused, nothing posted, no gh call).
+if [ "$review_seen" = 1 ] && ! [[ "$review_id" =~ ^[0-9]+$ ]]; then
+  echo "Error: refusing to post: --review takes a numeric review id, got '$review_id'. Nothing was posted." >&2
+  exit 2
+fi
+if [ -n "$review_id" ]; then
+  cr_mention='(^|[^[:alnum:]_])@coderabbitai([^[:alnum:]_-]|$)'
+  for arg in ${positional[@]+"${positional[@]}"}; do
+    # Lowercase via tr rather than nocasematch: portable to macOS bash 3.2 by construction.
+    arg_lc=$(printf '%s' "$arg" | tr '[:upper:]' '[:lower:]')
+    if [[ "$arg_lc" =~ $cr_mention ]]; then
+      cat >&2 <<'EOF'
+Error: refusing to post: the body contains its own @coderabbitai mention, but
+--review was given. The review id is already the ack token, and this helper
+appends the only mention needed ("Addressing @coderabbitai's review <id>").
+A bare mention in the body is parsed by CodeRabbit as a COMMAND (it can
+trigger an unauthorized review, #398). Remove the mention from the body and
+re-run; nothing was posted.
+EOF
+      exit 2
+    fi
+  done
+fi
+
+repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || {
+  echo "Error: could not determine repository. Run from inside a git repo with a GitHub remote." >&2
+  exit 1
+}
 
 # Append the review reference marker (when --review was given) to whatever body
 # the form below posts. The id in this marker is what pr-unreplied-comments.sh

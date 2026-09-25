@@ -63,7 +63,7 @@ Runtime (`scripts/`; canonical source is this repo):
   Enables in-session merge (no separate terminal) without teaching the floor network I/O. Its only
   write is the local token; no gh/git remote mutation, no allow-list/floor change.
 - `scripts/orchestrate-steer.sh` - the advisory WARN-level steering hook (#95), SEPARATE from the
-  deny-floor guard. Exit 0 ALWAYS (never blocks); emits a `STEER:` nudge to stderr on five rules:
+  deny-floor guard. Exit 0 ALWAYS (never blocks); emits a `STEER:` nudge to stderr on six rules:
   (1) a marker-gated mid-run edit of a canonical file -> log feedback instead (gated OFF for a `Read`
   so wiring the hook for Read never nags a reader). CANONICAL = SKILL.md/templates/guard/steer PLUS
   (#284) the Option-A-DEPLOYED helpers (`safe-push.sh`, `pr-*.sh`, `gh-*.sh`, `gate-runner.py`,
@@ -74,7 +74,8 @@ Runtime (`scripts/`; canonical source is this repo):
   ONE linear-time, quote-aware awk scan in which every code frame - top level, `$(...)`, backticks, a
   `bash -c`/`eval` script, a heredoc fed to a shell - owns its own clauses, so a separator inside
   quotes never splits a call and a `|` inside `$(...)` never cuts the outer one; REST keeps the base
-  -X/-f/-F/--field/--input test; a `gh api graphql` call warns when its query DOCUMENT on the line is
+  -X/-f/-F/--field/--input test but is silent when every explicit method is a literal
+  GET/HEAD/OPTIONS (#413; `-X POST` beside it, `-XPOST` or `-X "$M"` still warn); a `gh api graphql` call warns when its query DOCUMENT on the line is
   a `mutation` operation, or on an explicit `-X`/`--method PATCH|PUT|DELETE` (which GraphQL never
   takes, so that is a mis-aimed REST mutation); a `--jq` filter never counts, so GraphQL READS are
   silent, and with no document on the line and no such verb - `-F query=@file`, `--input`,
@@ -96,7 +97,13 @@ Runtime (`scripts/`; canonical source is this repo):
   answer a permission prompt), because a foreground agent BLOCKS the lead console for its whole run. Keyed on the EXACT shape: only an
   explicit `run_in_background: false` warns. The field is ABSENT (not false) when omitted and an Agent
   DEFAULTS TO BACKGROUND, so a naive falsy check would have fired on 28 of the 45 live spawns the #221
-  spike captured and been WRONG on 13 - absent/true/malformed/non-Agent are all SILENT.
+  spike captured and been WRONG on 13 - absent/true/malformed/non-Agent are all SILENT;
+  (6) a PIPED `safe-push.sh` (#432) -> run it bare: a safe-push call at command position in a clause
+  ended by a lone `|` (never `||`), judged by the same frame-scoped clause split as (2)/(3), so it
+  fires inside `bash -c`/`$(...)`, through a QUOTED script path (a prose quote ending in
+  `/safe-push.sh` re-exposes the name) and common wrappers (`timeout 60`, `nice`, `sudo -E`,
+  `bash -x`, `/bin/bash`), while comments and quoted prose stay silent. Without `pipefail` a
+  pipeline returns the LAST command's exit, so `safe-push.sh b 2>&1 | tail` reads a refused push as 0.
   Wired for Edit/Write/Bash/Read/Agent PreToolUse by `configure` (deployed Option-A like the guard).
   The `Agent` matcher is LOAD-BEARING, not cosmetic: without it the hook is never invoked on a spawn
   and rule (5) is DEAD CODE that fails open silently. Never duplicates
