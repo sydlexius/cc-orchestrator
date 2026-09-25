@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Proof harness for orchestrate-steer.sh (the WARN-level steering hook, #95).
 
-Asserts all five advisory rules. The command/file rules (1)-(3) run through BOTH input channels
+Asserts all six advisory rules. The command/file rules (1)-(3) run through BOTH input channels
 (stdin JSON and $TOOL_INPUT env); rules (4) and (5) need stdin top-level fields (tool_name,
 session_id), so they run through stdin only.
   (1) MID-RUN CANONICAL EDIT (marker-gated): an Edit/Write of a canonical file (SKILL.md,
@@ -13,6 +13,8 @@ session_id), so they run through stdin only.
       CODE (including $(...), backticks, `bash -c`/eval scripts and heredocs fed to a shell) WARNs;
       reads and prose are silent.
   (4) REDUNDANT RE-READ (per-session state) and (5) FOREGROUND AGENT (marker-gated).
+  (6) PIPED SAFE-PUSH (#432): a safe-push.sh call whose clause is ended by a lone `|` WARNs;
+      `||`, a comment, quoted prose, and safe-push as the LAST pipeline command are silent.
 Plus the #287 advisory invariant (no nonzero exit, no stdout), robustness on malformed input, and
 scan-time bounds. Every case asserts exit 0 (steering NEVER blocks) and the `STEER:` line's
 presence/absence.
@@ -483,10 +485,114 @@ def main():
         # only the query= value is the document: another field's value beginning `mutation` is data
         "gh api graphql -f query='query($q:String!){search(query:$q,type:ISSUE,first:1){issueCount}}' -f q='mutation testing'",
         "gh api graphql -f query='{viewer{login}}' -f note='\nmutation x'",
+        # #413: an explicit READ method makes -f/-F query parameters, not a body - silent
+        "gh api -X GET repos/o/r/issues",
+        "gh api --method GET search/issues -f q=x",
+        "gh api -X GET search/issues -f q='repo:o/r is:pr'",
+        "gh api -XGET search/issues -f q=x",
+        "gh api --method=GET search/issues -F per_page=5",
+        "gh api -X HEAD repos/o/r -f x=1",
+        "gh api --method OPTIONS repos/o/r",
+        "gh api -X GET -X GET search/issues -f q=x",           # adjacent reads both stripped
+        # CR on #450: a QUOTED literal read method is the same literal to bash and gh
+        "gh api -X 'GET' search/issues -f q=x",                # fast-path single quote
+        'gh api -X "GET" search/issues -f q=x',                # slow-path double quote
+        'gh api --method="HEAD" repos/o/r -f x=1',
+        "gh api --method 'OPTIONS' repos/o/r -f x=1",
     ]
     for c in SCAN3_SILENT:
         rc_ok, _, silent_all = both_channels({"command": c}, marker_active=True)
         check(f"scanner r3: read / prose -> silent ({c[:48]!r})", rc_ok and silent_all)
+
+    # #413: the read-method exemption is narrow. ANY explicit method that is not a literal read verb
+    # keeps the warn: a mutation verb (even after a GET), a glued -XPOST, a non-literal -X "$M", a
+    # lookalike (GETX), a lowercase verb, and a sibling clause's mutation.
+    READ_METHOD_WARN = [
+        "gh api -X POST repos/o/r/issues -f title=x",
+        "gh api -X PATCH repos/o/r/issues/1",
+        "gh api -X DELETE repos/o/r/git/refs/heads/x",
+        "gh api --method PUT repos/o/r/x",
+        "gh api -X GET repos/o/r/issues -X POST -f title=x",
+        "gh api -X GET repos/o/r/issues -XPOST",
+        "gh api -XPOST repos/o/r/issues -f title=x",
+        "gh api -X \"$M\" repos/o/r/issues -f title=x",
+        "gh api -X GET -X \"$M\" repos/o/r/issues",
+        "gh api -X GETX repos/o/r/issues -f q=1",
+        "gh api -X get repos/o/r/issues -f q=1",
+        "gh api -X GET repos/o/r/issues && gh api repos/o/r/issues -f title=x",
+        # a quoted NON-read or non-literal method still warns (only the exact verbs are exempt)
+        "gh api -X 'POST' repos/o/r/issues -f title=x",
+        "gh api -X 'GET' -X POST repos/o/r/issues -f title=x",
+        "gh api -X 'GETX' repos/o/r/issues -f q=1",
+        'gh api -X "GET $x" repos/o/r/issues -f q=1',
+    ]
+    for c in READ_METHOD_WARN:
+        rc_ok, warned_all, _ = both_channels({"command": c}, marker_active=False)
+        check(f"#413: non-read explicit method -> WARN, exit 0 ({c[:48]!r})", rc_ok and warned_all)
+
+    # ---- Rule 6 (#432): a PIPED safe-push -> WARN (its exit code is the verdict) ----
+    # Without pipefail a pipeline returns the LAST command's exit, so `safe-push.sh b 2>&1 | tail`
+    # reports a refused push as 0. Judged per clause by the same frame-scoped splitter as rules 2/3:
+    # the clause holding safe-push.sh at command position must be ENDED by a lone `|`.
+    PIPED_PUSH_WARN = [
+        "safe-push.sh b 2>&1 | tail -5",
+        "safe-push.sh origin b 2>&1 | tail -5",                # the observed incident shape
+        "scripts/safe-push.sh b | tail -5",
+        "~/.claude/scripts/safe-push.sh b 2>&1 | tail -5",
+        "\"$HOME\"/.claude/scripts/safe-push.sh b | tail",
+        "bash ~/.claude/scripts/safe-push.sh b | tee push.log",
+        "bash -c 'safe-push.sh b 2>&1 | tail -5'",             # a -c script is code
+        "safe-push.sh b |& tail",
+        "cd x && safe-push.sh b | tail",
+        "FOO=1 safe-push.sh b | head",
+        "if safe-push.sh b | tail; then echo ok; fi",
+        "out=$(safe-push.sh b | tail -3)",
+        # I1: a QUOTED script path collapses to one placeholder; the closing quote re-exposes the name
+        "bash '${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh' b 2>&1 | tail -5",   # prep-pr Step 7 shape
+        "bash \"$HOME/.claude/scripts/safe-push.sh\" b | tail",
+        "'safe-push.sh' b | tail",
+        "bash $'/x/safe-push.sh' b | tail",
+        "bash -c \"bash \\\"$HOME/x/safe-push.sh\\\" b | tail\"",
+        # M1: common wrappers and their -flag / numeric arguments
+        "timeout 60 safe-push.sh b | tail",
+        "nice safe-push.sh b | tail",
+        "nice -n 10 safe-push.sh b | tail",
+        "sudo -E safe-push.sh b | tail",
+        "bash -x safe-push.sh b | tail",
+        "/bin/bash safe-push.sh b | tail",
+        "/usr/bin/env bash scripts/safe-push.sh b | tail",
+    ]
+    for c in PIPED_PUSH_WARN:
+        rc_ok, warned_all, _ = both_channels({"command": c}, marker_active=False)
+        check(f"#432: piped safe-push -> WARN, exit 0 ({c[:48]!r})", rc_ok and warned_all)
+
+    PIPED_PUSH_SILENT = [
+        "safe-push.sh b",
+        "safe-push.sh b || echo x",                            # `||` is not a pipe
+        "safe-push.sh b # prep-pr-ok",
+        "safe-push.sh b --force-with-lease # prep-pr-ok",
+        "safe-push.sh b # then | tail",                        # a comment is prose
+        "echo \"safe-push.sh b | tail\"",                      # quoted prose
+        "git commit -m 'safe-push.sh b | tail'",
+        "echo hi | safe-push.sh b",                            # safe-push is the LAST command
+        "safe-push.sh b && echo done | tail",                  # the pipe belongs to echo's clause
+        "grep -n x scripts/safe-push.sh | head",               # not at command position
+        "my-safe-push.sh b | tail",                            # a different script
+        "safe-push.sh.bak b | tail",                           # the name must END at .sh
+        # I1 must not turn quoted PROSE into code: the name has to END the quote AND sit at command
+        # position
+        "git commit -m 'use safe-push.sh | tail'",
+        "echo 'safe-push.sh' | tail",                          # argument slot, not command position
+        "echo \"x/safe-push.sh\" | tail",
+        "bash 'safe-push.sh.bak' b | tail",
+        "bash 'x/my-safe-push.sh' b | tail",                   # a quoted name must follow a `/`
+        "grep -n x 'scripts/safe-push.sh' | head",
+        "bash '${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh' b",
+        "bash \"$HOME/.claude/scripts/safe-push.sh\" b || echo x",
+    ]
+    for c in PIPED_PUSH_SILENT:
+        rc_ok, _, silent_all = both_channels({"command": c}, marker_active=True)
+        check(f"#432: unpiped / prose safe-push -> silent ({c[:48]!r})", rc_ok and silent_all)
 
     # ROBUSTNESS: malformed / unbalanced / hostile input exits 0 promptly and never blocks.
     ROBUST = [
@@ -678,6 +784,12 @@ def main():
         {"tool_name": "Agent", "tool_input": {"run_in_background": False}},
         {"tool_name": "Bash", "tool_input": {"command": "ls"}},
         {"tool_name": "Agent", "tool_input": {}},
+        # rule 6 (#432; CR on #450): the piped safe-push WARN path must not write stdout either
+        {"tool_name": "Bash", "tool_input": {"command": "safe-push.sh b 2>&1 | tail -5"}},
+        {"tool_name": "Bash", "tool_input": {"command": "bash '/x/scripts/safe-push.sh' b | tail"}},
+        # #413 quoted read method (silent path) and a quoted mutation (warn path)
+        {"tool_name": "Bash", "tool_input": {"command": "gh api -X 'GET' search/issues -f q=x"}},
+        {"tool_name": "Bash", "tool_input": {"command": "gh api -X 'POST' repos/o/r -f a=b"}},
     ]
     stdout_clean, rc_clean = True, True
     for pl in payloads:

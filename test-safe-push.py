@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Proof harness for safe-push.sh: branch-arg validation (#35) + additive-vs-rewrite
+"""Proof harness for safe-push.sh: branch-arg validation (#35, #432) + additive-vs-rewrite
 classification (#148).
 
 #35: safe-push.sh adds `-u origin` itself, so the FIRST positional must be a branch
@@ -47,7 +47,19 @@ GIT_STUB = (
     '  if [ -n "${CUR_BRANCH:-}" ]; then echo "$CUR_BRANCH"; exit 0; else exit 1; fi\n'
     "fi\n"
     'if [ "$1" = "rev-parse" ] && [ "$2" = "--verify" ]; then\n'
+    '  # KNOWN_BRANCHES unset -> answer ANY name (the historical default). SET (space-separated)\n'
+    '  # -> resolve only refs/heads/<known>, FAIL otherwise, like real git (#432): without this\n'
+    '  # mode the missing-branch path was never exercised.\n'
+    '  if [ -n "${KNOWN_BRANCHES+x}" ]; then\n'
+    '    for b in $KNOWN_BRANCHES; do\n'
+    '      if [ "$3" = "refs/heads/$b" ]; then echo "$LOCAL_SHA"; exit 0; fi\n'
+    '    done\n'
+    '    echo "fatal: Needed a single revision" >&2; exit 128\n'
+    '  fi\n'
     '  echo "$LOCAL_SHA"; exit 0\n'
+    "fi\n"
+    'if [ "$1" = "remote" ] && [ "$#" -eq 1 ]; then\n'
+    '  for r in ${REMOTES-origin}; do echo "$r"; done; exit 0\n'
     "fi\n"
     'if [ "$1" = "cat-file" ]; then\n'
     '  # -e <sha>^{commit}: is the remote tip present locally? Configurable.\n'
@@ -87,7 +99,7 @@ GIT_STUB = (
 
 def run(args, *, cur_branch="feature/x", local_sha="aaaa111", remote_sha="",
         mb_r_anc_l=1, mb_l_anc_r=1, cat_file_rc=0, push_rc=0, push_transcript="",
-        post_push_remote=None):
+        post_push_remote=None, known_branches=None, remotes=None):
     """Invoke safe-push.sh with a stubbed git. Returns (rc, stdout, stderr, pushes, log)
     where pushes is the list of recorded `git push ...` argument strings and log is the
     content of safe-push's own log file (read before the tempdir is cleaned up)."""
@@ -116,6 +128,14 @@ def run(args, *, cur_branch="feature/x", local_sha="aaaa111", remote_sha="",
         else:
             env.pop("POST_PUSH_REMOTE", None)
         env["PUSHLOG"] = pushlog
+        if known_branches is not None:
+            env["KNOWN_BRANCHES"] = known_branches
+        else:
+            env.pop("KNOWN_BRANCHES", None)
+        if remotes is not None:
+            env["REMOTES"] = remotes
+        else:
+            env.pop("REMOTES", None)
         if cur_branch is not None:
             env["CUR_BRANCH"] = cur_branch
         else:
@@ -141,6 +161,44 @@ def main():
     check("'-u origin main' -> exit 2", rc == 2)
     check("'-u ...' does not invoke git push", len(pushes) == 0)
     check("'-u ...' error names the branch-first usage", "branch name" in err)
+
+    # #432: the stub's STRICT mode (KNOWN_BRANCHES set) makes `rev-parse --verify` fail for an
+    # unknown name, as real git does, so the missing-branch exit 2 is finally exercised.
+    print("== #432 nonexistent local branch -> exit 2, NO push ==")
+    rc, out, err, pushes, _log = run(["no-such-branch"], known_branches="feature/x")
+    check("nonexistent branch -> exit 2", rc == 2)
+    check("nonexistent branch does not invoke git push", len(pushes) == 0)
+    check("nonexistent branch error names the missing ref", "refs/heads/no-such-branch" in err)
+    rc, out, err, pushes, _log = run(["feature/x"], known_branches="feature/x")
+    check("strict stub: a KNOWN branch still pushes (exit 0)", rc == 0 and len(pushes) == 1)
+
+    print("== #432 git-push argument order (`origin <branch>`) -> exit 2 naming the form ==")
+    rc, out, err, pushes, _log = run(["origin", "feature/x"], known_branches="feature/x")
+    check("'origin feature/x' -> exit 2", rc == 2)
+    check("'origin feature/x' does not invoke git push", len(pushes) == 0)
+    check("'origin feature/x' error says the remote is implicit and names the form",
+          "remote is implicit" in err and "safe-push.sh <branch>" in err)
+    rc, out, err, pushes, _log = run(["upstream", "feature/x"], known_branches="feature/x",
+                                     remotes="origin upstream")
+    check("'upstream feature/x' (any configured remote) -> exit 2, no push",
+          rc == 2 and len(pushes) == 0 and "remote is implicit" in err)
+    # a word that is NOT a configured remote is a branch name as before
+    rc, out, err, pushes, _log = run(["feature/x", "--force-with-lease"], known_branches="feature/x",
+                                     remotes="origin upstream")
+    check("'<branch> --force-with-lease' is untouched by the remote check (exit 0)", rc == 0)
+    # a remote name with NO local branch of that name gets the real remedy whatever follows it:
+    # a bare `origin` or `origin --flag` used to fall through to the unhelpful
+    # "refs/heads/origin does not exist" (hostile review of #432, M6)
+    rc, out, err, pushes, _log = run(["origin", "--force-with-lease"], known_branches="feature/x")
+    check("'origin --flag' (no local branch 'origin') -> exit 2 naming the remote remedy",
+          rc == 2 and len(pushes) == 0 and "remote is implicit" in err)
+    rc, out, err, pushes, _log = run(["origin"], known_branches="feature/x")
+    check("bare 'origin' (no local branch 'origin') -> exit 2 naming the remote remedy",
+          rc == 2 and len(pushes) == 0 and "remote is implicit" in err)
+    # a genuine local branch that shares a remote's name, with no second word, still pushes
+    rc, out, err, pushes, _log = run(["origin"], known_branches="origin feature/x")
+    check("a real local branch named 'origin' (no second word) still pushes (exit 0)",
+          rc == 0 and len(pushes) == 1)
 
     print("== first-push (no remote ref) -> ADDITIVE, proceeds ==")
     rc, out, err, pushes, _log = run(["feature/x"])  # remote_sha="" -> first-push

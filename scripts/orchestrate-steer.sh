@@ -5,7 +5,7 @@
 # distinct script preserves the floor's integrity (the guard stays pure hard-deny) and lets the
 # steering be disabled (`configure --no-steer`) without touching deny logic.
 #
-# Rules (#95, #159, #226, #231, #284):
+# Rules (#95, #159, #226, #231, #284, #432):
 #   (1) MID-RUN CANONICAL EDIT (marker-gated): an Edit/Write whose target resolves to a canonical
 #       file while THIS session's orchestrate marker is fresh -> WARN: log feedback to the mailbox,
 #       do not edit mid-run. CANONICAL = SKILL.md, templates/*, orchestrate-guard.sh,
@@ -26,7 +26,8 @@
 #       turns reading a canonical file into a spurious "do not edit" nag.
 #   (2) RAW GH-API MUTATION -> WRAPPER: a shell clause (split quote-aware in EVERY code frame, see
 #       _steer_scan) invoking `gh api` NOT via a gh-* wrapper, with a REST mutation flag (-X/--method,
-#       -f/-F/--field/--raw-field/--input; same test as before 0.97.2) or, for `gh api graphql`, a
+#       -f/-F/--field/--raw-field/--input; silent when every explicit method is a literal read verb
+#       GET/HEAD/OPTIONS, #413) or, for `gh api graphql`, a
 #       query DOCUMENT on the line that is a `mutation` operation, or an explicit -X/--method
 #       PATCH|PUT|DELETE (which GraphQL never takes, so that is a mis-aimed REST mutation). A GraphQL
 #       READ is silent; a --jq filter never counts; with no document on the line and no such verb it
@@ -40,6 +41,12 @@
 #       its own subcommand; the only way a read-only command warns is unquoted prose elsewhere on it
 #       (`echo next: gh pr create`), an ACCEPTED false positive (see _steer_scan). Quote it to silence.
 #       Marker-independent (#159).
+#   (6) PIPED SAFE-PUSH -> RUN IT BARE (#432): a `safe-push.sh` call at command position (bare, any
+#       path, behind VAR=val / sudo / env / if ..., or `bash safe-push.sh`) in a clause ENDED by a
+#       lone `|` -> WARN. Without pipefail a pipeline returns the LAST command's exit code, so
+#       `safe-push.sh b 2>&1 | tail -5` reports a refused push as 0 (observed 3x downstream). Uses
+#       the same frame-scoped clause split as rules 2/3, so it fires inside `bash -c '...'` and
+#       `$(...)`, while `||`, a `#` comment and quoted prose stay silent. Marker-independent.
 #   (4) REDUNDANT RE-READ -> WARN (#226): a 2nd+ `Read` of a path already read THIS session with an
 #       unchanged mtime+size -> WARN: the content is already in context, skip the Read. Stateful
 #       (per-session, keyed on the stdin session_id), marker-independent, advisory only. The valid
@@ -90,9 +97,26 @@ if [ "${1:-}" = "--self-test" ]; then
     { [ "$st_rc" -eq 0 ] && printf '%s' "$st_out" | grep -q 'STEER'; } \
       || st_fail="gh-pr rule (create) (rc=$st_rc out=$st_out)"
   fi
+  # (6) a piped safe-push must WARN at exit 0 (#432).
+  if [ -z "$st_fail" ]; then
+    # the bare shape, a QUOTED path (prep-pr Step 7's own invocation, #432 I1), and a wrapper (M1)
+    for st_cmd in "safe-push.sh b 2>&1 | tail -5" \
+        "bash '\${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh' b 2>&1 | tail -5" \
+        "bash \"\$HOME/.claude/scripts/safe-push.sh\" b | tail" "timeout 60 safe-push.sh b | tail"; do
+      st_payload=$(jq -cn --arg c "$st_cmd" '{tool_name:"Bash",tool_input:{command:$c}}' 2>/dev/null) \
+        || { st_fail="piped safe-push rule (jq unavailable)"; break; }
+      st_out=$(printf '%s' "$st_payload" | "$0" 2>&1); st_rc=$?
+      { [ "$st_rc" -eq 0 ] && printf '%s' "$st_out" | grep -q 'STEER'; } \
+        || { st_fail="piped safe-push rule '$st_cmd' (rc=$st_rc out=$st_out)"; break; }
+    done
+  fi
   # (2r)/(3r) the two READ shapes that used to false-positive must stay SILENT at exit 0: a GraphQL
   # read, and a gh pr read compounded with a standalone `create` word.
-  for st_cmd in "gh api graphql -f query='{viewer{login}}'" "gh pr view 943 && echo create"; do
+  # (#413) an explicit READ method on a REST call is silent too, even with -f query parameters.
+  for st_cmd in "gh api graphql -f query='{viewer{login}}'" "gh pr view 943 && echo create" \
+      "gh api -X GET search/issues -f q=x" "gh api --method HEAD repos/o/r" \
+      "safe-push.sh b || echo x" "safe-push.sh b # prep-pr-ok" 'echo "safe-push.sh b | tail"' \
+      "git commit -m 'use safe-push.sh | tail'"; do
     [ -n "$st_fail" ] && break
     st_payload=$(jq -cn --arg c "$st_cmd" '{tool_name:"Bash",tool_input:{command:$c}}' 2>/dev/null) \
       || { st_fail="read-silence (jq unavailable)"; break; }
@@ -125,7 +149,7 @@ if [ "${1:-}" = "--self-test" ]; then
     fi
   fi
   if [ -z "$st_fail" ]; then
-    echo "orchestrate-steer self-test PASS (raw gh-api + raw gh pr comment/create mutations + read-dedup warned, graphql read + gh pr read silent, exit 0)"
+    echo "orchestrate-steer self-test PASS (raw gh-api + raw gh pr comment/create mutations + piped safe-push + read-dedup warned, graphql read + gh pr read + REST GET + unpiped safe-push silent, exit 0)"
     exit 0
   fi
   echo "orchestrate-steer self-test FAIL: expected a STEER warn at exit 0, got $st_fail" >&2
@@ -293,7 +317,10 @@ is_foreground_agent() {
 # `api` [flag groups] `graphql` is the endpoint, it warns only when the query DOCUMENT carries a
 # `mutation` operation (at the document's start, at the start of a line, or after the `}` closing a
 # preceding fragment), when an unquoted `query=mutation...` is on the clause, or on -X PATCH/PUT/DELETE;
-# otherwise (REST) it warns on an explicit -X/--method or any -f/-F/--field/--raw-field/--input.
+# otherwise (REST) it warns on an explicit -X/--method or any -f/-F/--field/--raw-field/--input, UNLESS
+# every explicit method on the clause is a literal read verb (-X GET/HEAD/OPTIONS, --method GET, #413):
+# there -f/-F are query parameters, so `gh api -X GET search/issues -f q=x` is silent. Any other
+# explicit method alongside it (-X GET ... -X POST, -XPOST) or a non-literal one (-X "$M") still warns.
 # RULE 3 (raw gh pr create/comment) is a WORD SEQUENCE anywhere in one clause:
 # `gh` [flag groups] `pr` [flag groups] `create|comment|new` (`new` is create's alias), where `gh` is a
 # standalone word (a path prefix like /opt/homebrew/bin/gh counts; gh-comment.sh does not). A read
@@ -319,6 +346,8 @@ _FLAGS='([[:space:]]+-[^[:space:]]+([[:space:]]+[^-[:space:]][^[:space:]]*)?)*'
 _steer_prefilter() {
   local c="$1" re_gh re_pr re_sub re_api re_flag
   [[ $c == *\\$'\n'* ]] && return 0
+  # rule 6 (#432): a safe-push.sh word and a `|` byte anywhere (a superset of a piped call).
+  [[ $c == *safe-push.sh* && $c == *'|'* ]] && return 0
   re_gh='(^|[^[:alnum:]_-])gh([^[:alnum:]_-]|$)'
   re_pr='(^|[^[:alnum:]_-])pr([^[:alnum:]_-]|$)'
   re_sub='(create|comment|new)'
@@ -330,7 +359,7 @@ _steer_prefilter() {
   return 1
 }
 
-# Print `api` (rule 2 fires), `pr` (rule 3 fires) or nothing. LC_ALL=C so the walk is bytewise.
+# Print `api` (rule 2 fires), `pr` (rule 3 fires), `push` (rule 6 fires) or nothing. LC_ALL=C so the walk is bytewise.
 # LINEAR by construction: the input is split to a char array once; every buffer is appended in 256-byte
 # chunks and joined pairwise only when a clause is judged; no substr() of the whole command is ever
 # taken in the loop (BWK awk's substr is O(length of the source string), which is what made the
@@ -368,18 +397,32 @@ _steer_scan() {
     function bclr(k) { sb[k] = ""; sl[k] = 0; nch[k] = 0; lc[k] = ""; gq[k] = 0 }
     function tail(k,   s, l) { s = lc[k] sb[k]; l = length(s); return (l > 64 ? substr(s, l - 63) : s) }
     # ---- judging one clause of code frame k ----
-    function judge(k,   s, dc) {
+    function judge(k, sep,   s, dc, t) {
       s = bget(k)
+      # RULE 6 (#432): a safe-push.sh call at command position whose clause is ended by a
+      # PIPE (`|`, never `||` - cut() records only a lone `|` as "|"). Judged before the gh
+      # early return because the clause carries no gh word.
+      if (sep == "|" && !FSP && index(s, "safe-push") && s ~ SP) FSP = 1
       if (!index(s, "gh") || s !~ GH) return
       if (index(s, "api") && s ~ API) {
         if (index(s, "graphql") && s ~ GQL) {
           dc = bget("d" k)
           if (dc ~ MUTD || s ~ MUTU || s ~ GQLM) { print "api"; exit }
-        } else if (s ~ RM || s ~ RF) { print "api"; exit }
+        } else if (s ~ RM || s ~ RF) {
+          # #413: an explicit READ method (GET/HEAD/OPTIONS) makes -f/-F query parameters, not a
+          # body. Silent only when EVERY explicit method on the clause is a literal read verb:
+          # strip each read-method occurrence, and any method flag left over (-X POST, -XPOST,
+          # -X "$M" -> -X Q) still warns. The loop re-matches from scratch, so adjacent
+          # occurrences are all stripped (a single gsub would consume the shared space).
+          if (s !~ GETM) { print "api"; exit }
+          t = s
+          while (match(t, GETM)) t = substr(t, 1, RSTART - 1) " " substr(t, RSTART + RLENGTH)
+          if (t ~ RM) { print "api"; exit }
+        }
       }
       if (!FPR && index(s, "pr") && s ~ PR) FPR = 1
     }
-    function cut(sep) { judge(d); bclr(d); bclr("d" d); lastcut[d] = sep }
+    function cut(sep) { judge(d, sep); bclr(d); bclr("d" d); lastcut[d] = sep }
     # ---- the frame stack ----
     function push(t, code, st,   p) {
       p = d; d++
@@ -391,7 +434,7 @@ _steer_scan() {
       if (code) { bclr(d); bclr("d" d); lastcut[d] = "" }
     }
     function pop() {
-      if (fc[d]) judge(d)
+      if (fc[d]) judge(d, "")
       if (ft[d] == "H") { HD = hprev[d]; HE = (HD ? he[HD] : -1) }
       if (dk[d] && !dq[d]) bapp("d" dk[d], "\n")
       d--
@@ -420,16 +463,49 @@ _steer_scan() {
       tl = (j > 6 && a[j - 1] == "=" && a[j - 6] == "q") ? a[j-6] a[j-5] a[j-4] a[j-3] a[j-2] "=" : ""
       dk[d] = p; dq[d] = (tl == "query=" ? 0 : 1)
     }
+    # (#432 I1) a prose quote collapses to ONE `Q`, so a QUOTED script path
+    # (bash + a single-quoted ${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh + `b | tail`, the exact
+    # prep-pr Step 7 shape) was invisible to rule 6. NOTE: no single-quote byte may appear in this
+    # awk program, comments included - the whole program is one single-quoted shell word. When a prose quote closes, spq() checks its RAW content (bytes s0..e-1,
+    # e = the closing byte) in O(1): it must END in `/safe-push.sh` or BE `safe-push.sh`. Only then is
+    # `/safe-push.sh` appended after the `Q`, so the clause reads `bash Q/safe-push.sh b` and SP judges
+    # command position as usual. Prose that merely MENTIONS it (`echo "safe-push.sh b | tail"`) does
+    # not end in the name, and a quoted name in an argument slot (`echo "x/safe-push.sh" | tail`) is
+    # not at command position, so both stay silent.
+    function spq(s0, e,   i, w) {
+      if (e - s0 < 12) return 0
+      w = ""; for (i = e - 12; i < e; i++) w = w a[i]
+      if (w != "safe-push.sh") return 0
+      return (e - s0 == 12 || a[e - 13] == "/")
+    }
+    # (#413, CR on #450) a QUOTED literal read method (-X "GET", or GET in single quotes) is the
+    # same literal to bash and gh, but collapsed to `Q` it read as a non-literal method and warned.
+    # rmw() returns that word when the raw content (bytes s0..e-1) is EXACTLY GET/HEAD/OPTIONS,
+    # else "". O(1): only a 3/4/7-byte span is ever built. The FAST path (sqprose) knows the close
+    # before writing, so it writes the word INSTEAD of `Q`. The slow path wrote its `Q` at OPEN
+    # time (it may already be flushed into a chunk, so it is never edited back out); on close it
+    # appends RMS + the word, and GETM accepts an optional `Q` RMS before the verb. RMS is the \001
+    # byte, which rmw never emits for anything else, so a quoted "$M" stays a bare `Q` and warns.
+    function rmw(s0, e,   w, i) {
+      if (e - s0 != 3 && e - s0 != 4 && e - s0 != 7) return ""
+      w = ""; for (i = s0; i < e; i++) w = w a[i]
+      return (w == "GET" || w == "HEAD" || w == "OPTIONS") ? w : ""
+    }
+    function qpop(e,   sp, rw) {
+      sp = spq(fst[d], e); rw = rmw(fst[d], e); pop()
+      if (rw != "") bapp(d, RMS rw)
+      if (sp) bapp(d, "/safe-push.sh")
+    }
     # FAST PATH for the common prose single quote: not inside a code "..." (whose `"` must still close
     # it), not a possible query= value (a `=` before it, or content starting with `q`): skip to the
     # closing quote without a frame. (Inside a single-quoted code script a quote never reaches here: the main loop
     # closes the script first.) Bounded by the enclosing shell-fed heredoc body; unbalanced -> slow path.
-    function sqprose(   k, lim) {
+    function sqprose(   k, lim, w) {
       if (qd[d] || a[j - 1] == "=" || a[j + 1] == "q") { pq("S", j + 1); return }
       lim = (HD ? HE : n + 1)
       k = j + 1; while (k < lim && a[k] != SQ) k++
       if (k >= lim) { pq("S", j + 1); return }
-      bapp(d, "Q"); j = k
+      w = rmw(j + 1, k); bapp(d, (w != "" ? w : "Q")); if (spq(j + 1, k)) bapp(d, "/safe-push.sh"); j = k
     }
     function dapp(c) {
       if (dq[d]) {
@@ -520,10 +596,21 @@ _steer_scan() {
       MUTU = "query=" MTAIL
       GQLM = "(--method[[:space:]=]+|-X[[:space:]=]*)(PATCH|PUT|DELETE)"
       RM = "(--method[[:space:]=]|-X[[:space:]=]?[A-Za-z])"
+      RMS = "\001"
+      GETM = "(^|[[:space:]])(--method[[:space:]=]+|-X[[:space:]=]*)(Q" RMS ")?(GET|HEAD|OPTIONS)([[:space:]]|$)"
       RF = "(^|[[:space:]])(--(field|input|raw-field)[[:space:]=]|-[fF][[:space:]=]?[^[:space:]])"
+      # command position: optional ( / { openers, then any run of VAR=val assignments, shell
+      # keywords, transparent wrappers (sudo/env/time/timeout/nice/nohup/...), an interpreter word
+      # (`bash`, `/bin/bash`), and the -flags / numeric args those take (`sudo -E`, `bash -x`,
+      # `timeout 60`, `nice -n 10`); then safe-push.sh itself, bare or behind any path (a quoted
+      # path reads as Q/safe-push.sh, see spq). DOCUMENTED RESIDUALS (silent, accepted): a wrapper
+      # option with a NON-numeric value (`sudo -u bob`, `timeout -s KILL 60`), `xargs safe-push.sh`,
+      # and a brace group `{ safe-push.sh b; } | tail` (the pipe ends the `}` clause, not the call).
+      SPW = "if|then|do|else|elif|while|until|!|time|command|exec|sudo|nohup|env|nice|ionice|stdbuf|timeout"
+      SP = "^[[:space:]]*[({]*[[:space:]]*(([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*|" SPW "|([^[:space:]]*/)?(ba|z|da|k)?sh|([^[:space:]]*/)?env|-[^[:space:]]*|[0-9][0-9.]*[smhd]?)[[:space:]]+)*([^[:space:]]*/)?safe-push\\.sh([[:space:]]|$)"
       PR = "(^|[^[:alnum:]_.-])gh" FL "[[:space:]]+pr" FL "[[:space:]]+(create|comment|new)([^[:alnum:]_-]|$)"
       d = 1; ft[1] = "U"; fc[1] = 1; fp[1] = 0; csq[1] = 0; qd[1] = 0; fst[1] = 1
-      bclr(1); bclr("d1"); HD = 0; HE = -1; nhd = 0; FPR = 0
+      bclr(1); bclr("d1"); HD = 0; HE = -1; nhd = 0; FPR = 0; FSP = 0
       for (j = 1; j <= n; j++) {
         if (HD && j >= HE) {
           # the innermost shell-fed heredoc body ended: close it (and anything left open inside it)
@@ -540,16 +627,16 @@ _steer_scan() {
         }
         if (!fc[d]) {
           if (t == "S") {
-            if (c == SQ) pop(); else if (c == "\"" && qd[d]) closeto(qd[d]); else if (dk[d]) dapp(c)
+            if (c == SQ) qpop(j); else if (c == "\"" && qd[d]) closeto(qd[d]); else if (dk[d]) dapp(c)
             continue
           }
           if (t == "E") {
             if (c == "\\") { j++; if (dk[d]) dapp(a[j]) }
-            else if (c == SQ) pop(); else if (c == "\"" && qd[d]) closeto(qd[d]); else if (dk[d]) dapp(c)
+            else if (c == SQ) qpop(j); else if (c == "\"" && qd[d]) closeto(qd[d]); else if (dk[d]) dapp(c)
             continue
           }
           if (t == "X") {
-            if (c == "\\" && a[j + 1] == "\"") { j++; pop() }
+            if (c == "\\" && a[j + 1] == "\"") { qe = j; j++; qpop(qe) }
             else if (c == "\\") { j++; if (dk[d]) dapp(a[j]) }
             else if (c == "\"") closeto(qd[d]); else if (dk[d]) dapp(c)
             continue
@@ -557,7 +644,7 @@ _steer_scan() {
           if (t == "D") {
             if (!(c in DSP)) { if (dk[d]) dapp(c); continue }
             if (c == "\\") { j++; if (dk[d]) dapp(a[j]) }
-            else if (c == "\"") pop()
+            else if (c == "\"") qpop(j)
             else if (c == "$" && a[j + 1] == "(") {
               if (a[j + 2] == "(") { push("A", 0, j + 3); j += 2 } else { push("P", 1, j + 2); j++ }
             }
@@ -619,12 +706,13 @@ _steer_scan() {
         }
         bapp(d, c)
       }
-      closeto(2); judge(1)
+      closeto(2); judge(1, "")
       if (FPR) print "pr"
+      else if (FSP) print "push"
     }'
 }
 
-# Which command rule (if any) fires: prints api | pr | nothing. Prefilter first (no fork on a miss).
+# Which command rule (if any) fires: prints api | pr | push | nothing. Prefilter first (no fork on a miss).
 _command_rule() {
   _steer_prefilter "$1" || return 0
   _steer_scan "$1"
@@ -795,6 +883,10 @@ if [ -n "$cmd" ]; then
   # (3) raw gh pr comment/create -> canonical path WARN.
   if [ "$cmd_rule" = "pr" ]; then
     emit_warn "Canonical path: 'gh pr comment' -> reply-comment.sh / gh-comment.sh; 'gh pr create' -> /prep-pr (the required gate)."
+  fi
+  # (6) piped safe-push WARN (#432).
+  if [ "$cmd_rule" = "push" ]; then
+    emit_warn "Never pipe safe-push.sh: without pipefail a pipe returns the LAST command's exit, so a refused push reads as 0. Run it bare; its exit code IS the verdict."
   fi
 fi
 
