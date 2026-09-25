@@ -26,6 +26,13 @@ def check(desc, cond):
         _fail += 1
 
 
+# Hermetic git: ignore the caller's global/system config (a global commit.gpgsign
+# through a network signer made every case fail offline), as test-finding-channel does.
+# Set on os.environ so the script under test inherits it too. Identity is per-repo.
+os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
+os.environ["GIT_CONFIG_SYSTEM"] = os.devnull
+
+
 def git(repo, *args):
     return subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
 

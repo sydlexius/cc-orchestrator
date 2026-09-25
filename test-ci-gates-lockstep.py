@@ -28,6 +28,10 @@ THREE CHECKS, because two of them can pass while the invariant is broken:
      agree and both omit a script that exists. Every `scripts/*.sh` must be linted
      somewhere, or the drift guard blesses a shared blind spot.
 
+#379 applies the same three checks to the `python3 test-*.py` HARNESS STEP lists, which had
+drifted to 16 of 42 gated harnesses never running in CI. A harness legitimately kept out of
+CI goes in CI_EXEMPT with a written reason; the default is a CI step.
+
 Stdlib only, no network. Run: python3 test-ci-gates-lockstep.py
 """
 import glob
@@ -47,6 +51,13 @@ CI = os.path.join(ROOT, ".github", "workflows", "ci.yml")
 # Scripts deliberately exempt from the filesystem cross-check, each with a stated reason.
 # An entry here is a decision to leave a file unlinted, so it must not be silently editable.
 FS_EXEMPT: dict[str, str] = {}
+
+# Harnesses .gates.toml runs but CI deliberately does NOT, each with a written reason (#379).
+# The default is a CI step; an entry here is a decision that a gated harness goes unchecked
+# on every PR, so it needs a reason a reviewer can dispute (live network, live `gh` auth,
+# machine-local tooling that no stub replaces). Empty today: every gated harness at #379
+# stubs its externals (gh / git / preflight / npm / cargo / df / prose-tooling via PATH or env).
+CI_EXEMPT: dict[str, str] = {}
 
 
 def fail(msg):
@@ -89,7 +100,7 @@ def ci_text():
         fail(f"cannot read ci.yml: {e}")
 
 
-print("CI <-> .gates.toml lint lockstep (#364)")
+print("CI <-> .gates.toml lint + harness lockstep (#364, #379)")
 
 ci_src = ci_text()
 
@@ -150,4 +161,64 @@ if stale:
     fail(f"shellcheck targets that no longer exist on disk: {stale}")
 print("  [ok  ] no shellcheck target is missing from disk")
 
-print("\nok: the CI and .gates.toml lint enumerations are in lockstep")
+# --- harness STEP lists (#379) ------------------------------------------------------------
+# The lint lists were not the only hand-maintained pair. The `python3 test-*.py` steps drifted
+# the same way: 16 of 42 gated harnesses never ran in CI, test-orchestrate-authorize-merge.py
+# (the merge-auth token writer the floor reads) among them, and the elmer stat-order defect
+# shipped CI-green for exactly that reason. Same three-part shape as above: parse floor first,
+# set equality both directions (minus written exemptions), then a filesystem cross-check.
+HARNESS_RE = re.compile(r"(?<![\w./-])python3\s+(test-[\w.-]+\.py)\b")
+
+
+def gates_harnesses():
+    try:
+        with open(GATES, "rb") as fh:
+            data = tomllib.load(fh)
+    except (OSError, ValueError) as e:
+        fail(f"cannot read/parse .gates.toml: {e}")
+    out = set()
+    for step in data.get("prep_pr", {}).get("steps", []):
+        out.update(HARNESS_RE.findall(step.get("run", "")))
+    return out
+
+
+gates_h = gates_harnesses()
+# Only `run:` lines count: a harness named in a CI comment is not a harness CI runs.
+ci_h = set(re.findall(r"^\s*run:\s*python3\s+(test-[\w.-]+\.py)\s*$", ci_src, re.M))
+
+for label, s in (("gates harness steps", gates_h), ("ci harness steps", ci_h)):
+    if len(s) < 10:
+        fail(f"{label} parsed only {len(s)} entries - the parse broke; fix it rather than "
+             f"the lists (an empty-vs-empty comparison passes and proves nothing)")
+print(f"  [ok  ] harness parses are non-degenerate ({len(gates_h)}/{len(ci_h)})")
+
+problems = []
+stale_exempt = sorted(set(CI_EXEMPT) - gates_h)
+if stale_exempt:
+    problems.append(f"CI_EXEMPT names harnesses .gates.toml does not run -> {stale_exempt}")
+exempt_but_run = sorted(set(CI_EXEMPT) & ci_h)
+if exempt_but_run:
+    problems.append(f"CI_EXEMPT names harnesses CI DOES run (drop the exemption) -> "
+                    f"{exempt_but_run}")
+only_gates = sorted(gates_h - ci_h - set(CI_EXEMPT))
+if only_gates:
+    problems.append(f"harness: in .gates.toml but NOT run by CI -> {only_gates}")
+only_ci = sorted(ci_h - gates_h)
+if only_ci:
+    problems.append(f"harness: in ci.yml but NOT in .gates.toml -> {only_ci}")
+if problems:
+    fail("the CI and .gates.toml harness step lists have drifted:\n  " + "\n  ".join(problems)
+         + "\n\nAdd a `harness - <name>` step to ci.yml (or a CI_EXEMPT entry with a written "
+           "reason). Do not delete from .gates.toml to make this pass.")
+print(f"  [ok  ] harness step lists match in both directions ({len(CI_EXEMPT)} exempt)")
+
+h_on_disk = {os.path.basename(p) for p in glob.glob(os.path.join(ROOT, "test-*.py"))}
+ungated = sorted(h_on_disk - gates_h)
+if ungated:
+    fail("these harnesses exist but .gates.toml runs NONE of them:\n  " + "\n  ".join(ungated))
+missing = sorted(gates_h - h_on_disk)
+if missing:
+    fail(f"harness steps that no longer exist on disk: {missing}")
+print(f"  [ok  ] every test-*.py is a gate step ({len(h_on_disk)} on disk)")
+
+print("\nok: the CI and .gates.toml lint + harness enumerations are in lockstep")
