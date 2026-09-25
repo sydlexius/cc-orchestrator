@@ -56,6 +56,9 @@
 # `safe-push.sh -u origin <branch>` is a misuse: the leading `-u` is rejected
 # (exit 2) rather than silently consumed, which previously produced a confusing
 # `fatal: refs/remotes/origin/HEAD cannot be resolved to branch` error (#35).
+# Likewise git-push argument order, `safe-push.sh origin <branch>`: a configured
+# remote name followed by another word is rejected (exit 2) naming the correct
+# form (#432); the remote is always origin and is never taken from the caller.
 #
 # Exit codes:
 #   0 -- push succeeded AND the remote ref matches local HEAD
@@ -65,7 +68,8 @@
 #        silent rewrite (no --rewrite/--rebased), the remote is
 #        ahead (diverged) and must be integrated first, or the remote tip is not
 #        in local history (run `git fetch origin` first so it can be classified)
-#   2 -- invalid invocation / not in a git repo / cannot resolve branch
+#   2 -- invalid invocation (a leading flag, a leading remote name) / not in a git
+#        repo / cannot resolve branch (the named local branch does not exist)
 
 set -euo pipefail
 
@@ -114,6 +118,24 @@ if [ -n "$branch" ]; then
     echo "           Usage: safe-push.sh <branch> [extra git-push flags]" >&2
     exit 2
   fi
+  # git-push argument order (`safe-push.sh origin <branch>`) parsed `origin` as the BRANCH and
+  # failed with a "refs/heads/origin does not exist" that never named the real mistake (#432).
+  # Reject a configured remote name with a usage error that does, when it is followed by a
+  # non-flag word OR there is no local branch of that name (so `safe-push.sh origin` and
+  # `safe-push.sh origin --dry-run` get the real remedy too; a genuine local branch named like
+  # a remote, with no second word, is still pushed). NOT silently accepted-and-dropped:
+  # safe-push only ever pushes to origin, so accepting `origin` would invite `upstream <b>`
+  # pushing to origin anyway. Remotes are captured first (no `git remote | grep -q` pipe,
+  # which pipefail can turn into a false negative on SIGPIPE).
+  remotes=$(git remote 2>/dev/null || true)
+  case $'\n'"$remotes"$'\n' in
+    *$'\n'"$branch"$'\n'*)
+      if { [ -n "${2:-}" ] && [ "${2#-}" = "$2" ]; } \
+         || ! git rev-parse --verify "refs/heads/$branch" >/dev/null 2>&1; then
+        echo "safe-push: '$branch' is a git remote, not a branch: the remote is implicit (origin); use: safe-push.sh <branch> [flags]" >&2
+        exit 2
+      fi ;;
+  esac
   shift_count=1
 fi
 
