@@ -629,18 +629,22 @@ cover this. Decide HERE whether the round owes an independent, fix-scoped hostil
 BEFORE any outward step (push, reply, resolve). It is OWED when ANY of these holds:
 
 - **(a)** the fix diff touches a deny-authority or advisory tier file. Apply `/prep-pr` Step 4a's
-  tier logic to the FIX-ROUND diff `$pre_round_head..HEAD`, NOT to the whole-branch merge-base
-  range Step 4a uses at PR time, so a doc-only round on a PR that once touched the guard is not
-  inflated to deny-authority.
+  tier logic to the FIX-ROUND diff, NOT to the whole-branch merge-base range Step 4a uses at PR
+  time, so a doc-only round on a PR that once touched the guard is not inflated to
+  deny-authority. Because this decision is made BEFORE the Step 7 commit, diff the WORKING TREE
+  against the pre-round HEAD (`git diff -M --name-status "$pre_round_head"`, with no `..HEAD`):
+  `$pre_round_head..HEAD` holds only committed history and would miss every uncommitted Step 5
+  edit, tiering a deny-authority fix as standard.
 - **(b)** a fix is not mechanical and falls on ANY axis in Step 5.5's "When agents are merited"
   list (every bullet there applies, including concurrency, API contract, and >~100 lines).
 - **(c)** the round answers a hostile DO NOT SHIP verdict.
 
 **Depth follows the tier:** the FULL engage-ralph-loop to K=2 dry rounds for deny-authority;
 ONE hostile, fix-scoped pass otherwise. The pass reviews the fix diff only,
-`<pre-round HEAD>..HEAD` (record the pre-round HEAD before Step 5 starts). A Critical or
-Important finding is fixed and re-committed, and the pass re-runs on the new diff before the
-push.
+`<pre-round HEAD>..HEAD` (record the pre-round HEAD before Step 5 starts). The lead assigns each
+finding's severity. A Critical or Important finding in a single-pass tier PROMOTES the round to
+the FULL loop (the `engage-ralph-loop.md` escalation hatch): fix and re-commit it, then run the
+full loop on the new diff until it converges at K=2 dry rounds, all before the push.
 
 **Not owed** for a standard-tier round of purely mechanical fixes (Step 5.5's one-line skip
 note covers it), for a round of replies with no code change, or for a standard-tier round whose
