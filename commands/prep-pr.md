@@ -683,7 +683,7 @@ Run Step 4a's review at the tier printed above, per `engage-ralph-loop.md`:
   FIXES END review (apply the fixes, re-run the gates green). DO NOT SHIP earns another HOSTILE,
   FIX-SCOPED round over `<pre-fix HEAD>..HEAD` (the fixes are new unreviewed code; that is where
   the longest-surviving defects come from), widened where the fix reaches a shared helper or
-  contract. An unfixed Critical or Important finding is DO NOT SHIP; the lead may upgrade a
+  contract. A Critical/Important finding is DO NOT SHIP, except that below the deny-authority tier a trivially mechanical fix may ride SHIP WITH FIXES (the lead may upgrade); the lead may upgrade a
   verdict to DO NOT SHIP, never downgrade it.
 
 Cap every tier at MAX_ROUNDS (default 6): the cap is a BUDGET ALARM, never "ship anyway" -- on

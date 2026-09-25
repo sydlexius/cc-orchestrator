@@ -652,7 +652,8 @@ drives `/plugin marketplace` update-detection, so they must never diverge. The C
     POST-diff file (no nonzero exit outside `--self-test`, no stdout write), never by the filename -
     a diff that ADDS an `exit 2` is exactly the diff that must not get the cheap tier. Any doubt ->
     deny-authority.
-  - ANY tier: an unfixed Critical/Important finding makes the verdict DO NOT SHIP, so the fast path is
+  - ANY tier: a Critical/Important finding is DO NOT SHIP, except that below the deny-authority tier a trivially mechanical fix may ride SHIP WITH FIXES (the lead may upgrade), and every
+    SHIP WITH FIXES item must be safe to apply without another review, so the fast path is
     taken only on diffs that come back clean. MAX_ROUNDS ~6 is a BUDGET ALARM, never "ship anyway" - on the cap,
     STOP and surface what is still unreviewed (and consider that the diff is too big).
   History: the retired untiered K=2 dry-round rule cost a ~50-minute, 10-round loop on an advisory
