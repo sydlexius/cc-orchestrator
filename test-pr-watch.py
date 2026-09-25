@@ -49,21 +49,21 @@ def check(label, ok):
 HEAD_SHA = "a" * 40
 COMMITTER_DATE = "2026-06-18T00:00:00Z"
 
-# Two DISTINCT roles for pr-watch.sh's timeout arg, kept separate to avoid a flake:
-#   SETTLE_TIMEOUT  -- a settle/review-blocked case reaches its terminal in ~2 poll
-#     iterations and EXITS immediately, so this value is only a safety ceiling and is
-#     never actually waited out; it must be generous. Each iteration forks ~11 `gh`
-#     stubs (each a Python cold-start) + jq, so ~1.3s locally but multiples of that on
-#     a loaded CI runner. A tight ceiling (the old shared `timeout_secs=2`) let the
-#     settle work race its own deadline and time out to exit 1 -- the ubuntu-only flake.
-#   PENDING_TIMEOUT -- a timeout-EXPECTED case (asserts exit 1 + a `pending=` token)
-#     spins until the deadline, so here the timeout IS the wall-clock duration and must
-#     stay short. (PR_WATCH_POLL_INTERVAL=0 keeps the loop fast in both roles.) 1s is the
-#     floor, not 0: pr-watch.sh tests the deadline at the TOP of its loop in whole
-#     seconds, so 1 still guarantees one poll (a populated `pending=`), while 0 exits
-#     before any poll and reads `pending=unknown` (#464).
+# pr-watch.sh's timeout arg counts FAKE-CLOCK ticks, not seconds (#464): run() puts a
+# `date` stub first on PATH that advances one "second" per `date +%s` call, and pr-watch.sh
+# reads the clock once at start and once at the TOP of each loop iteration. So timeout T
+# allows exactly T-1 polls, deterministically. The stubbed `gh` answers are fixed, so a
+# case's verdict never changes after its first poll; waiting on real wall time only ever
+# re-read the same stub (~42s of the old run) and let the deadline race scheduling (a
+# start/first-check pair straddling a real second boundary skipped the only poll, ~7% of
+# runs at a 1s deadline). Two roles:
+#   SETTLE_TIMEOUT  -- a settle/review-blocked case reaches its terminal in ~2 polls and
+#     EXITS, so this is only a generous ceiling (14 polls), never waited out.
+#   PENDING_TIMEOUT -- a timeout-EXPECTED case (asserts exit 1 + a `pending=` token) gets
+#     exactly ONE poll, so `pending=` is always populated. 1 would allow ZERO polls and read
+#     `pending=unknown` (33 checks fail, every run), which is why 2 is the floor.
 SETTLE_TIMEOUT = 15
-PENDING_TIMEOUT = 1
+PENDING_TIMEOUT = 2
 
 GH_STUB = r'''#!/usr/bin/env python3
 import os, sys, subprocess
@@ -193,6 +193,22 @@ def run(*, labels="[]", checks="[]", reviews="[]", codoki_rc=0,
         with open(gh, "w") as f:
             f.write(GH_STUB)
         os.chmod(gh, 0o755)
+
+        # FAKE CLOCK (#464): pr-watch.sh reads `date +%s` only as its loop clock, so each
+        # call advances one "second" and a timeout counts polls instead of wall time (see
+        # the constants above). Any OTHER `date` form fails loudly (exit 97) rather than
+        # passing through: a later pr-watch.sh change that starts using `date` differently
+        # must surface here, not silently run half on the real clock.
+        fake_date = os.path.join(bindir, "date")
+        with open(fake_date, "w") as f:
+            f.write('#!/usr/bin/env bash\n'
+                    'if [ "$#" -eq 1 ] && [ "$1" = "+%s" ]; then\n'
+                    '  c="$STUB_STATE_DIR/fake-clock"\n'
+                    '  n=$(( $(cat "$c" 2>/dev/null || echo 1000) + 1 ))\n'
+                    '  echo "$n" > "$c"; echo "$n"; exit 0\n'
+                    'fi\n'
+                    'echo "fake date: unsupported form: $*" >&2; exit 97\n')
+        os.chmod(fake_date, 0o755)
 
         # Stub the Codoki oracle: exit with the configured rc.
         oracle = os.path.join(oracle_dir, "ship-gate-preflight.sh")
