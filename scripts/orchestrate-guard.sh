@@ -103,7 +103,24 @@ if [ "${1:-}" = "--self-test" ]; then
     echo "orchestrate-guard self-test FAIL: tag push expected exit 0, got $trc (#186 carve-out broken)" >&2
     exit 1
   fi
-  echo "orchestrate-guard self-test PASS (Tier-1 push-main blocked; tag push exempt from advisory)"
+  trc=0
+  printf '%s' '{"tool_name":"Bash","tool_input":{"command":"git push --tags"}}' \
+    | "$0" >/dev/null 2>&1 || trc=$?
+  if [ "$trc" -ne 0 ]; then
+    echo "orchestrate-guard self-test FAIL: --tags push expected exit 0, got $trc (#186 carve-out broken)" >&2
+    exit 1
+  fi
+  # (#345) a bare tag NAME is indistinguishable from a branch, so it stays BLOCKED - but the
+  # message must point at the exempt refs/tags/<name> form, not only at the override.
+  brc=0
+  berr=$(printf '%s' '{"tool_name":"Bash","tool_input":{"command":"git push origin v0.0.0"}}' \
+    | "$0" 2>&1 >/dev/null) || brc=$?
+  case "$berr" in *'refs/tags/<name>'*) bmsg=1 ;; *) bmsg=0 ;; esac
+  if [ "$brc" -ne 2 ] || [ "$bmsg" -ne 1 ]; then
+    echo "orchestrate-guard self-test FAIL: bare tag-name push expected exit 2 naming refs/tags/<name>, got $brc (#345)" >&2
+    exit 1
+  fi
+  echo "orchestrate-guard self-test PASS (Tier-1 push-main blocked; tag push exempt from advisory; bare tag name advised toward refs/tags)"
   exit 0
 fi
 
@@ -124,12 +141,16 @@ fi
 # Vectors are the guard's OWN payload shapes, kept here so the check travels with the file
 # (a fragment edit and its proof cannot drift into separate files). Add one line per new deny.
 if [ "${1:-}" = "--assert-coverage" ]; then
+  # The vectors are built with jq; without it every one would read NOT BLOCKED. Say so plainly.
+  command -v jq >/dev/null 2>&1 || { echo "assert-coverage FAIL: jq is required to build the vector payloads" >&2; exit 1; }
   ac_fail=0
   # Each entry: <label>|<command that MUST be blocked>. Payloads live in this string table,
   # never on a Bash command line (the live hook greps command lines - see CLAUDE.md ISOLATION).
   ac_vectors="push-main|git push origin main
 push-force|git push --force origin feat
 safe-push-main|scripts/safe-push.sh main
+safe-push-sq-advisory|bash '/x/scripts/safe-push.sh' feat
+safe-push-dq-main|bash \"/x/scripts/safe-push.sh\" main
 git-no-verify|git commit --no-verify -m x
 git-sign-bypass-flag|git commit --no-gpg-sign -m x
 git-sign-bypass-config|git -c commit.gpgsign=false commit -m x
@@ -158,8 +179,10 @@ pr-merge-cli|gh pr merge 1 --squash"
     # 2. and the guard must actually block it end-to-end (catches a matcher that regressed
     #    independently of the prefilter). Tier-2 vectors need a fresh marker, so accept a
     #    block under either condition rather than teaching this mode the marker lifecycle.
+    # The payload is built by jq, not string-spliced, so a vector carrying a double quote (#436)
+    # is still valid JSON rather than a parse failure the guard fails OPEN on.
     ac_rc=0
-    printf '%s' "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"$ac_cmd\"}}" \
+    jq -nc --arg c "$ac_cmd" '{tool_name:"Bash",tool_input:{command:$c}}' \
       | "$0" >/dev/null 2>&1 || ac_rc=$?
     if [ "$ac_rc" -ne 2 ]; then
       case "$ac_label" in
@@ -360,8 +383,16 @@ looks_like_git_push() {
 # message or other prose (same prose-false-positive class that looks_like_git_push
 # fixes for the push subcommand). Per-clause splitting puts a `cd x && safe-push
 # ...` invocation at its own clause start, so this anchor still catches it.
+# (#436) The script path may also be ONE whole single- or double-quoted token whose content
+# is the wrapper name or ends in `/<name>` - `bash '${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh'`
+# is exactly what command bodies emit, and the shell strips the quotes, so it is the same
+# invocation. Unquoted-only matching let it skip the advisory AND the main/force denies. This
+# demands that exact shape (no quote char inside, closing quote then a boundary); it does not
+# reconstruct general shell quoting (`safe'-'push.sh` still evades - out of the threat model).
+_SP_NAME='safe-push(\.sh)?'
+_SP_PATH="(([^[:space:]]*/)?$_SP_NAME|'([^']*/)?$_SP_NAME'|\"([^\"]*/)?$_SP_NAME\")"
 looks_like_safe_push() {
-  printf '%s' "$cmd" | grep -Eq '^[[:space:]]*'"$_INTRO"'([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*((bash|sh)[[:space:]]+)?([^[:space:]]*/)?safe-push(\.sh)?([[:space:]]|$)'
+  printf '%s' "$cmd" | grep -Eq '^[[:space:]]*'"$_INTRO"'([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*((bash|sh)[[:space:]]+)?'"$_SP_PATH"'([[:space:]]|$)'
 }
 is_push() { looks_like_git_push || looks_like_safe_push; }
 
@@ -376,7 +407,7 @@ is_push() { looks_like_git_push || looks_like_safe_push; }
 # Accepted limitations (advisory-only, never a deny): a bare tag-NAME push
 # (`git push origin v1.2.3`) is indistinguishable from a branch push by static
 # matching and is NOT exempt (use the refs/tags/ form or the `# prep-pr-ok`
-# override); a clause that MIXES a tag ref with a branch ref is exempted by the tag
+# override; #345 made the advisory message itself say so); a clause that MIXES a tag ref with a branch ref is exempted by the tag
 # match and so skips the nudge for that branch - it only ever relaxes a NUDGE.
 is_tag_only_push() {
   is_push || return 1
@@ -882,7 +913,11 @@ if [ "$is_push_clause" -eq 1 ]; then
   if printf '%s' "$cmd" | grep -q 'prep-pr-ok'; then
     exit 0
   fi
-  echo "BLOCKED: git push must be preceded by /orchestrate:prep-pr (gate + review + squash). If you have already run the gate this turn, append the literal comment # prep-pr-ok to override." >&2
+  # (#345) A bare tag NAME (`origin v1.2.3`) cannot be told from a branch without a repo-state
+  # read, which the hot path deliberately never does, so it lands here. The message names that
+  # case and points at the EXEMPT spelling first, so the remedy is the tag form, not a reflexive
+  # override that would train `# prep-pr-ok` to mean "dismiss the guard".
+  echo "BLOCKED: git push must be preceded by /orchestrate:prep-pr (gate + review + squash). Pushing a release TAG by bare name? That looks like a branch here - name it refs/tags/<name>, which is exempt with no override. If you have already run the gate this turn, append the literal comment # prep-pr-ok to override." >&2
   exit 2
 fi
 
