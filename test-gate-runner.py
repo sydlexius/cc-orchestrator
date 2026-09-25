@@ -23,6 +23,7 @@ Run: python3 test-gate-runner.py
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -197,6 +198,49 @@ def test_form_b_hard_fail_stops():
         check("Form B: FAIL line for failing step", "[FAIL] boom" in out)
         check("Form B: stops at first hard fail (later step NOT run)",
               not os.path.exists(marker))
+
+
+def test_step_lines_carry_duration():
+    """#400: the PASS and FAIL lines report per-step wall time after the exit
+    code, e.g. `[PASS] fast (exit 0, 0.0s)`. Reporting only; the verdict and
+    exit code are unchanged."""
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        cfg = """\
+[prep_pr]
+  [[prep_pr.steps]]
+  name = "fast"
+  run = "true"
+  [[prep_pr.steps]]
+  name = "slow-soft"
+  run = "sleep 0.3; exit 4"
+  required = false
+"""
+        write(root, ".gates.toml", cfg)
+        rc, out = run_runner(root)
+        check("#400: soft fail still exits 0", rc == 0)
+        check("#400: PASS line carries a duration",
+              re.search(r"^\[PASS\] fast \(exit 0, \d+\.\ds\)$", out, re.M) is not None)
+        m = re.search(r"^\[FAIL\] slow-soft \(exit 4, (\d+\.\d)s\)$", out, re.M)
+        check("#400: FAIL line carries a duration", m is not None)
+        check("#400: duration reflects real wall time (>= 0.3s)",
+              m is not None and float(m.group(1)) >= 0.3)
+
+
+def test_launch_failure_carries_duration():
+    """#400 (Copilot on #451): a step that cannot LAUNCH (OSError, e.g. a vanished cwd)
+    reports its wall time too, so every FAIL line has the same shape. Driven through
+    _run_command directly: every caller passes the repo root, so no config reaches it."""
+    import importlib.util, io, contextlib
+    spec = importlib.util.spec_from_file_location("gate_runner_mod", RUNNER)
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        ok = mod._run_command("ghost", "true", "/nonexistent/gate-runner-cwd")
+    out = buf.getvalue()
+    check("#400: a launch failure is a FAIL (returns False)", ok is False)
+    check("#400: the launch-failure FAIL line carries a duration",
+          re.search(r"^\[FAIL\] ghost: could not launch \(.*\), \d+\.\ds$", out, re.M) is not None)
 
 
 def test_form_b_soft_fail_continues():
@@ -763,6 +807,8 @@ def main():
     for fn in [
         test_form_a_pass, test_form_a_fail,
         test_form_b_order_and_pass, test_form_b_hard_fail_stops,
+        test_step_lines_carry_duration,
+        test_launch_failure_carries_duration,
         test_form_b_soft_fail_continues,
         test_form_b_skip_if_absent_skips, test_form_b_skip_if_absent_present_runs,
         test_form_b_skip_if_no_match_skips, test_form_b_skip_if_match_runs,

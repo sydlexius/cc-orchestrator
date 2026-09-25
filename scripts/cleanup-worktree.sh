@@ -119,6 +119,40 @@ echo "Worktree: $worktree_path"
 echo "Branch:   $branch"
 echo ""
 
+# --- Refuse to remove the worktree holding the caller's cwd (#448) ---
+#
+# Removing the directory a shell is sitting in leaves that shell (and the Claude session
+# that owns it) with a vanished cwd: every later command fails and the session is locked
+# out. So refuse BEFORE any destructive or network step, while nothing has been touched.
+# Both sides are resolved with `pwd -P` so a symlinked path (macOS /tmp vs /private/tmp)
+# cannot slip past a string compare. The trailing-slash form matches the worktree itself
+# AND anything under it, but never a sibling that merely shares a prefix (/a/wt vs /a/wt2).
+# A worktree dir that is already gone cannot be anyone's cwd, so it skips the check.
+# FAIL CLOSED: if either physical path cannot be resolved, containment is UNKNOWN, and
+# unknown must refuse rather than skip the check (an unreadable worktree can still hold
+# the caller's cwd, which is exactly the lockout this guard exists to prevent).
+if [ -d "$worktree_path" ]; then
+  wt_real=$(CDPATH='' cd -- "$worktree_path" 2>/dev/null && pwd -P) || wt_real=""
+  cwd_real=$(pwd -P 2>/dev/null) || cwd_real=""
+  if [ -z "$wt_real" ] || [ -z "$cwd_real" ]; then
+    echo "Error: refusing to remove $worktree_path: could not resolve the physical path of" >&2
+    echo "  the worktree ('${wt_real:-<unresolved>}') or the current directory ('${cwd_real:-<unresolved>}')," >&2
+    echo "  so it cannot be ruled out that this shell's cwd is inside it. Fix access, or run" >&2
+    echo "  cleanup from the main checkout:  cd \"$main_worktree\"   Nothing was removed or deleted." >&2
+    exit 1  # cwd-guard-unresolved
+  else
+    case "$cwd_real/" in
+      "$wt_real"/*)
+        echo "Error: refusing to remove $worktree_path: it holds the current directory ($cwd_real)." >&2
+        echo "  Removing it would delete this shell's cwd and lock the session out." >&2
+        echo "  Run cleanup from the main checkout instead:  cd \"$main_worktree\"" >&2
+        echo "  Nothing was removed or deleted." >&2
+        exit 1  # cwd-guard-refuse
+        ;;
+    esac
+  fi
+fi
+
 # --- Capture the run dir BEFORE removing the worktree (#303 amendment 2) ---
 #
 # run-paths.sh is THE single producer of this path (#303). Sourcing it -- rather than
@@ -167,7 +201,7 @@ if [ -d "$worktree_path" ]; then
     echo "warning: 'git worktree remove $worktree_path' FAILED; the worktree is still present." >&2
     echo "  Common cause: modified or untracked files in it. Inspect, then re-run, or force with:" >&2
     echo "    git worktree remove --force \"$worktree_path\"" >&2
-    echo "  Continuing with the remaining cleanup; the run dir is KEPT (see below)." >&2
+    echo "  Continuing with the local cleanup; the run dir and the branch are KEPT (see below)." >&2
   fi
 else
   echo "Worktree directory already gone; pruning admin metadata."
@@ -243,8 +277,20 @@ if [ -z "$default_branch" ]; then
   default_branch=$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null || true)
 fi
 
-# Delete local + remote branch (guarded).
-if [ -n "$branch" ]; then
+# Delete local + remote branch (guarded) -- ONLY once the worktree is actually gone (#421).
+#
+# A worktree whose removal failed still has "$branch" checked out, so `git branch -d/-D`
+# refuses (the branch is in use by a worktree) and, under `set -e`, that aborted the run
+# right here -- ABOVE the remote delete and `git fetch --prune`, the #302 shape again.
+# Deleting the REMOTE branch while the local worktree still holds untracked or
+# uncommitted work is the wrong call too. So a failed removal keeps BOTH branches, says
+# so plainly, still prunes, and then exits non-zero on purpose (see the end).
+if [ "$wt_removed" -eq 0 ]; then
+  if [ -n "$branch" ]; then
+    echo "=== Keeping branch '$branch' (local and remote): worktree removal failed ===" >&2
+    echo "    It is still checked out in $worktree_path. Resolve that worktree, then re-run." >&2
+  fi
+elif [ -n "$branch" ]; then
   if [ -n "$default_branch" ] && [ "$branch" = "$default_branch" ]; then
     # Hard guard: the worktree is sitting on the default branch. This is the
     # `gh --delete-branch` aftermath -- the feature branch was already deleted
@@ -352,6 +398,14 @@ fi
 # it is tolerated and reported rather than aborting a run that already did its work.
 echo "=== Pruning stale refs ==="
 git fetch --prune || echo "warning: 'git fetch --prune' failed; stale tracking refs were not pruned." >&2
+
+if [ "$wt_removed" -eq 0 ]; then
+  # Deliberately non-zero (#421): the worktree and its branch were kept, so this cleanup
+  # is INCOMPLETE, and a caller chaining on the exit status must not read it as done.
+  echo ""
+  echo "INCOMPLETE: worktree $worktree_path and branch '${branch:-<none>}' were kept; see the warnings above." >&2
+  exit 1
+fi
 
 echo ""
 echo "Done. Update your worktrees memory/notes to reflect the change."

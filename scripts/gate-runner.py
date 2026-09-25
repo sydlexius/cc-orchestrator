@@ -43,6 +43,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 # So the sibling `orchestrate_schemas` module imports when gate-runner is run as
 # a script (its dir is not otherwise on sys.path).
@@ -90,13 +91,19 @@ def _run_command(label, command, cwd):
     shell=True is the documented trusted-repo-config path (the command came from
     `.gates.toml` / CLAUDE.md, both trusted like a Makefile). No dynamic string
     is built here -- the command is passed through verbatim."""
+    # Wall time is REPORTING only (#400): it never feeds the verdict, the exit
+    # code, the memo cache, or the receipt.
+    start = time.perf_counter()
     try:
         proc = subprocess.run(command, shell=True, cwd=cwd, check=False)
     except OSError as e:
-        log(f"[FAIL] {label}: could not launch ({e})")
+        log(f"[FAIL] {label}: could not launch ({e}), "
+            f"{time.perf_counter() - start:.1f}s")
         return False
+    elapsed = time.perf_counter() - start
     ok = proc.returncode == 0
-    log(f"[{'PASS' if ok else 'FAIL'}] {label} (exit {proc.returncode})")
+    log(f"[{'PASS' if ok else 'FAIL'}] {label} "
+        f"(exit {proc.returncode}, {elapsed:.1f}s)")
     return ok
 
 

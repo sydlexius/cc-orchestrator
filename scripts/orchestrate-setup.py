@@ -387,13 +387,22 @@ def _backup_before_overwrite(dest):
     destination is a DIRECTORY - it copies INTO it, so the bytes land at <dest>.bak/<name> while
     the caller believes <dest>.bak holds them and proceeds to overwrite the original. A bare
     try/except therefore reports a backup that does not exist. So: reject a directory up front,
-    and confirm a regular file is actually there afterward."""
+    and confirm a regular file is actually there afterward.
+
+    A SYMLINK at <dest>.bak is UNLINKED first (the link only, never its target). `copy2` follows
+    it, so the backup would overwrite whatever the link points at - and moving a symlinked dest
+    aside (every deploy path does, see _deploy_steer) leaves exactly such a link pointing into the
+    plugin source, so the NEXT refresh would clobber the source with the old deployed copy. That is
+    checked before the directory test because `isdir` follows a link to a directory too. Refusing
+    instead would wedge configure permanently on a state configure itself creates."""
     bak = dest + ".bak"
     try:
+        if os.path.islink(bak):
+            os.unlink(bak)
         if os.path.isdir(bak):
             return False, f"{bak} is a directory"
         shutil.copy2(dest, bak)
-        if not os.path.isfile(bak):
+        if os.path.islink(bak) or not os.path.isfile(bak):
             return False, f"{bak} missing after copy"
     except OSError as e:
         return False, str(e)
@@ -492,24 +501,44 @@ def _steer_deploy_action():
     return None
 
 
-def _deploy_steer():
-    """Copy the bundled steer script to the stable STEER path, executable. Caller gated on --apply +
-    consent. Atomic temp-then-replace, mirroring _deploy_guard. Returns (ok, message)."""
+def _stage_backup_install(src, dest, prefix, what):
+    """Install `src` at `dest`, executable, BACKING UP the old dest first (#425). Returns (ok, msg).
+
+    ORDER IS THE CONTRACT (CR on #451): stage the replacement in a temp file FIRST, then back up,
+    then one atomic os.replace. The old code moved a symlink dest aside BEFORE copying, so a copy or
+    chmod failure left the stable path EMPTY - the hook it names then silently stops running. Now any
+    failure before the final replace leaves dest exactly as it was. os.replace swaps a symlink dest
+    ITSELF (it never follows it), so the link needs no separate removal: backing it up is moving it
+    to <dest>.bak, done last, immediately before the replace. A failed file backup REFUSES the
+    overwrite (#292), and the staged temp is always cleaned up."""
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dest), prefix=prefix)
+    os.close(fd)
     try:
-        os.makedirs(os.path.dirname(STEER), exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(STEER), prefix=".orch-steer-")
-        os.close(fd)
-        try:
-            shutil.copy2(BUNDLED_STEER, tmp)
-            os.chmod(tmp, os.stat(tmp).st_mode | 0o111)
-            os.replace(tmp, STEER)
-        except OSError:
+        shutil.copy2(src, tmp)
+        os.chmod(tmp, os.stat(tmp).st_mode | 0o111)
+        if os.path.islink(dest):
+            os.replace(dest, dest + ".bak")
+        elif os.path.isfile(dest):
+            ok, err = _backup_before_overwrite(dest)
+            if not ok:
+                return False, (f"could not back up the deployed {what} at {dest} ({err}); "
+                               f"refusing to replace it unbacked")
+        os.replace(tmp, dest)
+    finally:
+        if os.path.lexists(tmp):
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
-            raise
-        return True, f"deployed the steering hook -> {STEER}"
+    return True, f"deployed the {what} -> {dest}"
+
+
+def _deploy_steer():
+    """Copy the bundled steer script to the stable STEER path, executable. Caller gated on --apply +
+    consent. Staged, backed up, then atomically replaced (_stage_backup_install). Returns (ok, message)."""
+    try:
+        return _stage_backup_install(BUNDLED_STEER, STEER, ".orch-steer-", "steering hook")
     except OSError as e:
         return False, f"FAILED to deploy the steering hook to {STEER}: {e}"
 
@@ -566,22 +595,9 @@ def _ctxmeter_deploy_action():
 
 def _deploy_ctxmeter():
     """Copy the bundled meter to the stable CTXMETER path, executable. Caller gated on --apply +
-    consent. Atomic temp-then-replace, mirroring _deploy_steer. Returns (ok, message)."""
+    consent. Staged, backed up, then atomically replaced (_stage_backup_install). Returns (ok, message)."""
     try:
-        os.makedirs(os.path.dirname(CTXMETER), exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CTXMETER), prefix=".orch-ctxmeter-")
-        os.close(fd)
-        try:
-            shutil.copy2(BUNDLED_CTXMETER, tmp)
-            os.chmod(tmp, os.stat(tmp).st_mode | 0o111)
-            os.replace(tmp, CTXMETER)
-        except OSError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-        return True, f"deployed the context-budget meter -> {CTXMETER}"
+        return _stage_backup_install(BUNDLED_CTXMETER, CTXMETER, ".orch-ctxmeter-", "context-budget meter")
     except OSError as e:
         return False, f"FAILED to deploy the context-budget meter to {CTXMETER}: {e}"
 
@@ -660,20 +676,9 @@ def _deploy_setup():
     if os.path.realpath(BUNDLED_SETUP) == os.path.realpath(SETUP_DEST):
         return True, f"setup script already at the stable path ({SETUP_DEST}); no self-copy needed"
     try:
-        os.makedirs(os.path.dirname(SETUP_DEST), exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(SETUP_DEST), prefix=".orch-setup-")
-        os.close(fd)
-        try:
-            shutil.copy2(BUNDLED_SETUP, tmp)
-            os.chmod(tmp, os.stat(tmp).st_mode | 0o111)
-            os.replace(tmp, SETUP_DEST)
-        except OSError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-        return True, f"deployed the setup script -> {SETUP_DEST}"
+        # #425: staged, backed up, then atomically replaced. The realpath self-copy check above
+        # already returned for a dest that IS the running script.
+        return _stage_backup_install(BUNDLED_SETUP, SETUP_DEST, ".orch-setup-", "setup script")
     except OSError as e:
         return False, f"FAILED to deploy the setup script to {SETUP_DEST}: {e}"
 
