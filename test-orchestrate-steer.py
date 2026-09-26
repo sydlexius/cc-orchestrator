@@ -192,6 +192,20 @@ def rule7_cases():
         "export SW_GATE_FULL=1; bash -c 'unset SW_GATE_FULL'; python3 scripts/gate-runner.py",
         "bash -c 'export SW_GATE_FULL=1; python3 scripts/gate-runner.py'",
         "eval 'export SW_GATE_FULL=1'; python3 scripts/gate-runner.py",  # eval shares the shell
+        # #478 (a): eval opening a code frame from INSIDE $(...) was read as prose (unbounded
+        # backward word-scan in codeq()); the export inside it must still flow (eval shares the
+        # shell of whichever frame it runs in).
+        "x=$(eval 'export SW_GATE_FULL=1'; python3 scripts/gate-runner.py)",
+        # #478 (b1): a prefix assignment on the command that OPENS a bash -c frame flows into that
+        # child process env even though it is never exported in the parent shell.
+        "SW_GATE_FULL=1 bash -c 'python3 scripts/gate-runner.py'",
+        # #478 (b2): a leading `{` (brace-group opener) before export must not blind the export scan.
+        "{ export SW_GATE_FULL=1; }; python3 scripts/gate-runner.py",
+        # #478 E1 (fix round 1): TWO contiguous prefix assignments both seed the child; a
+        # transparent wrapper keyword (env) between assignment(s) and the shell name is still
+        # skipped over, matching the same treatment CP7 already gives "env" elsewhere in this file.
+        "A=1 SW_GATE_FULL=1 bash -c 'python3 scripts/gate-runner.py'",
+        "SW_GATE_FULL=1 env bash -c 'python3 scripts/gate-runner.py'",
     ]
     SILENT = [
         "python3 scripts/gate-runner.py",                        # the default profile
@@ -218,9 +232,21 @@ def rule7_cases():
         'env SW_GATE_FULL="" python3 scripts/gate-runner.py',
         'export SW_GATE_FULL="0"; safe-push.sh b',
         'export SW_GATE_FULL=1; SW_GATE_FULL="" python3 scripts/gate-runner.py',
+        # #478 E2 (fix round 1): the (b2) leading-`{` allowance must not also misread the OFF value.
+        "{ export SW_GATE_FULL=0; }; python3 scripts/gate-runner.py",
         # an export inside a CODE frame dies with that process: it never reaches the outer gate
         "bash -c 'export SW_GATE_FULL=1' && python3 scripts/gate-runner.py",
         "x=$(export SW_GATE_FULL=1); python3 scripts/gate-runner.py",
+        # #478 (b1): a prefix assignment on a bash -c command is scoped to THAT child process only
+        # (the seed is snapshotted and restored on pop) - it must never leak to a LATER clause.
+        "SW_GATE_FULL=1 bash -c 'true'; python3 scripts/gate-runner.py",
+        # #478 (b1) off-value: a prefix assignment of 0 must not turn the gate on.
+        "SW_GATE_FULL=0 bash -c 'python3 scripts/gate-runner.py'",
+        # #478 E1 (fix round 1, regression): a NAME=value-shaped word that is merely an ARGUMENT to
+        # an earlier, unrelated command in the same clause is not a bash prefix assignment and must
+        # not seed the child. Both went silent -> WARN under the pre-fix-round-1 whole-buffer scan.
+        "find . -name SW_GATE_FULL=1 -exec bash -c 'python3 scripts/gate-runner.py' \\;",
+        "printf SW_GATE_FULL=1 bash -c 'python3 scripts/gate-runner.py'",
     ]
     with tempfile.TemporaryDirectory() as td:
         repo = os.path.join(td, "decl"); os.makedirs(repo)
@@ -652,6 +678,16 @@ def main():
         "gh api<<D graphql -f query='mutation{x}'\nD",  # re_api
         "gh pr<<D create --fill\nD",  # re_pr
         "gh<<D api -X POST repos/o/r/i\nD",  # re_gh
+        # #478 (a): eval opening a code frame from INSIDE another frame was read as prose, because
+        # the backward word-scan in codeq() was unbounded by the frame start and collected the
+        # enclosing opener glued to "eval" ($(eval / "eval) - which never equals "eval". Rules 2, 3
+        # and 6, each via an eval inside $(...) AND inside a double-quoted bash -c script.
+        "x=$(eval 'gh api -X PATCH repos/o/r/issues/1')",
+        "bash -c \"eval 'gh api -X PATCH repos/o/r/issues/1'\"",
+        "x=$(eval 'gh pr create --fill')",
+        "bash -c \"eval 'gh pr create --fill'\"",
+        "x=$(eval 'safe-push.sh b | tail -5')",
+        "bash -c \"eval 'safe-push.sh b | tail -5'\"",
     ]
     for c in SCAN3_WARN:
         rc_ok, warned_all, _ = both_channels({"command": c}, marker_active=False)

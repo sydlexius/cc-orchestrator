@@ -490,7 +490,7 @@ _steer_scan() {
     }
     function cut(sep) { judge(d, sep); bclr(d); bclr("d" d); lastcut[d] = sep }
     # ---- the frame stack ----
-    function push(t, code, st,   p, nm) {
+    function push(t, code, st,   p, nm, iscq, s, pfxnw, pfxw, pfxi, pfxnm) {
       p = d; d++
       ft[d] = t; fc[d] = code; fp[d] = 0; dk[d] = 0; dq[d] = 0; pb[d] = ""; fst[d] = st
       csq[d] = csq[p]; qd[d] = qd[p]
@@ -502,9 +502,38 @@ _steer_scan() {
       # own PROCESS, so an export/unset inside it never reaches the enclosing shell. Snapshot the
       # declared vars here and restore them in pop(). An `eval` script runs in the SAME shell, so
       # its frame is not scoped (fx7 = 0). CQEVAL is set by codeq() and consumed here only.
-      fx7[d] = (EXN && code && !(CQEVAL && (t == "S" || t == "D" || t == "E")))
+      iscq = (code && (t == "S" || t == "D" || t == "E"))
+      fx7[d] = (EXN && code && !(CQEVAL && iscq))
+      if (fx7[d]) {
+        for (nm in EXS) { XS[d, nm] = (nm in EXP) ? EXP[nm] : -1 }
+        # (#478) A -c SCRIPT FRAME (never eval, which already shares the shell) is a NEW PROCESS
+        # bash execs: a PREFIX ASSIGNMENT on the command that opens it (e.g. SW_X=1 bash -c SCRIPT)
+        # flows into that child process environment even though it is never export-ed in the
+        # parent shell, and the snapshot above alone leaves the child blind to it (EXP still reads
+        # whatever the OUTER shell had). The restore below already reverts EXP on pop(), matching
+        # bash (the assignment never touches the invoking shell own copy of the var).
+        # (E1, #478 fix round 1) ONLY a CONTIGUOUS assignment/wrapper run from the very START of
+        # bget(p) - matched by the anchored PFX7 - counts: a NAME=value word is a prefix assignment
+        # ONLY when nothing but more assignments/transparent-wrapper keywords sits between it and
+        # the clause start. A whole-buffer word scan (the prior version of this fix) instead
+        # treated ANY NAME=value-shaped word ANYWHERE in the clause as a prefix assignment, so
+        # `find . -name SW_GATE_FULL=1 -exec bash -c SCRIPT` seeded from an argument to `-name`,
+        # nowhere near being a prefix assignment on the `bash -c` it happens to precede. PFX7 stops
+        # at the first token that is neither: `-name`/`-exec`/`find`/`printf` all fail it, so the
+        # match consumes zero real assignments and nothing is seeded.
+        if (iscq && !CQEVAL) {
+          s = bget(p)
+          if (match(s, PFX7)) {
+            pfxnw = split(substr(s, 1, RLENGTH), pfxw, /[[:space:]]+/)
+            for (pfxi = 1; pfxi <= pfxnw; pfxi++)
+              if (match(pfxw[pfxi], /^[A-Za-z_][A-Za-z0-9_]*=/)) {
+                pfxnm = substr(pfxw[pfxi], 1, RLENGTH - 1)
+                if (pfxnm in EXS) EXP[pfxnm] = x7on(substr(pfxw[pfxi], RLENGTH + 1))
+              }
+          }
+        }
+      }
       CQEVAL = 0
-      if (fx7[d]) for (nm in EXS) { XS[d, nm] = (nm in EXP) ? EXP[nm] : -1 }
     }
     function pop(   nm) {
       if (fc[d]) judge(d, "")
@@ -520,12 +549,20 @@ _steer_scan() {
     # a quote in a code frame: CODE when it is the script of `<shell> [opts] -c` or `eval`
     function codeq(   tl, k, w) {
       # cheap necessary condition on the raw bytes first (no string building on the common path): the
-      # quote follows whitespace, and the word before it is `eval` or a `-...c...` option cluster
+      # quote follows whitespace, and the word before it is `eval` or a `-...c...` option cluster.
+      # (#478) BOTH scans are bounded by fst[d], the CURRENT frame own start: without that bound
+      # they walk past the frame boundary into the raw a[] bytes of the ENCLOSING frame (the open
+      # paren of a $( or the opening double-quote of a bash -c script), neither of which is
+      # whitespace - so eval as the very first word of a NESTED frame collected the enclosing
+      # opener plus "eval" as one token and failed the w == "eval" test: an eval opening a code
+      # frame from inside $(...) or a double-quoted bash -c script was read as prose. fst[d] is
+      # the frame own first CONTENT byte (set by the st argument to push()), so stopping there
+      # never eats the opener.
       k = j - 1
-      while (k >= 1 && (a[k] == " " || a[k] == "\t" || a[k] == "\n" || a[k] == "\\")) k--
-      if (k == j - 1 || k < 1) return 0
+      while (k >= fst[d] && (a[k] == " " || a[k] == "\t" || a[k] == "\n" || a[k] == "\\")) k--
+      if (k == j - 1 || k < fst[d]) return 0
       w = ""
-      while (k >= 1 && k > j - 24 && a[k] !~ /[[:space:]]/) { w = a[k] w; k-- }
+      while (k >= fst[d] && k > j - 24 && a[k] !~ /[[:space:]]/) { w = a[k] w; k-- }
       if (w != "eval" && w !~ /^-[A-Za-z]*c[A-Za-z]*$/) return 0
       CQEVAL = (w == "eval")   # rule 7: an eval script shares the shell (read by push)
       tl = tail(d)
@@ -565,13 +602,17 @@ _steer_scan() {
     # OFF = empty or 0, bare or as the whole of one quoted value (QOFF, see qoff).
     function x7on(v) { return (v != "" && v != "0" && v != QOFF) }
     function ex7(s,   m, w, i, nw, nm, v, kind) {
-      if (s ~ /^[[:space:]]*(export|unset)[[:space:]]/) {
+      # (#478 b2) an optional leading `{` (a brace-group opener, e.g. `{ export SW_X=1; }; <gate>`)
+      # is allowed before export/unset: `{` is not a special byte to this scanner (it is appended
+      # to the buffer like any ordinary character), so it stays on the clause text and previously
+      # made the anchored `^[[:space:]]*export` tests fail outright, silently skipping the export.
+      if (s ~ /^[[:space:]]*\{?[[:space:]]*(export|unset)[[:space:]]/) {
         nw = split(s, w, /[[:space:]]+/)
         for (i = 1; i <= nw; i++) {
-          if (w[i] in EXS) { if (s ~ /^[[:space:]]*unset/) EXP[w[i]] = 0 }
+          if (w[i] in EXS) { if (s ~ /^[[:space:]]*\{?[[:space:]]*unset/) EXP[w[i]] = 0 }
           else if (match(w[i], /^[A-Za-z_][A-Za-z0-9_]*=/)) {
             nm = substr(w[i], 1, RLENGTH - 1); v = substr(w[i], RLENGTH + 1)
-            if (nm in EXS) EXP[nm] = (s ~ /^[[:space:]]*export/ && x7on(v))
+            if (nm in EXS) EXP[nm] = (s ~ /^[[:space:]]*\{?[[:space:]]*export/ && x7on(v))
           }
         }
         return
@@ -734,6 +775,16 @@ _steer_scan() {
       CP7 = "^[[:space:]]*[({]*[[:space:]]*(([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*|" SPW "|([^[:space:]]*/)?((ba|z|da|k)?sh|env|python[0-9.]*)|-[^[:space:]]*|[0-9][0-9.]*[smhd]?)[[:space:]]+)*"
       EXG = CP7 "([^[:space:]]*/)?(gate-runner\\.py|pre-push-hook\\.sh)([[:space:]]|$)"
       EXU = CP7 "([^[:space:]]*/)?(safe-push\\.sh|git" FL "[[:space:]]+push)([[:space:]]|$)"
+      # (#478 E1) the push() prefix-assignment SEED (see push()) anchors on THIS, narrower than CP7:
+      # a CONTIGUOUS run of NAME=value assignments and/or the SAME transparent wrapper KEYWORDS
+      # (SPW; bare words only, no flags) from the very start of the clause. Deliberately EXCLUDES
+      # CP7 own generic flag alternative (-[^[:space:]]*) and its shell/env/python interpreter
+      # alternative: a bare hyphen-flag test is what let `find . -name SW_GATE_FULL=1 -exec bash -c`
+      # match past `-name`/`-exec` as if they were transparent, seeding SW_GATE_FULL from an
+      # argument to `find`/`printf` that has nothing to do with the `bash -c` it happens to precede.
+      # Excluding flags means a real `sudo -E bash -c` prefix assignment goes unseeded too (a false
+      # NEGATIVE, not a false positive) - the safe side for an advisory nudge, and accepted.
+      PFX7 = "^[[:space:]]*[({]*[[:space:]]*(([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*|" SPW ")[[:space:]]+)*"
       EXN = split(EXV, tmp, " "); for (i = 1; i <= EXN; i++) EXS[tmp[i]] = 1
       d = 1; ft[1] = "U"; fc[1] = 1; fp[1] = 0; csq[1] = 0; qd[1] = 0; fst[1] = 1
       bclr(1); bclr("d1"); HD = 0; HE = -1; nhd = 0; FPR = 0; FSP = 0; FEX = ""
