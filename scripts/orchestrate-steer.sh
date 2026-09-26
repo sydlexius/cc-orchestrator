@@ -526,7 +526,9 @@ _steer_scan() {
           if (match(s, PFX7)) {
             pfxnw = split(substr(s, 1, RLENGTH), pfxw, /[[:space:]]+/)
             for (pfxi = 1; pfxi <= pfxnw; pfxi++)
-              if (match(pfxw[pfxi], /^[A-Za-z_][A-Za-z0-9_]*=/)) {
+              if (pfxw[pfxi] == "-i" || pfxw[pfxi] == "--ignore-environment" || pfxw[pfxi] == "-") {
+                for (pfxnm in EXS) EXP[pfxnm] = 0   # env -i: the child starts EMPTY (PR #485)
+              } else if (match(pfxw[pfxi], /^[A-Za-z_][A-Za-z0-9_]*=/)) {
                 pfxnm = substr(pfxw[pfxi], 1, RLENGTH - 1)
                 if (pfxnm in EXS) EXP[pfxnm] = x7on(substr(pfxw[pfxi], RLENGTH + 1))
               }
@@ -784,7 +786,12 @@ _steer_scan() {
       # argument to `find`/`printf` that has nothing to do with the `bash -c` it happens to precede.
       # Excluding flags means a real `sudo -E bash -c` prefix assignment goes unseeded too (a false
       # NEGATIVE, not a false positive) - the safe side for an advisory nudge, and accepted.
-      PFX7 = "^[[:space:]]*[({]*[[:space:]]*(([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*|" SPW ")[[:space:]]+)*"
+      # (PR #485) The ONE flag PFX7 does accept is the env environment-CLEARING option (`-i`,
+      # `--ignore-environment`, a bare `-`), because it changes what reaches the child: push()
+      # walks the prefix words in order, so an assignment BEFORE it is wiped (and an outer export
+      # does not leak into the child) while an assignment AFTER it is still seeded.
+      ENVCLR = "-i|--ignore-environment|-"
+      PFX7 = "^[[:space:]]*[({]*[[:space:]]*(([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*|" SPW "|" ENVCLR ")[[:space:]]+)*"
       EXN = split(EXV, tmp, " "); for (i = 1; i <= EXN; i++) EXS[tmp[i]] = 1
       d = 1; ft[1] = "U"; fc[1] = 1; fp[1] = 0; csq[1] = 0; qd[1] = 0; fst[1] = 1
       bclr(1); bclr("d1"); HD = 0; HE = -1; nhd = 0; FPR = 0; FSP = 0; FEX = ""

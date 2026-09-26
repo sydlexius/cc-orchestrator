@@ -206,8 +206,21 @@ def rule7_cases():
         # skipped over, matching the same treatment CP7 already gives "env" elsewhere in this file.
         "A=1 SW_GATE_FULL=1 bash -c 'python3 scripts/gate-runner.py'",
         "SW_GATE_FULL=1 env bash -c 'python3 scripts/gate-runner.py'",
+        # PR #485 (Copilot 4109941320): an assignment AFTER `env -i` reaches the child env.
+        "env -i SW_GATE_FULL=1 bash -c 'python3 scripts/gate-runner.py'",
+        "env --ignore-environment SW_GATE_FULL=1 bash -c 'python3 scripts/gate-runner.py'",
+        # PR #485 (Copilot 4109941330): the export flows through an eval inside a DOUBLE-quoted
+        # bash -c frame (the second codeq() frame-boundary acceptance shape, for rule 7).
+        "bash -c \"eval 'export SW_GATE_FULL=1'; python3 scripts/gate-runner.py\"",
     ]
-    SILENT = [
+    SILENT_ENVI = [
+        # PR #485 (CR 4109966380): `env -i` starts the child with an EMPTY environment, so an
+        # assignment BEFORE it (or an outer export) never reaches the gate.
+        "SW_GATE_FULL=1 env -i bash -c 'python3 scripts/gate-runner.py'",
+        "export SW_GATE_FULL=1; env -i bash -c 'python3 scripts/gate-runner.py'",
+        "SW_GATE_FULL=1 env - bash -c 'python3 scripts/gate-runner.py'",
+    ]
+    SILENT = SILENT_ENVI + [
         "python3 scripts/gate-runner.py",                        # the default profile
         "safe-push.sh b",
         "SW_GATE_FULL=0 python3 scripts/gate-runner.py",
