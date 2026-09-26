@@ -458,6 +458,53 @@ def fix_round_1_cases():
         check("y/foo is not held by x/foo's worktree (exact match): pushes (exit 0)", rc == 0)
 
 
+def pr486_round_1_cases():
+    print("== PR #486 CR 4109994756: --follow-tags widens the push and is refused ==")
+    rc, out, err, pushes, _log = run(["feature/x", "--follow-tags"])
+    check("--follow-tags -> exit 2, NO push", rc == 2 and not pushes)
+
+    print("== PR #486 CR 4109994754 / Copilot 4109971294: unreadable worktree list refuses ==")
+    with tempfile.TemporaryDirectory() as td:
+        g, env, work, origin = real_repo(td)
+        g("branch", "feat")
+        gate(g, work, "feat")                # a caller receipt the fallback WOULD accept
+        shim = os.path.join(td, "shim"); os.mkdir(shim)
+        real_git = shutil.which("git", path=env.get("PATH"))
+        with open(os.path.join(shim, "git"), "w") as fh:
+            fh.write('#!/bin/sh\nif [ "$1" = worktree ] && [ "$2" = list ]; then exit 128; fi\n'
+                     'exec "%s" "$@"\n' % real_git)
+        os.chmod(os.path.join(shim, "git"), 0o755)
+        env2 = dict(env, PATH=shim + os.pathsep + env.get("PATH", ""))
+        rc, out = safe_push(env2, work, ["feat"])
+        check("worktree list fails -> refused (exit 1), never the caller-receipt fallback",
+              rc == 1 and "worktree" in out and g("ls-remote", origin, "refs/heads/feat") == "")
+
+    print("== PR #486 CR 4109994764: the push source is the SNAPSHOTTED tip the receipt covers ==")
+    with tempfile.TemporaryDirectory() as td:
+        g, env, work, origin = real_repo(td)
+        g("branch", "feat")
+        gate(g, work, "feat")
+        gated_tip = g("rev-parse", "refs/heads/feat")
+        # A git shim that advances refs/heads/feat to a NEW, UNGATED commit the moment the
+        # push starts (after every check has run): the push must still send the gated tip.
+        shim = os.path.join(td, "shim"); os.mkdir(shim)
+        real_git = shutil.which("git", path=env.get("PATH"))
+        with open(os.path.join(shim, "git"), "w") as fh:
+            fh.write('#!/bin/sh\nif [ "$1" = push ]; then\n'
+                     '  t=$("%s" commit-tree -p refs/heads/feat -m ungated "$("%s" rev-parse refs/heads/feat^{tree})")\n'
+                     '  "%s" update-ref refs/heads/feat "$t"\nfi\nexec "%s" "$@"\n'
+                     % (real_git, real_git, real_git, real_git))
+        os.chmod(os.path.join(shim, "git"), 0o755)
+        env2 = dict(env, PATH=shim + os.pathsep + env.get("PATH", ""))
+        rc, out = safe_push(env2, work, ["feat"])
+        landed = g("ls-remote", origin, "refs/heads/feat").split("\t")[0]
+        check("tip moved after the checks -> origin gets the GATED tip, never the new one",
+              landed == gated_tip)
+        up = subprocess.run(["git", "config", "branch.feat.merge"], cwd=work, env=env,
+                            capture_output=True, text=True).stdout.strip()
+        check("...and upstream tracking is still recorded", up == "refs/heads/feat")
+
+
 def main():
     print("== #35 leading-dash first positional -> exit 2, NO push ==")
     rc, out, err, pushes, _log = run(["-u", "origin", "main"])
@@ -507,9 +554,10 @@ def main():
     rc, out, err, pushes, _log = run(["feature/x"])  # remote_sha="" -> first-push
     check("first-push -> exit 0", rc == 0)
     check("first-push invokes exactly one git push", len(pushes) == 1)
-    # #466: the FULL refspec, never the bare name (a same-named tag makes the bare name ambiguous).
-    check("push targets origin refs/heads/feature/x:refs/heads/feature/x",
-          bool(pushes) and "origin refs/heads/feature/x:refs/heads/feature/x" in pushes[0])
+    # #466: the FULL destination ref, never the bare name (a same-named tag makes the bare name
+    # ambiguous). PR #486: the SOURCE is the snapshotted SHA the gates judged, never the name.
+    check("push sends the snapshotted sha to origin refs/heads/feature/x",
+          bool(pushes) and "origin aaaa111:refs/heads/feature/x" in pushes[0])
 
     print("== first-push + trailing flag -> flag forwarded intact ==")
     rc, out, err, pushes, _log = run(["feature/x", "--force-with-lease"])
@@ -520,7 +568,7 @@ def main():
     rc, out, err, pushes, _log = run([], cur_branch="feature/current")
     check("no-arg -> exit 0 (current-branch fallback)", rc == 0)
     check("no-arg pushes the symbolic-ref branch",
-          bool(pushes) and "origin refs/heads/feature/current:refs/heads/feature/current" in pushes[0])
+          bool(pushes) and "origin aaaa111:refs/heads/feature/current" in pushes[0])
 
     print("== #148 fast-forward (remote is ancestor of local) -> ADDITIVE, proceeds ==")
     rc, out, err, pushes, _log = run(["feature/x"], remote_sha="oldbbb222", mb_r_anc_l=0)
@@ -626,6 +674,7 @@ def main():
     receipt_stub_cases()
     real_git_cases()
     fix_round_1_cases()
+    pr486_round_1_cases()
 
     print()
     if FAILS:

@@ -815,10 +815,10 @@ recommendation still applies to the next PR.
 
 ## Step 7 -- Push
 
-Then push via the safe-push wrapper bundled with this plugin. It always pushes
-with `-u origin <branch>` and verifies the remote ref actually moved (guarding
-the pipe-swallow silent-failure mode), so the "no upstream yet" case needs no
-separate command:
+Then push via the safe-push wrapper bundled with this plugin. It pushes the
+branch's gated tip to `origin`, verifies the remote ref actually moved (guarding
+the pipe-swallow silent-failure mode), then records `origin/<branch>` as the
+upstream, so the "no upstream yet" case needs no separate command:
 
 ```bash
 # Literal helper path in every leg - see "Helper exec paths" at the top of this file.

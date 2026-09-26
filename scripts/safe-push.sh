@@ -127,7 +127,7 @@ if [ -n "$branch" ]; then
   # fallback); only a leading-dash first positional is rejected here. Legitimate
   # trailing flags in "$@" (e.g. `<branch> --force-with-lease`) are untouched.
   if [ "${branch#-}" != "$branch" ]; then
-    echo "safe-push: first arg must be a branch name; -u origin is added automatically." >&2
+    echo "safe-push: first arg must be a branch name; origin and the upstream are handled automatically." >&2
     echo "           Usage: safe-push.sh <branch> [extra git-push flags]" >&2
     exit 2
   fi
@@ -198,7 +198,7 @@ while [ "$#" -gt 0 ]; do
         echo "safe-push: $1 requires a value." >&2; exit 2
       fi
       push_args+=("$1" "$2"); shift 2 ;;
-    --all|--branches|--mirror|--tags|--delete|-d|--prune|--)
+    --all|--branches|--mirror|--tags|--follow-tags|--delete|-d|--prune|--)
       echo "safe-push: '$1' would push (or delete) refs other than '$branch', which nothing here checks; refused." >&2
       echo "           Usage: safe-push.sh <branch> [flags] - one branch per call." >&2
       exit 2 ;;
@@ -249,7 +249,10 @@ else
   holder=""
   n_holders=0
   wt_cur=""
-  wt_list=$(git worktree list --porcelain 2>/dev/null || true)
+  # An UNREADABLE list is not an empty one: treating it as "no holder" would fall back to the
+  # caller's receipt and skip the holder's dirty/mid-rebase checks (PR #486 review).
+  wt_list=$(git worktree list --porcelain 2>/dev/null) ||
+    receipt_refuse "cannot read 'git worktree list', so which worktree holds it (and its state) is unknown."
   while IFS= read -r wt_line; do
     case "$wt_line" in "worktree "*) wt_cur="${wt_line#worktree }" ;; esac
     if [ "$wt_line" = "branch refs/heads/$branch" ]; then
@@ -321,8 +324,10 @@ if not isinstance(t, str) or not re.fullmatch("[0-9a-fA-F]{40}", t):
 print(t.lower())' "$receipt" 2>/dev/null); then
     receipt_refuse "$(printf '%s' "${r_tree:-the receipt could not be checked}" | tr '\n' ' ')"
   fi
-  branch_tree=$(git rev-parse --verify --quiet "refs/heads/$branch^{tree}" 2>/dev/null || true)
-  [ -n "$branch_tree" ] || receipt_refuse "cannot resolve the tree of refs/heads/$branch."
+  # The tree of the SNAPSHOTTED tip ($local_sha), not a fresh read of the ref: the push below
+  # sends exactly $local_sha, so this is the tree that must match the receipt (PR #486 review).
+  branch_tree=$(git rev-parse --verify --quiet "$local_sha^{tree}" 2>/dev/null || true)
+  [ -n "$branch_tree" ] || receipt_refuse "cannot resolve the tree of refs/heads/$branch ($local_sha)."
   if [ "$r_tree" != "$branch_tree" ]; then
     receipt_refuse "STALE receipt: it gated tree $r_tree, but refs/heads/$branch is tree $branch_tree (the branch changed after the gate ran)."
   fi
@@ -503,9 +508,13 @@ push_status=0
 # FULL REFSPEC, NEVER THE BARE NAME (#466). A bare `git push origin <b>` resolves <b> as a SOURCE
 # ref, and a same-named TAG makes that ambiguous: git fails "src refspec <b> matches more than
 # one". refs/heads/<b>:refs/heads/<b> names exactly the branch this script classified and
-# verifies; -u still records the upstream (the source is a local branch), and a forwarded
-# --force-with-lease leases that same destination ref.
-if git push -u origin "refs/heads/$branch:refs/heads/$branch" ${push_args[@]+"${push_args[@]}"} >"$LOG" 2>&1; then
+# verifies, and a forwarded --force-with-lease leases that same destination ref.
+#
+# SOURCE = THE SNAPSHOTTED SHA (PR #486 review). Every gate above judged $local_sha; pushing the
+# NAME would send whatever the ref points at by the time git reads it, which a concurrent commit
+# can have moved to an ungated tip. An object-id source records no upstream, so tracking is set
+# explicitly below, only after the push is verified.
+if git push origin "$local_sha:refs/heads/$branch" ${push_args[@]+"${push_args[@]}"} >"$LOG" 2>&1; then
   push_status=0
 else
   push_status=$?
@@ -540,4 +549,10 @@ if [ "$remote_sha" != "$local_sha" ]; then
 fi
 
 echo "safe-push: verified origin/$branch -> $remote_sha" >&2
+# What `-u` used to record. Best-effort: the push is already verified, so a config write failure
+# is reported, never turned into a push failure.
+if ! { git config "branch.$branch.remote" origin &&
+       git config "branch.$branch.merge" "refs/heads/$branch"; } 2>/dev/null; then
+  echo "safe-push: note: pushed and verified, but could not record origin/$branch as the upstream." >&2
+fi
 exit 0
