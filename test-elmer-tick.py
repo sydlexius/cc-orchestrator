@@ -1484,27 +1484,54 @@ def _(env):
           and env.ls("drained") == [STEM + ".json", STEM + ".readmitted-501.json"])
 
 
-@case("#455 N2: a failed re-queue after the rename keeps the record and still posts nothing")
+def _shim(env, name, pattern):
+    # Root ignores file modes, so a write is failed with a PATH shim that refuses only
+    # the invocation whose arguments match `pattern` and defers to the real tool otherwise.
+    real = shutil.which(name)
+    with open(os.path.join(env.bin, name), "w") as f:
+        f.write(f'#!/usr/bin/env bash\ncase "$*" in {pattern}) exit 1 ;; esac\nexec "{real}" "$@"\n')
+    os.chmod(os.path.join(env.bin, name), 0o755)
+
+
+@case("#455 N2: a failed re-queue restores the record, posts nothing, and the next tick retries")
 def _(env):
-    # The hold-off must cover the window AFTER the commit-point rename and BEFORE the
-    # inbox write: set only on a successful re-queue, this tick would post the other
-    # queued entry on a quota that a countdown-less rate-limit reads as clear.
-    # Root ignores file modes, so the inbox write is failed with a jq shim that
-    # refuses only the re-queue filter (it alone names readmitted_from).
-    real_jq = shutil.which("jq")
-    with open(os.path.join(env.bin, "jq"), "w") as f:
-        f.write('#!/usr/bin/env bash\ncase "$*" in *readmitted_from*) exit 1 ;; esac\n'
-                f'exec "{real_jq}" "$@"\n')
-    os.chmod(os.path.join(env.bin, "jq"), 0o755)
+    # The hold-off must cover the window AFTER the commit-point rename: set only on a
+    # successful re-queue, this tick would post the other queued entry on a quota that
+    # a countdown-less rate-limit reads as clear. The jq shim fails only the re-queue
+    # filter (it alone names readmitted_from).
+    _shim(env, "jq", "*readmitted_from*")
+    _record(env)
+    env.queue(999)
+    comments = _comments((501, "coderabbitai[bot]", -115, RL_BODY))
+    r = env.run(GH_QUOTA=0, GH_COMMENTS=comments)
+    check("exit 0", r.returncode == 0)
+    check("warns the record was restored for retry", "restored " + STEM + ".json for retry" in r.stderr)
+    check("record restored under its original name",
+          STEM + ".json" in env.ls("drained")
+          and not any(".readmitted-" in n for n in env.ls("drained")))
+    check("the rate-limited entry is not in the inbox", STEM + ".json" not in env.ls("inbox"))
+    check("posted nothing (hold-off)", env.posts == [])
+    os.remove(os.path.join(env.bin, "jq"))
+    r2 = env.run(GH_QUOTA=0, GH_COMMENTS=comments)
+    check("next tick re-admits the same evidence", "RE-ADMITTED" in r2.stdout
+          and STEM + ".readmitted-501.json" in env.ls("drained")
+          and STEM + ".json" in env.ls("inbox"))
+    check("and still posts nothing that tick", env.posts == [])
+
+
+@case("#455 N2: re-queue AND restore both fail -> renamed record kept, manual warning, no post")
+def _(env):
+    _shim(env, "jq", "*readmitted_from*")
+    _shim(env, "mv", "*.readmitted-*.json\\ *")
     _record(env)
     env.queue(999)
     r = env.run(GH_QUOTA=0, GH_COMMENTS=_comments((501, "coderabbitai[bot]", -115, RL_BODY)))
     check("exit 0", r.returncode == 0)
-    check("warns the re-queue failed", "could not re-queue it" in r.stderr)
+    check("warns to re-enqueue by hand", "could not re-queue or restore it" in r.stderr)
     check("renamed record kept in drained/",
           STEM + ".readmitted-501.json" in env.ls("drained")
           and STEM + ".json" not in env.ls("drained"))
-    check("the rate-limited entry is not in the inbox", STEM + ".json" not in env.ls("inbox"))
+    check("nothing re-queued", STEM + ".json" not in env.ls("inbox"))
     check("posted nothing (hold-off)", env.posts == [])
 
 

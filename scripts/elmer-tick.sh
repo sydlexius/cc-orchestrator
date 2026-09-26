@@ -501,7 +501,9 @@ posts_last_hour() {
 # names a record is consumed, and a PR+SHA that already has a *.readmitted-* record is
 # never re-admitted again (a second rate-limit leaves it drained). The rename
 # happens BEFORE the inbox write, so every crash window loses the request (the
-# pre-#455 state) rather than posting twice.
+# pre-#455 state) rather than posting twice. A FAILED inbox write (not a crash)
+# renames the record back, so the next tick retries it; the tick that failed still
+# posts nothing.
 #
 # Candidates are bounded so a growing audit trail costs no gh reads: only records
 # inside the trailing hour, and only the NEWEST record for its repo+PR (an older one
@@ -554,7 +556,13 @@ readmit_one() {
     { echo "elmer-tick: RE-ADMITTED $repo #$pr at ${sha:0:12} (CodeRabbit comment $ev: Review rate limited.)"; } || true
   else
     rm -f "$tmp" 2>/dev/null || true
-    { echo "elmer-tick: WARNING - marked $dest re-admitted but could not re-queue it; re-enqueue by hand."; } >&2 || true
+    # Undo the commit point so a later tick retries the same evidence rather than
+    # losing the request. READMITTED stays set, so this tick still posts nothing.
+    if mv "$dest" "$f" 2>/dev/null; then
+      { echo "elmer-tick: WARNING - could not re-queue $repo #$pr; restored ${f##*/} for retry."; } >&2 || true
+    else
+      { echo "elmer-tick: WARNING - marked $dest re-admitted but could not re-queue or restore it; re-enqueue by hand."; } >&2 || true
+    fi
   fi
 }
 

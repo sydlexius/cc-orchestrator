@@ -424,7 +424,8 @@ Runtime (`scripts/`; canonical source is this repo):
   cap STILL counts the post, freeing the name so enqueue (exact-name check) no longer reads it as
   ALREADY TRIGGERED. AT MOST ONCE PER PR+SHA: a countdown-less rate-limit reads as a CLEAR quota,
   so re-admitting on each new reply looped the whole hourly budget into an active limit; and the
-  re-admitting tick posts nothing. No reply, other text, an unparseable bot timestamp, or a gh read
+  re-admitting tick posts nothing. A failed re-queue renames the record back so the next tick
+  retries (that tick still posts nothing). No reply, other text, an unparseable bot timestamp, or a gh read
   failure leaves it drained. The trigger is a FIXED literal, never
   composed from entry data. Exit 0 for every no-op (empty queue, throttled, cap spent, lock held -
   a timer-driven loop must not read those as failure), 1 for a refused entry (left queued), 2 for
