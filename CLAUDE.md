@@ -352,10 +352,15 @@ Runtime (`scripts/`; canonical source is this repo):
   silently misses the other ("your next review will be available in N" vs "your next INCLUDED
   review will be available in N"); durations are always RELATIVE and real messages include a
   SINGULAR "1 minute." and a different unit "4 seconds.", so a naive `(\d+) minutes` breaks. The
-  NEWEST signal wins outright and its deadline is computed from that comment's OWN timestamp,
-  because CR's limits are adaptive and the countdown is NON-MONOTONIC (53 minutes, then 51 minutes
-  an hour LATER) - counting down locally from an old reading is wrong by construction. A gh read
-  failure exits 2, NEVER 0: reporting "no limit" because the read failed is a false all-clear.
+  match is case-insensitive with "will be" optional (#454: CR's summary banner reads "Next included
+  review available in N"). Each deadline is computed from that comment's OWN timestamp, because
+  CR's limits are adaptive and the countdown is NON-MONOTONIC (53 minutes, then 51 minutes an hour
+  LATER) - counting down locally from an old reading is wrong by construction. A LIMIT is dated by
+  `updated_at` (CR edits its summary in place), an "available now" only by `created_at`, and among
+  limits newer than the newest "available" the LARGEST deadline wins: an unrelated edit can move
+  `updated_at`, so "newest signal wins" let an edited old comment outrank a live longer limit
+  (#454 review). Every tie-break fails toward "limited" (fewer posts). A gh read OR jq failure
+  exits 2, NEVER 0: reporting "no limit" because the read failed is a false all-clear.
   Only `coderabbitai[bot]` counts, and the matcher demands CR's exact relative-duration shape -
   the retired Codoki used an ABSOLUTE UTC timestamp and transcripts are full of them. CEILING (a
   product decision, not a parser gap): CR publishes a COUNTDOWN only once the limit is ALREADY
