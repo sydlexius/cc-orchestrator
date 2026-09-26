@@ -559,7 +559,7 @@ it sets the DEPTH of the review that always runs; it never blocks the push.
 
 **Why this is tiered (#287).** The old detector keyed on a flat basename set
 (`orchestrate-guard|orchestrate-steer|orchestrate-authorize-merge`) and demanded the FULL
-K=2 loop for all three. But `orchestrate-guard.sh` is the DENY AUTHORITY (a defect there
+K=2 dry-round loop (a rule since retired for verdict-driven rounds) for all three. But `orchestrate-guard.sh` is the DENY AUTHORITY (a defect there
 permits a bad push or merge), while `orchestrate-steer.sh` is ADVISORY -- it exits 0 on
 every path and cannot block a single tool call, so a defect there is a wrong or missing
 NUDGE. Giving them identical ceremony cost a ~50-minute, 10-round loop on an advisory
@@ -579,7 +579,7 @@ hook_hits=$(git diff -M --name-status "$base"..HEAD | \
 #
 # Deliberately NOT keyed on "touches orchestrate-setup.py": that was tried and it is TOO BROAD --
 # setup.py carries the hook WIRING but is edited by plenty of benign changes (PR #286 touched it only
-# to add a matcher), so keying on it re-tiers an advisory diff back to K=2 and re-creates the exact
+# to add a matcher), so keying on it re-tiers an advisory diff to deny-authority depth, the over-strictness behind the
 # 50-minute loop this tiering exists to prevent. Over-strictness that defeats the feature is still a bug.
 new_hook=$(git diff -M --name-status "$base"..HEAD | \
   grep -E '^A.*scripts/orchestrate-.*\.(sh|py)$' || true)
@@ -665,22 +665,26 @@ fi
 echo ">> RIGOR TIER: $tier"
 [ -n "$hook_hits" ] && printf '%s\n' "$hook_hits" | sed 's/^/   - /'
 case "$tier" in
-  deny-authority) echo "   -> FULL engage-ralph-loop, K=2 convergence (a defect here can permit a bad push/merge)." ;;
-  advisory)       echo "   -> ONE multi-lens pass + ONE fix-scoped verify round (hook proven exit-0/no-stdout: it cannot block anything)." ;;
-  standard)       echo "   -> ONE multi-lens pass." ;;
+  deny-authority) echo "   -> FULL multi-lens engage-ralph-loop pass per round, with a permit/deny differential (a defect here can permit a bad push/merge)." ;;
+  advisory)       echo "   -> Verify the advisory property on the post-diff file, then ONE multi-lens pass per round (it cannot block anything)." ;;
+  standard)       echo "   -> ONE multi-lens pass per round." ;;
 esac
-echo "   -> ESCALATE to the full loop on ANY Critical/Important finding, whatever the tier."
+echo "   -> Each round ends SHIP / SHIP WITH FIXES (review ends) or DO NOT SHIP (another round over the fix diff)."
 ```
 
 Run Step 4a's review at the tier printed above, per `engage-ralph-loop.md`:
 
-- **deny-authority** -> the FULL loop to K=2 dry rounds.
-- **advisory** / **standard** -> ONE pass with the lenses run IN PARALLEL (correctness-safety /
-  test-vacuity / doc-truth / adversarial-input), plus -- for advisory -- one HOSTILE, FIX-SCOPED
-  verify round over the fix diff (the fixes are new unreviewed code; that is where the
-  longest-surviving defects come from).
-- **ANY tier**: a Critical or Important finding ESCALATES the diff to the full loop. The fast path
-  is therefore taken only on diffs that come back clean, which is exactly where it is free.
+- **deny-authority** -> each round is the FULL multi-lens pass through the ISOLATION harness,
+  including an old-vs-new permit/deny differential.
+- **advisory** / **standard** -> each round is ONE pass with the lenses run IN PARALLEL
+  (correctness-safety / test-vacuity / doc-truth / adversarial-input); for advisory, first verify
+  the advisory property on the post-diff file.
+- **ANY tier**: every round ends with SHIP, SHIP WITH FIXES, or DO NOT SHIP. SHIP / SHIP WITH
+  FIXES END review (apply the fixes, re-run the gates green). DO NOT SHIP earns another HOSTILE,
+  FIX-SCOPED round over `<pre-fix HEAD>..HEAD` (the fixes are new unreviewed code; that is where
+  the longest-surviving defects come from), widened where the fix reaches a shared helper or
+  contract. A Critical/Important finding is DO NOT SHIP, except that below the deny-authority tier a trivially mechanical fix may ride SHIP WITH FIXES (the lead may upgrade); the lead may upgrade a
+  verdict to DO NOT SHIP, never downgrade it.
 
 Cap every tier at MAX_ROUNDS (default 6): the cap is a BUDGET ALARM, never "ship anyway" -- on
 hitting it, STOP and surface the rounds run, the findings fixed, the lens classes NOT yet probed,
@@ -947,7 +951,7 @@ declares. The mapping below reflects this repo's template
 |------|---------------|
 | Gate command (shellcheck / ruff / self-tests / `test-*.py`) | That command ran in the detected Step 2 gate block and passed |
 | Security-floor TDD item | The diff touches the guard AND harness cases were added/updated before the change; else leave `[ ]` (or delete the whole section if the guard is untouched) |
-| Adversarial-critic pass | Step 4a's hostile review ran and converged; else `[ ]` |
+| Adversarial-critic pass | Step 4a's hostile review ran and its final round's verdict was SHIP or SHIP WITH FIXES (fixes applied); else `[ ]` |
 | No trigger substrings on Bash lines | Confirmed no `git push`/`main`/`gh pr merge`/etc. payloads on command lines (payloads stay in fixtures); else `[ ]` |
 
 For a repo with a different template (UI screenshots, UAT, OpenAPI, `templ
