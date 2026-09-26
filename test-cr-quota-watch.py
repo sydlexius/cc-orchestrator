@@ -489,6 +489,17 @@ def main():
                                                       created=ago(minutes=2))))
     check("singular '1 review is currently available' -> exit 0 (clear), says 1 included review",
           rc == 0 and "1 included review available" in out)
+    # A POSITIVE count is an AVAILABLE signal, dated by created_at only (454-F1): an old
+    # '9 available' summary edited 1m ago (an unrelated edit leaving the count stale) must not
+    # outrank a limit that arrived AFTER the banner was written. A ZERO count stays dated by
+    # updated_at (the #454 LIMITED rule), which the first banner case above pins.
+    fresh = comment(RL_TEMPLATE.format(dur="59 minutes"), created=ago(minutes=5))
+    old_pos = comment(BANNER_A.format(n="9 reviews are", al="10 reviews"),
+                      created=ago(minutes=90), updated=ago(minutes=1))
+    for order, objs in [("banner last", (fresh, old_pos)), ("banner first", (old_pos, fresh))]:
+        rc, out, err = run(["1", "owner/repo"], comments=comments_json(*objs))
+        check(f"edited old '9 available' banner vs fresh 59m limit ({order}) -> LIMITED ~54m",
+              rc == 1 and "54m" in (out + err))
 
     print("== #456: account-wide scan across recently updated PRs ==")
     live = comments_json(comment(RL_TEMPLATE.format(dur="30 minutes"), created=ago(minutes=1)))

@@ -404,8 +404,9 @@ Runtime (`scripts/`; canonical source is this repo):
   publish a REMAINING-SLOT COUNT (survey 2026-09-26, 488 PRs / 12 repos, the MAJORITY form): the
   summary banner "Included review availability: N reviews are currently available ... allowance
   at A per hour" (older form "... up to A included review per hour; N remain"). A ZERO count has
-  NO countdown and takes the UNKNOWN path (LIMITED, 1h ceiling); N>0 is an "available" signal
-  dated by `updated_at`. The count is only as fresh as CR's last summary edit, and with no banner
+  NO countdown and takes the UNKNOWN path (LIMITED, 1h ceiling, dated by `updated_at`); N>0 is an
+  "available" signal dated by `created_at` ONLY, like "available now", since an unrelated edit
+  can move `updated_at` without refreshing the count. The count is only as fresh as CR's last summary edit, and with no banner
   or countdown in the scan "no announced limit" still means EITHER plenty of budget OR one review
   from the wall.
 - `scripts/elmer-enqueue.sh` - the RECEIPT-GATED queue writer for the unattended review requester

@@ -245,7 +245,8 @@ PFX='next (?<inc>included )?review (?:will be )?available in'
 #            per hour; 0 remain after this review."
 # A ZERO count means the included allowance is EXHAUSTED with NO countdown anywhere, so it
 # takes the UNKNOWN-deadline path (LIMITED, 1h ceiling); it used to read as "no limit".
-# N > 0 is newer evidence of budget: an "available" signal at its timestamp.
+# N > 0 is evidence of budget: an "available" signal dated by `created_at` ONLY, like
+# "Reviews are available now" above (an edit can move `updated_at` without refreshing N).
 BAN='included review availability:[* ]*(?:(?<n1>[0-9]+) reviews? (?:is|are) currently available\.(?:[^\n]*?allowance at (?<a1>[0-9]+) reviews? per hour)?|your plan provides up to (?<a2>[0-9]+) included reviews? per hour; *(?<n2>[0-9]+) remains? after this review)'
 TERM='[0-9]+ (?:second|minute|hour)s?'
 RX="$PFX (?<dur>$TERM(?:(?:, and |, | and )$TERM)*)\\."
@@ -278,8 +279,11 @@ if ! signal="$(printf '%s' "$comments" | jq -r --arg login "$CR_LOGIN" --arg rx 
       elif ($b | test($ban; "i")) and $t != null then
         ($b | capture($ban; "i")) as $m
         | (($m.n1 // $m.n2) | tonumber) as $n
-        | { kind: (if $n == 0 then "limited" else "available" end), t: $t,
-            deadline: (if $n == 0 then $t + $ceil else $t end), unknown: ($n == 0),
+        # A zero count is LIMITED (dated by updated_at); a positive count is AVAILABLE, and
+        # an edit never re-asserts availability, so it is dated by created_at only.
+        | (if $n == 0 then $t else ($tc // $t) end) as $bt
+        | { kind: (if $n == 0 then "limited" else "available" end), t: $bt,
+            deadline: (if $n == 0 then $t + $ceil else $bt end), unknown: ($n == 0),
             raw: "\($n) included review\(if $n == 1 then "" else "s" end) available, allowance \(($m.a1 // $m.a2) // "?")/hour",
             src: $src, noun: "included review" }
       elif ($b | test($pfx; "i")) and $t != null then
