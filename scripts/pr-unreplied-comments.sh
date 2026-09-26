@@ -474,7 +474,13 @@ build_coverage_advisory() {
   # exits 5 on). Reverting the type check alone changed nothing observable; reverting
   # the select-guard alone broke 6 cases. Two guards where one suffices is the same
   # dead-code-that-reads-as-safety trap as the removed check-run type guard below.
-  issue_comments=$(gh api "repos/$repo/issues/$pr_number/comments" --paginate 2>/dev/null || echo '[]')
+  #
+  # #468: `--paginate` emits one JSON array PER PAGE, not one merged array. Flatten
+  # ONCE here (`jq -s 'add // []'`) so a multi-page comment set is never silently
+  # reduced to page 1 (jq reads only the first top-level document by default) and so
+  # a page-2+ garbage/HTML body (the #316 concern above) fails the WHOLE pipeline
+  # under pipefail -> falls to the `|| echo '[]'` branch, rather than concatenating.
+  issue_comments=$(gh api "repos/$repo/issues/$pr_number/comments" --paginate 2>/dev/null | jq -s 'add // []' 2>/dev/null || echo '[]')
   codecov_comment=$(echo "$issue_comments" | jq '[.[] | select(.user.login == "codecov[bot]")] | sort_by(.created_at) | last // empty' 2>/dev/null || echo "")
 
   if [ -z "$codecov_comment" ] || [ "$codecov_comment" = "null" ]; then
@@ -759,7 +765,10 @@ if [ "$audit_mode" = true ]; then
   threads_json=$(jq -n --argjson nodes "$audit_thread_nodes" \
     '{data:{repository:{pullRequest:{reviewThreads:{nodes:$nodes}}}}}')
 
-  issue_comments_audit=$(gh api "repos/$repo/issues/$pr_number/comments" --paginate 2>/dev/null) || {
+  # #468: flatten the per-page arrays ONCE (pipefail propagates a gh OR jq failure
+  # to the `||` fail-closed branch below; audit mode must never read a truncated
+  # page-1-only set as complete coverage).
+  issue_comments_audit=$(gh api "repos/$repo/issues/$pr_number/comments" --paginate 2>/dev/null | jq -s 'add // []') || {
     echo "audit: could not fetch issue comments for PR #$pr_number ($repo)" >&2
     exit 2
   }
@@ -988,7 +997,10 @@ fi
 # "Pull request overview" body (#374), so such a body is admitted when -- and only
 # when -- it carries that block; an overview with no findings is still a pure
 # summary and stays excluded.
-all_reviews=$(gh api "repos/$repo/pulls/$pr_number/reviews" --paginate)
+# #468: `--paginate` emits one array PER PAGE; flatten ONCE here so every reader
+# below (review_bodies_raw, the SUPPRESSED-FORMAT canary, blocking_reviews, the
+# STALE-ADVISORY reviews scan) sees a single merged array instead of only page 1.
+all_reviews=$(gh api "repos/$repo/pulls/$pr_number/reviews" --paginate | jq -s 'add // []')
 
 if [ "$full_mode" = true ]; then
   rb_body_expr='.body'
@@ -1102,7 +1114,11 @@ trap 'rm -rf "$_rb_tmpdir"' EXIT
 echo "$review_bodies_raw" > "$_rb_tmpdir/reviews.json"
 echo "$all_comments"      > "$_rb_tmpdir/comments.json"
 echo "$unreplied_ids"     > "$_rb_tmpdir/unreplied.json"
-gh api "repos/$repo/issues/$pr_number/comments" --paginate 2>/dev/null > "$_rb_tmpdir/issue_comments.json" || echo '[]' > "$_rb_tmpdir/issue_comments.json"
+# #468: flatten with `jq -s 'add // []'` BEFORE writing the file. --slurpfile below
+# reads every top-level JSON value in the file into an array and the query takes
+# `$issue_comments[0]` -- an unflattened multi-page write (one array PER PAGE) put
+# page 1 at [0] and every later page at [1], [2], ... silently dropped by that index.
+gh api "repos/$repo/issues/$pr_number/comments" --paginate 2>/dev/null | jq -s 'add // []' > "$_rb_tmpdir/issue_comments.json" || echo '[]' > "$_rb_tmpdir/issue_comments.json"
 
 review_bodies=$(jq -n \
   --slurpfile reviews        "$_rb_tmpdir/reviews.json" \
@@ -1251,7 +1267,9 @@ if [ "$review_body_findings" -gt 0 ]; then
 fi
 
 # 3. Issue-level comments (skip auto-generated summaries)
-issue_comments=$(gh api "repos/$repo/issues/$pr_number/comments" --paginate)
+# #468: flatten the per-page arrays ONCE here so both readers below
+# (actionable_issue and the STALE-ADVISORY issue-comment scan) see every page.
+issue_comments=$(gh api "repos/$repo/issues/$pr_number/comments" --paginate | jq -s 'add // []')
 
 if [ "$full_mode" = true ]; then
   ic_body_expr='.body'

@@ -1757,6 +1757,93 @@ def main():
     rc, out, err = run(["--count-only", "--allow-stale"], reviews=PROSE_CLOSER, issue=ACK_422)
     check("#422: --count-only is 0 once acked", out.strip() == "0")
 
+    print("== #468 --paginate multi-page flatten (reviews, issue comments) ==")
+    # `--paginate` emits one JSON array PER PAGE, concatenated -- not one merged
+    # array. Split CR_TWO_SUBMISSIONS (two review objects) across two pages the
+    # same way the #332 CR-CONCERN test above splits `inline`, and confirm every
+    # mode reports the SAME numbers as the equivalent single-page fixture.
+    _revs = json.loads(CR_TWO_SUBMISSIONS)
+    reviews_paged = json.dumps(_revs[:1]) + "\n" + json.dumps(_revs[1:])
+
+    rc_p, out_p, _ = run(["--allow-stale"], reviews=reviews_paged)
+    rc_1, out_1, _ = run(["--allow-stale"], reviews=CR_TWO_SUBMISSIONS)
+    check("default mode: two-page reviews == one-page reviews (11 findings)",
+          findings_count(out_p) == 11 and findings_count(out_p) == findings_count(out_1))
+    check("default mode: two-page reviews exit 0 (no abort)", rc_p == 0 and rc_p == rc_1)
+
+    rc_p, out_p, _ = run(["--count-only"], reviews=reviews_paged)
+    rc_1, out_1, _ = run(["--count-only"], reviews=CR_TWO_SUBMISSIONS)
+    check("--count-only: two-page reviews == one-page reviews", (rc_p, out_p) == (rc_1, out_1))
+
+    rc_p, out_p, _ = run(["--itemized", "--allow-stale"], reviews=reviews_paged)
+    check("--itemized: two-page reviews -> BOTH review-body lines present (page-2 review not dropped)",
+          out_p.count("review-body |") == 2)
+
+    # A bot finding on issue-comments PAGE 2 must still be counted in every mode
+    # that reads issue comments -- not silently reduced to page 1 (the reported
+    # `--slurpfile` + `$all_comments[0]` and `--argjson`-on-multi-doc defects).
+    ISSUE_PAGE2_FINDING = (
+        '[{"id":701,"user":{"login":"codoki-pr-intelligence[bot]"},'
+        '"created_at":"2026-06-18T01:00:00Z","updated_at":"2026-06-18T01:00:00Z",'
+        '"body":"### Codoki PR Review\\nHigh: something"}]'
+    )
+    issue_paged = "[]\n" + ISSUE_PAGE2_FINDING
+
+    rc_p, out_p, _ = run(["--allow-stale"], issue=issue_paged)
+    rc_1, out_1, _ = run(["--allow-stale"], issue=ISSUE_PAGE2_FINDING)
+    check("default mode: page-2 issue-level finding is counted (not dropped)",
+          "Actionable issue-level bot comments: 1" in out_p)
+    check("default mode: two-page issue == one-page issue (exit code)", rc_p == rc_1)
+
+    rc_p, out_p, _ = run(["--count-only"], issue=issue_paged)
+    rc_1, out_1, _ = run(["--count-only"], issue=ISSUE_PAGE2_FINDING)
+    check("--count-only: page-2 issue-level finding counted, matches one-page fixture",
+          (rc_p, out_p) == (rc_1, out_1))
+
+    rc_p, out_p, _ = run(["--itemized", "--allow-stale"], issue=issue_paged)
+    check("--itemized: page-2 issue-level finding -> 'issue-level |' line present",
+          any(ln.startswith("issue-level |") for ln in out_p.splitlines()))
+
+    # --audit reads issue comments too (informational summaries); a page-2
+    # Codoki summary must be enumerated, not silently dropped.
+    codoki_summary_page2 = ("[]\n"
+        '[{"user":{"login":"codoki-pr-intelligence[bot]"},"body":"Review Status: Safe",'
+        '"created_at":"x","updated_at":"x"}]')
+    rc_p, out_p, _ = run(["--audit"], graphql=g_ok, issue=codoki_summary_page2)
+    check("--audit: page-2 Codoki summary is enumerated (not dropped)",
+          "codoki-pr-intelligence[bot]" in out_p)
+    check("--audit: page-2 summary does not flip exit (still 0, informational)", rc_p == 0)
+
+    # --coverage-only reads issue comments too (build_coverage_advisory), picking the
+    # LATEST codecov[bot] comment by created_at. Two DIFFERENT codecov comments split
+    # across pages: without a flatten, jq (no -s) runs the filter separately PER
+    # DOCUMENT, so "latest of one" is picked on EACH page and both survive into the
+    # body-extraction step -- the OLDER one's percentage then wins (first match) unless
+    # the pages are merged first.
+    CODECOV_OLD = ('[{"id":551,"user":{"login":"codecov[bot]"},"created_at":"2026-07-05T00:00:00Z",'
+                   '"body":"Patch coverage is `50.00000%` with `8 lines` missing coverage."}]')
+    CODECOV_NEW = ('[{"id":556,"user":{"login":"codecov[bot]"},"created_at":"2026-07-07T00:00:00Z",'
+                   '"body":"Patch coverage is `90.00000%` with `1 lines` missing coverage."}]')
+    codecov_one_page = json.dumps(json.loads(CODECOV_OLD) + json.loads(CODECOV_NEW))
+    codecov_two_pages = CODECOV_OLD + "\n" + CODECOV_NEW
+    rc_p, out_p, _ = run(["--coverage-only"], issue=codecov_two_pages, check_runs=CR_PATCH_PASS)
+    rc_1, out_1, _ = run(["--coverage-only"], issue=codecov_one_page, check_runs=CR_PATCH_PASS)
+    check("--coverage-only: two-page codecov comments -> picks the LATEST (90%), matching one-page",
+          out_p == out_1 and rc_p == rc_1
+          and json.loads(out_p).get("patch_pct") == 90.0)
+
+    # The ack-by-review-id channel (#289) reads issue comments via a THIRD fetch site
+    # (the tmpdir/--slurpfile path); an ack comment on issue-comments PAGE 2 must still
+    # clear the outside-diff review-body finding. `ACK` is redefined later in this
+    # function (the #374 suppressed-ack case), so build the ack fixture inline here
+    # rather than reuse the name.
+    ACK_468 = ('[{"id":9001,"user":{"login":"testuser"},"created_at":"2026-06-18T03:00:00Z",'
+               '"body":"Fixed in abc1234. Acking CR review 4680966542."}]')
+    ack_page2 = "[]\n" + ACK_468
+    rc_p, out_p, _ = run(["--count-only"], reviews=OUTSIDE_ONLY, issue=ack_page2)
+    check("--count-only: page-2 ack-by-review-id comment still clears the finding (count 0)",
+          rc_p == 0 and out_p.strip() == "0")
+
     print()
     if FAILS:
         print(f"FAILED ({len(FAILS)}):"); [print("  - " + f) for f in FAILS]; sys.exit(1)
