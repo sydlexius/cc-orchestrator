@@ -63,7 +63,7 @@ Runtime (`scripts/`; canonical source is this repo):
   Enables in-session merge (no separate terminal) without teaching the floor network I/O. Its only
   write is the local token; no gh/git remote mutation, no allow-list/floor change.
 - `scripts/orchestrate-steer.sh` - the advisory WARN-level steering hook (#95), SEPARATE from the
-  deny-floor guard. Exit 0 ALWAYS (never blocks); emits a `STEER:` nudge to stderr on six rules:
+  deny-floor guard. Exit 0 ALWAYS (never blocks); emits a `STEER:` nudge to stderr on seven rules:
   (1) a marker-gated mid-run edit of a canonical file -> log feedback instead (gated OFF for a `Read`
   so wiring the hook for Read never nags a reader). CANONICAL = SKILL.md/templates/guard/steer PLUS
   (#284) the Option-A-DEPLOYED helpers (`safe-push.sh`, `pr-*.sh`, `gh-*.sh`, `gate-runner.py`,
@@ -103,7 +103,19 @@ Runtime (`scripts/`; canonical source is this repo):
   fires inside `bash -c`/`$(...)`, through a QUOTED script path (a prose quote ending in
   `/safe-push.sh` re-exposes the name) and common wrappers (`timeout 60`, `nice`, `sudo -E`,
   `bash -x`, `/bin/bash`), while comments and quoted prose stay silent. Without `pipefail` a
-  pipeline returns the LAST command's exit, so `safe-push.sh b 2>&1 | tail` reads a refused push as 0.
+  pipeline returns the LAST command's exit, so `safe-push.sh b 2>&1 | tail` reads a refused push as 0;
+  (7) an EXPENSIVE GATE PROFILE (#343, OPT-IN) -> run the fast compile/vet step first: a repo declares
+  its profile var(s) in `.gates.toml` `[steer] expensive_profile_env`, and a clause setting one to a
+  value other than empty/`0` - bare, or as the WHOLE quoted word (`VAR="0"`, `VAR=''` are off; a mixed
+  `VAR=0""` or `VAR="$V"` counts as set) - via `VAR=1 cmd`, `env VAR=1 cmd`, an earlier `export VAR=1`, on a gate
+  (`gate-runner.py`, `pre-push-hook.sh`) or upload (`safe-push.sh`, `git push`) at command position
+  warns; an upload at a HEAD with a passing `/prep-pr` receipt is named a DOUBLE SPEND. Same clause
+  split as (2)/(3)/(6). Undeclared -> silent; the declaration is read (one `python3` tomllib fork, so
+  rule 7 needs python3 >= 3.11 like gate-runner; without tomllib it is silent and `--self-test` SKIPS it)
+  only after a fork-free `=`-plus-gate-word prefilter AND a fork-free check that `.gates.toml` names
+  the key at all (a non-opted-in repo never forks). Accepted false positives: `export -n VAR=1; <gate>`
+  and `export VAR=1 | <gate>` (the var never reaches the gate). Concurrent-gate lock detection was SKIPPED:
+  gate-runner takes no lock and a consumer's lock has no declared path, so no cheap deterministic test.
   Wired for Edit/Write/Bash/Read/Agent PreToolUse by `configure` (deployed Option-A like the guard).
   The `Agent` matcher is LOAD-BEARING, not cosmetic: without it the hook is never invoked on a spawn
   and rule (5) is DEAD CODE that fails open silently. Never duplicates

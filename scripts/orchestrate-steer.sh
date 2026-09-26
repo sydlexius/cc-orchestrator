@@ -47,6 +47,19 @@
 #       `safe-push.sh b 2>&1 | tail -5` reports a refused push as 0 (observed 3x downstream). Uses
 #       the same frame-scoped clause split as rules 2/3, so it fires inside `bash -c '...'` and
 #       `$(...)`, while `||`, a `#` comment and quoted prose stay silent. Marker-independent.
+#   (7) EXPENSIVE GATE PROFILE (#343, OPT-IN): a clause setting a var the repo DECLARES in
+#       `.gates.toml` (`[steer] expensive_profile_env`) to a value other than empty/0 - `VAR=1 cmd`,
+#       `env VAR=1 cmd`, or an earlier `export VAR=1` - on a gate (gate-runner.py, pre-push-hook.sh)
+#       or upload (safe-push.sh, git push) at command position -> WARN: fast compile step first. An
+#       upload at a HEAD holding a passing /prep-pr receipt is named as a DOUBLE SPEND. Same clause
+#       split as rules 2/3/6. No declaration -> silent. RESIDUALS (silent or accepted): the var
+#       reaching a gate only through `bash -c` from an outer prefix; a `cd` inside the command (the
+#       repo is taken from the payload cwd). A value is OFF when it is empty or `0`, bare or as the
+#       whole of one quoted word (`VAR="0"`, `VAR=""`, `VAR=$'0'`); a MIXED word (`VAR=0""`) or an
+#       expansion (`VAR="$V"`) counts as set. ACCEPTED FALSE POSITIVES (warn, the var never reaches
+#       the gate): `export -n VAR=1; <gate>` (un-exports) and `export VAR=1 | <gate>` (the export
+#       runs in a pipeline subshell). Needs python3 >= 3.11 (tomllib, as gate-runner.py does);
+#       without it the declaration is unreadable and the rule is silent.
 #   (4) REDUNDANT RE-READ -> WARN (#226): a 2nd+ `Read` of a path already read THIS session with an
 #       unchanged mtime+size -> WARN: the content is already in context, skip the Read. Stateful
 #       (per-session, keyed on the stdin session_id), marker-independent, advisory only. The valid
@@ -148,8 +161,35 @@ if [ "${1:-}" = "--self-test" ]; then
       st_fail="read-dedup rule (mktemp -d failed; sub-check could not run)"
     fi
   fi
+  # (7) expensive gate profile (#343): a fixture repo declaring SW_X warns on SW_X=1 + a gate and is
+  # silent on SW_X=0; the same command in an UNdeclared repo is silent (opt-in). Rule 7 reads the
+  # declaration with tomllib (python3 >= 3.11, the same floor as gate-runner.py): without it the rule
+  # is silent everywhere by design, so the warn case is SKIPPED (noted), never FAILED.
+  st_x7=""
+  if [ -z "$st_fail" ] && ! python3 -c 'import tomllib' >/dev/null 2>&1; then
+    st_x7=" (rule 7 SKIPPED: python3 tomllib unavailable, needs >= 3.11)"
+  elif [ -z "$st_fail" ]; then
+    st_tmp=$(mktemp -d 2>/dev/null) || st_tmp=""
+    if [ -n "$st_tmp" ] && mkdir -p "$st_tmp/r/.git" "$st_tmp/u/.git" 2>/dev/null \
+        && printf '[steer]\nexpensive_profile_env = ["SW_X"]\n' > "$st_tmp/r/.gates.toml"; then
+      for st_case in "r:1:SW_X=1 python3 gate-runner.py" "r:0:SW_X=0 python3 gate-runner.py" \
+          "u:0:SW_X=1 python3 gate-runner.py" "r:0:SW_X=\"0\" python3 gate-runner.py"; do
+        st_dir=${st_case%%:*}; st_want=${st_case#*:}; st_cmd=${st_want#*:}; st_want=${st_want%%:*}
+        st_payload=$(jq -cn --arg c "$st_cmd" --arg w "$st_tmp/$st_dir" \
+          '{tool_name:"Bash",cwd:$w,tool_input:{command:$c}}' 2>/dev/null) \
+          || { st_fail="expensive-profile rule (jq unavailable)"; break; }
+        st_out=$(printf '%s' "$st_payload" | "$0" 2>&1); st_rc=$?
+        st_got=0; printf '%s' "$st_out" | grep -q 'STEER' && st_got=1
+        { [ "$st_rc" -eq 0 ] && [ "$st_got" = "$st_want" ]; } \
+          || { st_fail="expensive-profile rule '$st_case' (rc=$st_rc out=$st_out)"; break; }
+      done
+    else
+      st_fail="expensive-profile rule (fixture setup failed; sub-check could not run)"
+    fi
+    [ -n "$st_tmp" ] && rm -rf "$st_tmp" 2>/dev/null
+  fi
   if [ -z "$st_fail" ]; then
-    echo "orchestrate-steer self-test PASS (raw gh-api + raw gh pr comment/create mutations + piped safe-push + read-dedup warned, graphql read + gh pr read + REST GET + unpiped safe-push silent, exit 0)"
+    echo "orchestrate-steer self-test PASS (raw gh-api + raw gh pr comment/create mutations + piped safe-push + read-dedup + declared expensive gate profile warned, graphql read + gh pr read + REST GET + unpiped safe-push + profile off/undeclared silent, exit 0)$st_x7"
     exit 0
   fi
   echo "orchestrate-steer self-test FAIL: expected a STEER warn at exit 0, got $st_fail" >&2
@@ -191,13 +231,14 @@ def f(p): (first(try (p | select(. != null and . != false)) catch empty) | s) //
   (if $t.ok then "1" else "" end), "\u0000",
   ($t.v | f(.file_path)), "\u0000", ($t.v | f(.command)), "\u0000",
   (if (try ($t.v.run_in_background == false) catch false) then "1" else "" end), "\u0000",
+  ($p | f(.cwd)), "\u0000",
   "END", "\u0000"'
 # Never let jq wait on a terminal (the old code skipped reading a TTY stdin for the same reason).
 if [ -t 0 ]; then exec </dev/null; fi
-tool_name="" session_id="" has_input="" file_path="" cmd="" fg_agent="" x_end=""
+tool_name="" session_id="" has_input="" file_path="" cmd="" fg_agent="" hook_cwd="" x_end=""
 { IFS= read -r -d '' tool_name; IFS= read -r -d '' session_id; IFS= read -r -d '' has_input
   IFS= read -r -d '' file_path; IFS= read -r -d '' cmd; IFS= read -r -d '' fg_agent
-  IFS= read -r -d '' x_end; } < <(jq -nj "$_EXTRACT" 2>/dev/null)
+  IFS= read -r -d '' hook_cwd; IFS= read -r -d '' x_end; } < <(jq -nj "$_EXTRACT" 2>/dev/null)
 [ "$x_end" = END ] && [ -n "$has_input" ] || exit 0
 
 # --- rule helpers ----------------------------------------------------------
@@ -398,7 +439,7 @@ _steer_prefilter() {
 #   - Inside a $'...' -c script, a `\'` is taken as an escape, not as a nested prose quote.
 #   - `case x in a) ...` inside $(...) closes the substitution early (as round 2 did).
 _steer_scan() {
-  printf '%s' "$1" | LC_ALL=C awk -v FL="$_FLAGS" '
+  printf '%s' "$1" | LC_ALL=C awk -v FL="$_FLAGS" -v EXV="${_EXV:-}" '
     # ---- chunked buffers: append O(1) amortized, joined pairwise (O(n log n)) only when judged ----
     function bapp(k, c) {
       sb[k] = sb[k] c
@@ -424,6 +465,7 @@ _steer_scan() {
       # PIPE (`|`, never `||` - cut() records only a lone `|` as "|"). Judged before the gh
       # early return because the clause carries no gh word.
       if (sep == "|" && !FSP && index(s, "safe-push") && s ~ SP) FSP = 1
+      if (EXN && FEX != "xpush") ex7(s)
       if (!index(s, "gh") || s !~ GH) return
       if (index(s, "api") && s ~ API) {
         if (index(s, "graphql") && s ~ GQL) {
@@ -493,11 +535,42 @@ _steer_scan() {
     # command position as usual. Prose that merely MENTIONS it (`echo "safe-push.sh b | tail"`) does
     # not end in the name, and a quoted name in an argument slot (`echo "x/safe-push.sh" | tail`) is
     # not at command position, so both stay silent.
-    function spq(s0, e,   i, w) {
-      if (e - s0 < 12) return 0
-      w = ""; for (i = e - 12; i < e; i++) w = w a[i]
-      if (w != "safe-push.sh") return 0
-      return (e - s0 == 12 || a[e - 13] == "/")
+    # (#343) generalized: returns the name to append (/safe-push.sh or /gate-runner.py) or "", so a
+    # quoted gate-runner path (prep-pr Step 3 shape) reaches rule 7 the same way.
+    function spq(s0, e,   i, w, L, nm) {
+      nm = (a[e - 1] == "h" ? "safe-push.sh" : (a[e - 1] == "y" ? "gate-runner.py" : ""))
+      L = length(nm); if (L == 0 || e - s0 < L) return ""
+      w = ""; for (i = e - L; i < e; i++) w = w a[i]
+      if (w != nm) return ""
+      return (e - s0 == L || a[e - L - 1] == "/") ? "/" nm : ""
+    }
+    # RULE 7 (#343): an EXPORT clause records each declared var as on/off (a later gate clause in
+    # this command inherits it); a gate/upload clause at command position fires when a declared
+    # var is on, its own VAR=val / env VAR=val prefix overriding the export. Off = empty or 0.
+    # OFF = empty or 0, bare or as the whole of one quoted value (QOFF, see qoff).
+    function x7on(v) { return (v != "" && v != "0" && v != QOFF) }
+    function ex7(s,   m, w, i, nw, nm, v, kind) {
+      if (s ~ /^[[:space:]]*(export|unset)[[:space:]]/) {
+        nw = split(s, w, /[[:space:]]+/)
+        for (i = 1; i <= nw; i++) {
+          if (w[i] in EXS) { if (s ~ /^[[:space:]]*unset/) EXP[w[i]] = 0 }
+          else if (match(w[i], /^[A-Za-z_][A-Za-z0-9_]*=/)) {
+            nm = substr(w[i], 1, RLENGTH - 1); v = substr(w[i], RLENGTH + 1)
+            if (nm in EXS) EXP[nm] = (s ~ /^[[:space:]]*export/ && x7on(v))
+          }
+        }
+        return
+      }
+      if (match(s, EXG)) kind = "xgate"; else if (match(s, EXU)) kind = "xpush"; else return
+      m = substr(s, RSTART, RLENGTH)
+      split("", EFF); for (nm in EXP) EFF[nm] = EXP[nm]
+      nw = split(m, w, /[[:space:]]+/)
+      for (i = 1; i <= nw; i++) if (match(w[i], /^[A-Za-z_][A-Za-z0-9_]*=/)) {
+        nm = substr(w[i], 1, RLENGTH - 1); v = substr(w[i], RLENGTH + 1)
+        if (nm in EXS) EFF[nm] = x7on(v)
+      }
+      # an UPLOAD outranks a gate, so gate-then-push in one command still reaches the double-spend test
+      for (nm in EFF) if (EFF[nm]) { if (FEX != "xpush") FEX = kind; return }
     }
     # (#413, CR on #450) a QUOTED literal read method (-X "GET", or GET in single quotes) is the
     # same literal to bash and gh, but collapsed to `Q` it read as a non-literal method and warned.
@@ -512,10 +585,20 @@ _steer_scan() {
       w = ""; for (i = s0; i < e; i++) w = w a[i]
       return (w == "GET" || w == "HEAD" || w == "OPTIONS") ? w : ""
     }
-    function qpop(e,   sp, rw) {
-      sp = spq(fst[d], e); rw = rmw(fst[d], e); pop()
+    # (#343 R343-3) a prose quote that is an ASSIGNMENT VALUE (raw `=` right before the opening quote,
+    # or before the `$` of a $-quote) whose content is EMPTY or exactly `0` appends OFFM after its `Q`,
+    # so rule 7 reads SW_X="0" / SW_X="" / SW_X=single-quoted-empty as the OFF value bash sees. OFFM is
+    # the \002 byte, never emitted for anything else; any other content (incl. "$V") stays a bare `Q`.
+    function qoff(s0, e,   o) {
+      if (e - s0 > 1 || (e - s0 == 1 && a[s0] != "0")) return 0
+      o = s0 - 1; if (ft[d] == "E") o--
+      return (o > 1 && a[o - 1] == "=")
+    }
+    function qpop(e,   sp, rw, of) {
+      sp = spq(fst[d], e); rw = rmw(fst[d], e); of = qoff(fst[d], e); pop()
+      if (of) bapp(d, OFFM)
       if (rw != "") bapp(d, RMS rw)
-      if (sp) bapp(d, "/safe-push.sh")
+      if (sp != "") bapp(d, sp)
     }
     # FAST PATH for the common prose single quote: not inside a code "..." (whose `"` must still close
     # it), not a possible query= value (a `=` before it, or content starting with `q`): skip to the
@@ -526,7 +609,7 @@ _steer_scan() {
       lim = (HD ? HE : n + 1)
       k = j + 1; while (k < lim && a[k] != SQ) k++
       if (k >= lim) { pq("S", j + 1); return }
-      w = rmw(j + 1, k); bapp(d, (w != "" ? w : "Q")); if (spq(j + 1, k)) bapp(d, "/safe-push.sh"); j = k
+      w = rmw(j + 1, k); bapp(d, (w != "" ? w : "Q")); w = spq(j + 1, k); if (w != "") bapp(d, w); j = k
     }
     function dapp(c) {
       if (dq[d]) {
@@ -618,6 +701,7 @@ _steer_scan() {
       GQLM = "(--method[[:space:]=]+|-X[[:space:]=]*)(PATCH|PUT|DELETE)"
       RM = "(--method[[:space:]=]|-X[[:space:]=]?[A-Za-z])"
       RMS = "\001"
+      OFFM = "\002"; QOFF = "Q" OFFM
       GETM = "(^|[[:space:]])(--method[[:space:]=]+|-X[[:space:]=]*)(Q" RMS ")?(GET|HEAD|OPTIONS)([[:space:]]|$)"
       RF = "(^|[[:space:]])(--(field|input|raw-field)[[:space:]=]|-[fF][[:space:]=]?[^[:space:]])"
       # command position: optional ( / { openers, then any run of VAR=val assignments, shell
@@ -630,8 +714,14 @@ _steer_scan() {
       SPW = "if|then|do|else|elif|while|until|!|time|command|exec|sudo|nohup|env|nice|ionice|stdbuf|timeout"
       SP = "^[[:space:]]*[({]*[[:space:]]*(([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*|" SPW "|([^[:space:]]*/)?(ba|z|da|k)?sh|([^[:space:]]*/)?env|-[^[:space:]]*|[0-9][0-9.]*[smhd]?)[[:space:]]+)*([^[:space:]]*/)?safe-push\\.sh([[:space:]]|$)"
       PR = "(^|[^[:alnum:]_.-])gh" FL "[[:space:]]+pr" FL "[[:space:]]+(create|comment|new)([^[:alnum:]_-]|$)"
+      # rule 7 (#343): the SP command-position prefix plus an interpreter word (python3 gate-runner.py).
+      # RECOGNIZED SET: GATE = gate-runner.py, pre-push-hook.sh; UPLOAD = safe-push.sh, git [flags] push.
+      CP7 = "^[[:space:]]*[({]*[[:space:]]*(([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*|" SPW "|([^[:space:]]*/)?((ba|z|da|k)?sh|env|python[0-9.]*)|-[^[:space:]]*|[0-9][0-9.]*[smhd]?)[[:space:]]+)*"
+      EXG = CP7 "([^[:space:]]*/)?(gate-runner\\.py|pre-push-hook\\.sh)([[:space:]]|$)"
+      EXU = CP7 "([^[:space:]]*/)?(safe-push\\.sh|git" FL "[[:space:]]+push)([[:space:]]|$)"
+      EXN = split(EXV, tmp, " "); for (i = 1; i <= EXN; i++) EXS[tmp[i]] = 1
       d = 1; ft[1] = "U"; fc[1] = 1; fp[1] = 0; csq[1] = 0; qd[1] = 0; fst[1] = 1
-      bclr(1); bclr("d1"); HD = 0; HE = -1; nhd = 0; FPR = 0; FSP = 0
+      bclr(1); bclr("d1"); HD = 0; HE = -1; nhd = 0; FPR = 0; FSP = 0; FEX = ""
       for (j = 1; j <= n; j++) {
         if (HD && j >= HE) {
           # the innermost shell-fed heredoc body ended: close it (and anything left open inside it)
@@ -730,13 +820,69 @@ _steer_scan() {
       closeto(2); judge(1, "")
       if (FPR) print "pr"
       else if (FSP) print "push"
+      else if (FEX != "") print FEX
     }'
 }
 
-# Which command rule (if any) fires: prints api | pr | push | nothing. Prefilter first (no fork on a miss).
+# Which command rule (if any) fires: prints api | pr | push | xgate | xpush | nothing. Prefilter
+# first (no fork on a miss); a rule-7 declaration ($_EXV) sends the command straight to the scan.
 _command_rule() {
-  _steer_prefilter "$1" || return 0
+  [ -n "${_EXV:-}" ] || _steer_prefilter "$1" || return 0
   _steer_scan "$1"
+}
+
+# --- rule 7 (#343) helpers: EXPENSIVE GATE PROFILE -------------------------------------------
+# OPT-IN: a repo declares its expensive-profile env var(s) in `.gates.toml` as
+# `[steer] expensive_profile_env = ["SW_GATE_FULL"]`; no declaration -> rule silent everywhere.
+# Fork-free prefilter: a `=` (an assignment shape) plus a gate/upload word. Only past it do we walk
+# up from the payload cwd (fork-free `[ -e ]` tests) to the nearest dir holding `.git` and read
+# its `.gates.toml` with ONE python3 tomllib fork (the grammar gate-runner.py itself requires, so a
+# hand-rolled TOML subset cannot silently drop a valid declaration). Nothing is cached.
+# NOT DONE: concurrent-gate lock detection. gate-runner.py takes no lock, and the lock a consumer's
+# own gate takes has no declared location, so there is nothing cheap and deterministic to test.
+_x7_prefilter() {
+  local c="$1"
+  [[ $c == *=* ]] || return 1
+  [[ $c == *\\$'\n'* || $c == *gate-runner* || $c == *push* ]]
+}
+
+# Print the declared var names (space-separated, identifiers only) for the repo holding $1.
+_x7_declared() {
+  local d="$1"
+  case "$d" in /*) ;; *) return 0 ;; esac
+  while [ ! -e "$d/.git" ]; do
+    [ "$d" = / ] && return 0
+    d="${d%/*}"; [ -n "$d" ] || d=/
+  done
+  [ -f "$d/.gates.toml" ] || return 0
+  # (R343-4) fork-free pre-check: a .gates.toml that never names the key (this repo, and every
+  # gate-runner user that has not opted in) skips the python3 fork. `read -d ''` returns 1 at EOF;
+  # that is its own statement, and the script runs `set -u` without -e, so the status is harmless.
+  local _t=""
+  IFS= read -r -d '' _t 2>/dev/null < "$d/.gates.toml"
+  [[ $_t == *expensive_profile_env* ]] || return 0
+  python3 -c '
+import re, sys
+try:
+    import tomllib
+    with open(sys.argv[1], "rb") as f:
+        v = tomllib.load(f).get("steer", {}).get("expensive_profile_env", [])
+    v = [v] if isinstance(v, str) else v
+    print(" ".join(n for n in v if isinstance(n, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", n)))
+except Exception:
+    pass' "$d/.gates.toml" 2>/dev/null
+}
+
+# DOUBLE-SPEND: a passing /prep-pr receipt (gate-runner.py --receipt, at
+# $(git rev-parse --git-dir)/prep-pr-receipt.json) whose commit_sha IS the current HEAD.
+_x7_gated_at_head() {
+  local out gd head sha
+  out=$(git -C "$1" rev-parse --absolute-git-dir HEAD 2>/dev/null) || return 1
+  gd=${out%%$'\n'*}; head=${out#*$'\n'}
+  [ -f "$gd/prep-pr-receipt.json" ] || return 1
+  sha=$(jq -r 'if .schema == "gate-receipt/v1" and .result == "pass" and .producer == "gate-runner"
+    then .commit_sha else empty end' "$gd/prep-pr-receipt.json" 2>/dev/null) || return 1
+  [ -n "$sha" ] && [ "$sha" = "$head" ]
 }
 
 # #312: EVERY key this session could have armed under, first-precedence first. Mirrors the guard's
@@ -896,6 +1042,8 @@ fi
 # (2)/(3) command rules, marker-independent (#159; advisory only). ONE scan decides both; the
 # prefilter inside _command_rule keeps a command with no gh api/pr shape fork-free.
 if [ -n "$cmd" ]; then
+  x7_dir="${hook_cwd:-$PWD}"; _EXV=""
+  _x7_prefilter "$cmd" && _EXV=$(_x7_declared "$x7_dir")
   cmd_rule=$(_command_rule "$cmd" 2>/dev/null)
   # (2) raw gh-api mutation WARN.
   if [ "$cmd_rule" = "api" ]; then
@@ -908,6 +1056,14 @@ if [ -n "$cmd" ]; then
   # (6) piped safe-push WARN (#432).
   if [ "$cmd_rule" = "push" ]; then
     emit_warn "Never pipe safe-push.sh: without pipefail a pipe returns the LAST command's exit, so a refused push reads as 0. Run it bare; its exit code IS the verdict."
+  fi
+  # (7) expensive gate profile WARN (#343). An upload at a HEAD a gate already passed is named as
+  # the double-spend it is: its pre-push hook re-runs that gate under the expensive profile.
+  if [ "$cmd_rule" = "xpush" ] && _x7_gated_at_head "$x7_dir"; then
+    emit_warn "Double spend: a gate already passed at this HEAD, so this expensive-profile push re-runs it as a second full pass. Push with the default profile."
+  fi
+  if [ "$cmd_rule" = "xgate" ] || [ "$cmd_rule" = "xpush" ]; then
+    emit_warn "Expensive gate profile: run the repo's fast compile/vet step first, and decide splits before gating; the default profile catches most breaks far cheaper."
   fi
 fi
 

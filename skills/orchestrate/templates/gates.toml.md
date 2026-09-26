@@ -119,6 +119,34 @@ Optional. Tunes merge-time behavior for the lifecycle commands.
 
 ---
 
+## `[steer]` section
+
+Optional. Read ONLY by the advisory steering hook (`orchestrate-steer.sh`),
+never by `gate-runner.py`; it cannot change a gate's verdict.
+
+- `expensive_profile_env` (array of strings, or one string; default none): the
+  env var name(s) that select this repo's EXPENSIVE gate profile (a race / full
+  / integration run). When declared, steer rule 7 (#343) nudges on a command
+  that sets one of them to a value other than empty or `0` (bare, or as the
+  whole quoted word: `VAR="0"` and `VAR=''` are off) (`VAR=1 cmd`,
+  `env VAR=1 cmd`, or an earlier `export VAR=1`) together with a recognized
+  gate or upload at command position: `gate-runner.py`, `pre-push-hook.sh`,
+  `safe-push.sh`, `git push`. The nudge points at the repo's fast compile/vet
+  step first; an upload at a HEAD whose `/prep-pr` receipt already passed is
+  named as a double spend (the pre-push hook would re-run the same gate).
+  Undeclared (the default) means the rule is silent. Names that are not shell
+  identifiers are ignored. Read from the `.gates.toml` at the nearest ancestor
+  holding `.git`, on each matching command (nothing is cached). Reading it
+  needs python3 >= 3.11 (`tomllib`, the same floor as `gate-runner.py`);
+  without it the rule is silent.
+
+```toml
+[steer]
+expensive_profile_env = ["SW_GATE_FULL"]
+```
+
+---
+
 ## Example -- Form A (delegate; stillwater-style)
 
 ```toml

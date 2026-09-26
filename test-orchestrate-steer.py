@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Proof harness for orchestrate-steer.sh (the WARN-level steering hook, #95).
 
-Asserts all six advisory rules. The command/file rules (1)-(3) run through BOTH input channels
+Asserts all seven advisory rules. The command/file rules (1)-(3) run through BOTH input channels
 (stdin JSON and $TOOL_INPUT env); rules (4) and (5) need stdin top-level fields (tool_name,
 session_id), so they run through stdin only.
   (1) MID-RUN CANONICAL EDIT (marker-gated): an Edit/Write of a canonical file (SKILL.md,
@@ -15,6 +15,8 @@ session_id), so they run through stdin only.
   (4) REDUNDANT RE-READ (per-session state) and (5) FOREGROUND AGENT (marker-gated).
   (6) PIPED SAFE-PUSH (#432): a safe-push.sh call whose clause is ended by a lone `|` WARNs;
       `||`, a comment, quoted prose, and safe-push as the LAST pipeline command are silent.
+  (7) EXPENSIVE GATE PROFILE (#343): a `.gates.toml`-declared var set on a gate/upload WARNs (a
+      DOUBLE SPEND with a passing receipt at HEAD); off values, prose and undeclared repos are silent.
 Plus the #287 advisory invariant (no nonzero exit, no stdout), robustness on malformed input, and
 scan-time bounds. Every case asserts exit 0 (steering NEVER blocks) and the `STEER:` line's
 presence/absence.
@@ -119,6 +121,181 @@ def both_channels(tool_input, **kw):
     warned_all = all(warned(err) for _, err in results)
     silent_all = all(not warned(err) for _, err in results)
     return rc_ok, warned_all, silent_all
+
+
+def _git(repo, *args):
+    return subprocess.run(["git", "-C", repo, "-c", "user.email=t@t", "-c", "user.name=t",
+                           "-c", "commit.gpgsign=false", *args],
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+
+def _fixture_repo(root, gates_toml):
+    """A real git repo (HEAD needed for the double-spend leg) with an optional .gates.toml."""
+    os.makedirs(os.path.join(root, "sub"), exist_ok=True)
+    _git(root, "init", "-q")
+    if gates_toml is not None:
+        with open(os.path.join(root, ".gates.toml"), "w") as f:
+            f.write(gates_toml)
+    _git(root, "commit", "-q", "--allow-empty", "-m", "init")
+    return _git(root, "rev-parse", "HEAD")
+
+
+def run7(command, cwd, *, channel="stdin", path_prefix=None):
+    """Rule 7 runs off the payload cwd (stdin) or the process cwd (env channel). Returns
+    (rc, stdout, stderr); no marker, no TMUX key (rule 7 is marker-independent)."""
+    env = dict(os.environ)
+    for k in ("TOOL_INPUT", "TMUX", "CLAUDE_CODE_SESSION_ID"):
+        env.pop(k, None)
+    if path_prefix:
+        env["PATH"] = path_prefix + os.pathsep + env.get("PATH", "")
+    stdin_data = ""
+    if channel == "stdin":
+        stdin_data = json.dumps({"tool_name": "Bash", "cwd": cwd, "tool_input": {"command": command}})
+    else:
+        env["TOOL_INPUT"] = json.dumps({"command": command})
+    p = subprocess.run([STEER], input=stdin_data, env=env, cwd=cwd,
+                       capture_output=True, text=True, timeout=10)
+    return p.returncode, p.stdout, p.stderr
+
+
+def rule7_cases():
+    # ---- Rule 7 (#343): EXPENSIVE GATE PROFILE, opt-in via .gates.toml [steer] ----
+    DECL = ('[prep_pr]\ngate = "true"\n\n[steer]\n'
+            'expensive_profile_env = ["SW_GATE_FULL", "SW_RACE", "bad name"]\n')
+    WARN = [
+        "SW_GATE_FULL=1 python3 scripts/gate-runner.py",
+        "SW_GATE_FULL=1 ./scripts/pre-push-hook.sh",
+        "env SW_GATE_FULL=1 python3 scripts/gate-runner.py",
+        "export SW_GATE_FULL=1; python3 scripts/gate-runner.py",
+        "export SW_GATE_FULL=yes && safe-push.sh b",
+        "SW_GATE_FULL=1 safe-push.sh b",
+        "SW_GATE_FULL=1 git push origin b",
+        "SW_GATE_FULL=1 git -C . push origin b",
+        "SW_RACE=1 python3 scripts/gate-runner.py",              # a second declared var
+        "OTHER=1 SW_GATE_FULL=1 python3 scripts/gate-runner.py",
+        "SW_GATE_FULL=1 timeout 1800 python3 scripts/gate-runner.py",
+        "cd x && SW_GATE_FULL=1 python3 scripts/gate-runner.py",
+        "bash -c 'SW_GATE_FULL=1 python3 scripts/gate-runner.py'",
+        "SW_GATE_FULL=1 python3 '${CLAUDE_PLUGIN_ROOT}/scripts/gate-runner.py' --receipt r",
+        "SW_GATE_FULL=1 \\\n  python3 scripts/gate-runner.py",   # backslash-newline continuation
+        # R343-3: a quoted ON value, a mixed word, and an expansion still count as set
+        'SW_GATE_FULL="1" python3 scripts/gate-runner.py',
+        'SW_GATE_FULL="$V" python3 scripts/gate-runner.py',
+        'SW_GATE_FULL=0"" python3 scripts/gate-runner.py',
+        'SW_GATE_FULL="00" safe-push.sh b',
+        'export SW_GATE_FULL="yes"; python3 scripts/gate-runner.py',
+    ]
+    SILENT = [
+        "python3 scripts/gate-runner.py",                        # the default profile
+        "safe-push.sh b",
+        "SW_GATE_FULL=0 python3 scripts/gate-runner.py",
+        "SW_GATE_FULL= safe-push.sh b",
+        "export SW_GATE_FULL=1; SW_GATE_FULL=0 python3 scripts/gate-runner.py",  # prefix overrides
+        "export SW_GATE_FULL=1; unset SW_GATE_FULL; python3 scripts/gate-runner.py",
+        "export SW_GATE_FULL=0; safe-push.sh b",
+        "SW_GATE_FULL=1; python3 scripts/gate-runner.py",        # not exported: never reaches the gate
+        'echo "SW_GATE_FULL=1 python3 scripts/gate-runner.py"',  # quoted prose
+        "git commit -m 'SW_GATE_FULL=1 safe-push.sh b'",
+        "python3 scripts/gate-runner.py # SW_GATE_FULL=1",       # comment
+        "OTHER=1 python3 scripts/gate-runner.py",                # an undeclared var
+        "SW_GATE_FULLER=1 python3 scripts/gate-runner.py",       # a name that merely starts alike
+        "SW_GATE_FULL=1 go build ./...",                         # not a gate/upload
+        "SW_GATE_FULL=1 grep -n x scripts/gate-runner.py",       # gate name not at command position
+        # R343-3: a QUOTED off value (empty or 0, as the whole word) is off, as bash sees it
+        'SW_GATE_FULL="0" python3 scripts/gate-runner.py',
+        'SW_GATE_FULL="" python3 scripts/gate-runner.py',
+        "SW_GATE_FULL='' safe-push.sh b",
+        "SW_GATE_FULL='0' python3 scripts/gate-runner.py",
+        "SW_GATE_FULL=$'0' python3 scripts/gate-runner.py",
+        'env SW_GATE_FULL="" python3 scripts/gate-runner.py',
+        'export SW_GATE_FULL="0"; safe-push.sh b',
+        'export SW_GATE_FULL=1; SW_GATE_FULL="" python3 scripts/gate-runner.py',
+    ]
+    with tempfile.TemporaryDirectory() as td:
+        repo = os.path.join(td, "decl"); os.makedirs(repo)
+        head = _fixture_repo(repo, DECL)
+        stdout_clean = True
+        for c in WARN:
+            rc, out, err = run7(c, os.path.join(repo, "sub"))     # cwd BELOW the root: walk-up
+            stdout_clean = stdout_clean and out == ""
+            check(f"#343: declared expensive profile -> WARN, exit 0 ({c[:50]!r})",
+                  rc == 0 and warned(err) and "Double spend" not in err)
+        for c in SILENT:
+            rc, out, err = run7(c, repo)
+            stdout_clean = stdout_clean and out == ""
+            check(f"#343: default / off / prose -> silent ({c[:50]!r})", rc == 0 and not warned(err))
+        rc, out, err = run7(WARN[0], repo, channel="env")
+        check("#343: $TOOL_INPUT channel (no payload cwd) reads the process cwd -> WARN",
+              rc == 0 and warned(err))
+
+        # NO DECLARATION -> silent everywhere (repo-agnostic, zero behavior change).
+        for name, toml in (("nosteer", '[prep_pr]\ngate = "true"\n'), ("nofile", None),
+                           ("broken", "[steer\nexpensive_profile_env = [\n"),
+                           ("wrongtype", "[steer]\nexpensive_profile_env = 1\n")):
+            r = os.path.join(td, name); os.makedirs(r); _fixture_repo(r, toml)
+            quiet = all(rc == 0 and not warned(err)
+                        for rc, _, err in (run7(c, r) for c in WARN[:6]))
+            check(f"#343: no usable declaration ({name}) -> silent on every WARN shape", quiet)
+        # R343-4: a .gates.toml that never names the key skips the python3 fork entirely (a stub
+        # python3 first on PATH records each call). The declaring repo proves the stub is reached.
+        stub = os.path.join(td, "stubbin"); os.makedirs(stub)
+        calls = os.path.join(td, "py-calls")
+        with open(os.path.join(stub, "python3"), "w") as f:
+            f.write(f"#!/bin/sh\necho x >> '{calls}'\nexit 0\n")
+        os.chmod(os.path.join(stub, "python3"), 0o755)
+        run7(WARN[0], os.path.join(td, "nosteer"), path_prefix=stub)
+        check("#343 R343-4: .gates.toml without the key -> no python3 fork", not os.path.exists(calls))
+        run7(WARN[0], repo, path_prefix=stub)
+        check("#343 R343-4: .gates.toml naming the key -> python3 reached (stub is live)",
+              os.path.exists(calls))
+        r = os.path.join(td, "strform"); os.makedirs(r)
+        _fixture_repo(r, '[steer]\nexpensive_profile_env = "SW_GATE_FULL"\n')
+        rc, _, err = run7(WARN[0], r)
+        check("#343: a single-string declaration is accepted -> WARN", rc == 0 and warned(err))
+        # The declaration is read from the nearest .git root only: a nested repo without one is silent.
+        nested = os.path.join(repo, "sub", "inner"); os.makedirs(nested); _fixture_repo(nested, None)
+        rc, _, err = run7(WARN[0], nested)
+        check("#343: nested repo with no declaration -> silent (root is the nearest .git)",
+              rc == 0 and not warned(err))
+
+        # DOUBLE SPEND: a passing receipt for THIS HEAD names the upload's pre-push re-run.
+        gitdir = _git(repo, "rev-parse", "--absolute-git-dir")
+        rpath = os.path.join(gitdir, "prep-pr-receipt.json")
+
+        def receipt(**over):
+            body = {"schema": "gate-receipt/v1", "commit_sha": head, "result": "pass",
+                    "producer": "gate-runner"}
+            body.update(over)
+            with open(rpath, "w") as f:
+                json.dump(body, f)
+
+        receipt()
+        for c in ("SW_GATE_FULL=1 safe-push.sh b", "SW_GATE_FULL=1 git push origin b",
+                  # gate THEN upload in one command: the upload must still be judged (it outranks)
+                  "SW_GATE_FULL=1 python3 scripts/gate-runner.py && SW_GATE_FULL=1 safe-push.sh b"):
+            rc, out, err = run7(c, repo)
+            stdout_clean = stdout_clean and out == ""
+            check(f"#343: upload at a receipt-passed HEAD -> DOUBLE SPEND ({c[:40]!r})",
+                  rc == 0 and "Double spend" in err)
+        rc, _, err = run7("SW_GATE_FULL=1 python3 scripts/gate-runner.py", repo)
+        check("#343: a GATE (not an upload) with a receipt -> generic nudge, not double spend",
+              rc == 0 and warned(err) and "Double spend" not in err)
+        rc, _, err = run7("safe-push.sh b", repo)
+        check("#343: default-profile upload with a receipt -> silent", rc == 0 and not warned(err))
+        for label, over in (("stale commit_sha", {"commit_sha": "0" * 40}),
+                            ("result=fail", {"result": "fail"}),
+                            ("wrong producer", {"producer": "hand"}),
+                            ("wrong schema", {"schema": "x/v0"})):
+            receipt(**over)
+            rc, _, err = run7("SW_GATE_FULL=1 safe-push.sh b", repo)
+            check(f"#343: receipt {label} -> generic nudge, NOT double spend",
+                  rc == 0 and warned(err) and "Double spend" not in err)
+        with open(rpath, "w") as f:
+            f.write("{not json")
+        rc, out, err = run7("SW_GATE_FULL=1 safe-push.sh b", repo)
+        check("#343: unreadable receipt -> generic nudge, exit 0",
+              rc == 0 and warned(err) and "Double spend" not in err and out == "")
+        check("#343: rule 7 never writes stdout (advisory invariant)", stdout_clean)
 
 
 def main():
@@ -594,6 +771,8 @@ def main():
     for c in PIPED_PUSH_SILENT:
         rc_ok, _, silent_all = both_channels({"command": c}, marker_active=True)
         check(f"#432: unpiped / prose safe-push -> silent ({c[:48]!r})", rc_ok and silent_all)
+
+    rule7_cases()
 
     # ROBUSTNESS: malformed / unbalanced / hostile input exits 0 promptly and never blocks.
     ROBUST = [
