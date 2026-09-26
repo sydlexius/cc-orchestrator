@@ -58,8 +58,11 @@
 #       whole of one quoted word (`VAR="0"`, `VAR=""`, `VAR=$'0'`); a MIXED word (`VAR=0""`) or an
 #       expansion (`VAR="$V"`) counts as set. ACCEPTED FALSE POSITIVES (warn, the var never reaches
 #       the gate): `export -n VAR=1; <gate>` (un-exports) and `export VAR=1 | <gate>` (the export
-#       runs in a pipeline subshell). Needs python3 >= 3.11 (tomllib, as gate-runner.py does);
-#       without it the declaration is unreadable and the rule is silent.
+#       runs in a pipeline subshell). An export/unset inside a CODE frame (`bash -c '...'`,
+#       `$(...)`, backticks, a heredoc fed to a shell) is SCOPED to that frame, as bash scopes
+#       it to that process; `eval` shares the shell, so its export does reach later clauses.
+#       Needs python3 >= 3.11 (tomllib, as gate-runner.py does); without it the declaration is
+#       unreadable and the rule is silent.
 #   (4) REDUNDANT RE-READ -> WARN (#226): a 2nd+ `Read` of a path already read THIS session with an
 #       unchanged mtime+size -> WARN: the content is already in context, skip the Read. Stateful
 #       (per-session, keyed on the stdin session_id), marker-independent, advisory only. The valid
@@ -487,7 +490,7 @@ _steer_scan() {
     }
     function cut(sep) { judge(d, sep); bclr(d); bclr("d" d); lastcut[d] = sep }
     # ---- the frame stack ----
-    function push(t, code, st,   p) {
+    function push(t, code, st,   p, nm) {
       p = d; d++
       ft[d] = t; fc[d] = code; fp[d] = 0; dk[d] = 0; dq[d] = 0; pb[d] = ""; fst[d] = st
       csq[d] = csq[p]; qd[d] = qd[p]
@@ -495,9 +498,20 @@ _steer_scan() {
       if (code && (t == "S" || t == "E")) csq[d] = d
       if (code && t == "D") qd[d] = d
       if (code) { bclr(d); bclr("d" d); lastcut[d] = "" }
+      # RULE 7: a CODE frame (bash -c script, $(...), backticks, a heredoc fed to a shell) is its
+      # own PROCESS, so an export/unset inside it never reaches the enclosing shell. Snapshot the
+      # declared vars here and restore them in pop(). An `eval` script runs in the SAME shell, so
+      # its frame is not scoped (fx7 = 0). CQEVAL is set by codeq() and consumed here only.
+      fx7[d] = (EXN && code && !(CQEVAL && (t == "S" || t == "D" || t == "E")))
+      CQEVAL = 0
+      if (fx7[d]) for (nm in EXS) { XS[d, nm] = (nm in EXP) ? EXP[nm] : -1 }
     }
-    function pop() {
+    function pop(   nm) {
       if (fc[d]) judge(d, "")
+      if (fx7[d]) for (nm in EXS) {
+        if (XS[d, nm] == -1) delete EXP[nm]; else EXP[nm] = XS[d, nm]
+        delete XS[d, nm]
+      }
       if (ft[d] == "H") { HD = hprev[d]; HE = (HD ? he[HD] : -1) }
       if (dk[d] && !dq[d]) bapp("d" dk[d], "\n")
       d--
@@ -513,6 +527,7 @@ _steer_scan() {
       w = ""
       while (k >= 1 && k > j - 24 && a[k] !~ /[[:space:]]/) { w = a[k] w; k-- }
       if (w != "eval" && w !~ /^-[A-Za-z]*c[A-Za-z]*$/) return 0
+      CQEVAL = (w == "eval")   # rule 7: an eval script shares the shell (read by push)
       tl = tail(d)
       if (!index(tl, "sh") && !index(tl, "eval")) return 0
       return (tl ~ CODEQ || tl ~ /(^|[^[:alnum:]_.-])eval[[:space:]]+$/)

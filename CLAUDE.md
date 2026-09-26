@@ -114,7 +114,9 @@ Runtime (`scripts/`; canonical source is this repo):
   rule 7 needs python3 >= 3.11 like gate-runner; without tomllib it is silent and `--self-test` SKIPS it)
   only after a fork-free `=`-plus-gate-word prefilter AND a fork-free check that `.gates.toml` names
   the key at all (a non-opted-in repo never forks). Accepted false positives: `export -n VAR=1; <gate>`
-  and `export VAR=1 | <gate>` (the var never reaches the gate). Concurrent-gate lock detection was SKIPPED:
+  and `export VAR=1 | <gate>` (the var never reaches the gate). An export/unset inside `bash -c`,
+  `$(...)`, backticks or a shell-fed heredoc is SCOPED to that frame (it cannot reach the outer
+  shell); `eval` shares the shell, so its export does. Concurrent-gate lock detection was SKIPPED:
   gate-runner takes no lock and a consumer's lock has no declared path, so no cheap deterministic test.
   Wired for Edit/Write/Bash/Read/Agent PreToolUse by `configure` (deployed Option-A like the guard).
   The `Agent` matcher is LOAD-BEARING, not cosmetic: without it the hook is never invoked on a spawn

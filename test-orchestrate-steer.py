@@ -140,6 +140,9 @@ def _fixture_repo(root, gates_toml):
     return _git(root, "rev-parse", "HEAD")
 
 
+RUN7_STDOUT = []
+
+
 def run7(command, cwd, *, channel="stdin", path_prefix=None):
     """Rule 7 runs off the payload cwd (stdin) or the process cwd (env channel). Returns
     (rc, stdout, stderr); no marker, no TMUX key (rule 7 is marker-independent)."""
@@ -155,6 +158,7 @@ def run7(command, cwd, *, channel="stdin", path_prefix=None):
         env["TOOL_INPUT"] = json.dumps({"command": command})
     p = subprocess.run([STEER], input=stdin_data, env=env, cwd=cwd,
                        capture_output=True, text=True, timeout=10)
+    RUN7_STDOUT.append((command, p.stdout))   # EVERY rule-7 call feeds the stdout invariant
     return p.returncode, p.stdout, p.stderr
 
 
@@ -184,6 +188,10 @@ def rule7_cases():
         'SW_GATE_FULL=0"" python3 scripts/gate-runner.py',
         'SW_GATE_FULL="00" safe-push.sh b',
         'export SW_GATE_FULL="yes"; python3 scripts/gate-runner.py',
+        # an unset inside a CODE frame cannot undo the OUTER export; inside the frame it still flows
+        "export SW_GATE_FULL=1; bash -c 'unset SW_GATE_FULL'; python3 scripts/gate-runner.py",
+        "bash -c 'export SW_GATE_FULL=1; python3 scripts/gate-runner.py'",
+        "eval 'export SW_GATE_FULL=1'; python3 scripts/gate-runner.py",  # eval shares the shell
     ]
     SILENT = [
         "python3 scripts/gate-runner.py",                        # the default profile
@@ -210,6 +218,9 @@ def rule7_cases():
         'env SW_GATE_FULL="" python3 scripts/gate-runner.py',
         'export SW_GATE_FULL="0"; safe-push.sh b',
         'export SW_GATE_FULL=1; SW_GATE_FULL="" python3 scripts/gate-runner.py',
+        # an export inside a CODE frame dies with that process: it never reaches the outer gate
+        "bash -c 'export SW_GATE_FULL=1' && python3 scripts/gate-runner.py",
+        "x=$(export SW_GATE_FULL=1); python3 scripts/gate-runner.py",
     ]
     with tempfile.TemporaryDirectory() as td:
         repo = os.path.join(td, "decl"); os.makedirs(repo)
@@ -295,7 +306,10 @@ def rule7_cases():
         rc, out, err = run7("SW_GATE_FULL=1 safe-push.sh b", repo)
         check("#343: unreadable receipt -> generic nudge, exit 0",
               rc == 0 and warned(err) and "Double spend" not in err and out == "")
-        check("#343: rule 7 never writes stdout (advisory invariant)", stdout_clean)
+        dirty = [c for c, out in RUN7_STDOUT if out != ""]
+        check(f"#343: rule 7 never writes stdout on ANY of {len(RUN7_STDOUT)} runs "
+              f"(advisory invariant){': ' + repr(dirty[:3]) if dirty else ''}",
+              stdout_clean and RUN7_STDOUT and not dirty)
 
 
 def main():
