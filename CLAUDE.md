@@ -658,8 +658,13 @@ drives `/plugin marketplace` update-detection, so they must never diverge. The C
   `git ... --no-verify`, `pulls/N/merge`) on a Bash command line. Keep all such payloads INSIDE the
   harness/fixtures (fed to the guard via its normal stdin/env channel). The harness is the only way
   to exercise the guard safely (ISOLATION: the artifact inspects its own invocation environment).
-- A PreToolUse hook loads at SESSION START, so editing the guard does not change the live hook
-  mid-session (no self-lockout); the harness + `--self-test` validate the new behavior directly.
+- Editing the REPO guard does not change the live hook (no self-lockout): the hook runs the
+  DEPLOYED copy, which bash re-reads on every call, so only a deploy or a direct edit of that
+  copy goes live; the harness + `--self-test` validate the new behavior directly.
+- EMERGENCY patch applied straight to the DEPLOYED guard, or authoring ANY PreToolUse hook: follow
+  `DESIGN-deterministic-floor.md` "Emergency hot-patch" (stage + validate a copy, then `mv` it over:
+  an in-place parse error BLOCKS every Bash call; port to source before any `configure --apply`;
+  the `.bak` is one slot) and its "Hook-authoring note" (read STDIN; a `$TOOL_INPUT`-only hook fails open) (#327).
 - Accepted false-positive limitations (documented, do not chase without shell-quote parsing): a
   flag token quoted inside an accepting (sub)command's argument, e.g. `git commit -m "...--no-verify..."`
   or a `gh pr comment` body quoting the literal merge command. Rare, recoverable by rewording or the
@@ -814,14 +819,15 @@ breaks the single-quoted tests. The elmer commands check the deployed leg before
 purpose (the wrapper grant). Full rule: `commands/prep-pr.md` "Helper exec paths" (#433).
 
 Deploying a merged floor/guard change to OTHER sessions: a merged guard change does NOT
-auto-propagate to already-running sessions or other machines. Three steps: (1) update the plugin
+auto-propagate to other machines, nor to any session until it is DEPLOYED. Three steps: (1) update the plugin
 (`/plugin marketplace update` + reinstall, or `git pull` + `/reload-plugins` for a `--plugin-dir`
 dev install) to get the new bundled guard + doctor; (2) `orchestrate-setup.py configure --apply` to
 RE-DEPLOY the updated guard to the stable `~/.claude/scripts/` path (the PreToolUse hook runs the
 DEPLOYED copy, not the repo) and wire any sanctioned allow-list entry - this stays CONSENT-GATED and
-never silently edits settings.json; (3) RESTART each open Claude Code session (the PreToolUse hook
-loads the guard at SESSION START, so a running window keeps the old guard until it is relaunched -
-this is a session restart, NOT an OS reboot).
+never silently edits settings.json; (3) RESTART open Claude Code sessions ONLY if step 2 changed
+settings.json hook WIRING (that config is loaded at SESSION START; a session restart, NOT an OS
+reboot). The redeployed guard SCRIPT needs no restart: the hook runs `bash` on the deployed path,
+which re-reads it, so it is live on each session's next Bash call.
 
 ## CI / security settings
 
