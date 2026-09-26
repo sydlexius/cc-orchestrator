@@ -11,6 +11,15 @@ never sees either one reliably:
      GitHub wraps this one in a <details> block that renders COLLAPSED, so the visible
      summary is only "Action performed" -- the quota sentence is invisible until clicked.
 
+  3. (#454) The banner in CR's SUMMARY comment, which CR EDITS IN PLACE:
+        "**Next included review available in 49 minutes."
+     Capital N and no "will be"; its countdown dates from `updated_at`, not
+     `created_at`, so the harness also asserts the deadline, the selection rule, and
+     the missing/unusable-`updated_at` fallback against that field. An EDIT never
+     outranks a newer, longer limit: "available" signals date from `created_at` only,
+     and among limited signals newer than the newest "available" the LARGEST deadline
+     wins (454-F1).
+
 This watcher reads those lines and prints them. It POSTS NOTHING and triggers nothing,
 so it can never consume a review slot.
 
@@ -77,6 +86,14 @@ INCLUDED_TEMPLATE = (
     "</details>"
 )
 
+# The #454 SUMMARY-comment banner (capital N, no "will be"). Only the quota sentence is
+# load-bearing here; the surrounding summary markup is abbreviated.
+SUMMARY_TEMPLATE = (
+    "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n"
+    "> [!NOTE]\n"
+    "> **Next included review available in {dur}.**\n"
+)
+
 # VERBATIM available-state reply, measured on cc-orchestrator #351.
 AVAILABLE_BODY = (
     "<!-- This is an auto-generated reply by CodeRabbit -->\n"
@@ -104,9 +121,12 @@ def ago(**kw):
     return iso(datetime.now(timezone.utc) - timedelta(**kw))
 
 
-def comment(body, login=CR, created=None):
+def comment(body, login=CR, created=None, updated=None, drop_updated=False):
     ts = created or ago(minutes=1)
-    return {"user": {"login": login}, "created_at": ts, "updated_at": ts, "body": body}
+    c = {"user": {"login": login}, "created_at": ts, "updated_at": updated or ts, "body": body}
+    if drop_updated:
+        del c["updated_at"]
+    return c
 
 
 def comments_json(*objs):
@@ -192,6 +212,90 @@ def main():
                                                       created=ago(minutes=2))))
     check("'next review will be available in' -> exit 1 (LIMITED)", rc == 1)
     check("reports ~57m remaining", "57m" in (out + err))
+
+    print("== #454: the SUMMARY banner ('Next included review available in', capital N) ==")
+    rc, out, err = run(["454", "owner/repo"],
+                       comments=comments_json(comment(SUMMARY_TEMPLATE.format(dur="49 minutes"),
+                                                      created=ago(minutes=2))))
+    check("capitalized banner without 'will be' -> exit 1 (LIMITED)", rc == 1)
+    check("banner reports ~47m remaining and the included-review noun",
+          "47m" in (out + err) and "included review" in (out + err))
+
+    print("== #454: an EDITED summary dates its countdown from updated_at ==")
+    edited = comment(SUMMARY_TEMPLATE.format(dur="59 minutes"),
+                     created=ago(minutes=34), updated=ago(minutes=1))
+    rc, out, err = run(["454", "owner/repo"], comments=comments_json(edited))
+    check("edited summary (updated 1m ago, created 34m ago) -> exit 1", rc == 1)
+    check("deadline from updated_at (~58m), not created_at (~25m)", "58m" in (out + err))
+    rc, out, err = run(["454", "owner/repo"],
+                       comments=comments_json(comment(SUMMARY_TEMPLATE.format(dur="20 minutes"),
+                                                      created=ago(minutes=34),
+                                                      updated=ago(minutes=1))))
+    check("20-minute notice edited 1m ago on a 34m-old summary -> still LIMITED (exit 1)",
+          rc == 1 and "19m" in (out + err))
+
+    print("== #454: newest-signal ordering is by updated_at ==")
+    reply = comment(RL_TEMPLATE.format(dur="10 minutes"), created=ago(minutes=5))
+    summ = comment(SUMMARY_TEMPLATE.format(dur="40 minutes"),
+                   created=ago(minutes=60), updated=ago(minutes=1))
+    for order, objs in [("summary last", (reply, summ)), ("summary first", (summ, reply))]:
+        rc, out, err = run(["1", "owner/repo"], comments=comments_json(*objs))
+        check(f"older-created but more-recently-edited summary wins ({order}) -> ~39m",
+              rc == 1 and "39m" in (out + err))
+
+    print("== #454: a missing updated_at falls back to created_at ==")
+    rc, out, err = run(["1", "owner/repo"],
+                       comments=comments_json(comment(RL_TEMPLATE.format(dur="30 minutes"),
+                                                      created=ago(minutes=2),
+                                                      drop_updated=True)))
+    check("no updated_at key -> deadline from created_at (~28m)", rc == 1 and "28m" in (out + err))
+    # 454-F3: a PRESENT but unusable updated_at (garbage string, JSON null) must take the
+    # same created_at fallback, not drop the signal or date it from nothing.
+    for label, bad in [("garbage-string", "garbage"), ("null", None)]:
+        c = comment(RL_TEMPLATE.format(dur="30 minutes"), created=ago(minutes=2))
+        c["updated_at"] = bad
+        rc, out, err = run(["1", "owner/repo"], comments=comments_json(c))
+        check(f"{label} updated_at -> deadline from created_at (~28m)",
+              rc == 1 and "28m" in (out + err))
+
+    print("== 454-F1: an EDIT never outranks a newer, longer limit ==")
+    # An old 'available now' reply edited 1m ago: an edit does not re-assert availability,
+    # so the fresh 59-minute limit (5m ago) still stands.
+    fresh = comment(RL_TEMPLATE.format(dur="59 minutes"), created=ago(minutes=5))
+    old_av = comment(AVAILABLE_BODY, created=ago(minutes=90), updated=ago(minutes=1))
+    for order, objs in [("available last", (fresh, old_av)), ("available first", (old_av, fresh))]:
+        rc, out, err = run(["1", "owner/repo"], comments=comments_json(*objs))
+        check(f"edited old 'available now' vs fresh 59m limit ({order}) -> LIMITED ~54m",
+              rc == 1 and "54m" in (out + err))
+    # A 120m-old summary whose STALE '2 minutes' banner survived an unrelated edit 1m ago:
+    # the largest live deadline wins, not the most recently touched comment.
+    fresh = comment(RL_TEMPLATE.format(dur="59 minutes"), created=ago(minutes=2))
+    stale = comment(SUMMARY_TEMPLATE.format(dur="2 minutes"),
+                    created=ago(minutes=120), updated=ago(minutes=1))
+    for order, objs in [("summary last", (fresh, stale)), ("summary first", (stale, fresh))]:
+        rc, out, err = run(["1", "owner/repo"], comments=comments_json(*objs))
+        check(f"stale 2m banner edited 1m ago vs fresh 59m reply ({order}) -> ~57m, not ~1m",
+              rc == 1 and "57m" in (out + err))
+
+    print("== 454-F2: an upper-case unit is still minutes, not hours ==")
+    rc, out, err = run(["1", "owner/repo"],
+                       comments=comments_json(comment("Next included review available in 49 MINUTES.",
+                                                      created=ago(minutes=1))))
+    check("'49 MINUTES.' -> ~48m (unit downcased, not the 3600 multiplier)",
+          rc == 1 and "~48m" in (out + err))
+
+    print("== 454-F5: a malformed comment neither blinds the scan nor reads as all-clear ==")
+    numeric = {"user": {"login": CR}, "created_at": ago(minutes=1), "updated_at": ago(minutes=1),
+               "body": 5}
+    live = comment(RL_TEMPLATE.format(dur="30 minutes"), created=ago(minutes=1))
+    rc, out, err = run(["1", "owner/repo"], comments=comments_json(numeric, live))
+    check("numeric-body CR comment beside a live 30m limit -> still LIMITED (exit 1)",
+          rc == 1 and "29m" in (out + err))
+    # A non-array response (an error object) makes jq fail at evaluation; that must be a
+    # setup error, never swallowed into "no quota signal" / exit 0.
+    rc, out, err = run(["1", "owner/repo"], comments='{"message": "Not Found"}')
+    check("non-array comments response -> exit 2 (jq failure is a setup error)",
+          rc == 2 and "setup error" in err)
 
     print("== unit and plurality variants that a naive '(\\d+) minutes' breaks on ==")
     # Every one of these is a REAL observed duration string.
