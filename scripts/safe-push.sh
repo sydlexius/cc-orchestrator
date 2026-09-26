@@ -229,16 +229,22 @@ else
     else
       # Capture rather than inherit stdout: the helper's one labeled line is surfaced on
       # stderr with safe-push's own prefix, keeping this wrapper's output shape stable.
+      #
+      # MEASURE THE BRANCH BEING PUSHED, NOT THE CHECKOUT (#457). safe-push pushes <branch> by
+      # NAME, so HEAD may be any other branch: measuring HEAD falsely refused a fresh branch
+      # pushed from a stale checkout and falsely passed a stale one pushed from a fresh checkout.
+      # The full refs/heads/ form is unambiguous (a same-named tag cannot shadow it) and makes the
+      # helper's labeled line name the branch actually measured.
       set +e
-      fresh_out=$(bash "$bf" "$fresh_base" HEAD 2>&1)
+      fresh_out=$(bash "$bf" "$fresh_base" "refs/heads/$branch" 2>&1)
       fresh_rc=$?
       set -e
       case "$fresh_rc" in
         1)
-          echo "safe-push: REFUSING a stale-base push." >&2
+          echo "safe-push: REFUSING a stale-base push of '$branch'." >&2
           echo "          $fresh_out" >&2
           echo "          Refresh ADDITIVELY, never with a rebase (a rewrite orphans every fix SHA cited in review replies):" >&2
-          echo "            git merge origin/$fresh_base       # in this worktree" >&2
+          echo "            git merge origin/$fresh_base       # with '$branch' checked out" >&2
           echo "            gh pr update-branch <n>            # for an OPEN PR (default merge-commit mode)" >&2
           echo "          Wrong base? Pass --base <name> (e.g. a backport's real base) - that is the fix, not the override." >&2
           echo "          Deliberately uploading behind-base WIP? Re-run with --stale-ok to declare it." >&2

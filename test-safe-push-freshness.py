@@ -228,6 +228,63 @@ check("base-freshness.sh is in HELPER_NAMES (deployed to the stable path)",
 check("...and safe-push.sh itself is too (the dependent script)",
       "safe-push.sh" in helper_names)
 
+print("\n== MEASURES THE BRANCH PUSHED, NOT THE CHECKOUT (#457) ==")
+# REAL git, not the stub: the stub's rev-list answers BEHIND_N for ANY ref, so it cannot tell
+# `HEAD` from `refs/heads/<branch>` and would pass with the bug present. A local bare repo is
+# the origin, so nothing leaves the temp dir. safe-push pushes <branch> BY NAME while the
+# checkout can be any other branch; measuring HEAD got both directions wrong.
+def real_repo_run(td, checkout, push_branch):
+    env = dict(os.environ, GIT_CONFIG_GLOBAL=os.path.join(td, "gitconfig"),
+               GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0")
+    env.pop("CLAUDE_PLUGIN_ROOT", None)
+    with open(env["GIT_CONFIG_GLOBAL"], "w") as fh:
+        fh.write("[user]\n\tname = t\n\temail = t@example.invalid\n"
+                 "[commit]\n\tgpgsign = false\n[init]\n\tdefaultBranch = main\n")
+    origin, work = os.path.join(td, "origin.git"), os.path.join(td, "work")
+
+    def g(*a, cwd=work):
+        subprocess.run(["git", *a], cwd=cwd, env=env, check=True, capture_output=True)
+
+    g("init", "-q", "--bare", origin, cwd=td)
+    g("clone", "-q", origin, work, cwd=td)
+    g("commit", "-q", "--allow-empty", "-m", "c0")
+    g("push", "-q", "origin", "main")        # seed the base (inside the harness only)
+    g("branch", "stale")                     # stale + release/1.2 sit at c0
+    g("branch", "release/1.2")
+    g("commit", "-q", "--allow-empty", "-m", "c1")
+    g("push", "-q", "origin", "main")        # origin/main advances: stale is 1 behind
+    g("branch", "feat")                      # feat is at c1: fresh
+    g("remote", "set-head", "origin", "main")
+    g("checkout", "-q", checkout)
+    ghlog = os.path.join(td, "gh.log")
+    bindir = os.path.join(td, "bin")
+    os.makedirs(bindir)
+    p = os.path.join(bindir, "gh")
+    with open(p, "w") as fh:
+        fh.write(GH_STUB)
+    os.chmod(p, 0o755)
+    env.update(PATH=bindir + os.pathsep + env["PATH"], GHLOG=ghlog)
+    r = subprocess.run(["bash", SCRIPT, push_branch], cwd=work, env=env,
+                       capture_output=True, text=True, timeout=60)
+    remote = subprocess.run(["git", "ls-remote", origin, "refs/heads/" + push_branch],
+                            env=env, capture_output=True, text=True).stdout
+    return r.returncode, r.stdout + r.stderr, remote, os.path.exists(ghlog)
+
+
+with tempfile.TemporaryDirectory() as td:
+    rc, out, remote, gh_used = real_repo_run(td, "release/1.2", "feat")
+check("checkout stale (release/1.2), push FRESH feat -> exit 0, no false refusal", rc == 0)
+check("...and no stale-base refusal was emitted", "REFUSING" not in out)
+check("...and feat actually reached origin (not vacuous)", remote.strip() != "")
+check("...and no gh was invoked", not gh_used)
+
+with tempfile.TemporaryDirectory() as td:
+    rc, out, remote, gh_used = real_repo_run(td, "main", "stale")
+check("checkout fresh (main), push STALE branch -> exit 1, no false pass", rc == 1)
+check("...the refusal names the branch actually measured",
+      "refs/heads/stale" in out and "1 commit(s) behind" in out)
+check("...and stale was NOT pushed", remote.strip() == "")
+
 print()
 if FAILS:
     print(f"FAILED ({len(FAILS)}):")
