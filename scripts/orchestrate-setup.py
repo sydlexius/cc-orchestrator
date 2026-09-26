@@ -236,10 +236,11 @@ def check_agent_teams(settings):
                        f"backend ({'/'.join(SUPPORTED_TEAMMATE_MODES)}); teammates may not spawn as expected")
 
 
-def check_tmux():
+def check_tmux(settings=None):
     """Doctor check (WARN-level, #294/#312): tmux is the PREFERRED teammate backend, NOT a
     requirement - this check WARNs, never FAILs. Outside tmux, teammates still spawn via the
-    documented iTerm2 / in-process backend; only the pane layout differs, and the pipeline plus
+    documented iTerm2 / in-process backend (EXCEPT under an explicit teammateMode=tmux - see
+    #346 below); only the pane layout differs, and the pipeline plus
     the deterministic floor are entirely unaffected. PASS = tmux installed AND lead inside it.
     Read-only: inspects $TMUX + PATH, changes nothing.
 
@@ -247,14 +248,43 @@ def check_tmux():
     $CLAUDE_CODE_SESSION_ID, so a non-tmux session arms a marker and IS merge-gated exactly
     like a tmux one. These WARNs are therefore pure UX advice - say so, and do not imply any
     loss of gating (the earlier wording named marker-arming as a real cost; that is now stale
-    and would be a FALSE warning, which is the class of defect #294 existed to remove)."""
+    and would be a FALSE warning, which is the class of defect #294 existed to remove).
+
+    #346: when the settings PIN teammateMode="tmux" and $TMUX is empty, the generic
+    iTerm2 / in-process fallback text is FALSE and is REPLACED with mode-specific text (still a
+    WARN, exit status unchanged). Claude Code falls back to in-process ONLY when the mode is
+    "auto"; with an explicit "tmux":
+      (a) tmux NOT installed -> teammate spawns FAIL (no fallback);
+      (b) tmux installed, $TMUX empty -> teammates spawn as panes in a SEPARATE tmux server
+          (socket claude-swarm-<pid>) the lead is not attached to, so plain tmux reads cannot
+          see them and the lead cannot enumerate its roster.
+    PROVENANCE: this behavior was READ from the Claude Code 2.1.283 bundled JS, not
+    live-verified; re-check it if a later Claude Code changes the backend selection. Every
+    other mode keeps the generic text unchanged. The mode is read from the USER settings file
+    only; a per-session `--teammate-mode` flag can override it and is invisible to doctor, so
+    the #346 text names itself as based on the configured setting."""
     fallback = ("teammates spawn via the iTerm2 / in-process backend instead "
                 "(pane layout differs; pipeline + deterministic floor unaffected)")
     gated = ("the session is still merge-gated: the floor marker keys off "
              "$CLAUDE_CODE_SESSION_ID when $TMUX is absent (#312)")
+    tmux_mode = (settings or {}).get("teammateMode") == "tmux"
+    # doctor reads only the user settings file; a per-session `--teammate-mode` flag can override
+    # it and is invisible here, so the #346 text is qualified as based on the CONFIGURED setting.
+    scope = ("(based on the configured user setting; a per-session --teammate-mode flag can "
+             "override it)")
     if not shutil.which("tmux"):
+        if tmux_mode:
+            return _emit(WARN, "tmux not installed and teammateMode=tmux (#346) " + scope + " - teammate spawns will FAIL "
+                               "(the in-process fallback is auto-mode only). Remedy: set teammateMode to "
+                               f"in-process or auto, or install tmux. NOTE: {gated}.")
         return _emit(WARN, f"tmux not installed - {fallback}. NOTE: {gated}.")
     if not os.environ.get("TMUX"):
+        if tmux_mode:
+            return _emit(WARN, "lead is not inside tmux ($TMUX empty) and teammateMode=tmux (#346) " + scope + " - teammates "
+                               "spawn as panes in a separate tmux server (socket claude-swarm-<pid>) the lead "
+                               "is not attached to, so plain tmux reads cannot see them; track spawned "
+                               "teammates yourself. Remedy: start the session inside tmux, or set "
+                               f"teammateMode to in-process. NOTE: {gated}.")
         return _emit(WARN, f"lead is not inside tmux ($TMUX empty) - {fallback}. NOTE: {gated}.")
     return _emit(PASS, "tmux installed and lead is inside it")
 
@@ -1963,7 +1993,7 @@ def check_slack_bot_user_id():
 def cmd_doctor(args):
     settings = _load_settings()
     repo_status, _head = check_repo_main(getattr(args, "repo", None))
-    results = [check_agent_teams(settings), check_tmux(),
+    results = [check_agent_teams(settings), check_tmux(settings),
                check_guard_wired(settings), check_guard_healthy(), check_guard_stale(),
                check_helpers_stale(), check_agents(), check_steer(settings), check_ctxmeter(settings),
                check_session_init_hook(settings),
