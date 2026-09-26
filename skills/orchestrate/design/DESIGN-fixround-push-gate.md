@@ -114,6 +114,24 @@ start passing `--receipt` so fix rounds produce one; the pr-shipper must push fr
 which needs verifying against where the shipper actually runs. Still forgeable by a dishonest
 agent - out of the threat model, same as elmer (`scripts/elmer-enqueue.sh:23-24`).
 
+OPEN PRECONDITIONS - B is not implementable as written until each is resolved:
+
+- **`/handle-review` does not push through safe-push.** Its Step 7 / Step 8.5 push is a raw
+  `git push origin $(git branch --show-current)` (`commands/handle-review.md`), so a receipt leg
+  in `safe-push.sh` never sees the fix-round push this design exists to gate. Either route that
+  push through the deployed `safe-push.sh` by its literal path, or scope B to the shipper and
+  design a separate handle-review gate.
+- **The receipt must bind the FINAL fix commit.** handle-review's only `gate-runner.py` call is
+  Step 5.5, BEFORE Step 7 creates the fix commit, so adding `--receipt` there records the
+  pre-fix tree and the bind refuses every normal fix round. The receipt-producing gate has to
+  run after the final commit (including any Step 5.6 follow-up commit) and before the push,
+  with an explicit receipt path.
+- **The shipper cannot see a per-worktree receipt.** `/prep-pr` writes the receipt under ITS
+  worktree's `$(git rev-parse --git-dir)`, but the pr-shipper pushes the branch by name from a
+  shared checkout, whose git-dir holds no receipt, so a caller-git-dir lookup refuses every
+  normal stack push. The handoff needs a location keyed by branch (or tree SHA) that the pushing
+  checkout can resolve, e.g. under the COMMON git dir, before B is presented as implementable.
+
 ### C. Elmer-style check at a lead-side step (no push-path change)
 
 Have the lead (or `/prep-pr` Step 8 / the shipper's PR-open) verify the receipt against the PR

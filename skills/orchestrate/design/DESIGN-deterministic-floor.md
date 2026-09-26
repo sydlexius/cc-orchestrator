@@ -525,20 +525,23 @@ short-circuit; see the `orchestrate-guard.sh` header and #324). The procedure:
    PreToolUse hook reports as a BLOCK. That denies every Bash call everywhere, the guard's own
    fail-open never runs (the parse fails first), and the only way out is the Edit/Write tool.
    So:
-   - Copy the deployed guard to a staging path IN THE SAME DIRECTORY, preserving its mode
-     (`cp -p ~/.claude/scripts/orchestrate-guard.sh ~/.claude/scripts/orchestrate-guard.sh.new`),
-     so the final `mv` is a same-filesystem atomic rename.
+   - Copy the deployed guard to a UNIQUE staging file IN THE SAME DIRECTORY, preserving its
+     mode: `stage=$(mktemp ~/.claude/scripts/orchestrate-guard.sh.XXXXXX)` then
+     `cp -p ~/.claude/scripts/orchestrate-guard.sh "$stage"`, and carry `$stage` through every
+     step below. Same directory keeps the final `mv` a same-filesystem atomic rename. Never a
+     fixed name like `orchestrate-guard.sh.new`: `cp` FOLLOWS a symlink already sitting at that
+     path and overwrites its target instead of making an isolated copy; `mktemp` creates a
+     fresh regular file that cannot be a pre-existing link.
    - Patch the COPY with the full deny recipe, not just the matcher: declare the `_PF_*`
      fragment, add it to `_PREFILTER_PARTS`, add an `--assert-coverage` BLOCK vector (CLAUDE.md
      "ADDING A DENY TO THE GUARD").
    - Validate the COPY: `bash -n` on it, then run it with `--self-test` and with
-     `--assert-coverage` by a path that re-resolves as `$0` (`./orchestrate-guard.sh.new` from
-     `~/.claude/scripts`, or its absolute path; never `bash <file>`, which makes `$0` a bare
-     name). Then feed it the new trigger on STDIN: write the JSON payload to a FILE with the
-     Write tool and redirect it (`~/.claude/scripts/orchestrate-guard.sh.new < <payload-file>`,
+     `--assert-coverage` by a path that re-resolves as `$0` (the absolute `"$stage"`; never
+     `bash <file>`, which makes `$0` a bare name). Then feed it the new trigger on STDIN: write the JSON payload to a FILE with the
+     Write tool and redirect it (`"$stage" < /path/to/payload.json`,
      expect exit 2). Never inline the trigger in an `echo` on a Bash command line: the LIVE
      guard greps command lines (CLAUDE.md floor rules), and the payload belongs in the file.
-   - Swap: `mv ~/.claude/scripts/orchestrate-guard.sh.new ~/.claude/scripts/orchestrate-guard.sh`.
+   - Swap: `mv "$stage" ~/.claude/scripts/orchestrate-guard.sh`.
      A rename also means a call already running keeps reading the old inode, whereas an
      in-place write can change the bytes under a bash that is still reading them.
 
@@ -552,8 +555,11 @@ short-circuit; see the `orchestrate-guard.sh` header and #324). The procedure:
    `deployed guard ... DIFFERS from the bundled plugin guard` and names this case: "PORT IT
    INTO THE REPO FIRST - a refresh would silently drop that floor behavior"
    (`check_guard_stale`, `scripts/orchestrate-setup.py:449-465`). During a hot-patch that WARN
-   is expected; it is the drift signal, not noise to clear. This blocks ALL `configure --apply`
-   work, not only the guard refresh: `configure` has no flag to skip the guard deploy (its only
+   is expected; it is the drift signal, not noise to clear. The WARN does NOT stop anything:
+   `_guard_deploy_action()` just returns `refresh`, and `configure --apply` proceeds, writes
+   settings, then `_deploy_guard()` REPLACES the deployed file, dropping the emergency deny
+   (recoverable only from `.bak`, below). This is a PROCEDURAL stop the operator must honor, and
+   it covers ALL `configure --apply` work, not only the guard refresh: `configure` has no flag to skip the guard deploy (its only
    opt-outs are `--no-steer` and `--no-ctxmeter`, `scripts/orchestrate-setup.py:2681-2692`),
    so wiring a hook, adding an allow-list entry or refreshing a helper all wait until the patch
    is ported (step 4).
