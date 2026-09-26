@@ -245,6 +245,25 @@ def main():
     check("same PR at a NEW gated sha -> exit 0 (a real new request)",
           rc == 0 and len(entries) == 1)
 
+    print("== #455: a RE-ADMITTED drained record does not block a re-queue ==")
+    # elmer-tick renames a record CR answered "Review rate limited." to
+    # <stem>.readmitted-<id>.json (still in drained/, so the cap counts it). That trigger
+    # reviewed nothing, so the same PR+SHA must be queueable again; a normal drained
+    # record for the same name must still refuse.
+    _, _, _, _, home = run(["42", "owner/repo", "--receipt", "__RECEIPT__"])
+    drained = os.path.join(home, "drained")
+    (name,) = os.listdir(os.path.join(home, "inbox"))
+    os.replace(os.path.join(home, "inbox", name),
+               os.path.join(drained, name[:-5] + ".readmitted-777.json"))
+    rc, _, _, entries, _ = run(["42", "owner/repo", "--receipt", "__RECEIPT__"], home=home)
+    check("only a readmitted record -> exit 0, re-queued", rc == 0 and entries == [name])
+    with open(os.path.join(drained, name), "w") as f:
+        f.write("{}")
+    for e in os.listdir(os.path.join(home, "inbox")):
+        os.remove(os.path.join(home, "inbox", e))
+    rc, _, _, entries, _ = run(["42", "owner/repo", "--receipt", "__RECEIPT__"], home=home)
+    check("readmitted + a NORMAL drained record -> exit 1 REFUSED", rc == 1 and entries == [])
+
     print("== the entry is machine-readable and carries the gate evidence ==")
     rc, _, _, entries, home = run(["42", "owner/repo", "--receipt", "__RECEIPT__"])
     body = json.load(open(os.path.join(home, "inbox", entries[0])))

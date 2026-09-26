@@ -388,7 +388,7 @@ Runtime (`scripts/`; canonical source is this repo):
   is a FILE pointing into `.git/worktrees/<name>`, so a literal path is unwritable exactly where
   this workflow normally runs, and `--git-dir` is also naturally per-worktree. IDEMPOTENCY is
   structural: an entry sits in `inbox/` until triggered then moves to `drained/`, and a PR+SHA in
-  EITHER is never queued again - asking GitHub "has a review happened" would be RACY, since CR
+  EITHER is never queued again (except a record elmer-tick renamed `*.readmitted-<id>.json`, #455) - asking GitHub "has a review happened" would be RACY, since CR
   takes minutes to post and a tick 30s later would fire twice. `full` review is refused outright
   regardless of what a caller asks (it re-surfaces resolved threads and owes a human decision); a
   gh read failure exits 2 rather than enqueuing. Reads a PR + writes one LOCAL queue entry: no
@@ -428,7 +428,17 @@ Runtime (`scripts/`; canonical source is this repo):
   so the conservative order is the one that cannot be wrong) and a quota READ FAILURE never falls
   through to a post. THE DRAIN RECORD is the idempotency mechanism, written the instant the post
   succeeds: asking GitHub "has a review happened" would be RACY the dangerous way, since CR takes
-  minutes to post and a tick 30s later would fire again. The trigger is a FIXED literal, never
+  minutes to post and a tick 30s later would fire again. RE-ADMISSION (#455) keeps that: a later
+  tick re-queues a drained entry ONLY on positive evidence - the FIRST `coderabbitai[bot]` issue
+  comment created after its `triggered_at` contains the exact "Review rate limited." (the post
+  reviewed nothing), the record is the NEWEST for its PR within the hour, and the head is unmoved.
+  The commit point is one rename to `<stem>.readmitted-<comment id>.json`, kept in `drained/` so the
+  cap STILL counts the post, freeing the name so enqueue (exact-name check) no longer reads it as
+  ALREADY TRIGGERED. AT MOST ONCE PER PR+SHA: a countdown-less rate-limit reads as a CLEAR quota,
+  so re-admitting on each new reply looped the whole hourly budget into an active limit; and the
+  re-admitting tick posts nothing. A failed re-queue renames the record back so the next tick
+  retries (that tick still posts nothing). No reply, other text, an unparseable bot timestamp, or a gh read
+  failure leaves it drained. The trigger is a FIXED literal, never
   composed from entry data. Exit 0 for every no-op (empty queue, throttled, cap spent, lock held -
   a timer-driven loop must not read those as failure), 1 for a refused entry (left queued), 2 for
   any setup error including a gh/quota read failure or a drain that failed AFTER a successful post.

@@ -89,7 +89,8 @@ receipt or the queue entry - both are checked, and editing them is the one path 
 un-gated code in front of a reviewer.
 
 **Already queued / already triggered** is also a refusal, by design: a PR+SHA present in `inbox/`
-or `drained/` is never queued twice. Asking GitHub "has a review happened yet" would be racy - CR
+or `drained/` is never queued twice (except a record the tick renamed `*.readmitted-<id>.json`
+after CR answered "Review rate limited.", #455). Asking GitHub "has a review happened yet" would be racy - CR
 takes minutes to post - so the drain record is the authority.
 
 ---

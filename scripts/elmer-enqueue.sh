@@ -25,7 +25,8 @@
 # reject an ACCIDENTALLY hand-rolled or wrong-tool artifact, not a determined forger.
 #
 # IDEMPOTENCY is by construction: an entry lives in inbox/ until triggered, then
-# moves to drained/. A PR+SHA present in EITHER directory is never queued again.
+# moves to drained/. A PR+SHA present in EITHER directory is never queued again,
+# except one whose record elmer-tick renamed *.readmitted-<id>.json (#455).
 # Checking GitHub for "has a review already happened" would be RACY (CR takes
 # minutes to post, so a tick 30s later sees nothing and fires twice); the drain
 # record closes that window the instant the post succeeds.
@@ -230,7 +231,7 @@ if [ "$r_commit" != "$head_sha" ]; then
   exit 1
 fi
 
-# --- Idempotency: PR+SHA present in inbox/ OR drained/ is never re-queued -----
+# --- Idempotency: PR+SHA in inbox/ OR drained/ is never re-queued (bar #455) ---
 ELMER_HOME="${ELMER_HOME:-$HOME/.claude/elmer}"
 inbox="$ELMER_HOME/inbox"
 drained="$ELMER_HOME/drained"
@@ -251,6 +252,9 @@ if [ -e "$inbox/$entry" ]; then
   { echo "REFUSED: PR #$pr ($repo) at ${r_commit:0:12} is ALREADY QUEUED ($inbox/$entry)."; } >&2 || true
   exit 1
 fi
+# EXACT NAME, never a prefix glob (#455): elmer-tick renames a trigger CR answered
+# "Review rate limited." to <stem>.readmitted-<id>.json. That post reviewed nothing,
+# so it must not read as ALREADY TRIGGERED; it stays in drained/ for the cap's count.
 if [ -e "$drained/$entry" ]; then
   { echo "REFUSED: PR #$pr ($repo) at ${r_commit:0:12} was ALREADY TRIGGERED (see $drained/$entry)."
     echo "         A drained entry is never re-posted. Push a change and re-run /prep-pr for a new request."

@@ -28,6 +28,7 @@ Run: python3 test-elmer-tick.py
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -71,6 +72,10 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
     *) printf '{"headRefOid":"%s","state":"%s"}\n' \
          "${GH_HEAD:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" "${GH_STATE:-OPEN}" ; exit 0 ;;
   esac
+fi
+if [ "$1" = "api" ]; then   # #455 re-admit: the PR's issue comments
+  [ "${GH_API_FAIL:-0}" = "1" ] && exit 1
+  printf '%s\n' "${GH_COMMENTS:-[]}" ; exit 0
 fi
 exit 0
 """
@@ -1362,6 +1367,218 @@ def _(env):
     check("exit 0", r.returncode == 0)
     check("says POSTED", "POSTED an incremental review request" in r.stdout)
     check("names the drain record", "drained: " in r.stdout)
+
+
+# --- #455: re-admit a trigger CR answered "Review rate limited." --------------------
+# MODELED on the #455 report (canticle #1052: "Action not completed" / "Review rate
+# limited."), not verbatim bytes; only the exact phrase is load-bearing.
+RL_BODY = ("<!-- This is an auto-generated reply by CodeRabbit -->\n<details>\n"
+           "<summary>Action not completed</summary>\n\nReview rate limited.\n\n</details>")
+STEM = "sydlexius-cc-orchestrator--354--" + SHA[:12]
+
+
+def _iso(delta_s):
+    import datetime
+    t = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=delta_s)
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _record(env, name=STEM + ".json", at=-120, sha=SHA):
+    with open(os.path.join(env.drained, name), "w") as f:
+        json.dump({"repo": "sydlexius/cc-orchestrator", "pr": 354, "commit_sha": sha,
+                   "form": "incremental", "enqueued_at": _iso(-600),
+                   "triggered_at": _iso(at), "trigger": "@coderabbitai review"}, f)
+
+
+def _comments(*items):
+    return json.dumps([{"id": i, "user": {"login": who}, "created_at": _iso(at), "body": b}
+                       for (i, who, at, b) in items])
+
+
+@case("#455 re-admit: exact bot reply newer than triggered_at -> re-queued, record renamed")
+def _(env):
+    _record(env)
+    r = env.run(GH_QUOTA=1, GH_COMMENTS=_comments((501, "coderabbitai[bot]", -115, RL_BODY)))
+    check("exit 0", r.returncode == 0)
+    check("says RE-ADMITTED", "RE-ADMITTED" in r.stdout)
+    check("record renamed with the evidence id",
+          env.ls("drained") == [STEM + ".readmitted-501.json"])
+    check("re-queued under the original name", env.ls("inbox") == [STEM + ".json"])
+    qp = os.path.join(env.inbox, STEM + ".json")
+    q = json.load(open(qp)) if os.path.exists(qp) else {}
+    check("entry carries readmitted_from + evidence, no triggered_at",
+          q.get("readmitted_from") == STEM + ".readmitted-501.json"
+          and q.get("readmit_evidence") == 501 and "triggered_at" not in q)
+    check("posted nothing (throttled)", env.posts == [])
+
+
+@case("#455 re-admit: the cap still counts the rate-limited post")
+def _(env):
+    _record(env)
+    r = env.run(ELMER_MAX_PER_HR=1,
+                GH_COMMENTS=_comments((501, "coderabbitai[bot]", -115, RL_BODY)))
+    check("re-admitted", env.ls("inbox") == [STEM + ".json"])
+    check("cap reached by the renamed record", "hourly cap reached (1/1" in r.stdout)
+    check("posted nothing", env.posts == [])
+
+
+def _no_readmit(env, r):
+    check("exit 0", r.returncode == 0)
+    check("record untouched", env.ls("drained") == [STEM + ".json"])
+    check("nothing re-queued", env.ls("inbox") == [])
+    check("posted nothing", env.posts == [])
+
+
+for _lbl, _items in [
+    ("reply OLDER than triggered_at", [(501, "coderabbitai[bot]", -125, RL_BODY)]),
+    ("non-bot author", [(501, "coderabbitai", -115, RL_BODY)]),
+    ("near-miss text (case)", [(501, "coderabbitai[bot]", -115, "review rate limited.")]),
+    ("near-miss text (wording)", [(501, "coderabbitai[bot]", -115, "Review rate limit exceeded.")]),
+    ("no reply", []),
+    ("first bot reply is not the rate-limit one",
+     [(501, "coderabbitai[bot]", -115, "Action performed"),
+      (502, "coderabbitai[bot]", -110, RL_BODY)]),
+]:
+    @case(f"#455 no re-admit: {_lbl}")
+    def _(env, _items=_items):
+        _record(env)
+        _no_readmit(env, env.run(GH_COMMENTS=_comments(*_items)))
+
+
+@case("#455 no re-admit: gh read failure skips re-admission, the tick still runs")
+def _(env):
+    _record(env)
+    env.queue(999)
+    r = env.run(GH_API_FAIL=1, GH_COMMENTS=_comments((501, "coderabbitai[bot]", -115, RL_BODY)))
+    check("exit 0", r.returncode == 0)
+    check("notes the read failure", "could not read comments" in r.stderr)
+    check("record untouched", STEM + ".json" in env.ls("drained"))
+    check("the other entry still posted, once", len(env.posts) == 1 and "999" in env.posts[0])
+
+
+@case("#455 no re-admit: head moved since the trigger")
+def _(env):
+    _record(env)
+    _no_readmit(env, env.run(GH_HEAD=OTHER_SHA,
+                             GH_COMMENTS=_comments((501, "coderabbitai[bot]", -115, RL_BODY))))
+
+
+@case("#455 F1: re-admit at most ONCE per PR+SHA; the re-admitting tick posts nothing")
+def _(env):
+    # CR answers EVERY trigger "Review rate limited." with no countdown, so the quota
+    # reads clear (GH_QUOTA=0). Pre-fix each new reply re-admitted: a 4/h loop.
+    _record(env)
+    c1 = (501, "coderabbitai[bot]", -115, RL_BODY)
+    r1 = env.run(GH_QUOTA=0, GH_COMMENTS=_comments(c1))
+    check("tick 1 re-admitted, posted nothing (hold-off)",
+          "RE-ADMITTED" in r1.stdout and "nothing posted this tick" in r1.stdout and env.posts == [])
+    env.run(GH_QUOTA=0, GH_COMMENTS=_comments(c1))
+    check("tick 2 re-posted once", len(env.posts) == 1)
+    check("both records kept", env.ls("drained") == [STEM + ".json", STEM + ".readmitted-501.json"])
+    c2 = _comments(c1, (502, "coderabbitai[bot]", 5, RL_BODY))   # a NEW RL reply to post 2
+    for _ in range(3):
+        r = env.run(GH_QUOTA=0, GH_COMMENTS=c2)
+        check("later tick: no second re-admit", "RE-ADMITTED" not in r.stdout)
+    check("2 posts total (1 original + 1 re-post), never more", len(env.posts) == 1)
+    check("second record stays drained", env.ls("inbox") == []
+          and env.ls("drained") == [STEM + ".json", STEM + ".readmitted-501.json"])
+
+
+def _shim(env, name, pattern):
+    # Root ignores file modes, so a write is failed with a PATH shim that refuses only
+    # the invocation whose arguments match `pattern` and defers to the real tool otherwise.
+    real = shutil.which(name)
+    with open(os.path.join(env.bin, name), "w") as f:
+        f.write(f'#!/usr/bin/env bash\ncase "$*" in {pattern}) exit 1 ;; esac\nexec "{real}" "$@"\n')
+    os.chmod(os.path.join(env.bin, name), 0o755)
+
+
+@case("#455 N2: a failed re-queue restores the record, posts nothing, and the next tick retries")
+def _(env):
+    # The hold-off must cover the window AFTER the commit-point rename: set only on a
+    # successful re-queue, this tick would post the other queued entry on a quota that
+    # a countdown-less rate-limit reads as clear. The jq shim fails only the re-queue
+    # filter (it alone names readmitted_from).
+    _shim(env, "jq", "*readmitted_from*")
+    _record(env)
+    env.queue(999)
+    comments = _comments((501, "coderabbitai[bot]", -115, RL_BODY))
+    r = env.run(GH_QUOTA=0, GH_COMMENTS=comments)
+    check("exit 0", r.returncode == 0)
+    check("warns the record was restored for retry", "restored " + STEM + ".json for retry" in r.stderr)
+    check("record restored under its original name",
+          STEM + ".json" in env.ls("drained")
+          and not any(".readmitted-" in n for n in env.ls("drained")))
+    check("the rate-limited entry is not in the inbox", STEM + ".json" not in env.ls("inbox"))
+    check("posted nothing (hold-off)", env.posts == [])
+    os.remove(os.path.join(env.bin, "jq"))
+    r2 = env.run(GH_QUOTA=0, GH_COMMENTS=comments)
+    check("next tick re-admits the same evidence", "RE-ADMITTED" in r2.stdout
+          and STEM + ".readmitted-501.json" in env.ls("drained")
+          and STEM + ".json" in env.ls("inbox"))
+    check("and still posts nothing that tick", env.posts == [])
+
+
+@case("#455 N2: re-queue AND restore both fail -> renamed record kept, manual warning, no post")
+def _(env):
+    _shim(env, "jq", "*readmitted_from*")
+    _shim(env, "mv", "*.readmitted-*.json\\ *")
+    _record(env)
+    env.queue(999)
+    r = env.run(GH_QUOTA=0, GH_COMMENTS=_comments((501, "coderabbitai[bot]", -115, RL_BODY)))
+    check("exit 0", r.returncode == 0)
+    check("warns to re-enqueue by hand", "could not re-queue or restore it" in r.stderr)
+    check("renamed record kept in drained/",
+          STEM + ".readmitted-501.json" in env.ls("drained")
+          and STEM + ".json" not in env.ls("drained"))
+    check("nothing re-queued", STEM + ".json" not in env.ls("inbox"))
+    check("posted nothing (hold-off)", env.posts == [])
+
+
+@case("#455 consumed evidence never re-admits a later record")
+def _(env):
+    _record(env, STEM[:-12] + OTHER_SHA[:12] + ".readmitted-501.json", at=-300)
+    _record(env, at=-200)
+    r = env.run(GH_COMMENTS=_comments((501, "coderabbitai[bot]", -100, RL_BODY)))
+    check("no re-admit", "RE-ADMITTED" not in r.stdout and env.ls("inbox") == [])
+    check("record untouched", STEM + ".json" in env.ls("drained"))
+
+
+@case("#455 F3: an unparseable bot created_at anywhere -> no re-admit (doubt = skip)")
+def _(env):
+    _record(env)
+    items = json.loads(_comments((501, "coderabbitai[bot]", -115, RL_BODY)))
+    items.insert(0, {"id": 500, "user": {"login": "coderabbitai[bot]"},
+                     "created_at": "2026-09-26T00:00:00.5Z", "body": "Action performed"})
+    _no_readmit(env, env.run(GH_COMMENTS=json.dumps(items)))
+
+
+@case("#455 F4: a drained record older than the trailing hour is not re-admitted")
+def _(env):
+    _record(env, at=-3700)
+    _no_readmit(env, env.run(GH_COMMENTS=_comments((501, "coderabbitai[bot]", -3690, RL_BODY))))
+
+
+@case("#455 F4: a stranded inbox+drained pair is not re-admitted or rewritten")
+def _(env):
+    _record(env)
+    body = '{"repo": "sydlexius/cc-orchestrator", "pr": 354, "stranded": true}'
+    with open(os.path.join(env.inbox, STEM + ".json"), "w") as f:
+        f.write(body)
+    r = env.run(GH_COMMENTS=_comments((501, "coderabbitai[bot]", -115, RL_BODY)))
+    check("no RE-ADMITTED", "RE-ADMITTED" not in r.stdout)
+    check("record not renamed", env.ls("drained") == [STEM + ".json"])
+    check("inbox entry not rewritten", open(os.path.join(env.inbox, STEM + ".json")).read() == body)
+    check("posted nothing", env.posts == [])
+
+
+@case("#455 only the NEWEST record for a PR is a candidate")
+def _(env):
+    _record(env, "older.json", at=-300)
+    _record(env, "newer.json", at=-200, sha=OTHER_SHA)   # head check fails for this one
+    r = env.run(GH_COMMENTS=_comments((501, "coderabbitai[bot]", -100, RL_BODY)))
+    check("the older record is not re-admitted by a reply to a later post",
+          "RE-ADMITTED" not in r.stdout and env.ls("drained") == ["newer.json", "older.json"])
 
 
 print()
