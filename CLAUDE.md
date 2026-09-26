@@ -360,6 +360,16 @@ Runtime (`scripts/`; canonical source is this repo):
   Step 1c runs BEFORE the Step 7 push, so the gate that STOPS has already fired; safe-push stays
   best-effort so a stripped-down install can still push. An unresolvable BASE stays unknown on
   both paths.
+  GATE RECEIPT LEG (#318, `DESIGN-fixround-push-gate.md`): BEFORE freshness and any network step,
+  `safe-push.sh` REFUSES unless a passing gate-runner `gate-receipt/v1` binds the pushed TREE
+  (`tree_sha == refs/heads/<b>^{tree}`, so a post-gate squash still passes). The receipt is read
+  from the git-dir of the worktree that has the branch CHECKED OUT (else the caller's), and that
+  worktree must be clean. Fail CLOSED on doubt: the full `orchestrate_schemas.py` validator runs
+  when found (repo/plugin legs; it is not deployed), and an inline check of the load-bearing
+  fields always runs. `--ungated` is the declared escape for a push with no gate. It pushes the FULL refspec `refs/heads/<b>:refs/heads/<b>` (#466: a same-named tag made
+  the bare name ambiguous) and ONE branch per call: a forwarded non-flag word (a second refspec) or
+  `--all`/`--tags`/`--mirror` exits 2. A branch held by two worktrees, or mid-rebase in one, refuses.
+  `/handle-review` pushes through it via one gated-push block.
 - `scripts/open-pr-staleness-sweep.sh` - the merge-side open-PR staleness sweep (#282), called from
   `/post-merge-cleanup` with the just-merged PR (which it EXCLUDES). A merge advances the base and
   silently leaves every OTHER open PR behind it; this notices them. THE SAFETY HINGE is the reviewed

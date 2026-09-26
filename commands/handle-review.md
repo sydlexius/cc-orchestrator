@@ -718,17 +718,44 @@ auto-review is OFF org-wide, so a push triggers no automatic re-review, and a
 SHA-citing reply to a not-yet-pushed commit 404s (the #2038 failure). Pushing first
 makes the cited commit reachable before any reply references it. Push-first decides
 push-vs-reply ONLY; it never decides when the review runs, and an owed pass always
-precedes the push. Once any owed Step 5.6 pass has cleared, push:
+precedes the push. Once any owed Step 5.6 pass has cleared, run the GATED PUSH block
+below. It runs the receipt-producing gate on the FINAL commit (after any Step 5.6 follow-up
+commit; the Step 5.5 run predates the fix commit, so its tree can never match), then pushes
+through safe-push, whose receipt leg (#318) REFUSES unless a passing receipt binds the exact
+tree being pushed. Never a raw `git push`: that skips both the receipt check and safe-push's
+remote-ref verification.
 
 ```bash
-git push origin $(git branch --show-current) 2>&1
+# Literal helper path in every leg (the "Helper exec paths" rule in prep-pr.md). gate-runner and
+# safe-push ship together on every leg; a leg missing either fails closed (no push).
+RECEIPT_PATH="$(git rev-parse --git-dir)/prep-pr-receipt.json"
+if [ -f scripts/safe-push.sh ] && jq -e '.name == "orchestrate"' .claude-plugin/plugin.json >/dev/null 2>&1; then leg=repo
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh' ]; then leg=plugin
+elif [ -f ~/.claude/scripts/safe-push.sh ]; then leg=stable
+else leg=none; fi
+gate_rc=2; push_rc=2
+[ "$leg" = repo ]   && { python3 scripts/gate-runner.py --receipt "$RECEIPT_PATH"; gate_rc=$?; }
+[ "$leg" = plugin ] && { python3 '${CLAUDE_PLUGIN_ROOT}/scripts/gate-runner.py' --receipt "$RECEIPT_PATH"; gate_rc=$?; }
+[ "$leg" = stable ] && { python3 ~/.claude/scripts/gate-runner.py --receipt "$RECEIPT_PATH"; gate_rc=$?; }
+[ "$gate_rc" = 0 ] && [ "$leg" = repo ]   && { bash scripts/safe-push.sh "$(git branch --show-current)"; push_rc=$?; }
+[ "$gate_rc" = 0 ] && [ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh' "$(git branch --show-current)"; push_rc=$?; }
+[ "$gate_rc" = 0 ] && [ "$leg" = stable ] && { bash ~/.claude/scripts/safe-push.sh "$(git branch --show-current)"; push_rc=$?; }
+[ "$leg" = none ]   && echo "safe-push.sh not found (repo-local, plugin, or ~/.claude/scripts/); NOT pushing" >&2
+[ "$leg" != none ] && [ "$gate_rc" != 0 ] && echo "gate FAILED (gate_rc=$gate_rc); NOT pushing - fix, commit, re-run this block" >&2
+echo "gate_rc=$gate_rc push_rc=$push_rc leg=$leg"
+(exit "$push_rc")  # prep-pr-ok
 ```
 
-Report the result. If the push fails, explain why -- do not retry automatically.
+The trailing `# prep-pr-ok` satisfies the floor's push advisory; what backs it is the gate
+run on the line above it and safe-push's receipt check. Never pipe this block (a pipeline
+reports the LAST command's exit, so a refused push reads as success, #432). Report the
+result. If the push fails or is refused, explain why -- do not retry automatically, and never
+reach for `--ungated` to get past a refusal (it declares that no gate exists, which is false
+here).
 
 **EXCEPTION -- CR auto-review is ON for this repo** (CodeRabbit posts an unsolicited
 review with no trigger, i.e. it auto-dismisses + re-triggers on every push): use the
-REPLY-FIRST order instead -- commit -> pass -> reply -> resolve -> push (Step 8.5). The org default is
+REPLY-FIRST order instead -- commit -> pass -> reply -> push -> guard-slice -> resolve (Step 8.5). The org default is
 auto-review OFF, so push-first is the standing case; see Step 8.5 for the full rule.
 
 Now substitute the real SHA into all "Fixed in <sha>" reply drafts from step 6.
@@ -824,8 +851,8 @@ Step 9 summary so the reader knows it was handled but not threaded.
 After the replies are posted (Step 7, against the already-pushed SHA), resolve the
 threads that were replied to in this round. In the push-first default the commit is
 already on origin, so every cited "Fixed in <sha>" is reachable before the thread is
-resolved. (In the reply-first EXCEPTION -- Step 8.5, CR auto-review ON -- this resolve
-runs before the push instead; it acts on already-replied threads either way.)
+resolved. (In the reply-first EXCEPTION -- Step 8.5, CR auto-review ON -- the replies go
+out before the push, and this resolve runs after the push once guard-slice passes.)
 
 ### CodeRabbit threads -- `@coderabbitai resolve`
 
@@ -908,14 +935,13 @@ the cited commit is reachable, then reply-with-hash and resolve.
 posts an unsolicited review with no trigger, i.e. it auto-dismisses + re-triggers on
 every push). There a fix-round push races CR's automatic re-review and can auto-resolve
 fresh threads before they are replied to. In that case invert (commit -> pass -> reply ->
-resolve -> push): reply (Step 7 replies) and resolve (Step 8) FIRST, then push here --
-
-```bash
-git push origin $(git branch --show-current) 2>&1
-```
-
--- annotating the replies "push in-flight" so the re-triggered review never runs ahead
-of the thread handling.
+push -> guard-slice -> resolve): post the Step 7 replies FIRST, then push here by running the
+Step 7 GATED PUSH block unchanged (never a raw `git push`) -- annotating the replies "push
+in-flight" so the re-triggered review never runs ahead of the thread handling. Then, now that the cited SHA is on origin, run the SKILL.md "Fix
+round" `finding_channel.py guard-slice` check and resolve (Step 8) ONLY on a zero exit;
+a non-zero exit means a reply cites an unpushed or unbound SHA, so correct those replies
+before resolving anything (#458: guard-slice needs a pushed SHA, so under this exception it
+gates the resolve rather than the replies).
 
 Either way, "never ship with unhandled review" is enforced at the pre-MERGE ship-gate
 (`ship-gate-preflight` + `pr-unreplied-comments`), NOT by push order. If a push fails,
