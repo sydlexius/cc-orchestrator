@@ -806,7 +806,7 @@ def main():
 
     # --- #287: THE ADVISORY INVARIANT (mechanically pinned, never assumed) ---------------------
     # /prep-pr Step 4a grants this script the CHEAP review tier (one multi-lens pass instead of the
-    # full K=2 loop) on the strength of ONE property: it is ADVISORY -- it cannot block a tool call.
+    # deny-authority depth) on the strength of ONE property: it is ADVISORY -- it cannot block a tool call.
     # Claude Code blocks only on a nonzero exit (2) or a stdout `permissionDecision: deny`, so the
     # property is: no nonzero exit on a live path, and NO STDOUT AT ALL.
     #
