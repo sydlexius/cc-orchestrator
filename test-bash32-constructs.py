@@ -36,7 +36,12 @@ import subprocess
 import sys
 import tempfile
 
-ROOT = os.environ.get("BASH32_ROOT") or os.path.dirname(os.path.abspath(__file__))
+# The mutation self-test re-runs this file on a fixture tree via --mutation-root. It is an
+# explicit argv flag, never an env var: an ambient override that also skipped the sanity floor
+# and the self-tests let an empty directory pass the gate silently.
+MUTATION_ROOT = (sys.argv[2] if len(sys.argv) == 3 and sys.argv[1] == "--mutation-root"
+                 else None)
+ROOT = MUTATION_ROOT or os.path.dirname(os.path.abspath(__file__))
 
 # (name, pattern, a line the pattern MUST catch). Bash 3.2 `declare` takes only -afFirtxp,
 # so any other attribute letter below is a bash 4+ attribute.
@@ -98,7 +103,10 @@ MUST_CATCH = [
 ]
 
 MARKER = re.compile(r"#\s*bash32-ok:(.*)$")
-FENCE_OPEN = re.compile(r"^\s*(`{3,}|~{3,})\s*(?:bash|sh|shell|zsh)(?:\s[^`]*)?$")
+# CommonMark: an opener is indented at most 3 spaces (4+ is an indented code block), and only a
+# BACKTICK fence forbids backticks in its info string; a tilde fence's info string may hold them.
+FENCE_OPEN = re.compile(r"^ {0,3}(?:(`{3,})[ \t]*(?:bash|sh|shell|zsh)(?:\s[^`]*)?"
+                        r"|(~{3,})[ \t]*(?:bash|sh|shell|zsh)(?:\s.*)?)$")
 
 
 def strip_comment(line):
@@ -147,7 +155,7 @@ def shell_lines(path):
         if fence is None:
             m = FENCE_OPEN.match(ln)
             if m:
-                fence = m.group(1)
+                fence = m.group(1) or m.group(2)
         elif s.startswith(fence) and not s.strip(fence[0]):
             fence = None
         else:
@@ -186,6 +194,12 @@ x4
 ```zsh
 x5
 ```
+~~~bash title=`demo`
+x6
+~~~
+    ```bash
+mapfile -t indented_is_not_a_fence
+    ```
 """
 
 
@@ -201,7 +215,7 @@ def selftest():
         with open(md, "w") as fh:
             fh.write(FENCE_FIXTURE)
         got = [ln for _, ln in shell_lines(md)]
-    if got != ["x1", "x2", "```", "x3", "x4", "x5"]:
+    if got != ["x1", "x2", "```", "x3", "x4", "x5", "x6"]:
         bad.append(f"fence extraction wrong: {got}")
     if bad or fp:
         sys.exit("FAIL: pattern self-test:\n  " + "\n  ".join(bad + fp))
@@ -218,8 +232,9 @@ def selftest():
         body.insert(1, 'mapfile -t prs < <(printf "1\\n")')
         with open(os.path.join(tmp, "scripts", "orchestrate-status.sh"), "w") as fh:
             fh.write("\n".join(body) + "\n")
-        r = subprocess.run([sys.executable, os.path.abspath(__file__)], capture_output=True,
-                           text=True, env={**os.environ, "BASH32_ROOT": tmp})
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "--mutation-root", tmp],
+                           capture_output=True,
+                           text=True)
         want = "scripts/orchestrate-status.sh:2: mapfile/readarray"
         if r.returncode == 0 or want not in r.stdout + r.stderr:
             sys.exit(f"FAIL: mutation self-test: injected mapfile not reported as '{want}' "
@@ -230,7 +245,9 @@ def selftest():
 def main():
     print("bash 3.2 construct gate (#463)")
     files, hits, md_lines = scan(ROOT)
-    if not os.environ.get("BASH32_ROOT"):
+    if len(sys.argv) > 1 and MUTATION_ROOT is None:
+        sys.exit(f"usage: {sys.argv[0]} (no arguments; --mutation-root is internal)")
+    if MUTATION_ROOT is None:
         # Parse-sanity floor: a broken glob or fence extractor scans nothing and passes.
         n_sh = sum(1 for f in files if f.endswith(".sh"))
         n_md = len(files) - n_sh
