@@ -297,6 +297,23 @@ def main():
     check("non-array comments response -> exit 2 (jq failure is a setup error)",
           rc == 2 and "setup error" in err)
 
+    # A null / false body passes `add // []` as an empty set; it must be refused, and so
+    # must malformed JSON (a truncated body), never read as "no quota signal".
+    for label, body in [("null", "null"), ("false", "false"), ("malformed", '[{"user":')]:
+        rc, out, err = run(["1", "owner/repo"], comments=body)
+        check(f"{label} comments response -> exit 2 (not a false all-clear)",
+              rc == 2 and "setup error" in err)
+
+    print("== a limit TIED with 'available' on the same second stays LIMITED ==")
+    ts = ago(minutes=1)
+    for order, objs in [("available last", (comment(RL_TEMPLATE.format(dur="30 minutes"), created=ts),
+                                            comment(AVAILABLE_BODY, created=ts))),
+                        ("available first", (comment(AVAILABLE_BODY, created=ts),
+                                             comment(RL_TEMPLATE.format(dur="30 minutes"), created=ts)))]:
+        rc, out, err = run(["1", "owner/repo"], comments=comments_json(*objs))
+        check(f"same-second limit and available ({order}) -> LIMITED ~29m",
+              rc == 1 and "29m" in (out + err))
+
     print("== unit and plurality variants that a naive '(\\d+) minutes' breaks on ==")
     # Every one of these is a REAL observed duration string.
     for dur, expect_rc, why in [

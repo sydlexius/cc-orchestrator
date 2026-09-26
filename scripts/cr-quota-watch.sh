@@ -112,8 +112,12 @@ raw="$(gh api --paginate "repos/$repo/issues/$pr/comments" 2>/dev/null)" || {
   echo "setup error: could not read issue comments for PR #$pr ($repo) (gh api read failed)" >&2
   exit 2
 }
-comments="$(printf '%s' "$raw" | jq -s 'add // []' 2>/dev/null || true)"
-if [ -z "$comments" ]; then
+# Every page must be a JSON ARRAY before the `// []` empty-result fallback: `add // []`
+# alone turns a `null`/`false` page into `[]`, so an error body would read as "no quota
+# signal", a false all-clear. jq's status is CHECKED (malformed JSON fails here, exit 2).
+if ! comments="$(printf '%s' "$raw" | jq -s '
+  if all(.[]; type == "array") then (add // []) else error("a comments page is not a JSON array") end
+' 2>/dev/null)" || [ -z "$comments" ]; then
   echo "setup error: could not parse issue comments for PR #$pr ($repo)" >&2
   exit 2
 fi
@@ -150,7 +154,7 @@ if ! signal="$(printf '%s' "$comments" | jq -r --arg login "$CR_LOGIN" --arg rx 
       else empty end
   ]
   | ([ .[] | select(.kind == "available") | .t ] | max) as $ta
-  | ([ .[] | select(.kind == "limited" and ($ta == null or .t > $ta)) ] | max_by(.deadline))
+  | ([ .[] | select(.kind == "limited" and ($ta == null or .t >= $ta)) ] | max_by(.deadline))
     // ([ .[] | select(.kind == "available") ] | max_by(.t))
   | if . == null then "" else "\(.kind)\t\(.deadline)\t\(.raw)\t\(.noun)" end
 ' 2>/dev/null)"; then
