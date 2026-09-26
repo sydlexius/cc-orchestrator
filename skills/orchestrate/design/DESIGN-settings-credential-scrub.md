@@ -1,7 +1,10 @@
 # Design: never persist a credential-shaped value in settings.local.json (#326)
 
-Status: PROPOSED 2026-08-16 — **scrubber now, hook deferred**; the CLAUDE.md tension
-(see that section below) needs MAINTAINER RATIFICATION before the actuating half ships.
+Status: PROPOSED 2026-08-16 — **scrubber now, hook deferred**. UPDATE 2026-09-25: the
+maintainer ruled on the CLAUDE.md tension below — redact ONLY behind explicit consent, with a
+VERIFIED backup first (configure's `_backup_before_overwrite` pattern). The REPORT half shipped
+as `scripts/settings-scrub.py` (#393) with no actuation path at all; the consented redact
+actuation is a separate follow-up on #326.
 
 Scope: a new `scripts/settings-scrub.py` reading and rewriting settings JSON on the LOCAL
 FILESYSTEM. No floor change, no guard change, no allow-list broadening, no `gh`, no git or
@@ -311,7 +314,7 @@ Carrier set:
 
 | Carrier | Example shape | Census count |
 | :-- | :-- | ---: |
-| env-assignment prefix | `KEY=<value> cmd ...` | 11 |
+| env-assignment prefix | `KEY=<value> cmd ...` | 10 |
 | `Authorization:` / `Bearer` header | `-H "Authorization: Bearer <v>"` | 2 |
 | short flag, tool-scoped | `ldapsearch -w <v>` | 2 |
 | long credential flag | `--token=`, `--api-key=`, `--password=` | 0 |
@@ -345,17 +348,17 @@ SHAPE (length, character classes, entropy bucket), and a short SHA-256 prefix. T
 is what makes a single rotation's blast radius visible across repos without revealing
 anything.
 
-Unredacted detail goes ONLY to a 0600 local file, created 0600-from-birth with the
-established idiom (`orchestrate-setup.py:956`):
+Unredacted detail goes ONLY to a NEW 0600 local file, CREATE-ONLY (as shipped, #393 review S1):
 
 ```python
-fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-...
-os.chmod(path, 0o600)   # enforce even if it pre-existed with looser perms
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+os.fchmod(fd, 0o600)   # on the fd: a restrictive umask cannot drop owner bits, no path re-resolve
 ```
 
-The `chmod` after the fact is not redundant: `O_CREAT` mode applies only when the file is
-newly created, so a pre-existing looser file would otherwise keep its mode.
+An earlier draft used `O_TRUNC` + a path `chmod` (the `orchestrate-setup.py` idiom). That
+TRUNCATES any existing path - `--detail-file ~/.claude/settings.local.json` clobbered the very file
+this tool promises never to write, a FIFO hung the open, and a reader fd opened while the old
+file was 0644 kept access. `O_EXCL` refuses every existing path instead.
 
 ---
 
@@ -502,6 +505,44 @@ never looked is indistinguishable from a clean machine — which is this repo's 
 frequently re-grown defect, and the exact shape #324's coverage assert exists to prevent.
 
 ---
+
+## Exposure / read-side surface inventory (#349)
+
+Storage is the durable leak; these commands are the TRANSIENT one: each writes a secret into the
+session TRANSCRIPT (and so into model context) the moment it runs. Inventory as of 2026-09-26:
+
+| Command shape | What it exposes |
+| :-- | :-- |
+| `ps aux`, `ps -ef`, `ps -o args`, `pgrep -af`, `cat /proc/*/cmdline` | every process's argv, including another session's secret passed on a command line |
+| `printenv`, bare `env`, bare `set`, `export -p`, `declare -x` | the whole environment (`GH_TOKEN`, `*_API_KEY`, `OP_SESSION_*`) |
+| `set -x`, `bash -x script` | each command AFTER expansion, so `$TOKEN` is printed expanded |
+| `history`, reading `~/.bash_history` / `~/.zsh_history` | past command lines carrying inline secrets |
+| `cat`/`head`/`less` (or the Read tool) of `.env`, `~/.netrc`, `~/.aws/credentials`, `~/.git-credentials`, `~/.pgpass`, `~/.npmrc`, `~/.docker/config.json`, `~/.config/gh/hosts.yml`, a `settings.local.json` | the stored credential file itself (the last is this doc's storage surface) |
+| `docker inspect`, `docker compose config`, `kubectl get secret -o yaml`, `kubectl describe pod` | container env and secret objects |
+| `git remote -v`, `git config --list` | a remote URL of the form `https://user:token@host` |
+| `curl -v` / `--trace` | the outgoing `Authorization:` header |
+| `gh auth token`, `gh auth status --show-token`, `op read`, `op item get --reveal`, `security find-generic-password -w` | print a secret BY DESIGN |
+
+**Steer coverage today: none, and that is the decision, not a gap.** `orchestrate-steer.sh` has
+no exposure rule (its rules are 1-7 as listed in its header); #325's secret matchers were all
+DENY-side command-line value matchers, and prevention has failed three times (maintainer, #349;
+two of the three are measured in "Why a PreToolUse deny cannot be the answer" above). Every row above is SILENT BY DESIGN. Do not add another
+command-line value matcher, and do not revive "blessed-absence" (enumerating the commands allowed
+to lack a secret): both are the same open-set spelling problem.
+
+**Machine-wide or nothing.** A secret leaks from whatever repo the session is in, so any check
+that ships must be machine-wide: a `settings.json` hook deployed Option-A to `~/.claude/scripts/`,
+or an on-demand script. Never a cwd-scoped hookify rule, which fires only inside the one project
+whose `.claude/` carries it.
+
+**Fail OPEN (maintainer, 2026-09-25).** A read-side guard that cannot decide lets the command
+run. A nudge that blocks on doubt blocks legitimate diagnostics, which is how the next person
+disables it.
+
+**Detection instead of prevention.** The periodic scan is `scripts/settings-scrub.py`, run on
+demand (no session hook, per "Invocation model" above). It covers the DURABLE surface (stored
+permission rules), not transcripts; its report states that limit rather than reading as an
+all-clear.
 
 ## Out of scope
 
