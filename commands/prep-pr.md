@@ -835,10 +835,13 @@ echo "push_rc=$push_rc"
 (exit "$push_rc")  # prep-pr-ok
 ```
 
-The trailing `# prep-pr-ok` is the floor guard's advisory override. It is an
-INSTRUCTION-LEVEL assertion, not a mechanism: nothing checks that Steps 1-6 actually ran, the
-token simply travels with this block. So run this block ONLY after Steps 1-6 passed in this
-run, and never add the token to a push that skipped them.
+The trailing `# prep-pr-ok` is the floor guard's advisory override. The token itself is an
+INSTRUCTION-LEVEL assertion; what backs part of it is safe-push's gate-receipt check (#318),
+which REFUSES unless the Step 2 receipt passed and binds the tree being pushed (a post-gate
+squash keeps the tree, so it still passes). Nothing mechanical checks Steps 3-6 (review,
+size, squash), so run this block ONLY after Steps 1-6 passed in this run, and never add the
+token to a push that skipped them. If a later step changed the tree, re-run the Step 2 block
+(it rewrites the receipt) before pushing; never reach for `--ungated` here.
 
 **Never pipe safe-push** (`| tail -N`, `| head`, `| tee` ...), foreground or backgrounded.
 Without `pipefail` a pipeline returns the LAST command's exit code, so a refusal (exit 1 or

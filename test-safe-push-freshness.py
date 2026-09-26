@@ -127,8 +127,11 @@ def run(args, *, origin_head="main", behind=0, fetch_rc=0):
             PUSHLOG=os.path.join(td, "push.log"),
             GHLOG=ghlog,
         )
+        # --ungated (#318): these cases test FRESHNESS, not the gate receipt, so they declare
+        # no receipt rather than forge one; the receipt leg is covered in test-safe-push.py.
+        # Inserted AFTER the first positional so `--base` with no value stays the last word.
         r = subprocess.run(
-            ["bash", SCRIPT, *args], capture_output=True, text=True, env=env, cwd=td, timeout=30
+            ["bash", SCRIPT, *args[:1], "--ungated", *args[1:]], capture_output=True, text=True, env=env, cwd=td, timeout=30
         )
         gh_calls = ""
         if os.path.exists(ghlog):
@@ -233,7 +236,7 @@ print("\n== MEASURES THE BRANCH PUSHED, NOT THE CHECKOUT (#457) ==")
 # `HEAD` from `refs/heads/<branch>` and would pass with the bug present. A local bare repo is
 # the origin, so nothing leaves the temp dir. safe-push pushes <branch> BY NAME while the
 # checkout can be any other branch; measuring HEAD got both directions wrong.
-def real_repo_run(td, checkout, push_branch):
+def real_repo_run(td, checkout, push_branch, extra=()):
     env = dict(os.environ, GIT_CONFIG_GLOBAL=os.path.join(td, "gitconfig"),
                GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0")
     env.pop("CLAUDE_PLUGIN_ROOT", None)
@@ -256,6 +259,8 @@ def real_repo_run(td, checkout, push_branch):
     g("branch", "feat")                      # feat is at c1: fresh
     g("remote", "set-head", "origin", "main")
     g("checkout", "-q", checkout)
+    for cmd in extra:                        # per-case setup: tags, a detached HEAD
+        g(*cmd)
     ghlog = os.path.join(td, "gh.log")
     bindir = os.path.join(td, "bin")
     os.makedirs(bindir)
@@ -264,7 +269,7 @@ def real_repo_run(td, checkout, push_branch):
         fh.write(GH_STUB)
     os.chmod(p, 0o755)
     env.update(PATH=bindir + os.pathsep + env["PATH"], GHLOG=ghlog)
-    r = subprocess.run(["bash", SCRIPT, push_branch], cwd=work, env=env,
+    r = subprocess.run(["bash", SCRIPT, push_branch, "--ungated"], cwd=work, env=env,
                        capture_output=True, text=True, timeout=60)
     remote = subprocess.run(["git", "ls-remote", origin, "refs/heads/" + push_branch],
                             env=env, capture_output=True, text=True).stdout
@@ -284,6 +289,29 @@ check("checkout fresh (main), push STALE branch -> exit 1, no false pass", rc ==
 check("...the refusal names the branch actually measured",
       "refs/heads/stale" in out and "1 commit(s) behind" in out)
 check("...and stale was NOT pushed", remote.strip() == "")
+
+print("\n== #466: DETACHED HEAD and a SAME-NAMED TAG still measure refs/heads/<branch> ==")
+# Detached checkout: safe-push is handed the branch by name, so the missing symbolic-ref must not
+# matter and the measured ref is still the named branch.
+with tempfile.TemporaryDirectory() as td:
+    rc, out, remote, _ = real_repo_run(td, "main", "stale", extra=[("checkout", "-q", "--detach")])
+check("detached HEAD, push STALE branch -> exit 1 naming refs/heads/stale",
+      rc == 1 and "refs/heads/stale" in out and "1 commit(s) behind" in out)
+with tempfile.TemporaryDirectory() as td:
+    rc, out, remote, _ = real_repo_run(td, "main", "feat", extra=[("checkout", "-q", "--detach")])
+check("detached HEAD, push FRESH feat -> exit 0 and feat lands", rc == 0 and remote.strip() != "")
+# A tag named like the branch, pointing at a DIFFERENT commit: the gate must measure the branch.
+# Tag `stale` sits on fresh main (c1) while branch stale is at c0 -> still refused.
+with tempfile.TemporaryDirectory() as td:
+    rc, out, remote, _ = real_repo_run(td, "main", "stale", extra=[("tag", "stale", "main")])
+check("same-named tag on a FRESH commit does not mask a STALE branch (exit 1, not pushed)",
+      rc == 1 and "refs/heads/stale" in out and remote.strip() == "")
+# Tag `feat` sits on stale c0 while branch feat is fresh -> pushes, and the push itself must not
+# trip over the ambiguous bare name either (the #466 refspec half).
+with tempfile.TemporaryDirectory() as td:
+    rc, out, remote, _ = real_repo_run(td, "main", "feat", extra=[("tag", "feat", "release/1.2")])
+check("same-named tag on a STALE commit does not refuse a FRESH branch, and the push lands",
+      rc == 0 and "REFUSING" not in out and remote.strip() != "")
 
 print()
 if FAILS:

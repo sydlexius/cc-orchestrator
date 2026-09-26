@@ -21,7 +21,9 @@ classification branch, and records every `git push` for assertion.
 
 Run: python3 test-safe-push.py
 """
+import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -29,6 +31,10 @@ import tempfile
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "safe-push.sh")
 
 FAILS = []
+TREE = "ab" * 20
+DROP = object()
+VALID_RECEIPT = {"schema": "gate-receipt/v1", "commit_sha": "cd" * 20, "tree_sha": TREE,
+                 "worktree": "/w", "result": "pass", "steps": [], "producer": "gate-runner"}
 
 
 def check(label, ok):
@@ -47,6 +53,10 @@ GIT_STUB = (
     '  if [ -n "${CUR_BRANCH:-}" ]; then echo "$CUR_BRANCH"; exit 0; else exit 1; fi\n'
     "fi\n"
     'if [ "$1" = "rev-parse" ] && [ "$2" = "--verify" ]; then\n'
+    '  # #318: the receipt leg asks for refs/heads/<b>^{tree}; TREE_SHA answers it (unset = fail).\n'
+    '  for a in "$@"; do\n'
+    '    case "$a" in *"^{tree}") if [ -n "${TREE_SHA:-}" ]; then echo "$TREE_SHA"; exit 0; fi; exit 128 ;; esac\n'
+    '  done\n'
     '  # KNOWN_BRANCHES unset -> answer ANY name (the historical default). SET (space-separated)\n'
     '  # -> resolve only refs/heads/<known>, FAIL otherwise, like real git (#432): without this\n'
     '  # mode the missing-branch path was never exercised.\n'
@@ -78,6 +88,7 @@ GIT_STUB = (
     '  if [ -n "${PUSH_TRANSCRIPT:-}" ]; then printf "%s\\n" "$PUSH_TRANSCRIPT"; printf "%s\\n" "$PUSH_TRANSCRIPT" >&2; fi\n'
     '  exit "${PUSH_RC:-0}"\n'
     "fi\n"
+    'if [ "$1" = "ls-remote" ] || [ "$1" = "fetch" ]; then echo "$1" >>"$NETLOG"; fi\n'
     'if [ "$1" = "ls-remote" ]; then\n'
     '  # Stateful: after a push has been recorded, the remote matches local (the push\n'
     '  # landed). Before any push, return the configurable OLD remote SHA (empty = no ref).\n'
@@ -99,14 +110,28 @@ GIT_STUB = (
 
 def run(args, *, cur_branch="feature/x", local_sha="aaaa111", remote_sha="",
         mb_r_anc_l=1, mb_l_anc_r=1, cat_file_rc=0, push_rc=0, push_transcript="",
-        post_push_remote=None, known_branches=None, remotes=None):
+        post_push_remote=None, known_branches=None, remotes=None, receipt="valid",
+        tree_sha=TREE, script=None, net=None, extra_env=None):
     """Invoke safe-push.sh with a stubbed git. Returns (rc, stdout, stderr, pushes, log)
     where pushes is the list of recorded `git push ...` argument strings and log is the
-    content of safe-push's own log file (read before the tempdir is cleaned up)."""
+    content of safe-push's own log file (read before the tempdir is cleaned up).
+    receipt: "valid" (the default, so every case exercises the leg's PASS path rather than
+    bypassing it), a dict merged over the valid receipt, a raw str written verbatim, or None
+    (no receipt file). net: a list that receives every ls-remote/fetch the stub saw."""
     with tempfile.TemporaryDirectory() as td:
         bindir = os.path.join(td, "bin"); os.makedirs(bindir)
         gitdir = os.path.join(td, "gitdir"); os.makedirs(gitdir)
         pushlog = os.path.join(td, "pushlog")
+        netlog = os.path.join(td, "netlog")
+        if receipt is not None:
+            with open(os.path.join(gitdir, "prep-pr-receipt.json"), "w") as fh:
+                if isinstance(receipt, str) and receipt != "valid":
+                    fh.write(receipt)
+                else:
+                    body = dict(VALID_RECEIPT)
+                    if isinstance(receipt, dict):
+                        body.update(receipt)
+                    json.dump({k: v for k, v in body.items() if v is not DROP}, fh)
 
         git = os.path.join(bindir, "git")
         with open(git, "w") as f:
@@ -128,6 +153,13 @@ def run(args, *, cur_branch="feature/x", local_sha="aaaa111", remote_sha="",
         else:
             env.pop("POST_PUSH_REMOTE", None)
         env["PUSHLOG"] = pushlog
+        env["NETLOG"] = netlog
+        if tree_sha is None:
+            env.pop("TREE_SHA", None)
+        else:
+            env["TREE_SHA"] = tree_sha
+        env.pop("CLAUDE_PLUGIN_ROOT", None)
+        env.update(extra_env or {})
         if known_branches is not None:
             env["KNOWN_BRANCHES"] = known_branches
         else:
@@ -141,18 +173,289 @@ def run(args, *, cur_branch="feature/x", local_sha="aaaa111", remote_sha="",
         else:
             env.pop("CUR_BRANCH", None)
 
-        p = subprocess.run(["bash", SCRIPT] + args, env=env,
+        p = subprocess.run(["bash", script or SCRIPT] + args, env=env,
                            capture_output=True, text=True, timeout=15)
         pushes = []
         if os.path.exists(pushlog):
             with open(pushlog) as fh:
                 pushes = [ln.rstrip("\n") for ln in fh if ln.strip()]
+        if net is not None and os.path.exists(netlog):
+            with open(netlog) as fh:
+                net.extend(ln.strip() for ln in fh if ln.strip())
         log = ""
         logpath = os.path.join(gitdir, "safe-push.log")
         if os.path.exists(logpath):
             with open(logpath) as fh:
                 log = fh.read()
         return p.returncode, p.stdout, p.stderr, pushes, log
+
+
+def receipt_stub_cases():
+    # (label, run kwargs, needle with the FULL validator present, needle from the INLINE check
+    # alone). Both legs must refuse every case: exit 1, no push, no network, /prep-pr + --ungated.
+    bad = [
+        ("missing receipt", dict(receipt=None), "no gate receipt", "no gate receipt"),
+        ("result=fail", dict(receipt={"result": "fail"}), "did not pass", "did not pass"),
+        ("wrong producer", dict(receipt={"producer": "hand-rolled"}), "producer", "producer"),
+        ("stale tree", dict(receipt={"tree_sha": "ef" * 20}), "STALE", "STALE"),
+        ("not JSON", dict(receipt="{nope"), "not a valid gate-receipt/v1", "not readable JSON"),
+        ("a JSON array, not an object", dict(receipt="[]"), "not a valid gate-receipt/v1",
+         "not a JSON object"),
+        ("tree_sha absent", dict(receipt={"tree_sha": DROP}), "not a valid gate-receipt/v1",
+         "tree_sha is null"),
+        ("tree_sha not 40-hex", dict(receipt={"tree_sha": "zz" * 20}), "not a valid gate-receipt/v1",
+         "not a 40-hex SHA"),
+        ("wrong schema name", dict(receipt={"schema": "gate-receipt/v2"}), "not a valid gate-receipt/v1",
+         "receipt schema is"),
+        ("branch tree unresolvable", dict(tree_sha=None), "cannot resolve the tree",
+         "cannot resolve the tree"),
+    ]
+    with tempfile.TemporaryDirectory() as td:
+        # A copy with NO orchestrate_schemas.py beside it and no CLAUDE_PLUGIN_ROOT (run() drops
+        # it): the shape of the DEPLOYED ~/.claude/scripts copy the pr-shipper runs.
+        lone = os.path.join(td, "safe-push.sh")
+        shutil.copy(SCRIPT, lone)
+        for leg, script, idx in (("validator present", SCRIPT, 2), ("validator ABSENT", lone, 3)):
+            print(f"== #318 receipt leg, {leg}: every refusal is exit 1, no push, no network ==")
+            for case in bad:
+                label, kw, needle = case[0], case[1], case[idx]
+                net = []
+                rc, out, err, pushes, _log = run(["feature/x"], net=net, script=script, **kw)
+                check(f"[{leg}] {label} -> exit 1, no push, no network, says '{needle}'",
+                      rc == 1 and not pushes and not net and needle in err)
+                check(f"[{leg}] {label} -> refusal points at /prep-pr and names --ungated",
+                      "/prep-pr" in err and "--ungated" in err)
+            rc, out, err, pushes, _log = run(["feature/x"], script=script)
+            check(f"[{leg}] valid receipt -> exit 0 and says it verified the receipt",
+                  rc == 0 and len(pushes) == 1 and "gate receipt verified" in err)
+            rc, out, err, pushes, _log = run(["feature/x"], script=script,
+                                             receipt={"tree_sha": TREE.upper()})
+            check(f"[{leg}] an upper-case tree_sha (valid hex) still binds (exit 0)",
+                  rc == 0 and len(pushes) == 1)
+            rc, out, err, pushes, _log = run(["feature/x", "--ungated"], script=script, receipt=None)
+            check(f"[{leg}] --ungated with no receipt -> exit 0 and one push", rc == 0 and len(pushes) == 1)
+            check(f"[{leg}] --ungated is announced on stderr", "--ungated DECLARED" in err and "SKIPPED" in err)
+            check(f"[{leg}] --ungated never reaches git push", bool(pushes) and "--ungated" not in pushes[0])
+        rc, out, err, pushes, _log = run(["feature/x"], script=lone)
+        check("validator ABSENT says so (load-bearing fields only), never silently",
+              "load-bearing fields only" in err)
+        rc, out, err, pushes, _log = run(["feature/x"])
+        check("validator present does NOT claim the reduced check", "load-bearing" not in err)
+        # PYTHONVERBOSE makes python write import traces to STDERR on success; only the inline
+        # check's STDOUT may reach the tree bind, or a noisy interpreter reads as a STALE receipt.
+        rc, out, err, pushes, _log = run(["feature/x"], script=lone, extra_env={"PYTHONVERBOSE": "1"})
+        check("interpreter stderr noise does not corrupt the tree bind (exit 0)",
+              rc == 0 and len(pushes) == 1)
+
+
+def real_repo(td):
+    """A throwaway repo whose origin is a LOCAL bare repo, so nothing leaves the temp dir.
+    Returns (g, env, work, origin): g(*args, cwd=work) runs real git and returns stdout."""
+    env = dict(os.environ, GIT_CONFIG_GLOBAL=os.path.join(td, "gitconfig"),
+               GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0")
+    env.pop("CLAUDE_PLUGIN_ROOT", None)
+    with open(env["GIT_CONFIG_GLOBAL"], "w") as fh:
+        fh.write("[user]\n\tname = t\n\temail = t@example.invalid\n"
+                 "[commit]\n\tgpgsign = false\n[tag]\n\tgpgsign = false\n"
+                 "[init]\n\tdefaultBranch = main\n")
+    origin, work = os.path.join(td, "origin.git"), os.path.join(td, "work")
+
+    def g(*a, cwd=work):
+        return subprocess.run(["git", *a], cwd=cwd, env=env, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    g("init", "-q", "--bare", origin, cwd=td)
+    g("clone", "-q", origin, work, cwd=td)
+    with open(os.path.join(work, "f.txt"), "w") as fh:
+        fh.write("base\n")
+    g("add", "f.txt"); g("commit", "-q", "-m", "c0")
+    g("push", "-q", "origin", "main")        # seed the base (inside the harness only)
+    g("remote", "set-head", "origin", "main")
+    return g, env, work, origin
+
+
+def gate(g, cwd, ref, **over):
+    """Write the receipt gate-runner --receipt would write, into cwd's git-dir, gating ref's tree."""
+    body = dict(VALID_RECEIPT, commit_sha=g("rev-parse", ref, cwd=cwd),
+                tree_sha=g("rev-parse", ref + "^{tree}", cwd=cwd), worktree=cwd)
+    body.update(over)
+    with open(os.path.join(g("rev-parse", "--absolute-git-dir", cwd=cwd), "prep-pr-receipt.json"), "w") as fh:
+        json.dump(body, fh)
+
+
+def safe_push(env, cwd, args):
+    p = subprocess.run(["bash", SCRIPT] + args, cwd=cwd, env=env,
+                       capture_output=True, text=True, timeout=60)
+    return p.returncode, p.stdout + p.stderr
+
+
+def real_git_cases():
+    print("== #466 REAL git: a TAG named like the branch does not break the push ==")
+    with tempfile.TemporaryDirectory() as td:
+        g, env, work, origin = real_repo(td)
+        g("checkout", "-q", "-b", "dup"); g("commit", "-q", "--allow-empty", "-m", "c1")
+        g("tag", "dup", "main")              # same name, DIFFERENT commit
+        g("checkout", "-q", "main")
+        gate(g, work, "dup")                 # dup is checked out nowhere: caller's git-dir
+        rc, out = safe_push(env, work, ["dup"])
+        remote = g("ls-remote", origin, "refs/heads/dup")
+        check("branch + same-named tag -> exit 0", rc == 0)
+        check("...and origin's refs/heads/dup is the BRANCH tip, not the tag",
+              remote.split("\t")[0] == g("rev-parse", "refs/heads/dup"))
+        check("...and no 'matches more than one' refspec error", "more than one" not in out)
+        up = subprocess.run(["git", "config", "branch.dup.merge"], cwd=work, env=env,
+                            capture_output=True, text=True).stdout.strip()
+        check("...and -u still recorded the upstream", up == "refs/heads/dup")
+        # --force-with-lease (auto-added by --rewrite) must compose with the full refspec: it
+        # leases the same refs/heads/dup destination, so a real rewrite lands.
+        g("checkout", "-q", "dup"); g("commit", "-q", "--amend", "--allow-empty", "-m", "c1b")
+        g("checkout", "-q", "main")
+        gate(g, work, "dup")
+        rc, out = safe_push(env, work, ["dup", "--rewrite"])
+        remote = g("ls-remote", origin, "refs/heads/dup")
+        check("rewrite + auto lease over the full refspec -> exit 0 and the new tip lands",
+              rc == 0 and remote.split("\t")[0] == g("rev-parse", "refs/heads/dup"))
+
+    print("== #318 REAL git: receipt of the worktree HOLDING the branch, pushed by name from elsewhere ==")
+    with tempfile.TemporaryDirectory() as td:
+        g, env, work, origin = real_repo(td)
+        wt = os.path.join(td, "wt")
+        g("worktree", "add", "-q", "-b", "feat", wt)
+        with open(os.path.join(wt, "f.txt"), "a") as fh:
+            fh.write("one\n")
+        g("commit", "-q", "-am", "f1", cwd=wt)
+        rc, out = safe_push(env, work, ["feat"])
+        check("holder has NO receipt -> refused (exit 1), nothing pushed",
+              rc == 1 and "no gate receipt" in out and g("ls-remote", origin, "refs/heads/feat") == "")
+        gate(g, work, "feat")                # a receipt in the WRONG (caller's) git-dir
+        rc, out = safe_push(env, work, ["feat"])
+        check("a receipt in the caller's git-dir does not stand in for the holder's (exit 1)", rc == 1)
+        os.remove(os.path.join(g("rev-parse", "--absolute-git-dir"), "prep-pr-receipt.json"))
+        gate(g, wt, "HEAD")                  # ONLY the holder has a receipt now
+        rc, out = safe_push(env, work, ["feat"])
+        check("holder's passing receipt found from the shared checkout -> exit 0",
+              rc == 0 and "gate receipt verified" in out)
+        check("...and feat landed on origin", g("ls-remote", origin, "refs/heads/feat") != "")
+        # dirty holder: an UNTRACKED file, then a modified tracked file - both refuse.
+        with open(os.path.join(wt, "f.txt"), "a") as fh:
+            fh.write("two\n")
+        g("commit", "-q", "-am", "f2", cwd=wt)
+        gate(g, wt, "HEAD")
+        with open(os.path.join(wt, "new.txt"), "w") as fh:
+            fh.write("x\n")
+        rc, out = safe_push(env, work, ["feat"])
+        check("holder with an UNTRACKED file -> refused (exit 1) naming uncommitted/untracked",
+              rc == 1 and "untracked" in out)
+        os.remove(os.path.join(wt, "new.txt"))
+        with open(os.path.join(wt, "f.txt"), "a") as fh:
+            fh.write("dirty\n")
+        rc, out = safe_push(env, work, ["feat"])
+        check("holder with a MODIFIED tracked file -> refused (exit 1)", rc == 1)
+        g("checkout", "-q", "--", "f.txt", cwd=wt)
+        # squash after the gate: new commit SHA, SAME tree -> the tree bind accepts it.
+        gated_commit = g("rev-parse", "HEAD", cwd=wt)
+        g("reset", "-q", "--soft", "main", cwd=wt); g("commit", "-q", "-m", "squashed", cwd=wt)
+        squashed = g("rev-parse", "HEAD", cwd=wt)
+        rc, out = safe_push(env, work, ["feat", "--rewrite"])
+        check("squashed-same-tree (commit %s.. != gated %s..) -> exit 0" % (squashed[:7], gated_commit[:7]),
+              rc == 0 and squashed != gated_commit)
+        # a later commit on the branch makes the receipt STALE.
+        with open(os.path.join(wt, "f.txt"), "a") as fh:
+            fh.write("three\n")
+        g("commit", "-q", "-am", "f3", cwd=wt)
+        rc, out = safe_push(env, work, ["feat"])
+        check("commit after the gate (tree moved) -> refused as STALE", rc == 1 and "STALE" in out)
+
+
+def fix_round_1_cases():
+    print("== #318 R2: one branch per call - no second refspec, no ref-widening flag ==")
+    for extra in (["refs/heads/y:refs/heads/y"], ["y"], ["--all"], ["--tags"], ["--mirror"], ["--", "y"]):
+        rc, out, err, pushes, _log = run(["feature/x"] + extra)
+        check(f"forwarded {extra} -> exit 2, NO push", rc == 2 and not pushes)
+    rc, out, err, pushes, _log = run(["feature/x", "-o", "ci.skip"])
+    check("a flag with a SEPARATE value (-o ci.skip) is still forwarded intact",
+          rc == 0 and bool(pushes) and pushes[0].endswith("-o ci.skip"))
+    with tempfile.TemporaryDirectory() as td:        # probe P1, real git
+        g, env, work, origin = real_repo(td)
+        g("branch", "a"); g("branch", "x")
+        gate(g, work, "a")
+        rc, out = safe_push(env, work, ["a", "refs/heads/x:refs/heads/x"])
+        check("real git: 'a refs/heads/x:refs/heads/x' -> exit 2, and NEITHER ref lands",
+              rc == 2 and g("ls-remote", origin, "refs/heads/x") == ""
+              and g("ls-remote", origin, "refs/heads/a") == "")
+
+    def holder_repo(td):
+        g, env, work, origin = real_repo(td)
+        wt = os.path.join(td, "wt")
+        g("worktree", "add", "-q", "-b", "feat", wt)
+        with open(os.path.join(wt, "f.txt"), "a") as fh:
+            fh.write("one\n")
+        g("commit", "-q", "-am", "f1", cwd=wt)
+        gate(g, wt, "HEAD")
+        return g, env, work, origin, wt
+
+    print("== #318 R3: a branch held by TWO worktrees is refused ==")
+    with tempfile.TemporaryDirectory() as td:
+        g, env, work, origin, wt = holder_repo(td)
+        wt2 = os.path.join(td, "wt2")
+        g("worktree", "add", "-q", "--force", wt2, "feat")
+        with open(os.path.join(wt2, "junk.txt"), "w") as fh:
+            fh.write("x\n")
+        rc, out = safe_push(env, work, ["feat"])
+        check("second holder (dirty) -> exit 1 naming the double checkout",
+              rc == 1 and "worktrees have it checked out" in out)
+
+    print("== #318 R4: status.showUntrackedFiles=no cannot hide an untracked file ==")
+    with tempfile.TemporaryDirectory() as td:
+        g, env, work, origin, wt = holder_repo(td)
+        g("config", "status.showUntrackedFiles", "no")
+        with open(os.path.join(wt, "new.txt"), "w") as fh:
+            fh.write("x\n")
+        rc, out = safe_push(env, work, ["feat"])
+        check("untracked file under showUntrackedFiles=no -> refused", rc == 1 and "untracked" in out)
+
+    print("== #318 R5: a worktree MID-REBASE of the branch refuses; a plain detached one is not a holder ==")
+    with tempfile.TemporaryDirectory() as td:
+        g, env, work, origin, wt = holder_repo(td)
+        with open(os.path.join(work, "f.txt"), "a") as fh:
+            fh.write("conflict\n")
+        g("commit", "-q", "-am", "main-side")
+        subprocess.run(["git", "rebase", "main"], cwd=wt, env=env, capture_output=True)
+        gate(g, work, "feat")                # a same-tree receipt in the CALLER's git-dir
+        rc, out = safe_push(env, work, ["feat"])
+        check("mid-rebase holder -> exit 1 naming the rebase", rc == 1 and "mid-rebase" in out)
+    with tempfile.TemporaryDirectory() as td:
+        g, env, work, origin, wt = holder_repo(td)
+        g("checkout", "-q", "--detach", cwd=wt)
+        gate(g, work, "feat")
+        rc, out = safe_push(env, work, ["feat"])
+        check("plain detached worktree is not a holder: caller's receipt pushes (exit 0)", rc == 0)
+
+    print("== #318 R6: status-read failure, prunable holder, and exact holder match ==")
+    with tempfile.TemporaryDirectory() as td:
+        g, env, work, origin, wt = holder_repo(td)
+        with open(os.path.join(g("rev-parse", "--absolute-git-dir", cwd=wt), "index"), "w") as fh:
+            fh.write("garbage")               # git status now FAILS in the holder
+        rc, out = safe_push(env, work, ["feat"])
+        check("holder whose status cannot be read -> refused (fail closed)",
+              rc == 1 and "cannot read the status" in out)
+    with tempfile.TemporaryDirectory() as td:
+        g, env, work, origin, wt = holder_repo(td)
+        gate(g, work, "feat")                # a same-tree receipt the fallback WOULD accept
+        shutil.rmtree(wt)                    # removed without `git worktree prune`
+        rc, out = safe_push(env, work, ["feat"])
+        check("prunable holder -> refused with the prune hint (no caller fallback)",
+              rc == 1 and "prune" in out)
+    with tempfile.TemporaryDirectory() as td:
+        g, env, work, origin = real_repo(td)
+        wt = os.path.join(td, "wt")
+        g("worktree", "add", "-q", "-b", "x/foo", wt)
+        with open(os.path.join(wt, "junk.txt"), "w") as fh:
+            fh.write("x\n")                 # x/foo's holder is dirty and has no receipt
+        g("branch", "y/foo")
+        gate(g, work, "y/foo")
+        rc, out = safe_push(env, work, ["y/foo"])
+        check("y/foo is not held by x/foo's worktree (exact match): pushes (exit 0)", rc == 0)
 
 
 def main():
@@ -204,7 +507,9 @@ def main():
     rc, out, err, pushes, _log = run(["feature/x"])  # remote_sha="" -> first-push
     check("first-push -> exit 0", rc == 0)
     check("first-push invokes exactly one git push", len(pushes) == 1)
-    check("push targets origin feature/x", bool(pushes) and "origin feature/x" in pushes[0])
+    # #466: the FULL refspec, never the bare name (a same-named tag makes the bare name ambiguous).
+    check("push targets origin refs/heads/feature/x:refs/heads/feature/x",
+          bool(pushes) and "origin refs/heads/feature/x:refs/heads/feature/x" in pushes[0])
 
     print("== first-push + trailing flag -> flag forwarded intact ==")
     rc, out, err, pushes, _log = run(["feature/x", "--force-with-lease"])
@@ -214,7 +519,8 @@ def main():
     print("== no-arg -> current-branch fallback via symbolic-ref ==")
     rc, out, err, pushes, _log = run([], cur_branch="feature/current")
     check("no-arg -> exit 0 (current-branch fallback)", rc == 0)
-    check("no-arg pushes the symbolic-ref branch", bool(pushes) and "origin feature/current" in pushes[0])
+    check("no-arg pushes the symbolic-ref branch",
+          bool(pushes) and "origin refs/heads/feature/current:refs/heads/feature/current" in pushes[0])
 
     print("== #148 fast-forward (remote is ancestor of local) -> ADDITIVE, proceeds ==")
     rc, out, err, pushes, _log = run(["feature/x"], remote_sha="oldbbb222", mb_r_anc_l=0)
@@ -316,6 +622,10 @@ def main():
     check("sha-mismatch: emits the bounded-tail header",
           "last" in err.lower() and "lines" in err.lower())
     check("sha-mismatch: names the log path", "safe-push.log" in err)
+
+    receipt_stub_cases()
+    real_git_cases()
+    fix_round_1_cases()
 
     print()
     if FAILS:

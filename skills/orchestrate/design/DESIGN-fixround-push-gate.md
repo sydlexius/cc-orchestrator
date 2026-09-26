@@ -1,9 +1,10 @@
 # Design: the `# prep-pr-ok` push override - self-attestation or mechanism?
 
 Date: 2026-09-25
-Status: PROPOSAL - needs a MAINTAINER DECISION. Nothing here changes code. Any guard change
-(including rewording the advisory message) is a deny-authority change and gets its OWN issue,
-the full K=2 loop, and maintainer merge (CLAUDE.md "Working ON the security floor").
+Status: DECIDED 2026-09-26 - option B WITH the `--ungated` escape (see "Decision" at the end).
+The floor is untouched. Any guard change (including rewording the advisory message) is still a
+deny-authority change and gets its OWN issue, the full K=2 loop, and maintainer merge (CLAUDE.md
+"Working ON the security floor").
 Issue: #318
 Companions: `DESIGN-deterministic-floor.md` (threat model, evaluation order),
 `DESIGN-tl-context-minimization.md` (Bet #1 KILLED), `DESIGN-merge-gate-readiness-vs-authority.md`
@@ -172,3 +173,37 @@ Open points for the maintainer: whether the escape flag should exist at all; whe
 consumer repo with no `gate-runner` gets a WARN (degrade) or a refusal; and whether the
 `elmer-enqueue.sh` `commit_sha` bind (`:223-231`) needs the same tree-SHA treatment for a PR
 whose first push was squashed after gating (observed from the code, not reproduced live).
+
+## Decision (2026-09-26, maintainer)
+
+Adopt B with the declared-intent escape `--ungated`; the floor stays ignorant of receipts and
+`# prep-pr-ok` stays the floor-side advisory. As implemented (`scripts/safe-push.sh`, "GATE
+RECEIPT" block):
+
+- The three open preconditions are resolved. `/handle-review` Step 7 is one GATED PUSH block:
+  `gate-runner.py --receipt <git-dir>/prep-pr-receipt.json` on the FINAL fix commit, then
+  safe-push by its literal leg path; Step 8.5 runs the same block. The shipper's shared-checkout
+  problem is solved WITHOUT moving the receipt: safe-push reads the receipt from the git-dir of
+  the worktree that has the branch checked out (`git worktree list --porcelain`), falling back
+  to the caller's own git-dir only when no worktree holds the branch. Every other receipt
+  consumer is unchanged.
+- The bind is `tree_sha == refs/heads/<branch>^{tree}` plus a clean holding worktree (untracked
+  counts, as in gate-runner), the stated deviation from the commit-bind contract above.
+- It runs before the freshness block and before any network step, and fails CLOSED: missing,
+  unreadable, schema-invalid, `producer != gate-runner`, `result != pass`, stale, dirty, or
+  unverifiable (no python3) all REFUSE with exit 1 and a pointer to `/prep-pr`.
+- Validation has two legs. `orchestrate_schemas.py --validate` runs when it is found beside the
+  script or under `$CLAUDE_PLUGIN_ROOT` (repo and plugin legs). It is NOT in HELPER_NAMES, so the
+  DEPLOYED copy the pr-shipper runs usually lacks it; refusing on its absence would refuse every
+  shipper push. An INLINE check therefore always runs and refuses on any doubt about the fields
+  the decision rests on (JSON object, `schema`, `producer`, `result`, 40-hex `tree_sha`); it does
+  not check `commit_sha`, `worktree` or `steps[]`, which the tree bind does not use. POSSIBLE
+  LATER HARDENING (not a tracked follow-up): deploy the validator via HELPER_NAMES so every leg
+  gets the full check. That also needs the `orchestrate-steer.sh` canonical list and the pinned
+  HELPER_NAMES count in `test-orchestrate-steer.py` (the #284 lockstep), which is why it was left out.
+
+Open points, answered: the escape flag EXISTS (`--ungated`, consumed, never forwarded, loud on
+stderr). A consumer repo with no gate-runner gets a REFUSAL, not a WARN: its push path declares
+`--ungated`. The `elmer-enqueue.sh` commit_sha bind for a PR squashed after gating stays a
+SEPARATE follow-up; enqueue is unchanged here. Step 3 of the sequence (rewording the guard
+message) remains its own deny-authority issue.

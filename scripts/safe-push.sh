@@ -13,13 +13,14 @@
 # the remote.
 #
 # What this wrapper does:
-#   1. Resolves the local HEAD and the branch (or current symbolic-ref).
+#   1. Resolves the branch (argument, or the current symbolic-ref) and its local tip
+#      (refs/heads/<branch>, which need not be the checked-out HEAD).
 #   2. Runs `git push` with full output captured to a log ONLY (not mirrored
 #      into the caller's context). On success the one-line verification is all
 #      the caller needs; on failure a BOUNDED tail of the log is surfaced. The
 #      complete transcript always lives in the log file.
-#   3. After push returns, queries `git ls-remote origin <branch>` and
-#      verifies the remote SHA matches local HEAD.
+#   3. After push returns, queries `git ls-remote origin refs/heads/<branch>` and
+#      verifies the remote SHA matches the local branch tip.
 #   4. Exits non-zero with a clear message if push's exit code OR the post-push
 #      ref check disagrees.
 #
@@ -33,6 +34,7 @@
 #   bash safe-push.sh <branch> --rewrite            # DECLARE a history rewrite (see below)
 #   bash safe-push.sh <branch> --base release/1.2   # measure freshness against a NON-DEFAULT base
 #   bash safe-push.sh <branch> --stale-ok           # DECLARE an intentional behind-base upload
+#   bash safe-push.sh <branch> --ungated            # DECLARE a push with no gate receipt (#318)
 #
 #   NEVER pipe safe-push (`| tail`, `| head`, `| tee` ...): without `pipefail` a
 #   pipeline returns the LAST command's exit code, so a refusal reads as 0 (#432).
@@ -51,6 +53,15 @@
 #     prior bot review owes a fresh full review. The --rewrite/--rebased flag is
 #     CONSUMED here, never forwarded to git push.
 #
+# GATE RECEIPT (#318): before any network step the wrapper REFUSES (exit 1) unless a passing
+# `gate-receipt/v1` from gate-runner binds the TREE being pushed. The receipt is
+# `<git-dir>/prep-pr-receipt.json` of the worktree that has <branch> checked out (so a push by
+# name from a shared checkout finds the builder's receipt), else of the caller's own checkout.
+# Missing / invalid / failing / stale (tree differs) / holding worktree dirty = REFUSED with a
+# pointer to /prep-pr. --ungated is the
+# declared-intent escape for a push that genuinely has no gate (a repo without gate-runner, a
+# human's deliberate push); it is CONSUMED, never forwarded, and says so loudly on stderr.
+#
 # NOTE: the branch name must be the FIRST argument; `-u origin` is added
 # automatically and must NOT be passed by the caller. Invoking it as
 # `safe-push.sh -u origin <branch>` is a misuse: the leading `-u` is rejected
@@ -61,14 +72,16 @@
 # form (#432); the remote is always origin and is never taken from the caller.
 #
 # Exit codes:
-#   0 -- push succeeded AND the remote ref matches local HEAD
-#   1 -- push exited non-zero, the remote ref does not match local HEAD, the push
+#   0 -- push succeeded AND the remote ref matches the local branch tip
+#   1 -- push exited non-zero, the remote ref does not match the local branch tip, the push
 #        was REFUSED as a stale-base upload (#330: definitively BEHIND the base and no
-#        --stale-ok declared; --base <name> corrects a wrong base), was REFUSED as a
+#        --stale-ok declared; --base <name> corrects a wrong base), was REFUSED for a
+#        missing/invalid/failing/stale gate receipt (#318; --ungated declares none), was REFUSED as a
 #        silent rewrite (no --rewrite/--rebased), the remote is
 #        ahead (diverged) and must be integrated first, or the remote tip is not
 #        in local history (run `git fetch origin` first so it can be classified)
-#   2 -- invalid invocation (a leading flag, a leading remote name) / not in a git
+#   2 -- invalid invocation (a leading flag, a leading remote name, a forwarded non-flag word or
+#        ref-widening flag such as --all/--tags/--mirror: one branch per call) / not in a git
 #        repo / cannot resolve branch (the named local branch does not exist)
 
 set -euo pipefail
@@ -159,12 +172,14 @@ fi
 # else verbatim. Accumulating into an array keeps flags-with-spaces intact.
 rewrite_intent=0
 stale_ok=0
+ungated=0
 base_override=""
 push_args=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --rewrite|--rebased) rewrite_intent=1; shift ;;
     --stale-ok) stale_ok=1; shift ;;
+    --ungated) ungated=1; shift ;;
     --base)
       # A VALUE is mandatory. Defaulting a missing one would silently measure against the
       # wrong base, which is the exact false-BEHIND this flag exists to prevent.
@@ -174,7 +189,24 @@ while [ "$#" -gt 0 ]; do
         exit 2
       fi
       base_override="$2"; shift 2 ;;
-    *) push_args+=("$1"); shift ;;
+    # ONE BRANCH, EXACTLY (#318 R2). Every gate here (receipt, freshness, rewrite classification,
+    # remote verification) is about <branch>; a forwarded word is an extra REFSPEC to git and a
+    # --all/--mirror/--tags style flag widens the push, so either would push refs nothing checked.
+    # Flags that take a SEPARATE value keep it; any other non-flag word is refused.
+    -o|--push-option|--receive-pack|--exec|--repo)
+      if [ "$#" -lt 2 ]; then
+        echo "safe-push: $1 requires a value." >&2; exit 2
+      fi
+      push_args+=("$1" "$2"); shift 2 ;;
+    --all|--branches|--mirror|--tags|--delete|-d|--prune|--)
+      echo "safe-push: '$1' would push (or delete) refs other than '$branch', which nothing here checks; refused." >&2
+      echo "           Usage: safe-push.sh <branch> [flags] - one branch per call." >&2
+      exit 2 ;;
+    -*) push_args+=("$1"); shift ;;
+    *)
+      echo "safe-push: extra argument '$1' is not a flag: git would push it as a SECOND refspec, ungated; refused." >&2
+      echo "           Usage: safe-push.sh <branch> [flags] - one branch per call." >&2
+      exit 2 ;;
   esac
 done
 
@@ -184,9 +216,128 @@ if [ -z "$local_sha" ]; then
   exit 2
 fi
 
+# --- GATE RECEIPT (#318) ---------------------------------------------------------------
+# The floor's `# prep-pr-ok` override is a literal string: it attests that a gate ran without
+# checking. This leg is the check, one layer OUT of the floor (which must never read a receipt:
+# DESIGN-fixround-push-gate.md). It runs BEFORE the freshness block and every network step: it is
+# local and cheap, and a push it refuses should not first pay for a fetch.
+#
+# BIND BY TREE, NOT COMMIT: /prep-pr gates and may then SQUASH, so the pushed commit's SHA can
+# differ from the receipt's commit_sha while the tree is identical. Plus a clean-worktree check
+# on the worktree HOLDING the branch (a receipt says what HEAD's tree was, not that the files the
+# gate saw were all committed). With no holding worktree there is no working state to check.
+#
+# FAIL CLOSED on the push it guards: every "could not tell" (no python3, an unreadable
+# receipt or git-dir, a status that errors) REFUSES. The one exit is the declared --ungated.
+receipt_refuse() {
+  echo "safe-push: REFUSING to push '$branch': $1" >&2
+  echo "          Produce a receipt for this tree: gate-runner.py --receipt <git-dir>/prep-pr-receipt.json in" >&2
+  echo "          the worktree holding the branch (what /prep-pr and the /handle-review Step 7 gated push run)." >&2
+  echo "          No gate exists for this push (a repo without gate-runner, a deliberate human push)?" >&2
+  echo "          Re-run with --ungated to declare it." >&2
+  exit 1
+}
+if [ "$ungated" -eq 1 ]; then
+  echo "safe-push: --ungated DECLARED: the gate-receipt check was SKIPPED for this push." >&2
+  echo "          Nothing verified that a gate passed on the tree being pushed." >&2
+else
+  # The worktree that has <branch> checked out, by EXACT `branch refs/heads/<b>` line. MORE than
+  # one (a `worktree add --force`) REFUSES: which receipt and which working state would be ambiguous.
+  # A DETACHED worktree does not hold the branch (git lets it be checked out elsewhere), so it is
+  # skipped - EXCEPT one mid-rebase of <branch> (git records that in rebase-*/head-name), which
+  # REFUSES: the branch is being rewritten there and its working state is not a gated tree.
+  holder=""
+  n_holders=0
+  wt_cur=""
+  wt_list=$(git worktree list --porcelain 2>/dev/null || true)
+  while IFS= read -r wt_line; do
+    case "$wt_line" in "worktree "*) wt_cur="${wt_line#worktree }" ;; esac
+    if [ "$wt_line" = "branch refs/heads/$branch" ]; then
+      [ -n "$holder" ] || holder="$wt_cur"
+      n_holders=$((n_holders + 1))
+    elif [ "$wt_line" = "detached" ]; then
+      wt_gd=$(git -C "$wt_cur" rev-parse --absolute-git-dir 2>/dev/null || true)
+      for hn in "$wt_gd/rebase-merge/head-name" "$wt_gd/rebase-apply/head-name"; do
+        if [ -n "$wt_gd" ] && [ -f "$hn" ] && [ "$(cat "$hn" 2>/dev/null)" = "refs/heads/$branch" ]; then
+          receipt_refuse "'$wt_cur' is mid-rebase of '$branch'; finish or abort the rebase first."
+        fi
+      done
+    fi
+  done <<<"$wt_list"
+  if [ "$n_holders" -gt 1 ]; then
+    receipt_refuse "$n_holders worktrees have it checked out; remove the extra checkout so one worktree holds it."
+  fi
+  if [ -n "$holder" ]; then
+    receipt_dir=$(git -C "$holder" rev-parse --absolute-git-dir 2>/dev/null || true)
+    [ -n "$receipt_dir" ] || receipt_refuse "cannot resolve the git-dir of '$holder', the worktree holding it (removed without 'git worktree prune'?)."
+  else
+    receipt_dir="$git_dir"
+  fi
+  receipt="$receipt_dir/prep-pr-receipt.json"
+  [ -f "$receipt" ] || receipt_refuse "no gate receipt at $receipt."
+  command -v python3 >/dev/null 2>&1 || receipt_refuse "python3 is required to read the receipt and was not found."
+  # FULL VALIDATOR when present: orchestrate_schemas.py (the gate-receipt/v1 source of truth) is
+  # found beside this script on the repo/plugin legs. It is NOT in HELPER_NAMES - adding it there
+  # pulls in the steer canonical-list lockstep - so a DEPLOYED copy (~/.claude/scripts, which is
+  # what the pr-shipper runs) usually has none, and refusing on its absence would refuse every
+  # shipper push. Absent, the INLINE check below still runs and still refuses on any doubt.
+  validator=""
+  for cand in "$(dirname "$0")/orchestrate_schemas.py" \
+              "${CLAUDE_PLUGIN_ROOT:+$CLAUDE_PLUGIN_ROOT/scripts/orchestrate_schemas.py}"; do
+    if [ -n "$cand" ] && [ -f "$cand" ]; then validator="$cand"; break; fi
+  done
+  if [ -n "$validator" ]; then
+    if ! v_out=$(python3 "$validator" --validate gate-receipt/v1 "$receipt" 2>&1); then
+      receipt_refuse "the receipt at $receipt is not a valid gate-receipt/v1 ($(printf '%s' "$v_out" | tr '\n' ' '))."
+    fi
+  else
+    echo "safe-push: note: orchestrate_schemas.py not found; checking the receipt's load-bearing fields only." >&2
+  fi
+  # INLINE CHECK, ALWAYS RUN (validator present or not). It verifies exactly the fields this push
+  # decision rests on: the object is JSON, schema == gate-receipt/v1, producer == gate-runner (a
+  # wrong-tool or hand-rolled artifact, not a forger: the threat model is an honest agent on the
+  # obvious path, as in elmer-enqueue.sh), result == pass, and tree_sha is a 40-hex SHA (printed
+  # lower-cased for the tree bind below). It does NOT verify commit_sha, worktree or steps[]: the
+  # bind is by TREE, and none of those change what is pushed. On success it prints the tree; on
+  # any doubt it prints the reason and exits nonzero, which REFUSES.
+  # STDOUT ONLY is captured: a stray interpreter warning on stderr must not reach the tree bind.
+  if ! r_tree=$(python3 -c 'import json, re, sys
+def die(msg):
+    print(msg)
+    sys.exit(1)
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception as e:
+    die("the receipt is not readable JSON (%s)" % e)
+if not isinstance(d, dict):
+    die("the receipt is not a JSON object")
+for k, want in (("schema", "gate-receipt/v1"), ("producer", "gate-runner"), ("result", "pass")):
+    if d.get(k) != want:
+        die("receipt %s is %s, expected %s%s" % (k, json.dumps(d.get(k)), json.dumps(want),
+            " (the gate did not pass)" if k == "result" else ""))
+t = d.get("tree_sha")
+if not isinstance(t, str) or not re.fullmatch("[0-9a-fA-F]{40}", t):
+    die("receipt tree_sha is %s, not a 40-hex SHA" % json.dumps(t))
+print(t.lower())' "$receipt" 2>/dev/null); then
+    receipt_refuse "$(printf '%s' "${r_tree:-the receipt could not be checked}" | tr '\n' ' ')"
+  fi
+  branch_tree=$(git rev-parse --verify --quiet "refs/heads/$branch^{tree}" 2>/dev/null || true)
+  [ -n "$branch_tree" ] || receipt_refuse "cannot resolve the tree of refs/heads/$branch."
+  if [ "$r_tree" != "$branch_tree" ]; then
+    receipt_refuse "STALE receipt: it gated tree $r_tree, but refs/heads/$branch is tree $branch_tree (the branch changed after the gate ran)."
+  fi
+  if [ -n "$holder" ]; then
+    if ! wt_status=$(git -C "$holder" status --porcelain --untracked-files=normal 2>/dev/null); then
+      receipt_refuse "cannot read the status of '$holder', the worktree holding it."
+    fi
+    [ -z "$wt_status" ] || receipt_refuse "'$holder' (the worktree holding it) has uncommitted or untracked changes, so the gated files may not be the pushed ones."
+  fi
+  echo "safe-push: gate receipt verified (tree $branch_tree)." >&2
+fi
+
 # --- BASE FRESHNESS (#330) ------------------------------------------------------------
 # The rewrite classifier below asks only about this branch's OWN remote ref. It never asks
-# whether HEAD is behind the BASE, so the first additive upload of a stale-base branch passed
+# whether the branch is behind the BASE, so the first additive upload of a stale-base branch passed
 # clean and opened a PR on a stale base. base-freshness.sh (#282) already answers exactly that
 # question; it was simply unwired here, and a check that exists but is not wired where it
 # matters is indistinguishable from no check (the #324 shape).
@@ -233,8 +384,9 @@ else
       # MEASURE THE BRANCH BEING PUSHED, NOT THE CHECKOUT (#457). safe-push pushes <branch> by
       # NAME, so HEAD may be any other branch: measuring HEAD falsely refused a fresh branch
       # pushed from a stale checkout and falsely passed a stale one pushed from a fresh checkout.
-      # The full refs/heads/ form is unambiguous (a same-named tag cannot shadow it) and makes the
-      # helper's labeled line name the branch actually measured.
+      # The full refs/heads/ form is unambiguous for THIS rev-parse (a same-named tag cannot shadow
+      # it) and makes the helper's labeled line name the branch actually measured. The push below
+      # needs the same treatment separately (#466).
       set +e
       fresh_out=$(bash "$bf" "$fresh_base" "refs/heads/$branch" 2>&1)
       fresh_rc=$?
@@ -347,7 +499,13 @@ esac
 # exists to prevent. (No pipe now, so `set -o pipefail` is neither needed nor used.)
 echo "safe-push: pushing $branch ($local_sha) to origin" >&2
 push_status=0
-if git push -u origin "$branch" ${push_args[@]+"${push_args[@]}"} >"$LOG" 2>&1; then
+#
+# FULL REFSPEC, NEVER THE BARE NAME (#466). A bare `git push origin <b>` resolves <b> as a SOURCE
+# ref, and a same-named TAG makes that ambiguous: git fails "src refspec <b> matches more than
+# one". refs/heads/<b>:refs/heads/<b> names exactly the branch this script classified and
+# verifies; -u still records the upstream (the source is a local branch), and a forwarded
+# --force-with-lease leases that same destination ref.
+if git push -u origin "refs/heads/$branch:refs/heads/$branch" ${push_args[@]+"${push_args[@]}"} >"$LOG" 2>&1; then
   push_status=0
 else
   push_status=$?
@@ -368,13 +526,13 @@ fi
 
 if [ -z "$remote_sha" ]; then
   echo "safe-push: git push exited 0 but origin has no '$branch' ref" >&2
-  echo "          local HEAD: $local_sha" >&2
+  echo "          local $branch: $local_sha" >&2
   emit_log_tail
   exit 1
 fi
 
 if [ "$remote_sha" != "$local_sha" ]; then
-  echo "safe-push: git push exited 0 but origin/'$branch' does not match local HEAD" >&2
+  echo "safe-push: git push exited 0 but origin/'$branch' does not match the local branch tip" >&2
   echo "          local:  $local_sha" >&2
   echo "          remote: $remote_sha" >&2
   emit_log_tail
