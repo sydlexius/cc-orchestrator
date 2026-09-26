@@ -22,7 +22,7 @@ Closes #
 ## Security-floor changes (delete this section if the guard is untouched)
 
 - [ ] New behavior is TDD-driven: harness cases added/updated before the change.
-- [ ] Independent adversarial-critic pass run (the `engage-ralph-loop.md` brief) AT THE RIGOR TIER `/prep-pr` printed: deny-authority -> converged at K=2 dry rounds; advisory -> one multi-lens pass + a fix-scoped verify round; escalated to the full loop on any Critical/Important finding.
+- [ ] Independent adversarial-critic pass run (the `engage-ralph-loop.md` brief) AT THE RIGOR TIER `/prep-pr` printed (deny-authority -> full multi-lens pass with a permit/deny differential; advisory -> property verified, then one multi-lens pass); the final round's verdict was SHIP, or SHIP WITH FIXES with every listed fix applied and the gates re-run green (every DO NOT SHIP earned a fix-scoped follow-up round).
 - [ ] No trigger substrings (`git push`, `main`/`master`, `gh pr merge`, `gh ... --admin`, `... --no-verify`, `pulls/N/merge`) on any Bash command line - payloads stay inside the harness/fixtures.
 
 ## Test plan
