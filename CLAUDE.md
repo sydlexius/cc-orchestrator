@@ -548,6 +548,21 @@ Runtime (`scripts/`; canonical source is this repo):
   `[[pref]]` it greps the directly-changed governed surfaces for the pref's `verify` regex; a governed,
   changed surface that misses the mechanism is a hard failure unless an `[[exempt]]` block covers it.
   Executes `git` ONLY - a repo-declared `list_cmd` drift-check was dropped for RCE safety (#201).
+- `scripts/settings-scrub.py` - REPORT-ONLY, ON-DEMAND scan of the settings cascade for credentials
+  stored inside permission rules (#393; design `skills/orchestrate/design/DESIGN-settings-credential-scrub.md`).
+  "Always allow" stores the approved command line VERBATIM, so a secret passed on argv becomes a
+  plaintext secret on disk. Discovery REPLICATES `orchestrate-setup.py` `_cascade_files()` (harness
+  asserts parity; `ORCHESTRATE_SETTINGS_FILES` replaces it), then dedups by resolved path. Carriers:
+  credential-named `KEY=VALUE` prefixes (quoted, and every one on the line), Authorization/key
+  headers, tool-scoped short flags, long credential flags, `://user:pw@`, known token prefixes, and a
+  MALFORMED `op://` reference (`op run` fails OPEN on one). Flags only non-placeholder (word-like
+  values excluded except on password carriers) AND high-entropy; the report names what it MISSES.
+  EXIT: 0 no findings FROM THE CONFIGURED DETECTORS (never "no credential exists") / 1 findings /
+  2 could not determine (a present file unreadable/unstat-able/malformed, any internal error, or
+  bad invocation), and 2 OUTRANKS 1.
+  NO output path prints a value (shape + SHA-256 prefix only); unredacted detail only via
+  `--detail-file`, CREATE-ONLY (O_EXCL; any existing or settings path refused), 0600 via fchmod. It
+  NEVER writes a settings file: the consented redact is a follow-up on #326; no `--yes` path exists.
 - `test-ci-gates-lockstep.py` - the CI/`.gates.toml` lint LOCKSTEP guard (#364). The two lint
   enumerations are HAND-MAINTAINED and nothing compared them, so they drifted until CI
   shellchecked 28 of the 37 scripts the local gate covered - `orchestrate-authorize-merge.sh`
@@ -600,7 +615,7 @@ clean-worktree check, so an unchanged committed tree skips re-running it
 
 ```sh
 shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/orchestrate-authorize-merge.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh scripts/base-freshness.sh scripts/open-pr-staleness-sweep.sh scripts/run-paths.sh scripts/cr-quota-watch.sh scripts/elmer-enqueue.sh scripts/elmer-triage.sh scripts/elmer-tick.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
-ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-ci-gates-lockstep.py test-steer-nudge-length.py test-helper-deploy-coverage.py test-jq-quoting.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-safe-push-freshness.py test-prep-pr-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py test-cr-quota-watch.py test-elmer-enqueue.py test-elmer-triage.py test-elmer-tick.py test-bash32-constructs.py
+ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py scripts/settings-scrub.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-ci-gates-lockstep.py test-steer-nudge-length.py test-helper-deploy-coverage.py test-jq-quoting.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-safe-push-freshness.py test-prep-pr-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py test-cr-quota-watch.py test-elmer-enqueue.py test-elmer-triage.py test-elmer-tick.py test-bash32-constructs.py test-settings-scrub.py
 ./scripts/orchestrate-guard.sh --self-test    # MUST use ./ - the self-test re-invokes "$0";
                                               # `bash scripts/orchestrate-guard.sh` makes $0 a bare name -> 127
 ./scripts/orchestrate-guard.sh --assert-coverage  # #324: no deny is unreachable behind the perf
@@ -640,6 +655,7 @@ python3 test-prefs-coverage.py
 python3 test-prose-lint.py
 python3 test-resolve-threads.py
 python3 test-cache-reclaim.py
+python3 test-settings-scrub.py
 python3 test-base-freshness.py
 python3 test-safe-push-freshness.py
 python3 test-prep-pr-freshness.py
