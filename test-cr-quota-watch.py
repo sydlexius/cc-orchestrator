@@ -37,6 +37,11 @@ Contract asserted:
   exit 1  LIMITED -- newest signal's deadline is still in the future; line surfaced
   exit 2  setup error (bad args, unresolvable repo, gh read failure)
 
+#467: a compound duration ("1 hour and 5 minutes.") is summed; a recognized CR limit
+phrase whose duration cannot be parsed is LIMITED ("deadline UNKNOWN") until a 1h
+ceiling. #456: the scan covers the queried PR plus the 10 most recently updated PRs,
+and the selection rule runs across all of them.
+
 Run: python3 test-cr-quota-watch.py
 """
 import json
@@ -94,6 +99,17 @@ SUMMARY_TEMPLATE = (
     "> **Next included review available in {dur}.**\n"
 )
 
+# VERBATIM banner forms from the 2026-09-26 survey (canticle #1056, cc-orchestrator #397,
+# canticle #918), with the count and allowance parameterized.
+BANNER_A = (
+    "**Included review availability:** {n} currently available. Your included PR review "
+    "attempts over the past 7 days set your current allowance at {al} per hour."
+)
+BANNER_B = (
+    "**Included review availability:** Your plan provides up to {al} included review per hour; "
+    "{n} remain after this review."
+)
+
 # VERBATIM available-state reply, measured on cc-orchestrator #351.
 AVAILABLE_BODY = (
     "<!-- This is an auto-generated reply by CodeRabbit -->\n"
@@ -143,10 +159,26 @@ def pacific_label(dt):
     return dt.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z")
 
 
-def run(args, *, comments="[]", api_fail=False, repo_fail=False):
-    """Invoke the watcher with a stubbed gh. Returns (rc, stdout, stderr)."""
+GH_LOG = []  # the endpoints the last run() asked gh for, in order
+
+
+def run(args, *, comments="[]", api_fail=False, repo_fail=False, pulls=None, per_pr=None,
+        pulls_fail=False, fail_pr=None):
+    """Invoke the watcher with a stubbed gh. Returns (rc, stdout, stderr).
+
+    `pulls` is the recently-updated PR list (#456); `per_pr` maps a PR number to its own
+    comments JSON, and any PR without an entry is served `comments`. GH_LOG records every
+    endpoint read, so a case can prove a PR beyond the scan bound was never read.
+    By default the list holds just the queried PR: an EMPTY list is a read failure (Q2)."""
+    if pulls is None:
+        pulls = json.dumps([{"number": int(args[0])}]) if args and args[0].isdigit() else "[]"
     with tempfile.TemporaryDirectory() as td:
         bindir = os.path.join(td, "bin"); os.makedirs(bindir)
+        cdir = os.path.join(td, "comments"); os.makedirs(cdir)
+        log = os.path.join(td, "gh.log")
+        for n, body in (per_pr or {}).items():
+            with open(os.path.join(cdir, f"{n}.json"), "w") as f:
+                f.write(body)
         gh = os.path.join(bindir, "gh")
         with open(gh, "w") as f:
             f.write(
@@ -154,7 +186,17 @@ def run(args, *, comments="[]", api_fail=False, repo_fail=False):
                 "set -eu\n"
                 "case \"${1:-}\" in\n"
                 "  repo) [ -n \"${GH_REPO_FAIL:-}\" ] && exit 1; echo 'owner/repo'; exit 0;;\n"
-                "  api)  [ -n \"${GH_API_FAIL:-}\" ] && exit 1; printf '%s' \"${COMMENTS_JSON:-[]}\"; exit 0;;\n"
+                "  api)  [ -n \"${GH_API_FAIL:-}\" ] && exit 1\n"
+                "        ep=''; for a in \"$@\"; do case \"$a\" in repos/*) ep=\"$a\";; esac; done\n"
+                "        printf '%s\\n' \"$ep\" >> \"$GH_LOG\"\n"
+                "        case \"$ep\" in\n"
+                "          */pulls\\?*) [ -n \"${GH_PULLS_FAIL:-}\" ] && exit 1\n"
+                "                     printf '%s' \"${PULLS_JSON-[]}\"; exit 0;;\n"
+                "          */issues/*/comments) n=${ep#*/issues/}; n=${n%%/*}\n"
+                "                     [ \"${GH_FAIL_PR:-}\" = \"$n\" ] && exit 1\n"
+                "                     if [ -f \"$COMMENTS_DIR/$n.json\" ]; then cat \"$COMMENTS_DIR/$n.json\"\n"
+                "                     else printf '%s' \"${COMMENTS_JSON-[]}\"; fi; exit 0;;\n"
+                "        esac; exit 1;;\n"
                 "esac\n"
                 "exit 0\n"
             )
@@ -163,13 +205,27 @@ def run(args, *, comments="[]", api_fail=False, repo_fail=False):
         env = dict(os.environ)
         env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
         env["COMMENTS_JSON"] = comments
+        env["PULLS_JSON"] = pulls
+        env["COMMENTS_DIR"] = cdir
+        env["GH_LOG"] = log
+        for k in ("GH_API_FAIL", "GH_REPO_FAIL", "GH_PULLS_FAIL", "GH_FAIL_PR"):
+            env.pop(k, None)
         if api_fail:
             env["GH_API_FAIL"] = "1"
         if repo_fail:
             env["GH_REPO_FAIL"] = "1"
+        if pulls_fail:
+            env["GH_PULLS_FAIL"] = "1"
+        if fail_pr is not None:
+            env["GH_FAIL_PR"] = str(fail_pr)
 
         p = subprocess.run([SCRIPT] + args, env=env, capture_output=True, text=True, timeout=30)
+        GH_LOG[:] = open(log).read().splitlines() if os.path.exists(log) else []
         return p.returncode, p.stdout, p.stderr
+
+
+def pulls_json(*numbers):
+    return json.dumps([{"number": n, "updated_at": ago(minutes=1)} for n in numbers])
 
 
 def main():
@@ -374,6 +430,127 @@ def main():
     rc, out, err = run(["1", "owner/repo"], comments="[]", api_fail=True)
     check("gh api read fails -> exit 2 (setup error, never a false exit 0)",
           rc == 2 and "setup error" in err)
+
+    print("== #467: COMPOUND durations are summed, never read as 'no limit' ==")
+    for dur, created, want, why in [
+        ("1 hour and 5 minutes", ago(minutes=1), "~1h 4m", "the reported shape"),
+        ("1 hour, 5 minutes, and 4 seconds", ago(minutes=1), "~1h 4m", "comma list + ', and'"),
+        ("2 Hours, 1 minute", ago(minutes=1), "~2h 0m", "comma only, mixed case, plural+singular"),
+        ("5 Minutes and 50 seconds", ago(minutes=1), "~5m", "minutes + seconds"),
+    ]:
+        rc, out, err = run(["1", "owner/repo"],
+                           comments=comments_json(comment(RL_TEMPLATE.format(dur=dur), created=created)))
+        check(f"'available in {dur}.' -> LIMITED {want} ({why})", rc == 1 and want in (out + err))
+
+    print("== #467: a recognized limit phrase with an UNPARSEABLE duration is LIMITED ==")
+    for dur in ["1 hour 5 minutes", "a little while"]:
+        rc, out, err = run(["1", "owner/repo"],
+                           comments=comments_json(comment(RL_TEMPLATE.format(dur=dur),
+                                                          created=ago(minutes=5))))
+        check(f"'available in {dur}.' 5m ago -> exit 1, 'deadline UNKNOWN', ~55m ceiling",
+              rc == 1 and "deadline UNKNOWN" in (out + err) and "~55m" in (out + err))
+    rc, out, err = run(["1", "owner/repo"],
+                       comments=comments_json(comment(RL_TEMPLATE.format(dur="a little while"),
+                                                      created=ago(minutes=61))))
+    check("unparseable notice older than the 1h ceiling -> EXPIRED, exit 0",
+          rc == 0 and "NO usable countdown" in (out + err))
+
+    print("== the AVAILABILITY BANNER: a remaining-slot count (survey 2026-09-26) ==")
+    zero = comment(BANNER_A.format(n="0 reviews are", al="1 review"),
+                   created=ago(minutes=90), updated=ago(minutes=5))
+    rc, out, err = run(["1", "owner/repo"], comments=comments_json(zero))
+    check("current form '0 reviews are currently available' (edited 5m ago) -> LIMITED, "
+          "deadline UNKNOWN, ~55m from updated_at",
+          rc == 1 and "deadline UNKNOWN" in out and "~55m" in out)
+    rc, out, err = run(["1", "owner/repo"],
+                       comments=comments_json(comment(BANNER_B.format(al="1", n="0"),
+                                                      created=ago(minutes=5))))
+    check("older form '0 remain after this review' -> LIMITED, deadline UNKNOWN",
+          rc == 1 and "deadline UNKNOWN" in out)
+    old_zero = comment(BANNER_A.format(n="0 reviews are", al="1 review"), created=ago(minutes=10))
+    rc, out, err = run(["1", "owner/repo"],
+                       comments=comments_json(old_zero,
+                                              comment(BANNER_A.format(n="9 reviews are", al="10 reviews"),
+                                                      created=ago(minutes=2))))
+    check("newer '9 reviews available' clears an older zero -> exit 0, surfaces N and allowance",
+          rc == 0 and "9 included reviews available" in out and "10/hour" in out)
+    rc, out, err = run(["1", "owner/repo"],
+                       comments=comments_json(comment(AVAILABLE_BODY, created=ago(minutes=10)),
+                                              comment(BANNER_A.format(n="0 reviews are", al="1 review"),
+                                                      created=ago(minutes=2))))
+    check("newer zero banner overrides an older 'available now' -> LIMITED", rc == 1)
+    rc, out, err = run(["1", "owner/repo"],
+                       comments=comments_json(comment(BANNER_A.format(n="0 reviews are", al="1 review"),
+                                                      created=ago(minutes=61))))
+    check("zero banner older than the 1h ceiling -> EXPIRED, exit 0",
+          rc == 0 and "NO usable countdown" in out)
+    rc, out, err = run(["1", "owner/repo"],
+                       comments=comments_json(comment(BANNER_A.format(n="1 review is", al="1 review"),
+                                                      created=ago(minutes=2))))
+    check("singular '1 review is currently available' -> exit 0 (clear), says 1 included review",
+          rc == 0 and "1 included review available" in out)
+
+    print("== #456: account-wide scan across recently updated PRs ==")
+    live = comments_json(comment(RL_TEMPLATE.format(dur="30 minutes"), created=ago(minutes=1)))
+    rc, out, err = run(["1", "owner/repo"], pulls=pulls_json(2, 1), per_pr={2: live})
+    check("limit on a DIFFERENT PR than the queried one -> exit 1, names it",
+          rc == 1 and "PR #2" in out and "account-wide" in out and "29m" in out)
+    check("PR list read with the fixed bound (state=all, sort=updated, per_page=10)",
+          "repos/owner/repo/pulls?state=all&sort=updated&direction=desc&per_page=10" in GH_LOG)
+    check("queried PR in the list is read ONCE (deduplicated)",
+          GH_LOG.count("repos/owner/repo/issues/1/comments") == 1)
+    old_limit = comments_json(comment(RL_TEMPLATE.format(dur="59 minutes"), created=ago(minutes=30)))
+    fresh_av = comments_json(comment(AVAILABLE_BODY, created=ago(minutes=1)))
+    rc, out, err = run(["1", "owner/repo"], pulls=pulls_json(2), per_pr={1: old_limit, 2: fresh_av})
+    check("'available' on PR B newer than a limit on PR A -> exit 0", rc == 0)
+    rc, out, err = run(["1", "owner/repo"], pulls=pulls_json(2), per_pr={1: live})
+    check("queried PR absent from the list is still scanned -> exit 1",
+          rc == 1 and "issues/1/comments" in " ".join(GH_LOG))
+    rc, out, err = run(["1", "owner/repo"], pulls_fail=True)
+    check("PR list read failure -> exit 2", rc == 2 and "setup error" in err)
+    rc, out, err = run(["1", "owner/repo"], pulls=pulls_json(2), fail_pr=2)
+    check("a scanned PR's comment read failure -> exit 2", rc == 2 and "setup error" in err)
+    for label, body in [("non-array", '{"message": "Not Found"}'),
+                        ("non-numeric number", '[{"number": "2"}]'),
+                        ("non-object entry", '[2]')]:
+        rc, out, err = run(["1", "owner/repo"], pulls=body)
+        check(f"{label} PR list -> exit 2", rc == 2 and "setup error" in err)
+    nums = list(range(101, 112))  # 11 PRs; the bound is 10
+    rc, out, err = run(["1", "owner/repo"], pulls=pulls_json(*nums), per_pr={111: live})
+    check("live limit on the 11th listed PR (beyond the bound) -> ignored, exit 0", rc == 0)
+    check("the 11th listed PR is never read",
+          not any("issues/111/" in e for e in GH_LOG))
+    rc, out, err = run(["1", "owner/repo"], pulls=pulls_json(*nums), per_pr={110: live})
+    check("live limit on the 10th listed PR (inside the bound) -> exit 1", rc == 1 and "PR #110" in out)
+
+    print("== review round 1 (Q1-Q7) ==")
+    rc, out, err = run(["1", "owner/repo"],
+                       comments=comments_json(comment(RL_TEMPLATE.format(dur="10000000000000000000 seconds"),
+                                                      created=ago(minutes=1))))
+    check("Q1 absurd duration is capped (no int overflow to EXPIRED) -> exit 1, ~23h",
+          rc == 1 and "~23h 59m" in out)
+    for label, kw in [("empty PR list output", {"pulls": ""}),
+                      ("'[]' PR list", {"pulls": "[]"}),
+                      ("empty comments body", {"comments": ""})]:
+        rc, out, err = run(["1", "owner/repo"], **kw)
+        check(f"Q2 {label} -> exit 2, never a silent shrink", rc == 2 and "setup error" in err)
+    rc, out, err = run(["1", "owner/repo"], pulls='[{"number": 1e3}]')
+    check("Q3 exponent-form PR number -> exit 2", rc == 2 and "setup error" in err)
+    rc, out, err = run(["01", "owner/repo"], pulls=pulls_json(1), per_pr={1: live})
+    check("Q4 '01' normalizes to PR #1: read once, not labeled account-wide",
+          rc == 1 and GH_LOG.count("repos/owner/repo/issues/1/comments") == 1
+          and "account-wide" not in out)
+    two_pages = (comments_json(comment("Just a normal human comment.", login="someuser"))
+                 + comments_json(comment(RL_TEMPLATE.format(dur="30 minutes"), created=ago(minutes=1))))
+    rc, out, err = run(["1", "owner/repo"], comments=two_pages)
+    check("Q5 multi-page comments (limit on page 2) -> exit 1", rc == 1 and "29m" in out)
+    for label, body in [("countdown", RL_TEMPLATE.format(dur="30 minutes")),
+                        ("zero banner", BANNER_A.format(n="0 reviews are", al="1 review"))]:
+        c = comment(body)
+        c["created_at"] = "garbage"; c["updated_at"] = None
+        rc, out, err = run(["1", "owner/repo"], comments=comments_json(c))
+        check(f"Q7 {label} with no parseable timestamp -> exit 2, not dropped",
+              rc == 2 and "no parseable timestamp" in err)
 
     print("== read-only: the script never posts ==")
     src = open(SCRIPT).read()
