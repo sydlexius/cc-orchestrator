@@ -1,5 +1,26 @@
 #!/usr/bin/env bash
 # gh-react.sh codoki-ack <pr> [owner/repo] [--react +1|-1]   (issue #234)
+# gh-react.sh ack <pr> [owner/repo] [--bot coderabbit|copilot|codoki|auto] [--react +1|-1]  (#338)
+#
+# `ack` is the BOT-AGNOSTIC actuator: it reacts (default +1) on each reviewer bot's
+# ROOT object that is not already acked by the CURRENT gh user. `codoki-ack` stays a
+# behavior-identical ALIAS of the original Codoki reader/actuator (below), which
+# ship-gate-preflight.sh calls; `ack` never changes what that gate reads or blocks on.
+# Ack TARGET per bot (resolved by AUTHOR + body marker, never by position):
+#   coderabbit  the issue-level walkthrough comment by `coderabbitai[bot]` carrying
+#               `<!-- This is an auto-generated comment: summarize by coderabbit.ai -->`
+#               (LATEST by created_at; CR's other auto-generated comments never match).
+#   codoki      the same summary `codoki-ack` resolves (shared resolver).
+#   copilot     NO reactable root object: Copilot posts a pull-request REVIEW, and the
+#               reactions API has no endpoint for a review, only for comments. Reported
+#               as no-target, never guessed onto an inline comment.
+#   auto        (default) every bot above with a root object on the PR; a Copilot review
+#               is reported as no-target (best-effort read, never fatal).
+# Idempotent: a target where the current user already has a +1 or -1 is SKIPPED.
+# `ack` EXIT CODES: 0 = every target acked (posted now or already acked);
+#   3 = NOTHING TO ACK (no reactable root object for the requested bot(s));
+#   2 = usage error OR ACK FAILED (a read, the current-user lookup, or a POST failed;
+#       remaining targets are still attempted, nothing is reported as acked falsely).
 #
 # Least-privilege wrapper for the Codoki ROOT-SUMMARY ACK surface. Codoki posts an
 # ISSUE-LEVEL review-summary comment (author login `codoki-pr-intelligence[bot]`,
@@ -12,7 +33,8 @@
 # the reaction for a human actuation.
 #
 # CONSTRUCTION / LEAST-PRIVILEGE GUARANTEE: this wrapper performs ONLY GETs
-# (list issue comments, read a comment's reactions) and the SINGLE reactions POST
+# (list issue comments, read a comment's reactions; `ack` adds the current `user`
+# and the PR's reviews) and the SINGLE reactions POST
 # (`POST repos/<repo>/issues/comments/<id>/reactions` with content=+1 or -1). Every
 # endpoint is built from a validated numeric pr / comment-id and a validated repo;
 # no caller input reaches a /merge, --admin, an arbitrary endpoint, or a -X verb.
@@ -33,6 +55,7 @@ set -euo pipefail
 
 CODOKI_LOGIN="codoki-pr-intelligence[bot]"
 CODOKI_MARKER="<!-- CODOKI_REVIEW_COMMENT -->"
+CR_MARKER="<!-- This is an auto-generated comment: summarize by coderabbit.ai -->"
 
 die() { echo "gh-react: $1" >&2; exit 2; }
 
@@ -60,22 +83,104 @@ resolve_repo() {
   printf '%s' "$r"
 }
 
+# --- `ack` (#338): react on each bot's root object not already acked by me ----
+# Needs: $repo $pr $react $bot $issue_comments $summary_id (the Codoki resolver's
+# pick). Prints one `ACK: <bot> -- <state>` line per bot considered; exit codes in
+# the header. A failure on one target never hides another's outcome.
+ack_one() {  # <bot> <comment-id> -> 0 acked/already, 1 failed
+  local b="$1" id="$2" rx n
+  is_num "$id" || { echo "gh-react: non-numeric ${b} target id ('${id}') -- refusing to POST" >&2; return 1; }
+  rx="$(gh api "repos/${repo}/issues/comments/${id}/reactions" --paginate)" \
+    || { echo "gh-react: could not read reactions on ${b} comment ${id} -- NOT acking blind" >&2; return 1; }
+  # PAGINATION-SAFE: `--paginate` emits one JSON array PER PAGE, concatenated, so a
+  # per-document count prints one number per page ("0\n1"), the numeric test errors
+  # and reads false, and a reaction of mine on page 2 was missed -> a duplicate POST.
+  # Slurp (-s) and flatten (.[][]) so the count spans every page, and REFUSE (never
+  # POST) on anything that is not a single whole number.
+  n="$(jq -rs --arg me "$me" '[ .[][] | select((.user.login // "") == $me)
+        | select(.content == "+1" or .content == "-1") ] | length' <<<"$rx")" \
+    || { echo "gh-react: could not parse reactions on ${b} comment ${id}" >&2; return 1; }
+  is_num "$n" \
+    || { echo "gh-react: unreadable reaction count on ${b} comment ${id} ('${n}') -- NOT acking blind" >&2; return 1; }
+  if [ "$n" -gt 0 ]; then
+    echo "ACK: ${b} -- already-acked (comment ${id} carries a reaction by ${me}; skipped)"
+    return 0
+  fi
+  if gh api -X POST "repos/${repo}/issues/comments/${id}/reactions" -f "content=${react}" >/dev/null; then
+    echo "ACK: ${b} -- posted ${react} on comment ${id} (PR #${pr} ${repo})"
+    return 0
+  fi
+  echo "gh-react: POST of ${react} on ${b} comment ${id} FAILED" >&2
+  return 1
+}
+
+ack_main() {
+  local cr_id="" targets=0 failed=0 copilot_n=""
+  me="$(gh api user --jq .login 2>/dev/null)" && [ -n "$me" ] \
+    || die "could not resolve the current gh user -- cannot check for an existing ack, refusing to POST"
+  if [ "$bot" = coderabbit ] || [ "$bot" = auto ]; then
+    # Slurp + flatten (.[][]) so a walkthrough on ANY page of the paginated
+    # issue-comment list is considered and the LATEST across all pages wins.
+    cr_id="$(jq -rs --arg m "$CR_MARKER" '[ .[][] | select((.user.login // "") == "coderabbitai[bot]")
+        | select((.body // "") | contains($m)) ] | sort_by(.created_at) | last | .id // empty' \
+        <<<"$issue_comments")" || die "could not parse issue comments for the CodeRabbit walkthrough"
+    if [ -n "$cr_id" ]; then
+      targets=$((targets+1)); ack_one coderabbit "$cr_id" || failed=$((failed+1))
+    elif [ "$bot" = coderabbit ]; then
+      echo "ACK: coderabbit -- no-target (no CodeRabbit walkthrough comment on PR #${pr})"
+    fi
+  fi
+  if [ "$bot" = codoki ] || [ "$bot" = auto ]; then
+    if [ -n "$summary_id" ]; then
+      targets=$((targets+1)); ack_one codoki "$summary_id" || failed=$((failed+1))
+    elif [ "$bot" = codoki ]; then
+      echo "ACK: codoki -- no-target (no Codoki review summary on PR #${pr})"
+    fi
+  fi
+  if [ "$bot" = copilot ]; then
+    echo "ACK: copilot -- no-target (Copilot posts a PR review, which has no reactions endpoint)"
+  elif [ "$bot" = auto ]; then
+    # Best-effort: only informs the report; a failed read never changes the outcome.
+    # Per-ITEM --jq output (one id per line), since --paginate applies --jq per PAGE.
+    copilot_n="$(gh api "repos/${repo}/pulls/${pr}/reviews" --paginate \
+      --jq '.[] | select((.user.login // "") | test("^(Copilot|copilot-pull-request-reviewer\\[bot\\])$")) | .id' \
+      2>/dev/null)" || copilot_n=""
+    if [ -n "$copilot_n" ]; then
+      echo "ACK: copilot -- no-target (Copilot reviewed, but a PR review has no reactions endpoint)"
+    fi
+  fi
+  [ "$failed" -eq 0 ] || return 2
+  if [ "$targets" -eq 0 ]; then
+    [ "$bot" != auto ] || echo "ACK: none -- no reviewer bot root object to ack on PR #${pr} (${repo})"
+    return 3
+  fi
+  return 0
+}
+
 sub="${1:-}"
-[ -n "$sub" ] || die "usage: gh-react.sh codoki-ack <pr> [owner/repo] [--react +1|-1]"
+[ -n "$sub" ] || die "usage: gh-react.sh codoki-ack|ack <pr> [owner/repo] [--bot coderabbit|copilot|codoki|auto] [--react +1|-1]"
 shift
 
 case "$sub" in
-  codoki-ack) ;;
-  *) die "unknown subcommand '${sub}' (only 'codoki-ack' is supported)" ;;
+  codoki-ack|ack) ;;
+  *) die "unknown subcommand '${sub}' (supported: 'ack', 'codoki-ack')" ;;
 esac
 
 pr=""
 repo=""
 react=""
+bot=""
+react_empty_set=""  # 1 when the LAST --react given was explicitly empty
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --react) [ "$#" -ge 2 ] || die "--react requires a value (+1 or -1)"; react="$2"; shift 2 ;;
-    --react=*) react="${1#--react=}"; shift ;;
+    --react) [ "$#" -ge 2 ] || die "--react requires a value (+1 or -1)"; react="$2"
+             react_empty_set=""; [ -n "$react" ] || react_empty_set=1; shift 2 ;;
+    --react=*) react="${1#--react=}"; react_empty_set=""; [ -n "$react" ] || react_empty_set=1; shift ;;
+    --bot) [ "$sub" = ack ] || die "--bot is only valid with 'ack'"
+           [ "$#" -ge 2 ] || die "--bot requires a value"; bot="$2"
+           [ -n "$bot" ] || die "--bot requires a non-empty value (coderabbit|copilot|codoki|auto)"; shift 2 ;;
+    --bot=*) [ "$sub" = ack ] || die "--bot is only valid with 'ack'"; bot="${1#--bot=}"
+             [ -n "$bot" ] || die "--bot requires a non-empty value (coderabbit|copilot|codoki|auto)"; shift ;;
     -*) die "unknown flag '${1}'" ;;
     *)
       if [ -z "$pr" ]; then pr="$1"
@@ -91,6 +196,16 @@ if [ -n "$react" ]; then
   case "$react" in
     +1|-1) ;;
     *) die "--react must be '+1' or '-1' (got: '${react}')" ;;
+  esac
+fi
+if [ "$sub" = ack ]; then
+  # An EXPLICIT empty --react is a usage error under `ack` (it would otherwise
+  # silently become the +1 default); codoki-ack keeps empty = READ mode.
+  [ -z "$react_empty_set" ] || die "--react requires a non-empty value (+1 or -1) with 'ack'"
+  [ -n "$react" ] || react="+1"
+  case "${bot:=auto}" in
+    coderabbit|copilot|codoki|auto) ;;
+    *) die "--bot must be coderabbit|copilot|codoki|auto (got: '${bot}')" ;;
   esac
 fi
 if [ -z "$repo" ]; then
@@ -118,7 +233,8 @@ issue_comments="$(gh api "repos/${repo}/issues/${pr}/comments" --paginate)" \
 # is empty -> READ reports no-summary -> the ack gate PASSes (genuinely no summary to
 # ack), and if Codoki comments DO exist a diagnostic is emitted (possible format drift).
 # Among matches the LATEST by created_at wins.
-summary_id="$(jq -r --arg login "$CODOKI_LOGIN" --arg marker "$CODOKI_MARKER" '
+codoki_summary_id() {
+  jq -r --arg login "$CODOKI_LOGIN" --arg marker "$CODOKI_MARKER" '
   [ .[] | select((.user.login // "") == $login) ] as $all
   | ([ $all[] | select((.body // "") | contains($marker)) ]) as $marked
   | ([ $all[] | select((.body // "") | test("Codoki PR Review"; "i")) ]) as $heuristic
@@ -126,8 +242,15 @@ summary_id="$(jq -r --arg login "$CODOKI_LOGIN" --arg marker "$CODOKI_MARKER" '
      elif ($heuristic | length) > 0 then $heuristic
      else [] end)
   | sort_by(.created_at) | last | .id // empty
-' <<<"$issue_comments" 2>/dev/null)" \
+' <<<"$issue_comments" 2>/dev/null
+}
+summary_id="$(codoki_summary_id)" \
   || die "could not parse issue comments for PR #${pr} (${repo}) -- ack state UNVERIFIABLE"
+
+if [ "$sub" = ack ]; then
+  ack_rc=0; ack_main || ack_rc=$?
+  exit "$ack_rc"
+fi
 
 # Loud diagnostic if Codoki commented but no comment is a recognized summary (marker
 # AND header both absent -- Codoki's format may have changed). Not a block: genuinely

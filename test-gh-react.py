@@ -63,28 +63,52 @@ if "-X" in args or "--method" in args:
         with open(log, "ab") as f:
             for a in args:
                 f.write(a.encode() + b"\0")
-    sys.exit(0)
+    sys.exit(1 if os.environ.get("GH_POST_FAIL") else 0)
 
 if GH_FAIL:
     sys.stderr.write("gh: simulated failure\n"); sys.exit(1)
+
+# `ack` (#338): the current-user lookup and the PR reviews list.
+if "user" in args:
+    if os.environ.get("USER_FAIL"):
+        sys.exit(1)
+    emit(json.dumps({"login": "me-human"}))
 
 endpoint = ""
 for a in args:
     if a.startswith("repos/"):
         endpoint = a; break
 if "/reactions" in endpoint:
+    # Failure knobs. REACTIONS_FAIL fails every reactions GET AFTER a clean first page
+    # (a --paginate that dies on page 2: stdout holds a VALID "[]", rc1), so only the
+    # exit-status guard can stop a blind POST. REACTIONS_FAIL_ID fails only that
+    # comment's GET (rc1 with an error body on STDOUT, as real gh does).
+    if os.environ.get("REACTIONS_FAIL"):
+        sys.stdout.write("[]"); sys.exit(1)
+    _fid = os.environ.get("REACTIONS_FAIL_ID", "")
+    if _fid and ("/comments/%s/" % _fid) in endpoint:
+        sys.stdout.write('{"message":"Server Error"}'); sys.exit(1)
+    # REACTIONS_PAGED: raw text served verbatim, i.e. the CONCATENATED per-page
+    # arrays that `gh api --paginate` really emits (no --jq applied).
+    if "REACTIONS_PAGED" in os.environ:
+        sys.stdout.write(os.environ["REACTIONS_PAGED"]); sys.exit(0)
     m = re.search(r"/comments/(\d+)/reactions", endpoint)
     if m and m.group(1) in REACTIONS_BY_ID:
         emit(json.dumps(REACTIONS_BY_ID[m.group(1)]))
     emit(REACTIONS)
 if endpoint.endswith("/comments") and "/issues/" in endpoint:
+    if "ISSUE_PAGED" in os.environ:  # concatenated per-page arrays, served verbatim
+        sys.stdout.write(os.environ["ISSUE_PAGED"]); sys.exit(0)
     emit(ISSUE)
+if endpoint.endswith("/reviews"):
+    emit(os.environ.get("REVIEWS_JSON", "[]"))
 # Unknown GET -> empty array (keeps jq happy).
 emit("[]")
 '''
 
 
-def run(args, *, issue="[]", reactions="[]", reactions_by_id=None, gh_fail=False, repo="owner/repo"):
+def run(args, *, issue="[]", reactions="[]", reactions_by_id=None, gh_fail=False, repo="owner/repo",
+        extra_env=None):
     """Invoke gh-react.sh with a stubbed gh. Returns (rc, stdout, stderr, posted_argv)."""
     with tempfile.TemporaryDirectory() as td:
         bindir = os.path.join(td, "bin"); os.makedirs(bindir)
@@ -105,6 +129,7 @@ def run(args, *, issue="[]", reactions="[]", reactions_by_id=None, gh_fail=False
             env["GITHUB_REPOSITORY"] = repo
         if gh_fail:
             env["GH_FAIL"] = "1"
+        env.update(extra_env or {})
         p = subprocess.run(["bash", WRAPPER] + args, env=env,
                            capture_output=True, text=True, timeout=20)
         posted = []
@@ -151,6 +176,149 @@ CODOKI_REPLY = (
 
 def issue_arr(*objs):
     return "[" + ",".join(objs) + "]"
+
+
+# --- `ack` fixtures (#338) ---------------------------------------------------
+CR_WALK = (
+    '{"id":7001,"user":{"login":"coderabbitai[bot]"},'
+    '"body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\\n## Walkthrough",'
+    '"created_at":"2026-07-01T00:00:00Z"}'
+)
+# NEWER CR auto-generated comments that are NOT the walkthrough: never the target.
+CR_OTHER = (
+    '{"id":7002,"user":{"login":"coderabbitai[bot]"},'
+    '"body":"<!-- This is an auto-generated comment: review in progress by coderabbit.ai -->",'
+    '"created_at":"2026-07-02T00:00:00Z"}'
+)
+CR_REPLY = (
+    '{"id":7003,"user":{"login":"coderabbitai[bot]"},'
+    '"body":"<!-- This is an auto-generated reply by CodeRabbit -->\\nReview triggered.",'
+    '"created_at":"2026-07-03T00:00:00Z"}'
+)
+# A human quoting the CR marker is not CR: the author must match too.
+FAKE_WALK = (
+    '{"id":7004,"user":{"login":"sydlexius"},'
+    '"body":"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->",'
+    '"created_at":"2026-07-04T00:00:00Z"}'
+)
+COPILOT_REVIEWS = ('[{"id":1,"user":{"login":"copilot-pull-request-reviewer[bot]"},'
+                   '"body":"## Pull request overview"}]')
+
+
+def posts(posted):
+    """The reaction endpoints a run POSTed to (from the NUL-logged argv stream)."""
+    return [a for a in posted if a.startswith("repos/") and a.endswith("/reactions")]
+
+
+def ack_cases():
+    print("== ack (#338): usage ==")
+    rc, _, _, posted = run(["ack", "5", "--bot", "greptile"], issue=issue_arr(CR_WALK))
+    check("ack --bot unknown -> rc2, no POST", rc == 2 and posted == [])
+    rc, _, _, posted = run(["codoki-ack", "5", "--bot", "codoki"], issue=issue_arr(SUMMARY_MARKED))
+    check("codoki-ack rejects --bot (alias surface unchanged) -> rc2, no POST", rc == 2 and posted == [])
+
+    print("== ack: CodeRabbit walkthrough target ==")
+    rc, out, _, posted = run(["ack", "5", "--bot", "coderabbit"],
+                             issue=issue_arr(CR_WALK, CR_OTHER, CR_REPLY, FAKE_WALK))
+    check("coderabbit: POSTs +1 on the walkthrough (7001) only, by author+marker not position",
+          rc == 0 and posts(posted) == ["repos/owner/repo/issues/comments/7001/reactions"]
+          and "content=+1" in posted and "posted +1" in out)
+    rc, out, _, posted = run(["ack", "5", "--bot", "coderabbit", "--react", "-1"], issue=issue_arr(CR_WALK))
+    check("coderabbit --react -1 -> content=-1", rc == 0 and "content=-1" in posted)
+    rc, out, _, posted = run(["ack", "5", "--bot", "coderabbit"],
+                             issue=issue_arr(CR_OTHER, CR_REPLY, FAKE_WALK))
+    check("coderabbit: no walkthrough -> exit 3 (nothing to ack), no POST",
+          rc == 3 and posted == [] and "no-target" in out)
+
+    print("== ack: idempotency ==")
+    rc, out, _, posted = run(["ack", "5", "--bot", "coderabbit"], issue=issue_arr(CR_WALK),
+                             reactions='[{"content":"+1","user":{"login":"me-human"}}]')
+    check("already acked by the current user -> exit 0, NO POST",
+          rc == 0 and posted == [] and "already-acked" in out)
+    rc, out, _, posted = run(["ack", "5", "--bot", "coderabbit"], issue=issue_arr(CR_WALK),
+                             reactions='[{"content":"+1","user":{"login":"someone-else"}},'
+                                       '{"content":"heart","user":{"login":"me-human"}}]')
+    check("another user's +1 / my non-ack emoji do NOT count -> POSTs",
+          rc == 0 and len(posts(posted)) == 1)
+
+    print("== ack: Copilot has no reactable root object ==")
+    rc, out, _, posted = run(["ack", "5", "--bot", "copilot"], issue=issue_arr(CR_WALK),
+                             extra_env={"REVIEWS_JSON": COPILOT_REVIEWS})
+    check("copilot -> exit 3, no POST, says no-target",
+          rc == 3 and posted == [] and "copilot -- no-target" in out)
+    rc, out, _, posted = run(["ack", "5"], issue="[]", extra_env={"REVIEWS_JSON": COPILOT_REVIEWS})
+    check("auto with only a Copilot review -> exit 3, Copilot reported no-target",
+          rc == 3 and posted == [] and "copilot -- no-target" in out)
+
+    print("== ack: auto ==")
+    rc, out, _, posted = run(["ack", "5"], issue=issue_arr(CR_WALK, SUMMARY_MARKED))
+    check("auto acks CodeRabbit AND Codoki root objects",
+          rc == 0 and sorted(posts(posted)) == ["repos/owner/repo/issues/comments/7001/reactions",
+                                                "repos/owner/repo/issues/comments/9001/reactions"])
+    rc, out, _, posted = run(["ack", "5"], issue=issue_arr(CR_WALK, SUMMARY_MARKED),
+                             reactions_by_id={"7001": [{"content": "-1", "user": {"login": "me-human"}}],
+                                              "9001": []})
+    check("auto skips the already-acked bot, acks the other",
+          rc == 0 and posts(posted) == ["repos/owner/repo/issues/comments/9001/reactions"]
+          and "already-acked" in out)
+    rc, out, _, posted = run(["ack", "5"], issue="[]")
+    check("auto with no bot root object -> exit 3", rc == 3 and posted == [])
+
+    print("== ack: failures are exit 2, never a false ack ==")
+    rc, out, err, posted = run(["ack", "5"], issue=issue_arr(CR_WALK), extra_env={"GH_POST_FAIL": "1"})
+    check("POST failure -> exit 2 (ack failed), no 'posted' claim",
+          rc == 2 and "posted" not in out and "FAILED" in err)
+    rc, out, err, posted = run(["ack", "5"], issue=issue_arr(CR_WALK), extra_env={"USER_FAIL": "1"})
+    check("current-user lookup failure -> exit 2, no POST", rc == 2 and posted == [])
+    rc, out, err, posted = run(["ack", "5"], gh_fail=True)
+    check("issue-comment read failure -> exit 2, no POST", rc == 2 and posted == [])
+
+    print("== ack: pagination (--paginate emits CONCATENATED per-page arrays) ==")
+    mine = '{"content":"+1","user":{"login":"me-human"}}'
+    rc, out, err, posted = run(["ack", "5", "--bot", "coderabbit"], issue=issue_arr(CR_WALK),
+                               extra_env={"REACTIONS_PAGED": "[]\n[" + mine + "]"})
+    check("my +1 on reactions PAGE 2 -> already-acked, NO duplicate POST",
+          rc == 0 and posted == [] and "already-acked" in out)
+    rc, out, err, posted = run(["ack", "5", "--bot", "coderabbit"], issue=issue_arr(CR_WALK),
+                               extra_env={"REACTIONS_PAGED": "[]\n[]"})
+    check("two empty reaction pages -> POSTs exactly once",
+          rc == 0 and posts(posted) == ["repos/owner/repo/issues/comments/7001/reactions"])
+    cr_new = CR_WALK.replace("7001", "7101").replace("2026-07-01", "2026-07-05")
+    rc, out, err, posted = run(["ack", "5", "--bot", "coderabbit"],
+                               extra_env={"ISSUE_PAGED": issue_arr(CR_WALK) + "\n" + issue_arr(cr_new)})
+    check("walkthroughs on two issue-comment pages -> the LATEST (7101) across pages is acked",
+          rc == 0 and posts(posted) == ["repos/owner/repo/issues/comments/7101/reactions"])
+
+    print("== ack: guarded properties (H3) ==")
+    rc, out, err, posted = run(["ack", "5", "--bot", "coderabbit"], issue=issue_arr(CR_WALK),
+                               extra_env={"REACTIONS_FAIL": "1"})
+    check("reactions READ failure (partial page, rc1) -> exit 2, NO POST (never acks blind)",
+          rc == 2 and posted == [])
+    rc, out, err, posted = run(["ack", "5"], issue=issue_arr(CR_WALK, SUMMARY_MARKED),
+                               extra_env={"REACTIONS_FAIL_ID": "7001"})
+    check("auto: CR target fails -> exit 2, Codoki target STILL attempted and POSTed",
+          rc == 2 and posts(posted) == ["repos/owner/repo/issues/comments/9001/reactions"])
+    rc, out, err, posted = run(["ack", "5", "--bot", "coderabbit"], issue=issue_arr(cr_new, CR_WALK))
+    check("two walkthroughs (newer listed FIRST) -> the LATEST by created_at (7101) is acked",
+          rc == 0 and posts(posted) == ["repos/owner/repo/issues/comments/7101/reactions"])
+    rc, out, err, posted = run(["ack", "5", "--bot", "coderabbit"], issue=issue_arr(CR_WALK, cr_new))
+    check("two walkthroughs (newer listed LAST) -> still 7101 (not positional)",
+          rc == 0 and posts(posted) == ["repos/owner/repo/issues/comments/7101/reactions"])
+
+    print("== ack: explicit empty values are usage errors (H4) ==")
+    for argv in (["ack", "5", "--react="], ["ack", "5", "--react", ""],
+                 ["ack", "5", "--bot", ""], ["ack", "5", "--bot="]):
+        rc, out, err, posted = run(argv, issue=issue_arr(CR_WALK))
+        check(f"{argv[2:]!r} under ack -> rc2, no POST", rc == 2 and posted == [])
+    rc, out, err, posted = run(["codoki-ack", "5", "--react="], issue=issue_arr(SUMMARY_MARKED),
+                               reactions="[]")
+    check("codoki-ack --react= keeps empty = READ mode (rc0, no POST)",
+          rc == 0 and posted == [] and "CODOKI-ACK: unacked" in out)
+
+    print("== codoki-ack alias unchanged ==")
+    rc, out, _, posted = run(["codoki-ack", "5"], issue=issue_arr(CR_WALK, SUMMARY_MARKED), reactions="[]")
+    check("codoki-ack READ never POSTs (no default +1) and ignores the CR walkthrough",
+          rc == 0 and posted == [] and "CODOKI-ACK: unacked" in out and "7001" not in out)
 
 
 def main():
@@ -256,6 +424,8 @@ def main():
     rc, out, err, posted = run(["codoki-ack", "5", "--react", "+1"], issue="[]")
     check("post with no summary -> nonzero + no POST (loud, not silent skip)",
           rc != 0 and posted == [])
+
+    ack_cases()
 
     print()
     if FAILS:
