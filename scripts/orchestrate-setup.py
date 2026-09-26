@@ -260,21 +260,27 @@ def check_tmux(settings=None):
           see them and the lead cannot enumerate its roster.
     PROVENANCE: this behavior was READ from the Claude Code 2.1.283 bundled JS, not
     live-verified; re-check it if a later Claude Code changes the backend selection. Every
-    other mode keeps the generic text unchanged."""
+    other mode keeps the generic text unchanged. The mode is read from the USER settings file
+    only; a per-session `--teammate-mode` flag can override it and is invisible to doctor, so
+    the #346 text names itself as based on the configured setting."""
     fallback = ("teammates spawn via the iTerm2 / in-process backend instead "
                 "(pane layout differs; pipeline + deterministic floor unaffected)")
     gated = ("the session is still merge-gated: the floor marker keys off "
              "$CLAUDE_CODE_SESSION_ID when $TMUX is absent (#312)")
     tmux_mode = (settings or {}).get("teammateMode") == "tmux"
+    # doctor reads only the user settings file; a per-session `--teammate-mode` flag can override
+    # it and is invisible here, so the #346 text is qualified as based on the CONFIGURED setting.
+    scope = ("(based on the configured user setting; a per-session --teammate-mode flag can "
+             "override it)")
     if not shutil.which("tmux"):
         if tmux_mode:
-            return _emit(WARN, "tmux not installed and teammateMode=tmux (#346) - teammate spawns will FAIL "
+            return _emit(WARN, "tmux not installed and teammateMode=tmux (#346) " + scope + " - teammate spawns will FAIL "
                                "(the in-process fallback is auto-mode only). Remedy: set teammateMode to "
                                f"in-process or auto, or install tmux. NOTE: {gated}.")
         return _emit(WARN, f"tmux not installed - {fallback}. NOTE: {gated}.")
     if not os.environ.get("TMUX"):
         if tmux_mode:
-            return _emit(WARN, "lead is not inside tmux ($TMUX empty) and teammateMode=tmux (#346) - teammates "
+            return _emit(WARN, "lead is not inside tmux ($TMUX empty) and teammateMode=tmux (#346) " + scope + " - teammates "
                                "spawn as panes in a separate tmux server (socket claude-swarm-<pid>) the lead "
                                "is not attached to, so plain tmux reads cannot see them; track spawned "
                                "teammates yourself. Remedy: start the session inside tmux, or set "

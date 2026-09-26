@@ -501,6 +501,9 @@ def _run_checks():
                 check(f"#346 {_lbl}: WARN carries verbatim {_m[:48]!r}...", _m in _w)
             check(f"#346 {_lbl}: the false generic fallback text is GONE", _GENERIC not in out)
             check(f"#346 {_lbl}: still says the session is merge-gated (#312)", "still merge-gated" in _w)
+            check(f"#346 {_lbl}: qualified as the CONFIGURED setting (a --teammate-mode flag can override)",
+                  "(based on the configured user setting; a per-session --teammate-mode flag can "
+                  "override it)" in _w)
         # tmux mode + $TMUX set -> PASS, no #346 text.
         rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": wired, "ORCHESTRATE_GUARD": guard,
                                                  "PATH": fakebin + os.pathsep + sanibin}, tmux=True)

@@ -155,7 +155,9 @@ Runtime (`scripts/`; canonical source is this repo):
   generic iTerm2/in-process fallback text (Claude Code falls back to in-process only in `auto` mode;
   read from the 2.1.283 binary, not live-verified) for mode-specific text: tmux absent -> teammate
   spawns FAIL; tmux present -> teammates land in a separate `claude-swarm-<pid>` tmux server the
-  lead cannot see. Still a WARN, never a FAIL.
+  lead cannot see. Still a WARN, never a FAIL. The mode comes from the USER settings file only, so
+  the text says it is based on the configured setting: a per-session `--teammate-mode` flag can
+  override it and doctor cannot see that.
   #292/#327: the deployed-vs-bundled comparison is a BYTE-COMPARE and therefore DIRECTION-BLIND -
   it cannot tell which copy is newer, so it now reports DIFFER (not "STALE", which asserts a
   direction it never established) and names the deployed-is-newer case explicitly, where a blind
