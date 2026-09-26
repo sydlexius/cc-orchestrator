@@ -1961,10 +1961,16 @@ _FALLBACK_PATTERNS = (
 
 
 def _tool_input_is_fallback(command):
-    """True if `command` shows $TOOL_INPUT sitting in a structurally-fallback position (see
-    _FALLBACK_PATTERNS above) -- i.e. the command's PRIMARY path is something else, and
-    $TOOL_INPUT is only the documented legacy fallback the corrected template recommends."""
-    return any(p.search(command) for p in _FALLBACK_PATTERNS)
+    """True if EVERY $TOOL_INPUT reference in `command` sits in a structurally-fallback
+    position (see _FALLBACK_PATTERNS above) -- i.e. the command's PRIMARY path is something
+    else, and $TOOL_INPUT is only the documented legacy fallback the corrected template
+    recommends. One fallback-shaped reference must not excuse a separate DIRECT one (PR #484
+    review): a reference is covered only when its position lies inside a fallback match."""
+    refs = [m.start() for m in _TOOL_INPUT_RE.finditer(command)]
+    if not refs:
+        return False
+    spans = [(m.start(), m.end()) for p in _FALLBACK_PATTERNS for m in p.finditer(command)]
+    return all(any(s <= r < e for s, e in spans) for r in refs)
 
 
 def _next_token(command, pos):
@@ -2025,8 +2031,13 @@ def _reads_stdin(command):
             j += 1
         if not redirected:
             return True
+    # A herestring/heredoc REPLACES the command's stdin with its own text, so it is evidence
+    # of reading the payload only when that text is a variable EXPANSION (e.g. `<<< "$INPUT"`
+    # after `INPUT=$(cat ...)`) other than $TOOL_INPUT. A LITERAL constant (`<<< '{}'`, a
+    # quoted-delimiter heredoc) never carries the payload (PR #484 review).
     for m in _HERESTRING_RE.finditer(command):
-        if not _tool_input_fed(_next_token(command, m.end())):
+        tok = _next_token(command, m.end())
+        if "$" in tok and not tok.startswith("'") and not _tool_input_fed(tok):
             return True
     for m in _HEREDOC_RE.finditer(command):
         delim = m.group(2)
@@ -2037,7 +2048,8 @@ def _reads_stdin(command):
         end_m = re.search(r"(?m)^\t*" + re.escape(delim) + r"\s*$", command[body_start:])
         if not end_m:
             return True  # no closing delimiter found: ambiguous, favor not-warning
-        if not _tool_input_fed(command[body_start:body_start + end_m.start()]):
+        body = command[body_start:body_start + end_m.start()]
+        if not m.group(1) and "$" in body and not _tool_input_fed(body):
             return True
     for m in _JQ_RE.finditer(command):
         prefix = command[:m.start()].rstrip()
@@ -2076,12 +2088,23 @@ def _pretooluse_hook_commands(data):
     """Yield (matcher, command) for every PreToolUse hook command string in a parsed
     settings dict, tolerating the null-coercion shapes the other cascade walkers already
     guard against. `matcher` is the block's tool matcher (e.g. 'Write'), or '<any>' when
-    the block carries none."""
-    hooks = (data or {}).get("hooks") or {}
-    for block in (hooks.get("PreToolUse") or []):
-        matcher = (block or {}).get("matcher") or "<any>"
-        for h in ((block or {}).get("hooks") or []):
-            cmd = (h or {}).get("command")
+    the block carries none. Any unexpected shape (a non-dict block or hook, a non-list
+    container) is SKIPPED, never raised: this check is WARN-only and must not crash doctor
+    on a malformed-but-valid-JSON settings file (PR #484 review)."""
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    blocks = hooks.get("PreToolUse") if isinstance(hooks, dict) else None
+    if not isinstance(blocks, list):
+        return
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        matcher = block.get("matcher")
+        matcher = matcher if isinstance(matcher, str) and matcher else "<any>"
+        entries = block.get("hooks")
+        if not isinstance(entries, list):
+            continue
+        for h in entries:
+            cmd = h.get("command") if isinstance(h, dict) else None
             if isinstance(cmd, str):
                 yield matcher, cmd
 
@@ -2106,7 +2129,7 @@ def check_toolinput_only_hooks():
         except OSError as e:
             errors.append((path, f"unreadable: {e}"))
             continue
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
             errors.append((path, f"unparseable JSON: {e}"))
             continue
         if not isinstance(data, dict):

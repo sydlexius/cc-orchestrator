@@ -2378,6 +2378,54 @@ def _run_checks():
         check("#327 H2: python sys.stdin primary + $TOOL_INPUT as a ${VAR:-...} fallback -> no WARN",
               not warned(h2))
 
+        # PR #484 review round (CR 4109938752): ONE fallback-shaped $TOOL_INPUT must not
+        # suppress the WARN when ANOTHER reference reads $TOOL_INPUT directly.
+        mixed = ('x=${A:-$TOOL_INPUT}; file=$(echo "$TOOL_INPUT" | jq -r .file_path); '
+                 'if [ -n "$file" ]; then exit 2; fi')
+        check("#484 CR: a fallback-shaped $TOOL_INPUT plus a DIRECT one -> still WARNS",
+              warned(mixed))
+
+        # PR #484 (Copilot 4109933807): a herestring/heredoc of a LITERAL constant replaces
+        # stdin with text that is never the payload, so it is not evidence of reading stdin.
+        lit_here = ('probe=$(jq -r .x <<< \'{}\'); file=$(echo "$TOOL_INPUT" | jq -r .file_path); '
+                    'if [ -n "$file" ]; then exit 2; fi')
+        check("#484 Copilot: jq over a LITERAL herestring -> still WARNS", warned(lit_here))
+        lit_doc = ('probe=$(jq -r .x <<EOF\n{}\nEOF\n); file=$(echo "$TOOL_INPUT" | jq -r .file_path); '
+                   'if [ -n "$file" ]; then exit 2; fi')
+        check("#484 Copilot: jq over a LITERAL heredoc body -> still WARNS", warned(lit_doc))
+        var_here = ('INPUT=$(python3 -c "import sys; print(sys.stdin.read())"); '
+                    'file=$(jq -r .tool_input.file_path <<< "$INPUT"); '
+                    'if [ -n "$file" ]; then exit 2; fi')
+        check("#484 Copilot: a herestring feeding a VARIABLE (captured stdin) -> no WARN",
+              not warned(var_here))
+
+        # PR #484 (Copilot 4109933823): a malformed-but-valid-JSON PreToolUse shape must be
+        # skipped, never crash doctor with a traceback. The malformed file goes in the CASCADE
+        # only (ORCHESTRATE_SETTINGS_FILES, what check_toolinput_only_hooks reads); the primary
+        # ORCHESTRATE_SETTINGS stays a clean fixture, because the pre-existing _load_settings /
+        # check_guard_wired readers are a separate surface this PR does not touch.
+        p_clean = hook_fixture(unrelated)
+
+        def cov(path):
+            return {"ORCHESTRATE_SETTINGS": p_clean, "ORCHESTRATE_SETTINGS_FILES": path}
+
+        for label, shape in [("string block", ["bad"]),
+                             ("string hook", [{"matcher": "Write", "hooks": ["bad"]}]),
+                             ("hooks not a list", [{"matcher": "Write", "hooks": {"x": 1}}]),
+                             ("PreToolUse a dict", {"x": 1})]:
+            pm = os.path.join(td327, f"malformed-{abs(hash(label))}.json")
+            json.dump({"hooks": {"PreToolUse": shape}}, open(pm, "w"))
+            rc, out = run(["doctor"], env_overrides=cov(pm))
+            check(f"#484 Copilot: malformed PreToolUse ({label}) -> no traceback",
+                  "Traceback" not in out)
+
+        # PR #484 (Copilot 4109933850): invalid UTF-8 in a cascade file -> WARN, not a traceback.
+        p_utf = os.path.join(td327, "bad-utf8.json")
+        open(p_utf, "wb").write(b'{"hooks": "\xff\xfe"}')
+        rc, out = run(["doctor"], env_overrides=cov(p_utf))
+        check("#484 Copilot: invalid UTF-8 cascade file -> 'could not be scanned', no traceback",
+              "could not be scanned" in out and p_utf in out and "Traceback" not in out)
+
     # #327 defect 2: execute the corrected template snippet from required-permissions.md
     # directly (verify by RUNNING it, not by reading it) against a stdin payload for a
     # secrets-shaped path (must BLOCK, exit 2) and a harmless path (must ALLOW, exit 0).
@@ -2406,6 +2454,22 @@ def _run_checks():
             rc, out = run_hook("/tmp/probe.txt")
             check("#327: corrected template ALLOWS a harmless path (exit 0, executed not read)",
                   rc == 0)
+
+            # PR #484 (CR 4109938757): with no jq on PATH the template must fail CLOSED (exit
+            # 2), not read an empty path and pass silently. PATH holds only a dir of symlinks
+            # to the few tools the script needs besides jq.
+            nojq = os.path.join(td327b, "nojq-bin")
+            os.mkdir(nojq)
+            for tool in ("cat", "printf"):
+                src = shutil.which(tool)
+                if src:
+                    os.symlink(src, os.path.join(nojq, tool))
+            p = subprocess.run(["/bin/sh", hook_path],
+                               input=json.dumps({"tool_input": {"file_path": "/tmp/probe.txt"}}),
+                               capture_output=True, text=True, timeout=15,
+                               env={"PATH": nojq})
+            check("#484 CR: corrected template with jq MISSING -> fails closed (exit 2)",
+                  p.returncode == 2 and "jq missing" in p.stderr)
 
             # H3: the comment must not claim content-based coverage the script never does -
             # verified by EXECUTION: a harmless-suffix file whose CONTENT looks like a secret

@@ -57,6 +57,9 @@ is not viable; see the guardrails section above).
 # whose name does not match one of the suffixes below is NOT caught. A content-scanning hook
 # would additionally read `.tool_input.content` (present on Write; Edit never carries the
 # full new content, only `old_string`/`new_string`) - out of scope here (#327 fix-round-1 H3).
+# Without jq the path would read as empty and every write would pass silently - the exact
+# stdin-blind failure this template replaces - so a missing jq BLOCKS (exit 2) instead.
+command -v jq >/dev/null 2>&1 || { echo "orchestrate: jq missing; secrets hook cannot check the path" >&2; exit 2; }
 INPUT=$(cat)
 if [ -n "$INPUT" ]; then
   file=$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // empty' 2>/dev/null)
