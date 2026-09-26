@@ -165,6 +165,11 @@ Runtime (`scripts/`; canonical source is this repo):
   shows the diff, writes only with --apply + a y/N, backs up, never clobbers an unparseable
   file, and reuses doctor's single shadow matcher.
   doctor stays read-only (it WARNs on a DIFFERING deployed guard) so "permissions are the user's to grant" holds.
+  #327 defect 2: `check_toolinput_only_hooks` WARNs (never edits settings.json, never hard-fails)
+  on a settings-cascade PreToolUse hook that reads `$TOOL_INPUT` - never delivered; Claude Code
+  puts the payload on stdin - with no evidence of reading stdin, naming the file, the matcher,
+  and the hook command, and pointing at the corrected stdin-first template in
+  `skills/orchestrate/templates/required-permissions.md`.
   #346: with `teammateMode` pinned to `tmux` and `$TMUX` empty, doctor's not-in-tmux WARN drops the
   generic iTerm2/in-process fallback text (Claude Code falls back to in-process only in `auto` mode;
   read from the 2.1.283 binary, not live-verified) for mode-specific text: tmux absent -> teammate

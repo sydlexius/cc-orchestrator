@@ -13,6 +13,7 @@ import datetime
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1899,6 +1900,236 @@ def check_merge_gate_shadows():
     return FAIL
 
 
+# #327 defect 2: a user-owned PreToolUse hook command that reads its payload ONLY from a
+# $TOOL_INPUT env var never fires, because Claude Code delivers the PreToolUse payload as
+# JSON on STDIN -- $TOOL_INPUT is unset, so a jq/grep over it always sees an empty string and
+# the hook silently checks nothing (a secrets-file Write/Edit block is the motivating case).
+_TOOL_INPUT_RE = re.compile(r"\$\{?TOOL_INPUT\}?")
+
+# fix round 1, H1/H2: the ORIGINAL heuristic here matched a bare `cat`/`read`/`<<<`/heredoc
+# token ANYWHERE in the command, unconditionally -- so a hook that is genuinely stdin-blind
+# but also `cat`s or `read`s an UNRELATED file elsewhere (an ignore-list, a log path) was
+# misread as reading stdin (false negative, #327 fix-round H1), and a jq loop that returned
+# True on the FIRST non-excluded `jq` call let an earlier, harmless file-fed `jq` call
+# short-circuit past the real broken call later in the same command. Conversely, the token
+# vocabulary was too NARROW: a hook reading real stdin via a non-jq/cat/read idiom (Python's
+# `sys.stdin`, Node's `process.stdin`, ...) with `$TOOL_INPUT` as a documented fallback was
+# wrongly flagged as stdin-blind (false positive, H2), contradicting this file's own stated
+# asymmetry (favor NOT warning over ever warning on a hook that genuinely reads stdin).
+#
+# The rewrite below keeps that same asymmetry but makes each signal CONTEXTUAL instead of a
+# blind substring hit:
+#   - `/dev/stdin` anywhere is still unambiguous.
+#   - a bare `cat`/`cat -` (no trailing token, or `-`) reads stdin; `cat <file>` does not (H1).
+#   - a bare `read` (no `<file` redirect later in the same clause) reads stdin; `read ... <
+#     file` does not (H1).
+#   - `<<<`/heredoc counts as reading stdin UNLESS the fed content is itself just
+#     `$TOOL_INPUT`/`${TOOL_INPUT}` -- mirrors the existing pipe-from-$TOOL_INPUT exclusion
+#     onto these two other redirection forms (H1).
+#   - a `jq` call counts as reading stdin only when it has NO trailing file argument (or an
+#     explicit `-`/`/dev/stdin`) AND is not fed via a pipe/herestring/heredoc that is itself
+#     just `$TOOL_INPUT`; a file-fed `jq` call no longer short-circuits the loop -- scanning
+#     continues to the remaining `jq` calls in the command (H1).
+#   - NEW: a `$TOOL_INPUT` reference that sits in a structurally FALLBACK position -- the
+#     losing side of `||`, the default of a `${VAR:-...}` expansion, or the `else` branch of
+#     an `if`/`else` -- is treated as evidence of the documented legacy-fallback shape even
+#     when the PRIMARY branch's stdin mechanism is not in the token vocabulary above (H2).
+#     This is deliberately STRUCTURAL rather than another token to memorize: it lets a hook
+#     read stdin via ANY language/mechanism on its primary path without teaching this
+#     heuristic every language's stdin idiom, and it keeps the same "favor not warning"
+#     doubt direction the rest of this heuristic documents.
+#
+# None of this is a real shell parser (still line/regex based, still conservative-by-design);
+# it is scoped to the specific false-negative/false-positive SHAPES reproduced in the #327
+# fix-round-1 review, not a general-purpose stdin-detector.
+_CAT_RE = re.compile(r"(?<![\w.-])cat(?![\w-])")
+_READ_RE = re.compile(r"(?<![\w.-])read(?![\w-])")
+_HERESTRING_RE = re.compile(r"<<<")
+_HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
+_JQ_RE = re.compile(r"\bjq\b")
+_CLAUSE_TERM_RE = re.compile(r"[;&`)\n]")
+
+# Structural "this $TOOL_INPUT reference is a documented fallback, not the primary path"
+# patterns (H2): the losing side of `||`, the default value of a `${VAR:-...}` expansion, or
+# the `else` branch of an `if`/`else`. re.S so a heredoc-shaped or multi-line command still
+# matches across newlines.
+_FALLBACK_PATTERNS = (
+    re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*:-[^}]*\$\{?TOOL_INPUT\}?", re.S),
+    re.compile(r"\|\|[^;\n]*\$\{?TOOL_INPUT\}?", re.S),
+    re.compile(r"\belse\b(?:(?!\bfi\b).)*\$\{?TOOL_INPUT\}?", re.S),
+)
+
+
+def _tool_input_is_fallback(command):
+    """True if `command` shows $TOOL_INPUT sitting in a structurally-fallback position (see
+    _FALLBACK_PATTERNS above) -- i.e. the command's PRIMARY path is something else, and
+    $TOOL_INPUT is only the documented legacy fallback the corrected template recommends."""
+    return any(p.search(command) for p in _FALLBACK_PATTERNS)
+
+
+def _next_token(command, pos):
+    """The next token starting at `pos`, or '' when a shell clause terminator (`;`, `|`, `&`,
+    a backtick, `)`, or a newline) or the end of the command comes first. QUOTE-AWARE: a token
+    starting with `"`/`'` runs to its MATCHING closing quote (so `"$TOOL_INPUT");` yields the
+    quoted token `"$TOOL_INPUT"`, not the whole unbroken run up to the next whitespace, which
+    would swallow the trailing `);` and defeat the exact-match check in _tool_input_fed).
+    Otherwise a token is a plain whitespace-delimited run. A tokenizing approximation, not a
+    real shell parser -- good enough to tell `cat` (no argument) from `cat <file>`."""
+    s = command[pos:].lstrip(" \t")
+    if not s or _CLAUSE_TERM_RE.match(s):
+        return ""
+    if s[0] in "\"'":
+        end = s.find(s[0], 1)
+        return s if end == -1 else s[:end + 1]
+    m = re.match(r"\S+", s)
+    return m.group(0) if m else ""
+
+
+def _ends_with_tool_input(text):
+    """True if `text`, ignoring trailing whitespace and ONE trailing quote character, ends in
+    a literal $TOOL_INPUT / ${TOOL_INPUT} reference -- i.e. `text` is (or ends in) exactly the
+    never-set legacy env var, not something that merely mentions it in passing."""
+    t = text.rstrip()
+    if t and t[-1] in "\"'":
+        t = t[:-1]
+    return t.endswith("$TOOL_INPUT") or t.endswith("${TOOL_INPUT}")
+
+
+def _tool_input_fed(text):
+    """True if `text`, once outer quotes are stripped, is EXACTLY a $TOOL_INPUT/${TOOL_INPUT}
+    reference -- the shape a herestring/heredoc feeds when it hands the (never-set) legacy env
+    var to a command rather than the hook's real stdin."""
+    t = text.strip()
+    if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'":
+        t = t[1:-1]
+    return bool(re.fullmatch(r"\$\{?TOOL_INPUT\}?", t.strip()))
+
+
+def _reads_stdin(command):
+    """True if `command` shows CONTEXTUAL evidence of reading the hook's real stdin (see the
+    heuristic block above)."""
+    if not command:
+        return False
+    if "/dev/stdin" in command:
+        return True
+    for m in _CAT_RE.finditer(command):
+        if _next_token(command, m.end()) in ("", "-", "/dev/stdin"):
+            return True
+    for m in _READ_RE.finditer(command):
+        j = m.end()
+        redirected = False
+        while j < len(command) and not _CLAUSE_TERM_RE.match(command[j]):
+            if command[j] == "<" and command[j:j + 2] != "<<":
+                redirected = True
+                break
+            j += 1
+        if not redirected:
+            return True
+    for m in _HERESTRING_RE.finditer(command):
+        if not _tool_input_fed(_next_token(command, m.end())):
+            return True
+    for m in _HEREDOC_RE.finditer(command):
+        delim = m.group(2)
+        nl = command.find("\n", m.end())
+        if nl == -1:
+            return True  # unterminated/one-line heredoc marker: ambiguous, favor not-warning
+        body_start = nl + 1
+        end_m = re.search(r"(?m)^\t*" + re.escape(delim) + r"\s*$", command[body_start:])
+        if not end_m:
+            return True  # no closing delimiter found: ambiguous, favor not-warning
+        if not _tool_input_fed(command[body_start:body_start + end_m.start()]):
+            return True
+    for m in _JQ_RE.finditer(command):
+        prefix = command[:m.start()].rstrip()
+        if prefix.endswith("|") and not prefix.endswith("||"):
+            left = prefix[:-1].rstrip()
+            sep = max(left.rfind(c) for c in (";", "&", "`", "("))
+            clause = left[sep + 1:] if sep >= 0 else left
+            if _ends_with_tool_input(clause):
+                continue  # this jq call is fed from $TOOL_INPUT via a pipe, not real stdin
+            return True
+        tail = command[m.end():]
+        term = _CLAUSE_TERM_RE.search(tail)
+        clause_tail = tail[:term.start()] if term else tail
+        if "<<" in clause_tail:
+            continue  # fed via a herestring/heredoc already judged by the loops above
+        try:
+            tokens = shlex.split(clause_tail)
+        except ValueError:
+            tokens = clause_tail.split()
+        saw_filter, file_arg = False, None
+        for t in tokens:
+            if t.startswith("-"):
+                continue
+            if not saw_filter:
+                saw_filter = True
+                continue
+            file_arg = t
+            break
+        if file_arg is None or file_arg in ("-", "/dev/stdin"):
+            return True
+        # else: this jq call reads a FILE argument, not stdin -- keep scanning other jq calls.
+    return False
+
+
+def _pretooluse_hook_commands(data):
+    """Yield (matcher, command) for every PreToolUse hook command string in a parsed
+    settings dict, tolerating the null-coercion shapes the other cascade walkers already
+    guard against. `matcher` is the block's tool matcher (e.g. 'Write'), or '<any>' when
+    the block carries none."""
+    hooks = (data or {}).get("hooks") or {}
+    for block in (hooks.get("PreToolUse") or []):
+        matcher = (block or {}).get("matcher") or "<any>"
+        for h in ((block or {}).get("hooks") or []):
+            cmd = (h or {}).get("command")
+            if isinstance(cmd, str):
+                yield matcher, cmd
+
+
+def check_toolinput_only_hooks():
+    """Doctor WARN check (#327 defect 2). Scans every PreToolUse hook command in the
+    settings cascade (_cascade_files, same reader check_merge_gate_shadows uses) for a
+    command that reads $TOOL_INPUT / ${TOOL_INPUT} but shows no evidence of reading stdin
+    (_reads_stdin) AND whose $TOOL_INPUT reference is not itself a structurally-documented
+    fallback (_tool_input_is_fallback, fix-round-1 H2). Settings are the user's to own: this
+    NEVER edits settings.json and NEVER hard-fails doctor, only WARNs and points at the
+    corrected template. An unreadable/unparseable cascade file is reported the same way
+    check_merge_gate_shadows reports it, demoted here to WARN (never FAIL) since this check's
+    own contract is WARN-only."""
+    hits, errors = [], []
+    for path in _cascade_files():
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except OSError as e:
+            errors.append((path, f"unreadable: {e}"))
+            continue
+        except json.JSONDecodeError as e:
+            errors.append((path, f"unparseable JSON: {e}"))
+            continue
+        if not isinstance(data, dict):
+            continue
+        for matcher, cmd in _pretooluse_hook_commands(data):
+            if (_TOOL_INPUT_RE.search(cmd) and not _reads_stdin(cmd)
+                    and not _tool_input_is_fallback(cmd)):
+                hits.append((path, matcher, cmd))
+    for path, msg in errors:
+        _emit(WARN, f"settings file in cascade could not be scanned: {path} ({msg})")
+    for path, matcher, cmd in hits:
+        _emit(WARN, f"PreToolUse[{matcher}] hook in {path} reads only $TOOL_INPUT and never "
+                    "stdin, so it never fires (Claude Code delivers the PreToolUse payload as "
+                    f"JSON on stdin, not $TOOL_INPUT). Command: {cmd}")
+    if hits:
+        print("         Fix: read the JSON payload from stdin first, keeping $TOOL_INPUT only "
+              "as a legacy fallback. See the corrected template in "
+              "skills/orchestrate/templates/required-permissions.md.")
+    if not hits and not errors:
+        return _emit(PASS, "no PreToolUse hook reads only $TOOL_INPUT (stdin-blind)")
+    return WARN
+
+
 # The non-merge `gh pr` subcommands a narrowed blanket is replaced WITH. `merge` is
 # DELIBERATELY OMITTED here because the explicit merge-scoped entry (`Bash(gh pr merge *)`)
 # comes via a SEPARATE path: _missing_allow_entries parses it from required-permissions.md
@@ -1998,7 +2229,8 @@ def cmd_doctor(args):
                check_helpers_stale(), check_agents(), check_steer(settings), check_ctxmeter(settings),
                check_session_init_hook(settings),
                repo_status, check_allowlist(settings),
-               check_merge_gate_shadows(), check_slack_channel(), check_slack_bot_user_id()]
+               check_merge_gate_shadows(), check_toolinput_only_hooks(),
+               check_slack_channel(), check_slack_bot_user_id()]
     hard_fail = any(s == FAIL for s in results)
     print()
     print("doctor: HARD-FAIL (fix the FAIL lines above before `up`)" if hard_fail else "doctor: ok (no hard fail)")
