@@ -322,6 +322,14 @@ def _run_checks():
                    "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
                        {"type": "command", "command": 'bash "$HOME/.claude/scripts/orchestrate-guard.sh"'}]}]}},
                   open(wired, "w"))
+        # #346: the GENERIC iTerm2 / in-process fallback text is only TRUE outside tmux mode (Claude
+        # Code falls back to in-process only for teammateMode=auto), so the #294 generic-fallback
+        # checks run against an `auto`-pinned twin of `wired`.
+        wired_auto = os.path.join(td, "wired-auto.json")
+        json.dump({"teammateMode": "auto", "env": {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"},
+                   "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                       {"type": "command", "command": 'bash "$HOME/.claude/scripts/orchestrate-guard.sh"'}]}]}},
+                  open(wired_auto, "w"))
 
         # Skeleton: doctor against a fully-healthy fixture exits 0 with "no hard fail".
         # Run with explicit fixtures (NOT the bare ambient env) so it is host-independent:
@@ -359,8 +367,8 @@ def _run_checks():
         # documented iTerm2 / in-process backend (both CLAUDE.md files describe the fallback);
         # only the pane layout differs. The old FAIL aborted `up` for a condition the
         # maintainer PREFERS, and trained the operator to skim a doctor that also carries
-        # genuinely dangerous WARNs.
-        rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": wired, "ORCHESTRATE_GUARD": guard}, tmux=False)
+        # genuinely dangerous WARNs. (auto mode: the generic fallback text is only true there, #346.)
+        rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": wired_auto, "ORCHESTRATE_GUARD": guard}, tmux=False)
         # Accept EITHER tmux-condition wording: a dev box has tmux installed (so the branch
         # under test is "installed but $TMUX empty"), a bare CI runner does not (so it takes
         # the "not installed" branch). Both must WARN, never FAIL - pinning only one phrasing
@@ -450,20 +458,62 @@ def _run_checks():
         open(fake_tmux, "w").write("#!/bin/sh\nexit 0\n"); os.chmod(fake_tmux, 0o755)
 
         # tmux present on PATH (our fake), $TMUX empty -> the "not inside tmux" branch.
-        rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": wired, "ORCHESTRATE_GUARD": guard,
+        # (auto mode: the generic iTerm2 / in-process fallback is only true outside tmux mode, #346.)
+        rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": wired_auto, "ORCHESTRATE_GUARD": guard,
                                                  "PATH": fakebin + os.pathsep + sanibin}, tmux=False)
         check("#294 tmux INSTALLED + $TMUX empty -> WARN 'not inside tmux' (deterministic branch)",
               rc == 0 and "not inside tmux" in out and "[WARN]" in out and "iTerm2" in out)
         check("#294/#312 tmux-installed-not-inside WARN says the session is still merge-gated",
               "still merge-gated" in out)
         # No tmux anywhere on PATH -> the "not installed" branch, on ANY host.
-        rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": wired, "ORCHESTRATE_GUARD": guard,
+        rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": wired_auto, "ORCHESTRATE_GUARD": guard,
                                                  "PATH": sanibin}, tmux=False)
         check("#294 tmux NOT INSTALLED -> WARN 'tmux not installed' (deterministic branch)",
               rc == 0 and "tmux not installed" in out and "[WARN]" in out and "iTerm2" in out)
         # #312: both branches must keep telling the truth - the session is STILL merge-gated.
         check("#294/#312 tmux-not-installed WARN says the session is still merge-gated",
               "still merge-gated" in out)
+
+        # #346: teammateMode=tmux + $TMUX empty -> the generic iTerm2 / in-process fallback is FALSE
+        # (Claude Code falls back to in-process only in auto mode) and is REPLACED with mode-specific
+        # text. `wired` pins tmux. The FULL remedy sentences are asserted verbatim so a typo in the
+        # remedy (the only actionable part of the WARN) turns the harness red; a bare "in-process" /
+        # "inside tmux" substring is satisfied by unrelated wording and guards nothing.
+        _GENERIC = "teammates spawn via the iTerm2 / in-process backend instead"
+        _TMUX_CASES = (
+            ("(a) not installed", sanibin, "tmux not installed and teammateMode=tmux (#346)",
+             ("teammate spawns will FAIL (the in-process fallback is auto-mode only)",
+              "Remedy: set teammateMode to in-process or auto, or install tmux.")),
+            ("(b) installed, $TMUX empty", fakebin + os.pathsep + sanibin,
+             "lead is not inside tmux ($TMUX empty) and teammateMode=tmux (#346)",
+             ("spawn as panes in a separate tmux server (socket claude-swarm-<pid>) the lead is not "
+              "attached to, so plain tmux reads cannot see them",
+              "Remedy: start the session inside tmux, or set teammateMode to in-process.")),
+        )
+        for _lbl, _path, _head, _musts in _TMUX_CASES:
+            rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": wired, "ORCHESTRATE_GUARD": guard,
+                                                     "PATH": _path}, tmux=False)
+            _warn = [ln for ln in out.splitlines() if ln.startswith("[WARN]") and _head in ln]
+            check(f"#346 {_lbl}: exactly one tmux-mode WARN, rc0 (WARN, never FAIL)",
+                  rc == 0 and len(_warn) == 1)
+            _w = _warn[0] if _warn else ""
+            for _m in _musts:
+                check(f"#346 {_lbl}: WARN carries verbatim {_m[:48]!r}...", _m in _w)
+            check(f"#346 {_lbl}: the false generic fallback text is GONE", _GENERIC not in out)
+            check(f"#346 {_lbl}: still says the session is merge-gated (#312)", "still merge-gated" in _w)
+        # tmux mode + $TMUX set -> PASS, no #346 text.
+        rc, out = run(["doctor"], env_overrides={"ORCHESTRATE_SETTINGS": wired, "ORCHESTRATE_GUARD": guard,
+                                                 "PATH": fakebin + os.pathsep + sanibin}, tmux=True)
+        check("#346 tmux mode + $TMUX set -> no #346 WARN", rc == 0 and "(#346)" not in out)
+        # Other modes, BOTH no-$TMUX branches -> the generic WARN text is unchanged, no #346 text.
+        for _mode in ("in-process", "iterm2", "auto"):
+            for _lbl, _path, _phrase in (("installed", fakebin + os.pathsep + sanibin, "not inside tmux"),
+                                         ("not installed", sanibin, "tmux not installed")):
+                rc, out = run(["doctor"], env_overrides={
+                    "ORCHESTRATE_SETTINGS": os.path.join(td, f"teams-{_mode}.json"),
+                    "ORCHESTRATE_GUARD": guard, "PATH": _path}, tmux=False)
+                check(f"#346 teammateMode={_mode} + $TMUX empty (tmux {_lbl}) -> generic WARN unchanged",
+                      rc == 0 and _phrase in out and _GENERIC in out and "(#346)" not in out)
 
         # PRESERVED genuine dependency: Agent Teams actually DISABLED is still a hard fail.
         # #294 only stops the FAIL on a WORKING non-tmux backend.
