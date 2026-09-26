@@ -22,6 +22,13 @@
 # another tick holds it. Quietly, because a second window is a normal thing for a
 # human to do, not an error to report.
 #
+# RE-ADMISSION (#455). A drained record whose post CR answered "Review rate limited."
+# (the FIRST coderabbitai[bot] comment created after its triggered_at, exact phrase)
+# is renamed <stem>.readmitted-<comment id>.json - still in drained/, so the cap
+# still counts it - and the entry is re-queued, at most ONCE per PR+SHA. The tick that
+# re-admits posts nothing (it just read evidence of a limit). Anything
+# short of that evidence, including a gh read failure, leaves the record drained.
+#
 # Exit codes:
 #   0  Did its job, INCLUDING the no-op cases: nothing queued, throttled by CR, the
 #      hourly cap is spent, or another tick holds the lock. A loop calling this on a
@@ -471,10 +478,127 @@ posts_last_hour() {
   echo "$n"
 }
 
+# --- Re-admission of a RATE-LIMITED trigger (#455) ----------------------------------
+# The drain below is written the instant a post succeeds, and that stays: draining
+# only on a positive reply would let a slow reply re-post. But CR can answer a post
+# with "Review rate limited.", which reviews nothing, and the drained record then
+# made the request permanently lost (enqueue refuses a drained PR+SHA). So a later
+# tick RE-ADMITS it, on POSITIVE EVIDENCE ONLY: the FIRST `coderabbitai[bot]` issue
+# comment CREATED strictly after the record's `triggered_at` contains the exact,
+# case-sensitive "Review rate limited.". No reply, any other first reply, a gh read
+# failure, a moved head or a closed PR all leave the record drained (silence on doubt).
+#
+# THE TICK RE-QUEUES IT ITSELF rather than waiting for a TL: the loop is unattended
+# and nobody is watching for the reply, which is how #455 lost the request. The SHA
+# is the one the receipt gated, and the head is re-checked here and again at the
+# posting site, so the receipt's guarantee still holds.
+#
+# THE COMMIT POINT IS ONE mv: `<stem>.json` -> `<stem>.readmitted-<comment id>.json`.
+# The renamed record STAYS in drained/ as *.json, so the cap still counts the post
+# that was made; the original name is freed, so the re-queued inbox entry is not
+# "stale" and its later drain cannot overwrite the audit record. The NAME is the
+# mark: a renamed record is never a candidate again, and evidence whose id already
+# names a record is consumed, and a PR+SHA that already has a *.readmitted-* record is
+# never re-admitted again (a second rate-limit leaves it drained). The rename
+# happens BEFORE the inbox write, so every crash window loses the request (the
+# pre-#455 state) rather than posting twice.
+#
+# Candidates are bounded so a growing audit trail costs no gh reads: only records
+# inside the trailing hour, and only the NEWEST record for its repo+PR (an older one
+# would otherwise be re-admitted by a reply to a later post).
+readmit_one() {
+  local f="$1" base stem repo pr sha t0="$2" raw ev pv g dest tmp
+  base="${f##*/}"; stem="${base%.json}"
+  repo="$(jq -r '.repo // ""' "$f" 2>/dev/null)" || return 0
+  pr="$(jq -r '.pr // "" | tostring' "$f" 2>/dev/null)" || return 0
+  sha="$(jq -r '.commit_sha // ""' "$f" 2>/dev/null)" || return 0
+  case "$pr" in ''|*[!0-9]*) return 0 ;; esac
+  [ -n "$repo" ] && [ -n "$sha" ] || return 0
+  [ -e "$inbox/$base" ] && return 0
+  # ONCE PER PR+SHA: a countdown-less "Review rate limited." reads as a CLEAR quota,
+  # so re-admitting on every new such reply loops the whole hourly budget into an
+  # active limit. One re-admission; after that the request stays drained.
+  for g in "$drained/$stem".readmitted-*.json; do [ -e "$g" ] && return 0; done
+  if ! raw="$(gh api --paginate "repos/$repo/issues/$pr/comments" 2>/dev/null)"; then
+    { echo "elmer-tick: note - could not read comments for $repo #$pr; not re-admitting."; } >&2 || true
+    return 0
+  fi
+  # An UNPARSEABLE bot created_at cannot be ordered, so dropping it could promote a
+  # later comment to "first": doubt about ANY bot comment means no re-admission.
+  ev="$(printf '%s' "$raw" | jq -rs --arg login 'coderabbitai[bot]' --argjson t0 "$t0" '
+        [ (add // [])[] | select((.user.login // "") == $login)
+          | {c: (try (.created_at | fromdateiso8601) catch null), id: .id, b: (.body // "")} ]
+        | if any(.[]; .c == null) then "" else
+            map(select(.c > $t0)) | sort_by(.c, .id) | first
+            | if . != null and (.id | type) == "number"
+                 and (.b | contains("Review rate limited.")) then (.id | tostring) else "" end
+          end
+        ' 2>/dev/null)" || return 0
+  case "$ev" in ''|*[!0-9]*) return 0 ;; esac
+  for g in "$drained"/*.readmitted-"$ev".json; do [ -e "$g" ] && return 0; done
+  pv="$(gh pr view "$pr" --repo "$repo" --json headRefOid,state 2>/dev/null)" || return 0
+  [ "$(jq -r '"\(.state) \(.headRefOid)"' <<<"$pv" 2>/dev/null)" = "OPEN $sha" ] || return 0
+  dest="$drained/$stem.readmitted-$ev.json"
+  mv "$f" "$dest" 2>/dev/null || return 0
+  # The tick has now acted on rate-limit evidence: hold off posting this tick even if the
+  # re-queue below fails (#455 review N2; this can only remove posts, never add one).
+  READMITTED=1
+  tmp="$drained/.$stem.tmp.$$"
+  jq --arg ev "$ev" '. + {readmit_evidence: ($ev | tonumber)}' "$dest" > "$tmp" 2>/dev/null \
+    && mv -f "$tmp" "$dest" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+  tmp="$inbox/.$base.tmp.$$"
+  if jq --arg from "${dest##*/}" --arg ev "$ev" \
+       'del(.triggered_at, .trigger, .response, .readmit_evidence)
+        + {readmitted_from: $from, readmit_evidence: ($ev | tonumber)}' \
+       "$dest" > "$tmp" 2>/dev/null && mv -f "$tmp" "$inbox/$base" 2>/dev/null; then
+    { echo "elmer-tick: RE-ADMITTED $repo #$pr at ${sha:0:12} (CodeRabbit comment $ev: Review rate limited.)"; } || true
+  else
+    rm -f "$tmp" 2>/dev/null || true
+    { echo "elmer-tick: WARNING - marked $dest re-admitted but could not re-queue it; re-enqueue by hand."; } >&2 || true
+  fi
+}
+
+TAB="$(printf '\t')"
+READMITTED=0
+readmit_rows=""
+readmit_now="$(date +%s 2>/dev/null || true)"
+for f in "$drained"/*.json; do
+  [ -e "$f" ] || continue
+  case "$f" in *"$TAB"*) continue ;; esac
+  row="$(jq -r '[.repo, (.pr | tostring), .triggered_at] | map(. // "" | tostring) | @tsv' "$f" 2>/dev/null)" || continue
+  ts="${row##*"$TAB"}"
+  t0="$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null || date -u -d "$ts" +%s 2>/dev/null || true)"
+  case "$t0" in ''|*[!0-9]*) continue ;; esac
+  case "$readmit_now" in ''|*[!0-9]*) break ;; esac
+  [ $(( readmit_now - t0 )) -le 3600 ] || continue
+  readmit_rows="$readmit_rows$t0$TAB${row%"$TAB"*}$TAB$f
+"
+done
+while IFS="$TAB" read -r t0 cf; do
+  [ -n "$cf" ] && readmit_one "$cf" "$t0" || true
+done <<EOF
+$(printf '%s' "$readmit_rows" | awk -F'\t' '
+  { e[NR] = $1 + 0; k[NR] = $2 SUBSEP $3; f[NR] = $4 }
+  END { for (i = 1; i <= NR; i++) {
+          if (f[i] ~ /\.readmitted-[0-9]+\.json$/) continue
+          ok = 1
+          for (j = 1; j <= NR; j++) if (j != i && k[j] == k[i] && e[j] >= e[i]) ok = 0
+          if (ok) print e[i] "\t" f[i] } }' 2>/dev/null || true)
+EOF
+
 recent="$(posts_last_hour)"
 if [ "$recent" -ge "$ELMER_MAX_PER_HR" ]; then
   report_queue_health
   { echo "elmer-tick: hourly cap reached ($recent/$ELMER_MAX_PER_HR posts in the last hour); nothing posted."; } || true
+  exit 0
+fi
+
+# HOLD-OFF (#455): this tick just READ a "Review rate limited." reply, i.e. positive
+# evidence CR is limiting right now, even though the quota read may say clear. Post
+# nothing this tick; the re-admitted entry is eligible from the next tick on.
+if [ "$READMITTED" = 1 ]; then
+  report_queue_health
+  { echo "elmer-tick: re-admitted on rate-limit evidence; nothing posted this tick."; } || true
   exit 0
 fi
 
@@ -633,7 +757,8 @@ fi
 # Written the INSTANT the post succeeds, closing the double-post window immediately.
 # Asking GitHub "has a review happened yet" would be racy in the dangerous direction:
 # CR takes minutes to post, so a tick 30 seconds later would see nothing and fire
-# again. Anything in drained/ is never re-posted, and the directory doubles as the
+# again. Anything in drained/ is never re-posted (a #455 re-admission re-queues a
+# NEW inbox entry on positive evidence; the record itself stays), and it doubles as the
 # permanent audit trail the carve-out requires.
 #
 # A drain failure after a SUCCESSFUL post is the one genuinely bad state here (the

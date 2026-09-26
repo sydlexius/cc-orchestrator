@@ -81,6 +81,12 @@ review slot.
 **Exit 0 is not "posted".** Most healthy ticks post nothing. Do not treat a quiet tick as a
 malfunction to investigate.
 
+**`elmer-tick: RE-ADMITTED <repo> #<pr> ...`** (exit 0) means CR answered an earlier trigger
+"Review rate limited.", so the tick re-queued it and posted nothing that tick. It happens at most
+ONCE per PR+SHA; a second rate-limited reply leaves the request drained, and that SHA cannot be
+re-queued (enqueue refuses it as ALREADY TRIGGERED). To request another review, push a new commit
+and re-run `/prep-pr`.
+
 ---
 
 ## Step 2 -- Sleep until the next window, not on a fixed clock
@@ -150,9 +156,9 @@ per-PR maildir digest so a TL wakes to a readable queue instead of a raw comment
 
 Set `TRIAGE_PRS` to the space-separated PR numbers to digest before running the block: the PRs
 the loop triggered SINCE THE LAST TRIAGE. `drained/` is a permanent audit trail that only grows,
-so take recent entries, not all of them. Entries are named `<repo-slug>--<pr>--<sha12>.json`, so
-for the last 24 hours:
-`TRIAGE_PRS=$(find ~/.claude/elmer/drained -name '*.json' -mtime -1 | sed -E 's/.*--([0-9]+)--[0-9a-f]+\.json$/\1/' | sort -un | tr '\n' ' ')`.
+so take recent entries, not all of them. Entries are named `<repo-slug>--<pr>--<sha12>.json` (or
+`...<sha12>.readmitted-<id>.json` after a re-admission), so for the last 24 hours:
+`TRIAGE_PRS=$(find ~/.claude/elmer/drained -name '*.json' -mtime -1 | sed -E 's/.*--([0-9]+)--[0-9a-f]+(\.readmitted-[0-9]+)?\.json$/\1/' | sort -un | tr '\n' ' ')`.
 The helper REQUIRES at least one PR number - called bare it prints its usage and exits 2 - so the block
 checks the BUILT ARRAY and stops loudly when it is empty. (Not a `${TRIAGE_PRS:?}` guard: inside
 a `$(...)` zsh does not abort the outer command on it, so the helper would still run bare.)
