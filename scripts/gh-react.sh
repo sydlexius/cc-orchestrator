@@ -90,6 +90,14 @@ resolve_repo() {
 ack_one() {  # <bot> <comment-id> -> 0 acked/already, 1 failed
   local b="$1" id="$2" rx n
   is_num "$id" || { echo "gh-react: non-numeric ${b} target id ('${id}') -- refusing to POST" >&2; return 1; }
+  # Resolve the current user LAZILY, only once a reactable target exists: a run with
+  # nothing to ack (--bot copilot, or no root object) never reads `user`, so a failed
+  # lookup cannot turn "nothing to ack" (exit 3) into "ack FAILED" (exit 2). Cached in
+  # `me` across targets; a failure here is this target's failure (never a blind POST).
+  if [ -z "${me:-}" ]; then
+    me="$(gh api user --jq .login 2>/dev/null)" && [ -n "$me" ] \
+      || { me=""; echo "gh-react: could not resolve the current gh user -- cannot check for an existing ack on ${b} comment ${id}, refusing to POST" >&2; return 1; }
+  fi
   rx="$(gh api "repos/${repo}/issues/comments/${id}/reactions" --paginate)" \
     || { echo "gh-react: could not read reactions on ${b} comment ${id} -- NOT acking blind" >&2; return 1; }
   # PAGINATION-SAFE: `--paginate` emits one JSON array PER PAGE, concatenated, so a
@@ -116,8 +124,7 @@ ack_one() {  # <bot> <comment-id> -> 0 acked/already, 1 failed
 
 ack_main() {
   local cr_id="" targets=0 failed=0 copilot_n=""
-  me="$(gh api user --jq .login 2>/dev/null)" && [ -n "$me" ] \
-    || die "could not resolve the current gh user -- cannot check for an existing ack, refusing to POST"
+  me=""  # resolved lazily by ack_one (see there)
   if [ "$bot" = coderabbit ] || [ "$bot" = auto ]; then
     # Slurp + flatten (.[][]) so a walkthrough on ANY page of the paginated
     # issue-comment list is considered and the LATEST across all pages wins.

@@ -270,6 +270,18 @@ def ack_cases():
           rc == 2 and "posted" not in out and "FAILED" in err)
     rc, out, err, posted = run(["ack", "5"], issue=issue_arr(CR_WALK), extra_env={"USER_FAIL": "1"})
     check("current-user lookup failure -> exit 2, no POST", rc == 2 and posted == [])
+    # The lookup is LAZY: with nothing to ack, a failed `user` read must not turn
+    # "nothing to ack" (exit 3) into "ack FAILED" (exit 2) (CR review on PR #476).
+    rc, out, err, posted = run(["ack", "5", "--bot", "copilot"], issue=issue_arr(CR_WALK),
+                               extra_env={"USER_FAIL": "1", "REVIEWS_JSON": COPILOT_REVIEWS})
+    check("copilot-only + user lookup failure -> exit 3 (nothing to ack), not 2",
+          rc == 3 and posted == [] and "copilot -- no-target" in out)
+    rc, out, err, posted = run(["ack", "5"], issue="[]", extra_env={"USER_FAIL": "1"})
+    check("auto, no root object + user lookup failure -> exit 3, not 2", rc == 3 and posted == [])
+    rc, out, err, posted = run(["ack", "5", "--bot", "coderabbit"], issue=issue_arr(CR_WALK),
+                               extra_env={"USER_FAIL": "1"})
+    check("coderabbit target + user lookup failure -> exit 2, no POST, says why",
+          rc == 2 and posted == [] and "current gh user" in err)
     rc, out, err, posted = run(["ack", "5"], gh_fail=True)
     check("issue-comment read failure -> exit 2, no POST", rc == 2 and posted == [])
 
