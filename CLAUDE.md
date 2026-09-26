@@ -389,11 +389,26 @@ Runtime (`scripts/`; canonical source is this repo):
   `updated_at`, so "newest signal wins" let an edited old comment outrank a live longer limit
   (#454 review). Every tie-break fails toward "limited" (fewer posts). A gh read OR jq failure
   exits 2, NEVER 0: reporting "no limit" because the read failed is a false all-clear.
+  ACCOUNT-WIDE (#456): CR's limit is per ACCOUNT (a review on one PR moved ANOTHER PR's
+  countdown, measured), so it reads the queried PR PLUS the 10 most recently updated PRs
+  (`state=all`, one bounded `gh api` list read, no new grant) and applies the rule above across
+  all of them; a failure reading the list or ANY scanned PR (an EMPTY body included) exits 2,
+  and so does a recognized notice with no parseable timestamp (it cannot anchor a ceiling). COMPOUND durations (#467,
+  "1 hour and 5 minutes.") are summed; a recognized limit phrase whose duration still does not
+  parse is LIMITED ("deadline UNKNOWN", exit 1) with an assumed 1h ceiling, then EXPIRED: never
+  "no limit" (the old false all-clear), never infinite (one such notice would wedge the loop),
+  and 1h because a longer CR throttle has not been seen in a long time (a short guess is
+  recovered by elmer-tick's #455 re-admission).
   Only `coderabbitai[bot]` counts, and the matcher demands CR's exact relative-duration shape -
-  the retired Codoki used an ABSOLUTE UTC timestamp and transcripts are full of them. CEILING (a
-  product decision, not a parser gap): CR publishes a COUNTDOWN only once the limit is ALREADY
-  reached, never a remaining-slot count, so "no announced limit" means EITHER plenty of budget OR
-  one review from the wall.
+  the retired Codoki used an ABSOLUTE UTC timestamp and transcripts are full of them. CR DOES
+  publish a REMAINING-SLOT COUNT (survey 2026-09-26, 488 PRs / 12 repos, the MAJORITY form): the
+  summary banner "Included review availability: N reviews are currently available ... allowance
+  at A per hour" (older form "... up to A included review per hour; N remain"). A ZERO count has
+  NO countdown and takes the UNKNOWN path (LIMITED, 1h ceiling, dated by `updated_at`); N>0 is an
+  "available" signal dated by `created_at` ONLY, like "available now", since an unrelated edit
+  can move `updated_at` without refreshing the count. The count is only as fresh as CR's last summary edit, and with no banner
+  or countdown in the scan "no announced limit" still means EITHER plenty of budget OR one review
+  from the wall.
 - `scripts/elmer-enqueue.sh` - the RECEIPT-GATED queue writer for the unattended review requester
   ("elmer"). A TL files a request; a separate single writer is the only thing that ever posts.
   THE POINT: a TL must not be able to queue a review for code that never passed `/prep-pr`, and
@@ -442,9 +457,10 @@ Runtime (`scripts/`; canonical source is this repo):
   `/elmer-loop` window is a normal thing for a human to open, not a fault. THE CAP counts
   `drained/` records rather than a counter file (which could drift while looking authoritative) and
   fails toward FEWER posts - an unreadable record COUNTS as a recent post, never discounted.
-  ONE entry per tick is CORRECTNESS, not throttling: CR publishes a countdown only once its limit
-  is already reached and never a remaining-slot count, so an all-clear reading means EITHER plenty
-  of budget OR one review from the wall, and batching on it would blow past that wall unseen.
+  ONE entry per tick is CORRECTNESS, not throttling: CR's countdown appears only once its limit is
+  already reached, and its remaining-slot banner is only as fresh as the last summary edit (the
+  account may have spent those slots since), so an all-clear reading can still be one review from
+  the wall, and batching on it would blow past that wall unseen.
   Quota is queried BEFORE posting (whether a trigger during a limit burns the slot is UNMEASURED,
   so the conservative order is the one that cannot be wrong) and a quota READ FAILURE never falls
   through to a post. THE DRAIN RECORD is the idempotency mechanism, written the instant the post

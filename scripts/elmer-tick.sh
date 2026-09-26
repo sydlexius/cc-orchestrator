@@ -266,10 +266,10 @@ acquire_lock() {
 # nothing starves behind a busy repo.
 #
 # Only ONE entry is selected per tick, and that is a correctness requirement rather
-# than throttling: CR publishes a countdown only once its limit is ALREADY reached,
-# never a remaining-slot count, so "no announced limit" means EITHER plenty of budget
-# OR one review from the wall. Posting a batch on a single all-clear reading would
-# blow past the wall unseen. Post one, then re-read the signal.
+# than throttling: CR's countdown appears only once its limit is ALREADY reached, and
+# its remaining-slot banner (survey 2026-09-26) is only as fresh as CR's last summary
+# edit, so an all-clear reading can still be one review from the wall. Posting a batch
+# on a single all-clear reading would blow past the wall unseen. Post one, then re-read.
 #
 # ONE PASS, AT MOST ONCE PER RUN. Selection and health reporting read the same fields,
 # so they are the same loop: `report_queue_health` runs this scan only if the normal

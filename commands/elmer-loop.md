@@ -119,7 +119,12 @@ it become the block's failure status would make the normal path look like a faul
 under a caller running `set -e`). The missing-PR guard still fails loudly - the capture is scoped
 to the helper call alone.
 
+The reading is ACCOUNT-WIDE (#456): besides `PR_FOR_QUOTA` it scans the repo's 10 most recently
+updated PRs, because CR's limit is per account and a notice often lands on a different PR.
+
 Exit 1 means limited, and the output carries the remaining time plus a Pacific-labeled deadline.
+If the line says `deadline UNKNOWN`, CR announced a limit whose duration did not parse; the
+shown time is an assumed 1h ceiling, not CR's countdown, so pace on it but expect to re-query.
 Exit 0 means no announced limit. `quota rc=2` is a FAILURE, never an all-clear: either the
 helper's own setup/read error, or (`leg=none`, `quota: NOT RUN`) no quota helper was found on
 any leg. There is no reading to pace against - report it, sleep the long default (20-30 min),
@@ -137,10 +142,11 @@ counting down locally:
 - **"Available now" is PERISHABLE.** Triggering consumes the slot immediately and resets the
   counter to a full window, which is why the tick posts ONE entry and then re-reads.
 
-**CR never publishes a remaining-slot count** - only a countdown, and only once the limit is
-ALREADY reached. That ceiling is a product decision, not a parser gap: do not go hunting for a
-better matcher or a hidden endpoint. It means an all-clear reading is genuinely ambiguous (plenty
-of budget, OR one review from the wall), which is exactly why the tick never batches.
+**CR's remaining-slot count is stale by construction.** Its summary banner ("N reviews are
+currently available", measured 2026-09-26) is refreshed only when CR edits a summary, and its
+countdown appears only once the limit is ALREADY reached. So an all-clear reading is still
+ambiguous (plenty of budget, OR one review from the wall), which is exactly why the tick never
+batches.
 
 When the queue is empty there is nothing to pace against - sleep long (20-30 min is fine) and
 re-check.
