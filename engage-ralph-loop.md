@@ -45,8 +45,8 @@ DENY-AUTHORITY tier.** (This is why cc-orchestrator's `orchestrate-steer.sh` is 
 ESCALATION HATCH (the reason the fast tiers are safe): a **CRITICAL or IMPORTANT** finding means
 the round's verdict is DO NOT SHIP, except that BELOW the deny-authority tier a trivially
 mechanical fix may be listed under SHIP WITH FIXES (the reviewer's call; the lead may upgrade).
-At the deny-authority tier a Critical/Important is always DO NOT SHIP. The speed win is therefore taken ONLY on
-diffs that come back clean - which is exactly where it is free. A diff that deserved ten rounds
+At the deny-authority tier a Critical/Important is always DO NOT SHIP. The speed win is therefore taken
+ONLY where every listed fix is safe to apply without another review - which is exactly where it is free. A diff that deserved ten rounds
 still gets them; it just has to earn them.
 
 STATE THE BUDGET BEFORE ROUND 1 (tier, round cap, rough token/wall-clock cost), so the cost

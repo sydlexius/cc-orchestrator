@@ -640,8 +640,8 @@ BEFORE any outward step (push, reply, resolve). It is OWED when ANY of these hol
 engage-ralph-loop pass (with a permit/deny differential) for deny-authority; ONE hostile,
 fix-scoped pass otherwise. The pass reviews the fix diff, `<pre-round HEAD>..HEAD` (record the
 pre-round HEAD before Step 5 starts), widened where a fix reaches a shared helper or contract.
-SHIP / SHIP WITH FIXES end it (fixes applied, gates green); DO NOT SHIP (any unfixed Critical or
-Important) means fix, re-commit, and run another pass on the new fix diff before the push.
+SHIP / SHIP WITH FIXES end it (fixes applied, gates green); DO NOT SHIP (any unfixed finding that
+would make the diff unsafe or wrong on merge, whatever its severity label) means fix, re-commit, and run another pass on the new fix diff before the push.
 
 **Not owed** for a standard-tier round of purely mechanical fixes (Step 5.5's one-line skip
 note covers it), for a round of replies with no code change, or for a standard-tier round whose

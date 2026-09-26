@@ -654,7 +654,7 @@ drives `/plugin marketplace` update-detection, so they must never diverge. The C
     deny-authority.
   - ANY tier: a Critical/Important finding is DO NOT SHIP, except that below the deny-authority tier a trivially mechanical fix may ride SHIP WITH FIXES (the lead may upgrade), and every
     SHIP WITH FIXES item must be safe to apply without another review, so the fast path is
-    taken only on diffs that come back clean. MAX_ROUNDS ~6 is a BUDGET ALARM, never "ship anyway" - on the cap,
+    taken only where every listed fix is safe to apply without another review. MAX_ROUNDS ~6 is a BUDGET ALARM, never "ship anyway" - on the cap,
     STOP and surface what is still unreviewed (and consider that the diff is too big).
   History: the retired untiered K=2 dry-round rule cost a ~50-minute, 10-round loop on an advisory
   hook that could not block anything.
