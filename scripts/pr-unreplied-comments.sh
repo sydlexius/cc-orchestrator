@@ -98,6 +98,11 @@
 # a verdict that was made against pre-HEAD code (Codoki edits its single comment in
 # place: created_at fixed, updated_at advances, verdict can flip on the same id).
 #
+# Approve-with-concern screen (#332): in the same default display mode, one
+# non-fatal "CR-CONCERN-ADVISORY:" line per inline thread where CodeRabbit spoke
+# LAST, after a reply, without an addressed/withdrawn/resolved marker. Informational:
+# never counted, exit code UNCHANGED.
+#
 # Each entry includes reply_type to indicate which reply form to use:
 #   "inline"    -- the ID is a pull request review comment; use reply-comment.sh <pr> <id> <body>
 #   "top-level" -- the ID is a review or issue object; use reply-comment.sh <pr> <body>
@@ -374,7 +379,9 @@ _gh_read_sha() {
 
 count_unreplied() {
   local all_comments
-  all_comments=$(gh api "repos/$repo/pulls/$pr_number/comments" --paginate)
+  # `--paginate` emits one JSON array PER PAGE; merge them ONCE here so every reader below
+  # (and --argjson, which rejects a multi-document value) sees a single array.
+  all_comments=$(gh api "repos/$repo/pulls/$pr_number/comments" --paginate | jq -s 'add // []')
 
   local bot_ids
   bot_ids=$(echo "$all_comments" | jq '[.[] | select(
@@ -934,7 +941,10 @@ found=0
 head_sha=$(gh api "repos/$repo/pulls/$pr_number" --jq '.head.sha[:7]' 2>/dev/null || echo "unknown")
 
 # 1. Inline review comments
-all_comments=$(gh api "repos/$repo/pulls/$pr_number/comments" --paginate)
+# `--paginate` emits one JSON array PER PAGE; merge them ONCE here so every reader below
+# (and --argjson, which rejects a multi-document value) sees a single array. pipefail makes
+# a failed gh read still abort (set -e), exactly as the unpiped form did.
+all_comments=$(gh api "repos/$repo/pulls/$pr_number/comments" --paginate | jq -s 'add // []')
 
 bot_ids=$(echo "$all_comments" | jq '[.[] | select(
   '"$BOT_LOGIN_FILTER"'
@@ -1545,6 +1555,33 @@ if [ "$check_resolved" = true ] && [ "$count_only" = false ]; then
   else
     echo "UNRESOLVED-ADVISORY: could not fully enumerate review threads for PR #$pr_number ($repo); resolution state unverified" >&2
   fi
+fi
+
+# --- CodeRabbit approve-with-concern screen (#332; non-fatal, exit UNCHANGED) --
+# A reply on a CR thread can draw a CR answer that DISAGREES while CR still approves
+# the PR, and nothing downstream sees it: the thread counts as replied, isResolved and
+# "bot spoke last" are both useless as screens (measured on 25 PRs / 71 threads, #332).
+# CR marks the answers it accepts: `review_comment_addressed` / `review_comment_withdrawn`
+# markers or a "Review thread resolved" line. So a thread where CR SPOKE LAST, after a
+# reply, with NONE of those markers is surfaced as one "CR-CONCERN-ADVISORY:" line to
+# READ. INFORMATIONAL ONLY: never counted in $found, never changes the exit code, and
+# ship-gate-preflight does not read it. Fails toward SURFACING (a null body carries no
+# marker, so it is listed); a jq failure degrades to one stderr note. Suppressed in
+# --count-only / --itemized, like STALE-ADVISORY. SLURPED (-s + add): `--paginate`
+# emits one array PER PAGE, and a per-page group_by split a thread whose root and CR
+# reply sit on different pages into fragments that each failed the screen (silence).
+if [ "$count_only" = false ] && [ "$itemized" = false ]; then
+  echo "$all_comments" | jq -rs '
+    add // [] | group_by(.in_reply_to_id // .id) | .[]
+    | select(length > 1)
+    | sort_by(.created_at, .id) as $t
+    | ($t | last) as $l
+    | select(($l.user.login // "") == "coderabbitai[bot]")
+    | ($l.body // "") as $b
+    | select(([ "review_comment_addressed", "review_comment_withdrawn", "Review thread resolved" ]
+              | map(. as $m | $b | contains($m)) | any) | not)
+    | "CR-CONCERN-ADVISORY: coderabbitai[bot] spoke last on thread \($t[0].id) at \($t[0].path // "?"):\($t[0].original_line // $t[0].line // 0) with no addressed/withdrawn/resolved marker -- read its reply (possible approve-with-concern; not counted)"' \
+    || echo "CR-CONCERN-ADVISORY: could not screen CodeRabbit thread replies for PR #$pr_number ($repo); unverified" >&2
 fi
 
 # --- Summary ---

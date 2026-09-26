@@ -408,6 +408,61 @@ def main():
     check("found>0 + --check-resolved: advisory ALSO emitted", "UNRESOLVED-ADVISORY:" in out)
     check("found>0 + --check-resolved: exit unchanged (0)", rc == 0)
 
+    print("== #332 CR-CONCERN-ADVISORY: CR spoke last without a marker (informational) ==")
+    def cr_thread(last_body, last_login="coderabbitai[bot]"):
+        root = ('{"id":501,"user":{"login":"coderabbitai[bot]"},"in_reply_to_id":null,'
+                '"path":"a.sh","original_line":10,"commit_id":"abcdef1",'
+                '"created_at":"2026-06-18T01:00:00Z","body":"finding"}')
+        mine = ('{"id":502,"user":{"login":"testuser"},"in_reply_to_id":501,"path":"a.sh",'
+                '"created_at":"2026-06-18T02:00:00Z","body":"Fixed in abc, declining the rest"}')
+        last = ('{"id":503,"user":{"login":"%s"},"in_reply_to_id":501,"path":"a.sh",'
+                '"created_at":"2026-06-18T03:00:00Z","body":%s}' % (last_login, json.dumps(last_body)))
+        return "[" + ",".join([root, mine, last]) + "]"
+    concern = cr_thread("I still think the unquoted expansion is a real risk here.")
+    rc_c, out_c, _ = run(["--allow-stale"], inline=concern)
+    check("CR last + no marker -> CR-CONCERN-ADVISORY naming thread + path:line",
+          "CR-CONCERN-ADVISORY:" in out_c and "thread 501 at a.sh:10" in out_c)
+    for label, body in (("addressed", "<!-- <review_comment_addressed> -->\nThanks!"),
+                        ("withdrawn", "<!-- <review_comment_withdrawn> -->"),
+                        ("resolved", "Review thread resolved.")):
+        rc, out, _ = run(["--allow-stale"], inline=cr_thread(body))
+        check("CR last WITH the %s marker -> no advisory" % label, "CR-CONCERN-ADVISORY" not in out)
+    rc_h, out_h, _ = run(["--allow-stale"], inline=cr_thread("follow-up", last_login="testuser"))
+    check("human spoke last -> no advisory", "CR-CONCERN-ADVISORY" not in out_h)
+    rc_n, out_n, _ = run(["--allow-stale"], inline=cr_thread(None))
+    check("CR last with a null body -> surfaced (fail toward surfacing)", "CR-CONCERN-ADVISORY:" in out_n)
+    lone = ('[{"id":601,"user":{"login":"coderabbitai[bot]"},"in_reply_to_id":null,"path":"b.sh",'
+            '"original_line":3,"commit_id":"abcdef1","created_at":"2026-06-18T01:00:00Z","body":"finding"}]')
+    rc, out, _ = run(["--allow-stale"], inline=lone)
+    check("unanswered CR root (no reply yet) -> no advisory (the unreplied gate owns it)",
+          "CR-CONCERN-ADVISORY" not in out)
+    check("advisory never changes the summary line or exit code",
+          rc_c == rc_h and [ln for ln in out_c.splitlines() if "unreplied" in ln.lower()]
+          == [ln for ln in out_h.splitlines() if "unreplied" in ln.lower()])
+    rc1, out1, _ = run(["--count-only"], inline=concern)
+    rc2, out2, _ = run(["--count-only"], inline=cr_thread("follow-up", last_login="testuser"))
+    check("--count-only: identical count + exit, no advisory text",
+          (rc1, out1) == (rc2, out2) and "CR-CONCERN" not in out1)
+    rc, out, _ = run(["--itemized", "--allow-stale"], inline=concern)
+    check("--itemized: advisory suppressed", "CR-CONCERN-ADVISORY" not in out)
+    # `--paginate` emits CONCATENATED per-page arrays: a thread whose root is on page 1
+    # and whose replies are on page 2 must still be screened as ONE thread. END TO END:
+    # the stub serves INLINE verbatim, so two concatenated arrays ARE the multi-page
+    # response; the script merges pages once at the fetch, so every reader (not just the
+    # advisory) sees one array.
+    _t = json.loads(concern)
+    paged = json.dumps(_t[:1]) + "\n" + json.dumps(_t[1:])
+    rc_p, out_p, err_p = run(["--allow-stale"], inline=paged)
+    rc_1, out_1, _ = run(["--allow-stale"], inline=concern)
+    check("thread split across two pages (end to end) -> CR-CONCERN-ADVISORY still emitted",
+          "CR-CONCERN-ADVISORY:" in out_p and "thread 501 at a.sh:10" in out_p)
+    check("two-page response: same count + exit as the one-page response (no abort)",
+          rc_p == rc_1 and [ln for ln in out_p.splitlines() if "unreplied" in ln.lower()]
+          == [ln for ln in out_1.splitlines() if "unreplied" in ln.lower()])
+    rc_p, out_p, _ = run(["--count-only"], inline=paged)
+    rc_1, out_1, _ = run(["--count-only"], inline=concern)
+    check("--count-only on a two-page response == one-page response", (rc_p, out_p) == (rc_1, out_1))
+
     # Multi-page reviewThreads: the advisory loop must follow hasNextPage/endCursor
     # and surface unresolved threads from EVERY page (not just the first 100).
     g_page1 = ('{"data":{"repository":{"pullRequest":{"reviewThreads":{'

@@ -211,6 +211,13 @@ Runtime (`scripts/`; canonical source is this repo):
   in `reviewThreads`); `ship-gate-preflight.sh` FULL mode BLOCKs when a Codoki summary exists
   with no NON-BOT ack, PASSES on no-summary, and
   `pr-unreplied-comments.sh --audit` surfaces the summary's ACKED/UNACKED state (informational).
+  #338: `gh-react.sh ack <pr> [--bot coderabbit|copilot|codoki|auto] [--react +1|-1]` is the
+  BOT-AGNOSTIC actuator (default +1, `auto`): it reacts on each bot's ROOT object, resolved by
+  AUTHOR + body marker (CR = its `summarize by coderabbit.ai` walkthrough), skipping any the
+  current gh user already reacted to. Copilot posts a REVIEW, which has no reactions endpoint,
+  so it is reported no-target, never guessed onto an inline comment. Exit 0 acked / 3 nothing
+  to ack / 2 usage or ack FAILED. `codoki-ack` is kept as an unchanged alias; `ack` changes
+  nothing ship-gate-preflight reads or blocks on.
   #334: the FULL-mode gating path now reads `mergeStateStatus` from the SAME snapshot as the
   checks and BLOCKS unless it is CLEAN/UNSTABLE/HAS_HOOKS/BEHIND. It previously fetched that
   field ONLY in DIAGNOSE mode, so the oracle could return PASS on a PR GitHub was actively
