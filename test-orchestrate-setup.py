@@ -2270,6 +2270,229 @@ def _run_checks():
               and blanket in json.load(open(ncfg5))["permissions"]["allow"]
               and not os.path.exists(ncfg5 + ".bak"))
 
+    # #327 defect 2: doctor WARNs when a settings-cascade PreToolUse hook reads only
+    # $TOOL_INPUT (never delivered - Claude Code puts the payload on stdin) and shows no
+    # evidence of reading stdin. WARN-only: never touches settings.json, never hard-fails.
+    with tempfile.TemporaryDirectory() as td327:
+        def hook_fixture(command, extra_perms=None):
+            p = os.path.join(td327, f"cfg-{abs(hash(command))}.json")
+            d = {"hooks": {"PreToolUse": [{"matcher": "Write", "hooks": [
+                {"type": "command", "command": command}]}]}}
+            if extra_perms is not None:
+                d["permissions"] = {"allow": extra_perms}
+            json.dump(d, open(p, "w"))
+            return p
+
+        def hov(path):
+            return {"ORCHESTRATE_SETTINGS": path, "ORCHESTRATE_SETTINGS_FILES": path}
+
+        toolinput_only = ('file=$(echo "$TOOL_INPUT" | jq -r \'.file_path // empty\' '
+                           '2>/dev/null); if [ -n "$file" ]; then exit 2; fi')
+        p_toolinput_only = hook_fixture(toolinput_only)
+        rc, out = run(["doctor"], env_overrides=hov(p_toolinput_only))
+        check("#327: TOOL_INPUT-only hook -> WARN naming the file, matcher + hook command",
+              "reads only $TOOL_INPUT and never stdin" in out and p_toolinput_only in out
+              and "PreToolUse[Write]" in out and toolinput_only in out)
+
+        stdin_first = ('INPUT=$(cat); file=$(echo "$INPUT" | jq -r '
+                        '\'.tool_input.file_path // empty\'); if [ -n "$file" ]; then exit 2; fi')
+        p_stdin_first = hook_fixture(stdin_first)
+        rc, out = run(["doctor"], env_overrides=hov(p_stdin_first))
+        check("#327: stdin-first hook (no $TOOL_INPUT at all) -> no WARN",
+              "never fires" not in out
+              and "no PreToolUse hook reads only $TOOL_INPUT" in out)
+
+        both = ('INPUT=$(cat); if [ -n "$INPUT" ]; then '
+                'file=$(echo "$INPUT" | jq -r \'.tool_input.file_path // empty\'); else '
+                'file=$(echo "$TOOL_INPUT" | jq -r \'.file_path // empty\'); fi; '
+                'if [ -n "$file" ]; then exit 2; fi')
+        p_both = hook_fixture(both)
+        rc, out = run(["doctor"], env_overrides=hov(p_both))
+        check("#327: hook reading stdin FIRST with $TOOL_INPUT as legacy fallback -> no WARN",
+              "never fires" not in out
+              and "no PreToolUse hook reads only $TOOL_INPUT" in out)
+
+        unrelated = 'echo "hello world" >&2'
+        p_unrelated = hook_fixture(unrelated)
+        rc, out = run(["doctor"], env_overrides=hov(p_unrelated))
+        check("#327: unrelated hook (no $TOOL_INPUT reference) -> no WARN",
+              "never fires" not in out
+              and "no PreToolUse hook reads only $TOOL_INPUT" in out)
+
+        # Malformed settings: same convention check_merge_gate_shadows uses for an
+        # unparseable cascade file, demoted here to WARN (this check never hard-fails).
+        p_bad = os.path.join(td327, "bad.json")
+        open(p_bad, "w").write("{not valid json")
+        rc, out = run(["doctor"], env_overrides=hov(p_bad))
+        check("#327: unparseable cascade file -> reported, never crashes, never hard-fails here",
+              "could not be scanned" in out and p_bad in out)
+
+        # Fix round 1 (adversarial review of 2d29034): H1 false negatives + H2 false
+        # positive, reproduced with the EXACT command shapes from review-hookcheck.md.
+        def warned(cmd):
+            p = hook_fixture(cmd)
+            rc, out = run(["doctor"], env_overrides=hov(p))
+            return "never fires" in out
+
+        # H1a: a bare `cat` reading an UNRELATED file must not credit the command as
+        # reading stdin - the hook is still genuinely stdin-blind (broken jq is unchanged).
+        h1a = ('file=$(echo "$TOOL_INPUT" | jq -r .file_path); cat /etc/hostname >/dev/null; '
+               'if [ -n "$file" ]; then exit 2; fi')
+        check("#327 H1a: cat over an UNRELATED file -> still WARNS (not credited as stdin)",
+              warned(h1a))
+
+        # H1b: `jq ... <<< "$TOOL_INPUT"` feeds the herestring from $TOOL_INPUT itself, not
+        # real stdin - mirrors the existing pipe-from-$TOOL_INPUT exclusion onto `<<<`.
+        h1b = 'file=$(jq -r .file_path <<< "$TOOL_INPUT"); if [ -n "$file" ]; then exit 2; fi'
+        check("#327 H1b: jq herestring fed from $TOOL_INPUT -> still WARNS",
+              warned(h1b))
+
+        # H1c: same as H1b but via a heredoc body that is just $TOOL_INPUT.
+        h1c = ('file=$(jq -r .file_path <<EOF\n$TOOL_INPUT\nEOF\n); '
+               'if [ -n "$file" ]; then exit 2; fi')
+        check("#327 H1c: jq heredoc body is $TOOL_INPUT -> still WARNS",
+              warned(h1c))
+
+        # H1d: an EARLIER, harmless file-fed jq call must not short-circuit past the REAL
+        # broken jq call later in the same command.
+        h1d = ('config=$(jq -r .x /etc/hostname 2>/dev/null); '
+               'file=$(echo "$TOOL_INPUT" | jq -r .file_path); '
+               'if [ -n "$file" ]; then exit 2; fi')
+        check("#327 H1d: an earlier file-fed jq call does not mask the later broken one",
+              warned(h1d))
+
+        # H1e: `read -r x < /etc/hostname` consumes a FILE redirect, not stdin - must not be
+        # credited as reading stdin either.
+        h1e = ('file=$(echo "$TOOL_INPUT" | jq -r .file_path); read -r x < /etc/hostname; '
+               'if [ -n "$file" ]; then exit 2; fi')
+        check("#327 H1e: read with a FILE redirect -> still WARNS (not credited as stdin)",
+              warned(h1e))
+
+        # H2: a hook reading real stdin via a NON-jq/cat/read idiom (python's sys.stdin) with
+        # $TOOL_INPUT as a documented ${VAR:-...} fallback must NOT be flagged - the fallback
+        # STRUCTURE around $TOOL_INPUT is itself evidence of the legacy-fallback shape.
+        h2 = ('OUT=$(python3 -c "import sys,json; d=json.load(sys.stdin); '
+              'print(d.get(\'tool_input\',{}).get(\'file_path\',\'\'))" 2>/dev/null); '
+              'file=${OUT:-$(echo "$TOOL_INPUT" | jq -r .file_path 2>/dev/null)}; '
+              'if [ -n "$file" ]; then exit 2; fi')
+        check("#327 H2: python sys.stdin primary + $TOOL_INPUT as a ${VAR:-...} fallback -> no WARN",
+              not warned(h2))
+
+        # PR #484 review round (CR 4109938752): ONE fallback-shaped $TOOL_INPUT must not
+        # suppress the WARN when ANOTHER reference reads $TOOL_INPUT directly.
+        mixed = ('x=${A:-$TOOL_INPUT}; file=$(echo "$TOOL_INPUT" | jq -r .file_path); '
+                 'if [ -n "$file" ]; then exit 2; fi')
+        check("#484 CR: a fallback-shaped $TOOL_INPUT plus a DIRECT one -> still WARNS",
+              warned(mixed))
+
+        # PR #484 (Copilot 4109933807): a herestring/heredoc of a LITERAL constant replaces
+        # stdin with text that is never the payload, so it is not evidence of reading stdin.
+        lit_here = ('probe=$(jq -r .x <<< \'{}\'); file=$(echo "$TOOL_INPUT" | jq -r .file_path); '
+                    'if [ -n "$file" ]; then exit 2; fi')
+        check("#484 Copilot: jq over a LITERAL herestring -> still WARNS", warned(lit_here))
+        lit_doc = ('probe=$(jq -r .x <<EOF\n{}\nEOF\n); file=$(echo "$TOOL_INPUT" | jq -r .file_path); '
+                   'if [ -n "$file" ]; then exit 2; fi')
+        check("#484 Copilot: jq over a LITERAL heredoc body -> still WARNS", warned(lit_doc))
+        var_here = ('INPUT=$(python3 -c "import sys; print(sys.stdin.read())"); '
+                    'file=$(jq -r .tool_input.file_path <<< "$INPUT"); '
+                    'if [ -n "$file" ]; then exit 2; fi')
+        check("#484 Copilot: a herestring feeding a VARIABLE (captured stdin) -> no WARN",
+              not warned(var_here))
+
+        # PR #484 (Copilot 4109933823): a malformed-but-valid-JSON PreToolUse shape must be
+        # skipped, never crash doctor with a traceback. The malformed file goes in the CASCADE
+        # only (ORCHESTRATE_SETTINGS_FILES, what check_toolinput_only_hooks reads); the primary
+        # ORCHESTRATE_SETTINGS stays a clean fixture, because the pre-existing _load_settings /
+        # check_guard_wired readers are a separate surface this PR does not touch.
+        p_clean = hook_fixture(unrelated)
+
+        def cov(path):
+            return {"ORCHESTRATE_SETTINGS": p_clean, "ORCHESTRATE_SETTINGS_FILES": path}
+
+        for label, shape in [("string block", ["bad"]),
+                             ("string hook", [{"matcher": "Write", "hooks": ["bad"]}]),
+                             ("hooks not a list", [{"matcher": "Write", "hooks": {"x": 1}}]),
+                             ("PreToolUse a dict", {"x": 1})]:
+            pm = os.path.join(td327, f"malformed-{abs(hash(label))}.json")
+            json.dump({"hooks": {"PreToolUse": shape}}, open(pm, "w"))
+            rc, out = run(["doctor"], env_overrides=cov(pm))
+            check(f"#484 Copilot: malformed PreToolUse ({label}) -> no traceback",
+                  "Traceback" not in out)
+
+        # PR #484 (Copilot 4109933850): invalid UTF-8 in a cascade file -> WARN, not a traceback.
+        p_utf = os.path.join(td327, "bad-utf8.json")
+        open(p_utf, "wb").write(b'{"hooks": "\xff\xfe"}')
+        rc, out = run(["doctor"], env_overrides=cov(p_utf))
+        check("#484 Copilot: invalid UTF-8 cascade file -> 'could not be scanned', no traceback",
+              "could not be scanned" in out and p_utf in out and "Traceback" not in out)
+
+    # #327 defect 2: execute the corrected template snippet from required-permissions.md
+    # directly (verify by RUNNING it, not by reading it) against a stdin payload for a
+    # secrets-shaped path (must BLOCK, exit 2) and a harmless path (must ALLOW, exit 0).
+    with tempfile.TemporaryDirectory() as td327b:
+        reqperm = os.path.join(os.path.dirname(os.path.abspath(SCRIPT)), "..",
+                                "skills", "orchestrate", "templates", "required-permissions.md")
+        reqperm = os.path.normpath(reqperm)
+        md = open(reqperm).read()
+        m = re.search(r"```sh\n(#!/bin/sh\n.*?)\n```", md, re.S)
+        check("#327: required-permissions.md carries the corrected hook template", bool(m))
+        if m:
+            hook_script = m.group(1)
+            hook_path = os.path.join(td327b, "secrets-hook.sh")
+            open(hook_path, "w").write(hook_script)
+            os.chmod(hook_path, 0o755)
+
+            def run_hook(file_path):
+                payload = json.dumps({"tool_input": {"file_path": file_path, "content": "x"}})
+                p = subprocess.run(["/bin/sh", hook_path], input=payload,
+                                    capture_output=True, text=True, timeout=15)
+                return p.returncode, p.stdout + p.stderr
+
+            rc, out = run_hook("/tmp/probe.pem")
+            check("#327: corrected template BLOCKS a .pem write (exit 2, executed not read)",
+                  rc == 2)
+            rc, out = run_hook("/tmp/probe.txt")
+            check("#327: corrected template ALLOWS a harmless path (exit 0, executed not read)",
+                  rc == 0)
+
+            # PR #484 (CR 4109938757): with no jq on PATH the template must fail CLOSED (exit
+            # 2), not read an empty path and pass silently. PATH holds only a dir of symlinks
+            # to the few tools the script needs besides jq.
+            nojq = os.path.join(td327b, "nojq-bin")
+            os.mkdir(nojq)
+            for tool in ("cat", "printf"):
+                src = shutil.which(tool)
+                if src:
+                    os.symlink(src, os.path.join(nojq, tool))
+            p = subprocess.run(["/bin/sh", hook_path],
+                               input=json.dumps({"tool_input": {"file_path": "/tmp/probe.txt"}}),
+                               capture_output=True, text=True, timeout=15,
+                               env={"PATH": nojq})
+            check("#484 CR: corrected template with jq MISSING -> fails closed (exit 2)",
+                  p.returncode == 2 and "jq missing" in p.stderr)
+
+            # H3: the comment must not claim content-based coverage the script never does -
+            # verified by EXECUTION: a harmless-suffix file whose CONTENT looks like a secret
+            # must still be ALLOWED (the hook is path-suffix-only), and the surrounding prose
+            # must say so rather than claiming `.tool_input.content` coverage.
+            payload = json.dumps({"tool_input": {"file_path": "/tmp/probe.txt",
+                                                   "content": "AWS_SECRET_ACCESS_KEY=xyz"}})
+            p = subprocess.run(["/bin/sh", hook_path], input=payload,
+                                capture_output=True, text=True, timeout=15)
+            check("#327 H3: a secret-shaped CONTENT in a harmless-named file is NOT caught "
+                  "(the hook is path-suffix-only, matching the corrected comment)",
+                  p.returncode == 0)
+            # The comment MAY now mention `.tool_input.content` (to explain it is NOT read);
+            # what must stay true is that no line of the SCRIPT itself extracts it (no jq
+            # query against `.tool_input.content`, no `content=` assignment).
+            script_lines = [ln for ln in hook_script.splitlines() if not ln.lstrip().startswith("#")]
+            script_body = "\n".join(script_lines)
+            check("#327 H3: the script body never extracts .tool_input.content (comment matches code)",
+                  ".tool_input.content" not in script_body and "content=" not in script_body)
+            check("#327 H3: required-permissions.md no longer claims content-based Write coverage",
+                  "covers Write (new-file body)" not in md
+                  and "FILE PATH SUFFIX ONLY" in md)
+
     # #68: slug derivation - _derive_repo_slug parses both SSH and HTTPS remote URL forms
     # and scaffold_artifacts renders the slug (not the raw path) into the brief's <REPO>.
     # Import the function directly from the module (no subprocess) to test the parser in

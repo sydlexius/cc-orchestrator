@@ -32,7 +32,50 @@ The merge / push-main / force invariants now HAVE a deterministic floor: `orches
 - DONE (floor, ALWAYS-ON): `git push`/`safe-push.sh` to `main`/`master`, bare `--force`/`-f` (non-lease), and `--no-verify` are DENIED unconditionally - this closes the safe-push `$@`-forwarding gap (the old hook matched only literal `git push main`).
 - STILL CHARTER-LEVEL (deliberately NOT on the floor): mutations the LEAD legitimately needs mid-session (CodeQL dismiss, `resolveReviewThread`, comment/branch-delete) now go through the P3-F WRAPPERS, not raw `gh api -X` (which is removed from the allow-list, so it PROMPTS). Keep the `gh api -X` (raw) + `gh pr review --approve` prohibitions in BOTH read-only charters (pr-triage's is the model - copy it): a read-only bot uses only `gh-api-get.sh`, never a mutating wrapper. Same for `gh pr review/close/edit/ready`, `make remove-worktree/migrate`, and `pkill -f`/`kill` patterns broader than the bot's own PID (they can reap other agents' servers) - charter-forbid + monitor.
 - Add explicit "never push main / never --force / never --no-verify / only the head stack entry" lines to the pr-shipper charter (belt-and-suspenders over the floor).
-- The Write/Edit secret-file PreToolUse hooks ARE real deterministic guards (keep them).
+- The Write/Edit secret-file PreToolUse hooks ARE real deterministic guards (keep them) - BUT see
+  the STDIN-FIRST correction below (#327 defect 2): a common hand-rolled version of this hook reads
+  its payload only from a `$TOOL_INPUT` env var, which Claude Code never sets, so the "guard" checks
+  nothing while looking wired. `orchestrate-setup.py doctor` WARNs (never fails) when it finds this
+  shape in the settings cascade, because settings are the user's to own and are never edited here.
+
+### Corrected secrets-file PreToolUse hook (user-applied; #327 defect 2)
+Claude Code delivers the PreToolUse tool-call payload as JSON on the hook's **stdin**, not via a
+`$TOOL_INPUT` environment variable. A hook command such as
+```sh
+file=$(echo "$TOOL_INPUT" | jq -r '.file_path // empty' 2>/dev/null); if [ -n "$file" ]; then ...
+```
+sees an unset `$TOOL_INPUT`, so `file` is always empty and the hook exits 0 having blocked nothing.
+Read stdin FIRST; keep `$TOOL_INPUT` only as a legacy fallback for a caller that already sets it.
+Deny the same way the repo's own working hooks deny (`orchestrate-guard.sh`): exit 2, with the
+reason on stderr - that is the PreToolUse deny contract Claude Code honors (`permissionDecision:ask`
+is not viable; see the guardrails section above).
+```sh
+#!/bin/sh
+# Reads the PreToolUse JSON payload from stdin first; $TOOL_INPUT (legacy) is a fallback ONLY
+# for a caller that still sets it. This blocks by FILE PATH SUFFIX ONLY, identically for
+# Write and Edit -- it never inspects `.tool_input.content`, so a secret pasted into a file
+# whose name does not match one of the suffixes below is NOT caught. A content-scanning hook
+# would additionally read `.tool_input.content` (present on Write; Edit never carries the
+# full new content, only `old_string`/`new_string`) - out of scope here (#327 fix-round-1 H3).
+# Without jq the path would read as empty and every write would pass silently - the exact
+# stdin-blind failure this template replaces - so a missing jq BLOCKS (exit 2) instead.
+command -v jq >/dev/null 2>&1 || { echo "orchestrate: jq missing; secrets hook cannot check the path" >&2; exit 2; }
+INPUT=$(cat)
+if [ -n "$INPUT" ]; then
+  file=$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // empty' 2>/dev/null)
+else
+  file=$(printf '%s' "$TOOL_INPUT" | jq -r '.file_path // empty' 2>/dev/null)
+fi
+case "$file" in
+  *.env|*.pem|*credentials.json|*id_rsa|*secrets.yaml)
+    echo "orchestrate: blocked write to a secrets-shaped path: $file" >&2
+    exit 2 ;;
+esac
+```
+MANUAL VERIFICATION (doctor cannot reach this - it only WARNs on the stdin-blind shape, it never
+proves a hook fires): after wiring this as a PreToolUse Write/Edit hook, ask Claude to write a file
+named `probe.pem` and confirm the tool call is BLOCKED (exit 2 -> Claude Code refuses the write);
+then confirm a harmless path (e.g. `probe.txt`) is ALLOWED.
 - Do NOT add `Bash(jq *)` just for stack edits - jq plus a shell redirect can clobber any file; use the Write tool (scoped to /tmp) for stack mutations instead.
 - gh-api access is GET-only-by-default by CONSTRUCTION now: raw `Bash(gh api *)` is removed, so reads go through `gh-api-get.sh` (refuses every mutation flag) and each mutation has its own dedicated, endpoint-pinned wrapper. A read-only bot is charter-restricted to `gh-api-get.sh` only.
 
