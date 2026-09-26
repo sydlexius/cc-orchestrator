@@ -234,8 +234,11 @@ issue_comments="$(gh api "repos/${repo}/issues/${pr}/comments" --paginate)" \
 # ack), and if Codoki comments DO exist a diagnostic is emitted (possible format drift).
 # Among matches the LATEST by created_at wins.
 codoki_summary_id() {
-  jq -r --arg login "$CODOKI_LOGIN" --arg marker "$CODOKI_MARKER" '
-  [ .[] | select((.user.login // "") == $login) ] as $all
+  # SLURP + flatten (.[][]): `--paginate` emits one JSON array PER PAGE, so a per-page
+  # resolve printed one id per page with a summary, and the newline-joined result failed
+  # is_num -- the target was never acked. One pass over every page picks ONE latest id.
+  jq -rs --arg login "$CODOKI_LOGIN" --arg marker "$CODOKI_MARKER" '
+  [ .[][] | select((.user.login // "") == $login) ] as $all
   | ([ $all[] | select((.body // "") | contains($marker)) ]) as $marked
   | ([ $all[] | select((.body // "") | test("Codoki PR Review"; "i")) ]) as $heuristic
   | (if ($marked | length) > 0 then $marked

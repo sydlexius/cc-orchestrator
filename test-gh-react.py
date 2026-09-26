@@ -288,6 +288,16 @@ def ack_cases():
                                extra_env={"ISSUE_PAGED": issue_arr(CR_WALK) + "\n" + issue_arr(cr_new)})
     check("walkthroughs on two issue-comment pages -> the LATEST (7101) across pages is acked",
           rc == 0 and posts(posted) == ["repos/owner/repo/issues/comments/7101/reactions"])
+    # A Codoki summary on EACH of two pages: the resolver must see every page in ONE pass and
+    # pick ONE latest id (a per-page resolve printed "9001\n9101", failed is_num, never acked).
+    cd_new = SUMMARY_MARKED.replace("9001", "9101").replace("2026-07-01", "2026-07-05")
+    two_pages = issue_arr(SUMMARY_MARKED) + "\n" + issue_arr(cd_new)
+    rc, out, err, posted = run(["ack", "5", "--bot", "codoki"], extra_env={"ISSUE_PAGED": two_pages})
+    check("Codoki summaries on two issue-comment pages -> the LATEST (9101) is acked",
+          rc == 0 and posts(posted) == ["repos/owner/repo/issues/comments/9101/reactions"])
+    rc, out, err, posted = run(["codoki-ack", "5"], extra_env={"ISSUE_PAGED": two_pages})
+    check("codoki-ack READ over two pages -> resolves ONE summary, no non-numeric-id die",
+          rc != 2 and "non-numeric" not in err and "9101" in (out + err))
 
     print("== ack: guarded properties (H3) ==")
     rc, out, err, posted = run(["ack", "5", "--bot", "coderabbit"], issue=issue_arr(CR_WALK),

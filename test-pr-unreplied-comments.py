@@ -27,7 +27,6 @@ Run: python3 test-pr-unreplied-comments.py
 """
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -447,27 +446,22 @@ def main():
     rc, out, _ = run(["--itemized", "--allow-stale"], inline=concern)
     check("--itemized: advisory suppressed", "CR-CONCERN-ADVISORY" not in out)
     # `--paginate` emits CONCATENATED per-page arrays: a thread whose root is on page 1
-    # and whose replies are on page 2 must still be screened as ONE thread, not dropped
-    # as two fragments. Exercised on the advisory's OWN jq program (flags included),
-    # extracted from the script: the script's other readers of the same variable are
-    # not multi-page-safe (they abort before the advisory runs), so an end-to-end run
-    # on concatenated pages cannot reach this screen.
-    with open(SCRIPT) as f:
-        _src = f.read()
-    _m = re.search(r"""echo "\$all_comments" \| jq ((?:-\w+ )*)'(\n[^']*CR-CONCERN-ADVISORY: coderabbitai[^']*)'""", _src)
-    check("advisory jq program extracted from the script", _m is not None)
-    if _m:
-        _t = json.loads(concern)
-        paged = json.dumps(_t[:1]) + "\n" + json.dumps(_t[1:])
-        _p = subprocess.run(["jq"] + _m.group(1).split() + [_m.group(2)], input=paged,
-                            capture_output=True, text=True)
-        check("thread split across two pages -> CR-CONCERN-ADVISORY still emitted",
-              _p.returncode == 0 and "CR-CONCERN-ADVISORY:" in _p.stdout
-              and "thread 501 at a.sh:10" in _p.stdout)
-        _p = subprocess.run(["jq"] + _m.group(1).split() + [_m.group(2)], input="",
-                            capture_output=True, text=True)
-        check("advisory program on empty input -> no line, no error",
-              _p.returncode == 0 and _p.stdout == "")
+    # and whose replies are on page 2 must still be screened as ONE thread. END TO END:
+    # the stub serves INLINE verbatim, so two concatenated arrays ARE the multi-page
+    # response; the script merges pages once at the fetch, so every reader (not just the
+    # advisory) sees one array.
+    _t = json.loads(concern)
+    paged = json.dumps(_t[:1]) + "\n" + json.dumps(_t[1:])
+    rc_p, out_p, err_p = run(["--allow-stale"], inline=paged)
+    rc_1, out_1, _ = run(["--allow-stale"], inline=concern)
+    check("thread split across two pages (end to end) -> CR-CONCERN-ADVISORY still emitted",
+          "CR-CONCERN-ADVISORY:" in out_p and "thread 501 at a.sh:10" in out_p)
+    check("two-page response: same count + exit as the one-page response (no abort)",
+          rc_p == rc_1 and [ln for ln in out_p.splitlines() if "unreplied" in ln.lower()]
+          == [ln for ln in out_1.splitlines() if "unreplied" in ln.lower()])
+    rc_p, out_p, _ = run(["--count-only"], inline=paged)
+    rc_1, out_1, _ = run(["--count-only"], inline=concern)
+    check("--count-only on a two-page response == one-page response", (rc_p, out_p) == (rc_1, out_1))
 
     # Multi-page reviewThreads: the advisory loop must follow hasNextPage/endCursor
     # and surface unresolved threads from EVERY page (not just the first 100).

@@ -379,7 +379,9 @@ _gh_read_sha() {
 
 count_unreplied() {
   local all_comments
-  all_comments=$(gh api "repos/$repo/pulls/$pr_number/comments" --paginate)
+  # `--paginate` emits one JSON array PER PAGE; merge them ONCE here so every reader below
+  # (and --argjson, which rejects a multi-document value) sees a single array.
+  all_comments=$(gh api "repos/$repo/pulls/$pr_number/comments" --paginate | jq -s 'add // []')
 
   local bot_ids
   bot_ids=$(echo "$all_comments" | jq '[.[] | select(
@@ -939,7 +941,10 @@ found=0
 head_sha=$(gh api "repos/$repo/pulls/$pr_number" --jq '.head.sha[:7]' 2>/dev/null || echo "unknown")
 
 # 1. Inline review comments
-all_comments=$(gh api "repos/$repo/pulls/$pr_number/comments" --paginate)
+# `--paginate` emits one JSON array PER PAGE; merge them ONCE here so every reader below
+# (and --argjson, which rejects a multi-document value) sees a single array. pipefail makes
+# a failed gh read still abort (set -e), exactly as the unpiped form did.
+all_comments=$(gh api "repos/$repo/pulls/$pr_number/comments" --paginate | jq -s 'add // []')
 
 bot_ids=$(echo "$all_comments" | jq '[.[] | select(
   '"$BOT_LOGIN_FILTER"'
