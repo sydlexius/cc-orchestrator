@@ -26,6 +26,7 @@ import json
 import math
 import os
 import re
+import stat
 import subprocess
 import sys
 
@@ -91,7 +92,9 @@ _SHORT = [  # tool-scoped: the flag only counts after the tool word in the same 
 ]
 _LONG = re.compile(r"(?:^|\s)--((?:[a-z]+-)*(?:token|api-?key|password|passwd|secret|"
                    r"client-secret|private-key|access-key|secret-key|auth))(?:=|\s+)" + _VAL, re.I)
-_URL = re.compile(r"\b[a-z][a-z0-9+.-]*://(?:[^:/@\s\"'`]*:)?([^:@\s/\"'`]+)@", re.I)
+# Userinfo can hold neither '?' nor '#' (they start the query/fragment), so both classes exclude
+# them: a `user:pass@` shape inside a query string is not a URL credential (PR #487 review).
+_URL = re.compile(r"\b[a-z][a-z0-9+.-]*://(?:[^:/?#@\s\"'`]*:)?([^:@\s/?#\"'`]+)@", re.I)
 _PREFIX = re.compile(r"\b((?:ghp|gho|ghs|ghu|ghr)_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
                      r"sk-(?:ant-)?[A-Za-z0-9_-]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[A-Z0-9]{16}|"
                      r"glpat-[A-Za-z0-9_-]{20,}|npm_[A-Za-z0-9]{30,}|[sr]k_live_[A-Za-z0-9]{16,}|"
@@ -220,11 +223,23 @@ def scan_rule(text):
 
 def _load(path):
     """-> (rules, None) or (None, reason). Any doubt about the file is a reason, never 'clean'."""
+    # O_NONBLOCK so opening a FIFO cannot block, then fstat the DESCRIPTOR (not the path, which
+    # could be swapped between a stat and the open) and read only a regular file (PR #487).
     try:
-        with open(path, "rb") as f:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError as e:
+        return None, f"unreadable ({type(e).__name__})"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None, "not a regular file"
+        with os.fdopen(fd, "rb") as f:
+            fd = None
             raw = f.read()
     except OSError as e:
         return None, f"unreadable ({type(e).__name__})"
+    finally:
+        if fd is not None:
+            os.close(fd)
     try:
         data = json.loads(raw.decode("utf-8"))
     except UnicodeDecodeError:

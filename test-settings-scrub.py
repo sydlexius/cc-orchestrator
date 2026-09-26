@@ -153,6 +153,14 @@ check("proxy: labeled Proxy-Authorization", "label=Proxy-Authorization" in run([
 f = write("c-denyask.json", rules(deny=[f"Bash(API_TOKEN={S['deny']} x)"], ask=[f"Bash(X_SECRET={S['ask']} y)"]))
 rc, out, _ = run([f])
 check("deny and ask lists scanned", rc == 1 and "rule=deny[0]" in out and "rule=ask[0]" in out, out)
+# PR #487 (CR 4109973997): userinfo cannot contain '?' or '#', so a user:pass@ shape inside a
+# query string or fragment is NOT a url-credential.
+for sep in ("?x=abc", "#frag"):
+    qv = tok()
+    f = write(f"c-urlq{abs(hash(sep))}.json", rules(f"Bash(curl https://h{sep}:{qv}@y)"))
+    rc, out, _ = run([f])
+    check(f"url in {sep[0]}: no url-credential taken from the query/fragment",
+          "carrier=url-credential" not in out, out[-300:])
 
 # ---- 2. realistic benign corpus: a clean machine reports clean ---------------------------------
 print("clean corpus")
@@ -308,6 +316,14 @@ p = subprocess.run([sys.executable, SCRUB], capture_output=True, timeout=60, env
     os.environ, HOME=TMP, PYTHONIOENCODING="utf-8:strict", ORCHESTRATE_SETTINGS_FILES=TMP.encode() + b"/caf\xe9.json"))
 check("entry point is _guarded: internal error -> exit 2, no traceback", p.returncode == 2 and
       b"internal error (UnicodeEncodeError)" in p.stderr and b"Traceback" not in p.stderr, p.stderr[-300:])
+# PR #487 (Copilot 4109974410): a FIFO in the CASCADE is skipped (exit 2), never a hang.
+cfifo = os.path.join(TMP, "cascade-fifo.json"); os.mkfifo(cfifo)
+try:
+    rc, _, err = run([fs, cfifo], timeout=10)
+except subprocess.TimeoutExpired:
+    rc, err = "HANG", ""
+check("cascade: a FIFO settings path is SKIPPED (exit 2), never hangs",
+      rc == 2 and "SKIPPED" in err and "not a regular file" in err, f"rc={rc}")
 tgt = write("victim.txt", None, b"keep")
 dl = os.path.join(TMP, "detail-link.json"); os.symlink(tgt, dl)
 rc, _, err = run([fs], "--detail-file", dl)
