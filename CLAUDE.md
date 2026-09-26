@@ -642,18 +642,27 @@ drives `/plugin marketplace` update-detection, so they must never diverge. The C
 - Security-floor changes get rigor SCALED BY BLAST RADIUS (#287), not by which file was touched:
   TDD harness cases always, plus an independent adversarial critic pass (`engage-ralph-loop.md`)
   at the tier `/prep-pr` Step 4a prints.
+  - The TIER sets the DEPTH and LENSES of each round; the VERDICT sets the round count. Every round
+    ends with SHIP, SHIP WITH FIXES, or DO NOT SHIP. SHIP / SHIP WITH FIXES END review (apply the
+    fixes, gates green, no further round owed); DO NOT SHIP earns another round over the fix diff
+    (`<pre-fix HEAD>..HEAD`), widened where the fix reaches a shared helper or contract. The
+    reviewer proposes the verdict; the lead may upgrade it to DO NOT SHIP, never downgrade it, and
+    an unfixed merge-unsafe finding is always DO NOT SHIP.
   - DENY-AUTHORITY (`orchestrate-guard.sh`, `orchestrate-authorize-merge.sh` - a defect can PERMIT a
-    bad push/merge): the FULL loop, converging at K=2 dry rounds with all gates green.
+    bad push/merge): the FULL multi-lens pass per round through the ISOLATION harness, including an
+    old-vs-new permit/deny differential.
   - ADVISORY (`orchestrate-steer.sh`, `orchestrate-context-meter.sh` - provably `exit 0` on every
-    path, cannot block any tool call, so a defect is a wrong or missing NUDGE): ONE multi-lens pass
-    + ONE hostile fix-scoped verify round. The advisory tier is EARNED by a verified property of the
+    path, cannot block any tool call, so a defect is a wrong or missing NUDGE): verify the advisory
+    property on the post-diff file, then ONE multi-lens pass per round. The advisory tier is EARNED by a verified property of the
     POST-diff file (no nonzero exit outside `--self-test`, no stdout write), never by the filename -
     a diff that ADDS an `exit 2` is exactly the diff that must not get the cheap tier. Any doubt ->
     deny-authority.
-  - ANY tier: a Critical/Important finding ESCALATES to the full loop, so the fast path is taken only
-    on diffs that come back clean. MAX_ROUNDS ~6 is a BUDGET ALARM, never "ship anyway" - on the cap,
+  - ANY tier: a Critical/Important finding is DO NOT SHIP, except that below the deny-authority tier a trivially mechanical fix may ride SHIP WITH FIXES (the lead may upgrade), and every
+    SHIP WITH FIXES item must be safe to apply without another review, so the fast path is
+    taken only where every listed fix is safe to apply without another review. MAX_ROUNDS ~6 is a BUDGET ALARM, never "ship anyway" - on the cap,
     STOP and surface what is still unreviewed (and consider that the diff is too big).
-  Untiered K=2 cost a ~50-minute, 10-round loop on an advisory hook that could not block anything.
+  History: the retired untiered K=2 dry-round rule cost a ~50-minute, 10-round loop on an advisory
+  hook that could not block anything.
 
 ## Operating model (lead-driven; distilled from prior orchestration sessions)
 
