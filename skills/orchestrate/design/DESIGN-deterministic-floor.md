@@ -229,11 +229,37 @@ Adopted design (#105 - what ships):
 - **Command-input channel (Finding F23 - getting this wrong nullifies the floor):**
   the EXISTING working hooks read the command from the `$TOOL_INPUT` env var
   (`echo "$TOOL_INPUT" | jq -r '.command'`); the hookify plugin reads the
-  `tool_input.command` field from a stdin JSON payload. CC populates both on this
-  version, but the guard MUST be robust: read stdin JSON first, FALL BACK to
-  `$TOOL_INPUT`, and if BOTH yield an empty command, FAIL OPEN (exit 0) - never
-  block on an empty read. The install self-test (see Error behavior) verifies the
-  chosen channel is actually populated before the guard is trusted.
+  `tool_input.command` field from a stdin JSON payload. (CORRECTED by #327: the
+  original "CC populates both on this version" was wrong. The STDIN JSON payload is
+  the channel Claude Code actually delivers; a hook that read ONLY `$TOOL_INPUT` got
+  an empty value and so FAILED OPEN silently, protecting nothing. See "Hook-authoring
+  note" below.) The guard therefore reads stdin JSON first, FALLS BACK to
+  `$TOOL_INPUT`, and if BOTH yield an empty command, FAILS OPEN (exit 0) - never
+  block on an empty read. The install self-test (see Error behavior) pipes its OWN
+  stdin payload into the guard (`scripts/orchestrate-guard.sh:91-93`), so it proves
+  the guard PARSES stdin and denies; it does NOT prove Claude Code populates that
+  channel. Only a live deny on a real Bash call in a session proves that.
+- **Hook-authoring note (#327; applies to ANY PreToolUse hook, ours or the user's):**
+  - READ STDIN FIRST. The payload is one JSON object; the tool's arguments are under
+    `.tool_input` (`.tool_input.command` for Bash, `.tool_input.file_path` for
+    Edit/Write/Read), and `tool_name` and `session_id` are TOP-LEVEL keys
+    (`scripts/orchestrate-guard.sh:341-353`, `scripts/orchestrate-steer.sh:159-199`).
+  - `$TOOL_INPUT` is a legacy FALLBACK only, and there is no evidence Claude Code sets
+    it at all: the installed Claude Code 2.1.283 binary contains the string `TOOL_INPUT`
+    ZERO times (control: `CLAUDE_PROJECT_DIR` is present), so on that version stdin JSON
+    is the only channel. The SHAPE our scripts assume for it is the `tool_input` object
+    alone (the guard reads `.command` from it, not `.tool_input.command`); that is OUR
+    scripts' assumption, not documented Claude Code behavior, and under it the channel
+    carries NO `tool_name` and NO `session_id` (`scripts/orchestrate-steer.sh:160-162`). Any rule keyed on the tool name or the
+    session cannot fire on that channel: steer's read-dedup rule (4) and its Read/Agent
+    tool-name checks go silent there by design.
+  - A `$TOOL_INPUT`-ONLY hook is the #327 failure: it reads an empty string, takes its
+    own fail-open branch, and a deny or redaction hook written that way is inert while
+    looking wired. Doctor does not detect this pattern in a user's own hooks today
+    (a WARN would be a script change); check by hand, and prove a new hook fires by
+    feeding it a stdin payload, as `--self-test` does.
+  - The harness still runs BOTH channels (Finding F24): the fallback ships, so it is
+    tested, but a pass on the env channel is not evidence that Claude Code uses it.
 - **Error behavior (Finding F19 - fail OPEN):** on ANY internal error (missing
   `jq`, malformed payload, `stat` failure, empty command read), the guard exits 0
   (allow). Rationale: this guard runs on EVERY Bash call across ALL sessions;
@@ -256,7 +282,9 @@ Adopted design (#105 - what ships):
   was REMOVED - see "Tier-2: ask rejected, allow-list adopted" - so no decision can be
   pre-empted by an earlier clause). The `# prep-pr-ok` override is checked LAST and can
   ONLY satisfy the advisory gate - it can NEVER reach a hard deny (so
-  `git push main # prep-pr-ok` stays blocked by step 1).
+  `git push main # prep-pr-ok` stays blocked by step 1). The override itself is a
+  self-attestation string; whether and where to make it deterministic (outside the
+  floor) is `DESIGN-fixround-push-gate.md` (#318, a proposal).
 - **Behavior detail:** preserves the existing `git push` -> require-prep-or-
   `# prep-pr-ok` gate; adds safe-push-to-main coverage, bare-force, no-verify
   (Tier 1); adds MUTATING merge-by-API (`pulls/{n}/merge` with a mutating
@@ -362,7 +390,9 @@ Adopted design (#105 - what ships):
 ### settings.json wiring
 - Replace the current inline `PreToolUse.Bash` push hook with a single
   `command` invoking `~/.claude/scripts/orchestrate-guard.sh`. Keep the existing
-  Write/Edit secret-file hooks (real deterministic guards - unchanged). KEEP the
+  Write/Edit secret-file hooks (real deterministic guards - unchanged; but see #327:
+  the ones that read only `$TOOL_INPUT` were found INERT, per the Hook-authoring note
+  above, and those are the user's own hooks to fix, not ours). KEEP the
   PostToolUse `gh pr merge` print (Finding F16): since `gh pr merge` is now
   FLOOR-GATED (marker-gated deny in a team session), this print is only reached in a
   SOLO/non-marker session where the human or solo lead ran a merge - the
@@ -476,6 +506,73 @@ caps + pr-watch exit-code branching, port allocator, worktree keep-until-merge,
 teardown clean-worktree assertion. Track as a phase-3 tranche. Adversarial-
 evasion containment (a true allowlist-only/sandbox model) is explicitly not
 attempted.
+
+## Emergency hot-patch of the DEPLOYED guard (#327)
+
+The PreToolUse hook runs the DEPLOYED copy at `~/.claude/scripts/orchestrate-guard.sh`, not
+this repo. In an incident it can be right to patch that copy directly (a new deny needed NOW,
+before a PR can land). #327 is what happens when that patch never reaches canonical source:
+the deployed guard ran AHEAD of the repo, and every later `configure --apply` refresh would
+have dropped the deny from the floor, because the deployed-vs-bundled check is a byte-compare
+and cannot tell which copy is newer (`_guard_deploy_action`, `scripts/orchestrate-setup.py:364-376`).
+The same drift also shipped a deny that never fired (its token was missing from the
+short-circuit; see the `orchestrate-guard.sh` header and #324). The procedure:
+
+1. **Stage, validate, then swap. NEVER edit the deployed file in place.** The hook command is
+   `bash "$HOME/.claude/scripts/orchestrate-guard.sh"` (`scripts/orchestrate-setup.py:270`), so
+   bash re-reads that file on EVERY Bash call in EVERY session: an in-place edit is live
+   machine-wide on the next call, and a parse error makes bash exit 2 (measured), which a
+   PreToolUse hook reports as a BLOCK. That denies every Bash call everywhere, the guard's own
+   fail-open never runs (the parse fails first), and the only way out is the Edit/Write tool.
+   So:
+   - Copy the deployed guard to a staging path IN THE SAME DIRECTORY, preserving its mode
+     (`cp -p ~/.claude/scripts/orchestrate-guard.sh ~/.claude/scripts/orchestrate-guard.sh.new`),
+     so the final `mv` is a same-filesystem atomic rename.
+   - Patch the COPY with the full deny recipe, not just the matcher: declare the `_PF_*`
+     fragment, add it to `_PREFILTER_PARTS`, add an `--assert-coverage` BLOCK vector (CLAUDE.md
+     "ADDING A DENY TO THE GUARD").
+   - Validate the COPY: `bash -n` on it, then run it with `--self-test` and with
+     `--assert-coverage` by a path that re-resolves as `$0` (`./orchestrate-guard.sh.new` from
+     `~/.claude/scripts`, or its absolute path; never `bash <file>`, which makes `$0` a bare
+     name). Then feed it the new trigger on STDIN: write the JSON payload to a FILE with the
+     Write tool and redirect it (`~/.claude/scripts/orchestrate-guard.sh.new < <payload-file>`,
+     expect exit 2). Never inline the trigger in an `echo` on a Bash command line: the LIVE
+     guard greps command lines (CLAUDE.md floor rules), and the payload belongs in the file.
+   - Swap: `mv ~/.claude/scripts/orchestrate-guard.sh.new ~/.claude/scripts/orchestrate-guard.sh`.
+     A rename also means a call already running keeps reading the old inode, whereas an
+     in-place write can change the bytes under a bash that is still reading them.
+
+   The swapped script is live immediately, on each session's next Bash call; no restart is
+   needed. A restart matters only for a settings.json hook WIRING change, which is loaded at
+   session start.
+2. **Record the drift the same hour.** File an issue (or a feedback entry) naming the exact
+   diff: `diff <repo>/scripts/orchestrate-guard.sh ~/.claude/scripts/orchestrate-guard.sh`.
+   Until it is ported, that diff is the only copy of the deny outside the deployed file.
+3. **Do NOT run `configure --apply` while the deployed guard is ahead.** Doctor reports it as
+   `deployed guard ... DIFFERS from the bundled plugin guard` and names this case: "PORT IT
+   INTO THE REPO FIRST - a refresh would silently drop that floor behavior"
+   (`check_guard_stale`, `scripts/orchestrate-setup.py:449-465`). During a hot-patch that WARN
+   is expected; it is the drift signal, not noise to clear. This blocks ALL `configure --apply`
+   work, not only the guard refresh: `configure` has no flag to skip the guard deploy (its only
+   opt-outs are `--no-steer` and `--no-ctxmeter`, `scripts/orchestrate-setup.py:2681-2692`),
+   so wiring a hook, adding an allow-list entry or refreshing a helper all wait until the patch
+   is ported (step 4).
+4. **Port into canonical source promptly** as a normal floor change: same diff into
+   `scripts/orchestrate-guard.sh`, harness cases in `test-orchestrate-guard.py`, the
+   DENY-AUTHORITY rigor tier, maintainer merge. Done means the diff in step 2 is EMPTY after
+   the merged bundle is deployed (doctor then reports the guard matches).
+
+**Recovery if a refresh already ran.** `configure --apply` backs the replaced guard up to
+`~/.claude/scripts/orchestrate-guard.sh.bak` before overwriting it, and refuses to overwrite if
+that backup cannot be made (`_deploy_guard` + `_backup_before_overwrite`,
+`scripts/orchestrate-setup.py:412-446`, `:379-409`). A regular-file guard is COPIED to the
+`.bak` (`shutil.copy2`, `:404`); a SYMLINKED deployed guard is instead MOVED aside with
+`os.replace` (`:425-426`), so its `.bak` is the link itself, pointing at whatever it pointed at
+before. The `.bak` is ONE slot: the next refresh overwrites it with whatever is deployed at that
+moment. So first COPY the `.bak` to a dated name outside the deploy path, then
+`diff` it against the repo guard to recover the lost deny, then port it (step 4). Copying the
+`.bak` back over the deployed guard restores protection immediately, but it re-creates the
+drift, so it is a stopgap that still owes step 4.
 
 ## DO NOT ADD A CREDENTIAL-IN-ARGV MATCHER (measured dead, both directions; #350)
 
