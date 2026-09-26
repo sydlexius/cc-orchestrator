@@ -28,6 +28,7 @@ Run: python3 test-elmer-tick.py
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1481,6 +1482,30 @@ def _(env):
     check("2 posts total (1 original + 1 re-post), never more", len(env.posts) == 1)
     check("second record stays drained", env.ls("inbox") == []
           and env.ls("drained") == [STEM + ".json", STEM + ".readmitted-501.json"])
+
+
+@case("#455 N2: a failed re-queue after the rename keeps the record and still posts nothing")
+def _(env):
+    # The hold-off must cover the window AFTER the commit-point rename and BEFORE the
+    # inbox write: set only on a successful re-queue, this tick would post the other
+    # queued entry on a quota that a countdown-less rate-limit reads as clear.
+    # Root ignores file modes, so the inbox write is failed with a jq shim that
+    # refuses only the re-queue filter (it alone names readmitted_from).
+    real_jq = shutil.which("jq")
+    with open(os.path.join(env.bin, "jq"), "w") as f:
+        f.write('#!/usr/bin/env bash\ncase "$*" in *readmitted_from*) exit 1 ;; esac\n'
+                f'exec "{real_jq}" "$@"\n')
+    os.chmod(os.path.join(env.bin, "jq"), 0o755)
+    _record(env)
+    env.queue(999)
+    r = env.run(GH_QUOTA=0, GH_COMMENTS=_comments((501, "coderabbitai[bot]", -115, RL_BODY)))
+    check("exit 0", r.returncode == 0)
+    check("warns the re-queue failed", "could not re-queue it" in r.stderr)
+    check("renamed record kept in drained/",
+          STEM + ".readmitted-501.json" in env.ls("drained")
+          and STEM + ".json" not in env.ls("drained"))
+    check("the rate-limited entry is not in the inbox", STEM + ".json" not in env.ls("inbox"))
+    check("posted nothing (hold-off)", env.posts == [])
 
 
 @case("#455 consumed evidence never re-admits a later record")
