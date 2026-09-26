@@ -19,12 +19,19 @@
 #      spent slot at the moment the review lands, with no extra query -- and it
 #      appears ONLY when the limit is actually reached. Invisible to a human,
 #      trivially readable via the API.
+#   3. (#454, measured 2026-09) The banner in CR's SUMMARY comment:
+#        "**Next included review available in 49 minutes."
+#      Capital N and NO "will be", so the match is case-insensitive and "will be" is
+#      optional. CR EDITS that summary IN PLACE, so its countdown is anchored to the
+#      comment's `updated_at`, not `created_at` (dating it from creation reported ~26m
+#      for a fresh 59-minute notice on a summary created 33 minutes before the edit).
 #
 # Result: the throttle FEELS arbitrary when it has in fact been announced every time.
 # This converts that invisible announcement into one visible terminal line.
 #
-# MATCHER (measured across 21 real instances, 2026-07-24..27, plus 2026-07-30):
-#   available in (\d+) (second|minute|hour)s?\.
+# MATCHER (measured across 21 real instances, 2026-07-24..27, plus 2026-07-30, plus
+# the #454 summary banner 2026-09; case-insensitive):
+#   next (included )?review (will be )?available in (\d+) (second|minute|hour)s?\.
 # The duration is always RELATIVE -- never a wall-clock time, never a timezone, never
 # a date. A naive `(\d+) minutes` breaks on real messages: "1 minute." is SINGULAR and
 # "4 seconds." is a DIFFERENT UNIT. `hour` and values above 59 are accepted even though
@@ -38,8 +45,20 @@
 #
 # NON-MONOTONIC BY DESIGN: CR's limits are adaptive, so a later reading can be LARGER
 # than an earlier one (canticle #656 read 53 minutes, then 51 minutes an HOUR later).
-# Never count down locally from an old reading. This script therefore takes the NEWEST
-# signal outright and computes its deadline from that comment's own timestamp.
+# Never count down locally from an old reading: every deadline is computed from its
+# OWN comment's timestamp. SELECTION RULE (#454 review):
+#   - A LIMITED signal is dated by `updated_at` (falling back to `created_at` when
+#     absent/unparseable): an edited-in-place summary's countdown was written at its
+#     last edit.
+#   - An AVAILABLE ("Reviews are available now") signal is dated by `created_at` ONLY.
+#     An edit to an old reply (or to anything else in that comment) does not re-assert
+#     availability, and dating it by the edit let an old reply outrank a fresh limit.
+#   - Among the limited signals NEWER than the newest available one, the LARGEST
+#     deadline wins -- not the newest signal. An edit can refresh a comment's
+#     `updated_at` without refreshing a stale banner inside it (a human ticking a
+#     checkbox in CR's summary), so "most recently touched" is not "most recent
+#     reading"; taking the max fails only toward LIMITED, never toward a false
+#     all-clear. With no such limited signal, the newest available one wins.
 #
 # Usage:
 #   cr-quota-watch.sh <PR#> [owner/repo]
@@ -49,12 +68,13 @@
 #   owner/repo  Repo slug (optional; resolved via `gh repo view` if omitted).
 #
 # Exit codes:
-#   0  No ACTIVE limit -- no signal found, the newest signal's deadline has passed, or
-#      CR reported reviews available. (Also the state a caller may act on.)
-#   1  LIMITED -- the newest signal's deadline is still in the future; the remaining
+#   0  No ACTIVE limit -- no signal found, the selected signal's deadline has passed,
+#      or CR reported reviews available. (Also the state a caller may act on.)
+#   1  LIMITED -- the selected signal's deadline is still in the future; the remaining
 #      time and the Pacific-labeled deadline are surfaced.
-#   2  SETUP ERROR -- bad/missing args, repo unresolvable, or a gh read failure. A read
-#      failure is NEVER reported as "no limit": that would be a false all-clear.
+#   2  SETUP ERROR -- bad/missing args, repo unresolvable, a gh read failure, or a
+#      failure evaluating the comments. A read or evaluation failure is NEVER reported
+#      as "no limit": that would be a false all-clear.
 set -euo pipefail
 
 # -h / --help: print this script's header comment block as usage, then exit.
@@ -92,40 +112,55 @@ raw="$(gh api --paginate "repos/$repo/issues/$pr/comments" 2>/dev/null)" || {
   echo "setup error: could not read issue comments for PR #$pr ($repo) (gh api read failed)" >&2
   exit 2
 }
-comments="$(printf '%s' "$raw" | jq -s 'add // []' 2>/dev/null || true)"
-if [ -z "$comments" ]; then
+# Every page must be a JSON ARRAY before the `// []` empty-result fallback: `add // []`
+# alone turns a `null`/`false` page into `[]`, so an error body would read as "no quota
+# signal", a false all-clear. jq's status is CHECKED (malformed JSON fails here, exit 2).
+if ! comments="$(printf '%s' "$raw" | jq -s '
+  if all(.[]; type == "array") then (add // []) else error("a comments page is not a JSON array") end
+' 2>/dev/null)" || [ -z "$comments" ]; then
   echo "setup error: could not parse issue comments for PR #$pr ($repo)" >&2
   exit 2
 fi
 
-# --- Select the NEWEST quota signal ---
+# --- Select the quota signal (see SELECTION RULE in the header) ---
 # Emitted as tab-separated: kind, deadline epoch, the raw duration phrase, the noun
-# phrase CR used. Timestamps are parsed with `try/catch` so one malformed comment
-# cannot abort the whole read.
-RX='next (?<inc>included )?review will be available in (?<n>[0-9]+) (?<unit>second|minute|hour)s?\.'
+# phrase CR used. Timestamps are parsed with `try/catch` and a non-string body is
+# coerced with `tostring`, so one malformed comment cannot abort the whole read. The
+# "i" flag makes the match case-insensitive (#454).
+RX='next (?<inc>included )?review (?:will be )?available in (?<n>[0-9]+) (?<unit>second|minute|hour)s?\.'
 
-signal="$(printf '%s' "$comments" | jq -r --arg login "$CR_LOGIN" --arg rx "$RX" '
-  [ .[]
+# jq's exit status is CHECKED: a runtime error here (a non-array response, a comment
+# jq cannot index) used to be swallowed by `|| true` into an empty signal, which then
+# read as "no quota signal" -- exit 0, a false all-clear. It is a setup error instead.
+if ! signal="$(printf '%s' "$comments" | jq -r --arg login "$CR_LOGIN" --arg rx "$RX" '
+  if type != "array" then error("issue comments are not a JSON array") else . end
+  | [ .[]
     | select((.user.login // "") == $login)
-    | (.body // "") as $b
-    | ((try (.created_at | fromdateiso8601) catch null)) as $t
-    | select($t != null)
-    | if ($b | test($rx)) then
-        ($b | capture($rx)) as $m
+    | (.body // "" | tostring) as $b
+    | (try (.created_at | fromdateiso8601) catch null) as $tc
+    | ((try (.updated_at | fromdateiso8601) catch null) // $tc) as $t
+    | if ($b | test($rx; "i")) and $t != null then
+        ($b | capture($rx; "i")) as $m
         | ($m.n | tonumber) as $n
-        | (if $m.unit == "second" then 1 elif $m.unit == "minute" then 60 else 3600 end) as $mult
+        | ($m.unit | ascii_downcase) as $u
+        | (if $u == "second" then 1 elif $u == "minute" then 60 else 3600 end) as $mult
         | { kind: "limited",
             t: $t,
             deadline: ($t + ($n * $mult)),
-            raw: "\($m.n) \($m.unit)\(if $n == 1 then "" else "s" end)",
+            raw: "\($m.n) \($u)\(if $n == 1 then "" else "s" end)",
             noun: (if ($m.inc // "") != "" then "included review" else "review" end) }
-      elif ($b | test("Reviews are available now")) then
-        { kind: "available", t: $t, deadline: $t, raw: "", noun: "review" }
+      elif ($b | test("Reviews are available now")) and $tc != null then
+        { kind: "available", t: $tc, deadline: $tc, raw: "", noun: "review" }
       else empty end
   ]
-  | sort_by(.t) | last
+  | ([ .[] | select(.kind == "available") | .t ] | max) as $ta
+  | ([ .[] | select(.kind == "limited" and ($ta == null or .t >= $ta)) ] | max_by(.deadline))
+    // ([ .[] | select(.kind == "available") ] | max_by(.t))
   | if . == null then "" else "\(.kind)\t\(.deadline)\t\(.raw)\t\(.noun)" end
-' 2>/dev/null || true)"
+' 2>/dev/null)"; then
+  echo "setup error: could not evaluate issue comments for PR #$pr ($repo) (jq failed)" >&2
+  exit 2
+fi
 
 if [ -z "$signal" ]; then
   echo "CR quota: no quota signal from CodeRabbit on PR #$pr ($repo). No announced limit."
