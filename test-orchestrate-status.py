@@ -35,12 +35,20 @@ import tempfile
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "orchestrate-status.sh")
 
 FAILS = []
+# The most recent run's (argv, rc, stderr). A failing check prints it, because a script that
+# dies early (#460: `mapfile: command not found` under macOS bash 3.2, exit 127) otherwise
+# shows up only as a wall of unexplained FAILs with the one useful line swallowed (#463).
+LAST_RUN = {}
 
 
 def check(label, ok):
     status = "ok  " if ok else "FAIL"; print(f"  [{status}] {label}")
     if not ok:
         FAILS.append(label)
+        if LAST_RUN:
+            print(f"         last run: args={LAST_RUN['args']} rc={LAST_RUN['rc']}")
+            for ln in (LAST_RUN["stderr"].rstrip() or "<empty stderr>").splitlines():
+                print(f"         stderr| {ln}")
 
 
 GH_STUB = r'''#!/usr/bin/env python3
@@ -95,6 +103,7 @@ sys.exit(0)
 
 def run(args, *, prlist="[]", views=None, unreplied=None, unreplied_fail=None,
         gh_list_fail=False, unreplied_warn=None):
+    LAST_RUN.clear()  # a run that dies before recording must not show an earlier run's stderr
     views = views or {}
     unreplied = unreplied or {}
     unreplied_fail = unreplied_fail or []
@@ -130,6 +139,7 @@ def run(args, *, prlist="[]", views=None, unreplied=None, unreplied_fail=None,
 
         p = subprocess.run(["bash", SCRIPT] + args, env=env,
                            capture_output=True, text=True, timeout=20)
+        LAST_RUN.update(args=args, rc=p.returncode, stderr=p.stderr)
         import json
         gh_calls = [json.loads(ln) for ln in open(gh_log).read().splitlines() if ln]
         return p.returncode, p.stdout, p.stderr, gh_calls

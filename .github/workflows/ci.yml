@@ -47,6 +47,25 @@ jobs:
         with:
           python-version: '3.12'
 
+      # #463: macOS /bin/bash is 3.2, but the runner image puts a Homebrew bash 5 first on
+      # PATH, so harnesses (`bash script`, `#!/usr/bin/env bash`) never ran the scripts under
+      # the bash a stock Mac user has (#460: `mapfile` -> exit 127, CI green). GITHUB_PATH
+      # PREPENDS for every later step, and this runs after setup-python so nothing added
+      # later shadows it. `#!/bin/bash` scripts already hit 3.2. Nothing here needs bash 4.
+      - name: macOS - run bash as /bin/bash 3.2
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p "$RUNNER_TEMP/bash32"
+          ln -sf /bin/bash "$RUNNER_TEMP/bash32/bash"
+          echo "$RUNNER_TEMP/bash32" >> "$GITHUB_PATH"
+
+      # The shim must not silently stop applying (an image change, a later PATH edit).
+      - name: macOS - assert bash is 3.x
+        if: runner.os == 'macOS'
+        run: |
+          command -v bash && bash --version | head -n1
+          [ "$(bash -c 'echo "${BASH_VERSINFO[0]}"')" = 3 ] || { echo "::error::bash on PATH is not 3.x, the #463 shim stopped applying"; exit 1; }
+
       # ruff runs Linux-only (the `ruff (F,E741)` step is `if: runner.os == 'Linux'`),
       # so only install it there - no need to spend the macOS leg installing an unused tool.
       - name: Install ruff
@@ -81,7 +100,7 @@ jobs:
 
       - name: ruff (F,E741)
         if: runner.os == 'Linux'
-        run: ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-ci-gates-lockstep.py test-steer-nudge-length.py test-helper-deploy-coverage.py test-jq-quoting.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-safe-push-freshness.py test-prep-pr-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py test-cr-quota-watch.py test-elmer-enqueue.py test-elmer-triage.py test-elmer-tick.py
+        run: ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-ci-gates-lockstep.py test-steer-nudge-length.py test-helper-deploy-coverage.py test-jq-quoting.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-safe-push-freshness.py test-prep-pr-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py test-cr-quota-watch.py test-elmer-enqueue.py test-elmer-triage.py test-elmer-tick.py test-bash32-constructs.py
 
       # Platform-sensitive: run on BOTH macOS (BSD stat) and Linux (GNU stat).
       # Must invoke via ./ so the self-test's "$0" re-invocation resolves
@@ -130,6 +149,11 @@ jobs:
       # and had drifted to 28-of-37 shellcheck coverage. Fails when they disagree either way.
       - name: harness - ci-gates-lockstep
         run: python3 test-ci-gates-lockstep.py
+
+      # #463 early signal: grep for bash-4-only syntax shellcheck does not flag. The runtime
+      # guard is the macOS bash 3.2 shim above; this names the file:line before a harness fails.
+      - name: harness - bash32-constructs
+        run: python3 test-bash32-constructs.py
 
       # jq single-quote integrity: an apostrophe inside a single-quoted jq program
       # closes the shell quote. A PAIR of them re-opens it, so `bash -n` passes while
