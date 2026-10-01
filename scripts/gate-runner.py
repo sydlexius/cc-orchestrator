@@ -442,26 +442,74 @@ def _memo_write_pass(memo_file):
 
 # --- Gate receipt (--receipt) ----------------------------------------------
 
-def _write_receipt(path, root, rc, records):
+def _snapshot(root, receipt_path):
+    """Pre-run snapshot: (commit, tree, dirty). Any git error leaves commit/tree
+    empty or dirty non-empty: doubt = no pass. Never raises."""
+    commit = _git_out(["rev-parse", "HEAD"], root)
+    tree = _git_out(["rev-parse", "HEAD^{tree}"], root)
+    dirty = _tree_dirty_excluding(root, receipt_path)
+    return commit, tree, dirty
+
+
+def _write_receipt(path, root, rc, records, pre):
     """Write a `gate-receipt/v1` receipt (schema-validated, atomic). The receipt
     is a BYPRODUCT: any failure here WARNs and never changes the gate exit code.
-    FAIL-OPEN when HEAD/tree cannot resolve (not a git repo / no commit)."""
-    commit_sha = _git_out(["rev-parse", "HEAD"], root)
-    tree_sha = _git_out(["rev-parse", "HEAD^{tree}"], root)
-    if not commit_sha or not tree_sha:
+    FAIL-OPEN when HEAD/tree cannot resolve (not a git repo / no commit).
+    `pre` is the _snapshot taken BEFORE the gate ran."""
+    pre_commit, pre_tree, pre_dirty = pre
+    if not pre_commit or not pre_tree:
         warn("cannot resolve HEAD/tree (not a git repo or no commit); "
              "skipping gate receipt")
         return
+    # #481 R7 + review round 1 (TOCTOU): the receipt binds HEAD^{tree} but the
+    # gate tested the WORKING tree. A pass therefore needs rc==0 AND a clean
+    # tree BEFORE the run AND a clean tree AFTER it AND an unchanged tree sha
+    # across the run (a mid-run discard or commit would otherwise let a gate
+    # that saw dirt, or a different tree, bind a clean tree). A git error
+    # anywhere is doubt = no pass. Otherwise write result=fail with a `reason`,
+    # which also OVERWRITES any older pass at this path. The gate exit code is
+    # untouched (the receipt stays a byproduct). The receipt records the PRE-run
+    # commit/tree: that is what the gate tested.
+    # KNOWN WINDOW: these are two point-in-time reads, before the first step and
+    # after the last. An edit made AND undone between them (clean -> dirty ->
+    # clean while the gate runs) is invisible here. Closing it means running the
+    # gate against an exported checkout of HEAD^{tree}; that is out of scope and
+    # outside the honest-actor model (it needs a concurrent editor). See #497.
+    reason = ""
+    if pre_dirty:
+        reason = "dirty-before-run: " + pre_dirty
+    else:
+        post_tree = _git_out(["rev-parse", "HEAD^{tree}"], root)
+        post_dirty = _tree_dirty_excluding(root, path)
+        if not post_tree:
+            # Redundant for the verdict (an empty post_tree would also fail the
+            # != test below); kept only so the reason says "unresolvable".
+            reason = "tree-changed-during-run: " + pre_tree + "..unresolvable"
+        elif post_tree != pre_tree:
+            reason = ("tree-changed-during-run: " + pre_tree + ".."
+                      + post_tree)
+        elif post_dirty:
+            reason = "dirty-after-run: " + post_dirty
     receipt = {
         "schema": "gate-receipt/v1",
-        "commit_sha": commit_sha,
-        "tree_sha": tree_sha,
+        "commit_sha": pre_commit,
+        "tree_sha": pre_tree,
         "worktree": root,
-        # verdict chosen HERE from the tool's own overall exit code.
-        "result": "pass" if rc == 0 else "fail",
+        # verdict chosen HERE: pass needs the tool's own exit code 0 AND no
+        # receipt invariant tripped (`reason` empty: clean before and after,
+        # tree unchanged). Do not reduce this to the exit code alone.
+        "result": "pass" if (rc == 0 and not reason) else "fail",
         "steps": records,
         "producer": "gate-runner",
     }
+    if reason:
+        receipt["reason"] = reason + "; gate tested the working tree, not a clean unchanged HEAD^{tree}"
+        warn("gate receipt written as result=fail (" + reason + ")")
+    if receipt["result"] != "pass":
+        # Belt-and-braces, for EVERY non-pass (a plain gate failure on a clean
+        # tree included, PR #498 review): if writing the fail receipt below
+        # itself fails (schema/write error), the older pass must not survive.
+        _remove_stale(path)
     try:
         import orchestrate_schemas
     except Exception as e:  # degraded but functional: write without validation.
@@ -475,6 +523,100 @@ def _write_receipt(path, root, rc, records):
              + "; ".join(errors))
         return
     _atomic_write_json(path, receipt)
+
+
+def _remove_stale(path):
+    """Best-effort removal of an older receipt so it cannot survive if the
+    fail receipt below cannot be written (e.g. schema or write error)."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _porcelain_paths(root):
+    """Run `git status --porcelain -z --untracked-files=normal`; return a list
+    of paths, or None on any error. -z avoids quoting; a rename carries two
+    NUL-separated paths (both are returned)."""
+    try:
+        p = subprocess.run(["git", "status", "--porcelain", "-z",
+                            "--untracked-files=normal"],
+                           cwd=root, capture_output=True, check=False)
+    except OSError:
+        return None
+    if p.returncode != 0:
+        return None
+    fields = p.stdout.decode("utf-8", "surrogateescape").split("\0")
+    out, i = [], 0
+    while i < len(fields):
+        f = fields[i]
+        i += 1
+        if len(f) < 4:
+            continue
+        out.append(f[3:])
+        if f[0] in "RC":  # rename/copy: the next field is the source path.
+            if i < len(fields) and fields[i]:
+                out.append(fields[i])
+            i += 1
+    return out
+
+
+def _tree_dirty_excluding(root, receipt_path):
+    """'' when the worktree is clean ignoring the receipt file itself (and its
+    atomic-write tmp); else a short description. Any git error => dirty."""
+    paths = _porcelain_paths(root)
+    if paths is None:
+        return "git status failed"
+    rroot = os.path.realpath(root)
+    rpath = os.path.realpath(receipt_path)
+
+    def own(p):
+        # The receipt itself, or a leftover of _atomic_write_json's temp file
+        # (`<receipt>.tmp.<pid>`; an interrupted write can leave one). Without
+        # the tmp leg, one interrupted write inside the worktree turned every
+        # later clean gate into result=fail (PR #498 review).
+        # The tmp leg matches ONLY a plain FILE with an ASCII-digit suffix:
+        # git reports a whole untracked DIRECTORY as one `name/` entry, and
+        # realpath strips the slash, so without the isdir test a directory
+        # named `<receipt>.tmp.123/` would hide every file inside it.
+        # Accepted limit: a TRACKED file with that exact name is matched by
+        # path alone; only a receipt path inside the worktree is exposed, and
+        # the standard path lives under the git-dir, where status shows nothing.
+        if p == rpath:
+            return True
+        suffix = p[len(rpath) + 5:]
+        return (p.startswith(rpath + ".tmp.") and suffix.isascii()
+                and suffix.isdigit() and not os.path.isdir(p))
+
+    dirty = []
+    for rel in paths:
+        ap = os.path.realpath(os.path.join(rroot, rel))
+        if own(ap):
+            continue
+        if rel.endswith("/") and rpath.startswith(ap + os.sep):
+            # untracked DIR holding the receipt: look inside for anything else.
+            # `normal` collapses the dir; expand untracked files explicitly.
+            try:
+                lst = subprocess.run(
+                    ["git", "ls-files", "--others", "--exclude-standard",
+                     "-z", "--", rel], cwd=root, capture_output=True,
+                    check=False)
+            except OSError:
+                return "git ls-files failed"
+            if lst.returncode != 0:
+                return "git ls-files failed"
+            names = [n for n in lst.stdout.decode(
+                "utf-8", "surrogateescape").split("\0") if n]
+            others = [n for n in names
+                      if not own(os.path.realpath(os.path.join(rroot, n)))]
+            if others:
+                dirty.append(others[0])
+            continue
+        dirty.append(rel)
+    if dirty:
+        more = f" (+{len(dirty) - 1} more)" if len(dirty) > 1 else ""
+        return dirty[0] + more
+    return ""
 
 
 def _atomic_write_json(path, obj):
@@ -548,9 +690,10 @@ def main(argv=None):
     argv = argv if argv is not None else sys.argv[1:]
     receipt_path, memoize_dir = _parse_args(argv)
     root = find_repo_root()
+    pre = _snapshot(root, receipt_path) if receipt_path else None
     rc, records = _run_gates(root, memoize_dir)
     if receipt_path:
-        _write_receipt(receipt_path, root, rc, records)
+        _write_receipt(receipt_path, root, rc, records, pre)
     return rc
 
 
