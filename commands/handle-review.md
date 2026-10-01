@@ -633,14 +633,19 @@ the maintainer has explicitly declined (2026-09-22, and again 2026-09-30 on PRs 
 Decide HERE, against exactly this closed list. A pass is OWED ONLY when ONE of these holds, and
 nothing else makes it owed:
 
-- **(a)** the fix diff is DENY-AUTHORITY tier: it changes `orchestrate-guard.sh` or
-  `orchestrate-authorize-merge.sh` (a defect could PERMIT a bad push or merge). Apply `/prep-pr`
-  Step 4a's tier logic to the FIX-ROUND diff `$pre_round_head..HEAD`, NOT to the whole-branch
-  merge-base range Step 4a uses at PR time, so a doc-only round on a PR that once touched the
-  guard is not inflated to deny-authority. ADVISORY or STANDARD tier is NOT owed.
+- **(a)** the fix diff is DENY-AUTHORITY tier, as COMPUTED by `/prep-pr` Step 4a's classifier run
+  on the FIX-ROUND diff `$pre_round_head..HEAD` (not the whole-branch merge-base range Step 4a uses
+  at PR time, so a doc-only round on a PR that once touched the guard is not inflated). Use the
+  classifier's result, not a file list: it also rates a NEWLY ADDED `scripts/orchestrate-*` hook
+  deny-authority. Typical cases are a change to `orchestrate-guard.sh` or
+  `orchestrate-authorize-merge.sh` (a defect could PERMIT a bad push or merge). ADVISORY or
+  STANDARD tier is NOT owed.
 - **(b)** the round answers a hostile **DO NOT SHIP** verdict (not SHIP WITH FIXES, which ended
   review when it was issued).
 - **(c)** the maintainer asked for one, in this session, for this round.
+- **(d)** the round answers ONLY reviewers with no re-review after a fix: Greptile, or a legacy
+  Codoki finding. The default rests on Copilot/CodeRabbit re-reviewing the next push; when no
+  such reviewer covers this round, nothing independent would see the fix.
 
 If none holds, record `not owed` in the Step 9 "Fix-scoped pass" field and go straight to the
 Step 7 commit and push. Step 5.5's deterministic gate still runs; its optional review agents are
@@ -656,7 +661,7 @@ pre-round HEAD before Step 5 starts), widened where a fix reaches a shared helpe
 SHIP / SHIP WITH FIXES end it (fixes applied, gates green); DO NOT SHIP (any unfixed finding that
 would make the diff unsafe or wrong on merge, whatever its severity label) means fix, re-commit, and run another pass on the new fix diff before the push.
 
-**Not owed** (the common case): every round not matched by (a), (b) or (c) above. That
+**Not owed** (the common case): every round not matched by (a), (b), (c) or (d) above. That
 includes mechanical fixes, non-mechanical logic fixes in advisory or standard tier scripts,
 doc and test fixes, and rounds of replies with no code change.
 
