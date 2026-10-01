@@ -751,6 +751,11 @@ drives `/plugin marketplace` update-detection, so they must never diverge. The C
     (`<pre-fix HEAD>..HEAD`), widened where the fix reaches a shared helper or contract. The
     reviewer proposes the verdict; the lead may upgrade it to DO NOT SHIP, never downgrade it, and
     an unfixed merge-unsafe finding is always DO NOT SHIP.
+  - BOT-REVIEW FIX ROUNDS GET NO AGENT HOSTILE PASS BY DEFAULT. Once Copilot/CodeRabbit review a
+    PR, their next pass IS the review: fix -> gates -> push -> reply. The ONLY exceptions are
+    `commands/handle-review.md` Step 5.6's closed list (a deny-authority fix diff, a round
+    answering DO NOT SHIP, or a maintainer ask). "Not mechanical" / "changes script logic" is NOT
+    one. The same holds pre-open: SHIP WITH FIXES ends review, so never add a pass over its fixes.
   - DENY-AUTHORITY (`orchestrate-guard.sh`, `orchestrate-authorize-merge.sh` - a defect can PERMIT a
     bad push/merge): the FULL multi-lens pass per round through the ISOLATION harness, including an
     old-vs-new permit/deny differential.

@@ -623,18 +623,31 @@ wording): report and move on. Do not extend the fix scope for these.
 
 ## Step 5.6 -- Fix-scoped hostile pass (gates the push)
 
-Fix rounds are new, unreviewed code. Step 5.5 is conditional and not hostile, so it does not
-cover this. Decide HERE whether the round owes an independent, fix-scoped hostile pass per
-`engage-ralph-loop.md`; the pass itself runs inside Step 7, after the round's commit and
-BEFORE any outward step (push, reply, resolve). It is OWED when ANY of these holds:
+**DEFAULT: NOT OWED.** This command runs on a PR that a bot reviewer (Copilot and/or CodeRabbit)
+is already reviewing, and that bot's next pass IS the review of this fix round. So a bot-review fix
+round goes fix -> gates -> push -> reply -> resolve with NO agent hostile pass. "The fix is not
+mechanical", "it changes script logic", "it touches error handling", and "the fixes were outside
+the scope the last review saw" are NOT reasons to run one. Running one anyway costs an opus pass
+the maintainer has explicitly declined (2026-09-22, and again 2026-09-30 on PRs #496 and #498).
 
-- **(a)** the fix diff touches a deny-authority or advisory tier file. Apply `/prep-pr` Step 4a's
-  tier logic to the FIX-ROUND diff `$pre_round_head..HEAD`, NOT to the whole-branch merge-base
-  range Step 4a uses at PR time, so a doc-only round on a PR that once touched the guard is not
-  inflated to deny-authority.
-- **(b)** a fix is not mechanical and falls on ANY axis in Step 5.5's "When agents are merited"
-  list (every bullet there applies, including concurrency, API contract, and >~100 lines).
-- **(c)** the round answers a hostile DO NOT SHIP verdict.
+Decide HERE, against exactly this closed list. A pass is OWED ONLY when ONE of these holds, and
+nothing else makes it owed:
+
+- **(a)** the fix diff is DENY-AUTHORITY tier: it changes `orchestrate-guard.sh` or
+  `orchestrate-authorize-merge.sh` (a defect could PERMIT a bad push or merge). Apply `/prep-pr`
+  Step 4a's tier logic to the FIX-ROUND diff `$pre_round_head..HEAD`, NOT to the whole-branch
+  merge-base range Step 4a uses at PR time, so a doc-only round on a PR that once touched the
+  guard is not inflated to deny-authority. ADVISORY or STANDARD tier is NOT owed.
+- **(b)** the round answers a hostile **DO NOT SHIP** verdict (not SHIP WITH FIXES, which ended
+  review when it was issued).
+- **(c)** the maintainer asked for one, in this session, for this round.
+
+If none holds, record `not owed` in the Step 9 "Fix-scoped pass" field and go straight to the
+Step 7 commit and push. Step 5.5's deterministic gate still runs; its optional review agents are
+a separate, cheaper, non-hostile check and do not make this pass owed.
+
+When one IS owed, the pass itself runs inside Step 7, after the round's commit and BEFORE any
+outward step (push, reply, resolve).
 
 **Depth follows the tier; the round count follows the verdict:** the FULL multi-lens
 engage-ralph-loop pass (with a permit/deny differential) for deny-authority; ONE hostile,
@@ -643,10 +656,9 @@ pre-round HEAD before Step 5 starts), widened where a fix reaches a shared helpe
 SHIP / SHIP WITH FIXES end it (fixes applied, gates green); DO NOT SHIP (any unfixed finding that
 would make the diff unsafe or wrong on merge, whatever its severity label) means fix, re-commit, and run another pass on the new fix diff before the push.
 
-**Not owed** for a standard-tier round of purely mechanical fixes (Step 5.5's one-line skip
-note covers it), for a round of replies with no code change, or for a standard-tier round whose
-non-mechanical fixes fall on NO "When agents are merited" axis and that does not answer a DO NOT
-SHIP verdict.
+**Not owed** (the common case): every round not matched by (a), (b) or (c) above. That
+includes mechanical fixes, non-mechanical logic fixes in advisory or standard tier scripts,
+doc and test fixes, and rounds of replies with no code change.
 
 **Pushed before its owed pass?** Say so plainly in the next report. The late pass must still
 clear before MERGE: record it as `LATE (pending)` in the Step 9 "Fix-scoped pass" field, which

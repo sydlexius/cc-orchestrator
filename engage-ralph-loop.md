@@ -99,7 +99,9 @@ it guarded; a WARN whose remedy was causally FALSE ("name it" does not make an a
 ## Verdict + honesty
 - **Every round ends with ONE verdict: SHIP, SHIP WITH FIXES, or DO NOT SHIP.**
   - **SHIP / SHIP WITH FIXES END REVIEW:** apply the listed fixes, re-run ALL gates green, and no
-    further review round is owed. Because nothing re-reviews them, EVERY SHIP WITH FIXES item must
+    further review round is owed. Do NOT dispatch a "fix-scoped" pass over those fixes on the
+    grounds that they were outside the scope the reviewer saw: the reviewer already judged them
+    safe to apply unreviewed. Only DO NOT SHIP earns another round. Because nothing re-reviews them, EVERY SHIP WITH FIXES item must
     be safe to apply without another review (fixes are where the longest-surviving defects come
     from); a fix that is not goes under DO NOT SHIP.
   - **DO NOT SHIP earns ANOTHER round**, run as the fix-scoped follow-up above.
