@@ -698,4 +698,4 @@ The FLOOR gate also requires the hostile-critic pass (spec Testing strategy step
 
 **Type/name consistency:** matcher function names (`is_push`, `has_main_dest`, `has_bare_force`, `has_no_verify`, `is_gh_pr_merge`, `is_merge_api`, `marker_active`) are defined once and reused consistently; env vars `ORCHESTRATE_FLOOR_MARKER` / `ORCHESTRATE_FLOOR_TTL_HOURS` and the marker filename are consistent across guard, harness, and Task 7/8.
 
-**Known accepted limitations (from spec, not bugs):** `refs/heads/main` explicit-ref form and bare-push-on-main-checked-out-worktree evade (branch-protection backstop); Bash-tool-only coverage; adversarial evasion out of scope.
+**Known accepted limitations (from spec, not bugs):** `refs/heads/main` explicit-ref form (CLOSED by #480: now denied) and bare-push-on-main-checked-out-worktree evade (branch-protection backstop); Bash-tool-only coverage; adversarial evasion out of scope.

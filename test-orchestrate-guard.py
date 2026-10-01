@@ -133,6 +133,56 @@ CASES = [
     # false-positive guards
     ("branch named maintenance allowed", "git push origin maintenance # prep-pr-ok", False, "allow"),
     ("branch named domain allowed", "git push origin domain # prep-pr-ok", False, "allow"),
+    # --- #480: the FULL-REF spelling of the default branch is a push to it. Every BLOCK
+    # vector carries `# prep-pr-ok`: without it the prep-pr ADVISORY already exits 2, so the
+    # vector would pass for the WRONG reason and prove nothing about the main deny.
+    # Each shape is checked with the marker OFF and ON (Tier-1 is marker-independent).
+    *[(f"#480 {lbl} [marker={m}]", c, m, "block") for m in (False, True) for lbl, c in [
+        ("HEAD:refs/heads/main", "git push origin HEAD:refs/heads/main # prep-pr-ok"),
+        ("feat:refs/heads/main", "git push origin feat:refs/heads/main # prep-pr-ok"),
+        ("bare refs/heads/main", "git push origin refs/heads/main # prep-pr-ok"),
+        ("-u refs/heads/main:refs/heads/main",
+         "git push -u origin refs/heads/main:refs/heads/main # prep-pr-ok"),
+        ("HEAD:refs/heads/master", "git push origin HEAD:refs/heads/master # prep-pr-ok"),
+        ("feat:refs/heads/master", "git push origin feat:refs/heads/master # prep-pr-ok"),
+        ("bare refs/heads/master", "git push origin refs/heads/master # prep-pr-ok"),
+        ("-u refs/heads/master:refs/heads/master",
+         "git push -u origin refs/heads/master:refs/heads/master # prep-pr-ok"),
+    ]],
+    ("#480 single-quoted 'refs/heads/main'",
+     "git push origin 'refs/heads/main' # prep-pr-ok", False, "block"),
+    ('#480 double-quoted "HEAD:refs/heads/main"',
+     'git push origin "HEAD:refs/heads/main" # prep-pr-ok', False, "block"),
+    ("#480 git -C wt push full ref", "git -C ../wt push origin HEAD:refs/heads/main # prep-pr-ok",
+     False, "block"),
+    ("#480 safe-push.sh refs/heads/main", "scripts/safe-push.sh refs/heads/main # prep-pr-ok",
+     False, "block"),
+    ("#480 compound: build && push full ref main",
+     "make && git push origin HEAD:refs/heads/main # prep-pr-ok", False, "block"),
+    # #480 ALLOW boundary: `main` as a path SEGMENT or SUBSTRING of a longer ref is not the
+    # default branch. The deny demands the whole ref `refs/heads/main|master`, nothing longer.
+    *[(f"#480 allow {lbl} [marker={m}]", c, m, "allow") for m in (False, True) for lbl, c in [
+        ("feature/main", "git push origin feature/main # prep-pr-ok"),
+        ("refs/heads/feature/main", "git push origin refs/heads/feature/main # prep-pr-ok"),
+        ("HEAD:refs/heads/feature/main", "git push origin HEAD:refs/heads/feature/main # prep-pr-ok"),
+        ("refs/heads/maintenance", "git push origin refs/heads/maintenance # prep-pr-ok"),
+        ("refs/heads/main-fix", "git push origin refs/heads/main-fix # prep-pr-ok"),
+        ("refs/heads/mainline", "git push origin HEAD:refs/heads/mainline # prep-pr-ok"),
+        ("refs/heads/master-x", "git push origin refs/heads/master-x # prep-pr-ok"),
+        ("mainline", "git push origin mainline # prep-pr-ok"),
+        # safe-push's own #466 full-refspec form, for a NON-default branch
+        ("safe-push full refspec feat",
+         "git push origin refs/heads/feat:refs/heads/feat # prep-pr-ok"),
+        ("safe-push full refspec feature/main",
+         "git push origin refs/heads/feature/main:refs/heads/feature/main # prep-pr-ok"),
+    ]],
+    # a full-ref main in a NON-push clause / read-only command stays allowed
+    ("#480 allow git log refs/heads/main..HEAD (read-only)",
+     "git log refs/heads/main..HEAD", False, "allow"),
+    ("#480 allow git rev-parse refs/heads/main (read-only)",
+     "git rev-parse refs/heads/main", False, "allow"),
+    ("#480 allow compound: rev-parse full ref && push feat",
+     "git rev-parse refs/heads/main && git push origin feat # prep-pr-ok", False, "allow"),
     ("feature branch push (advisory only, has override)",
      "git push origin feat # prep-pr-ok", False, "allow"),
     # Tier-1 force / no-verify: blocked ALWAYS

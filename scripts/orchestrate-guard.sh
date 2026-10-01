@@ -147,6 +147,7 @@ if [ "${1:-}" = "--assert-coverage" ]; then
   # Each entry: <label>|<command that MUST be blocked>. Payloads live in this string table,
   # never on a Bash command line (the live hook greps command lines - see CLAUDE.md ISOLATION).
   ac_vectors="push-main|git push origin main
+push-main-full-ref|git push origin HEAD:refs/heads/main # prep-pr-ok
 push-force|git push --force origin feat
 safe-push-main|scripts/safe-push.sh main
 safe-push-sq-advisory|bash '/x/scripts/safe-push.sh' feat
@@ -422,11 +423,24 @@ is_tag_only_push() {
 # main/master as a push DESTINATION: whole word, boundary = start/space/colon/quote.
 # Quotes catch `git push origin 'main'` / "main" (the shell strips them, so it IS a
 # push to main); the right-side colon catches a refspec (feat:main, HEAD:main). Slash
-# is deliberately excluded so feature/main and refs/heads/main are NOT matched (the
-# explicit-ref form is a non-obvious spelling, branch-protection backstop). A branch
-# named maintenance/domain/main-ci is NOT matched (the boundary excludes substrings).
+# is deliberately NOT a left boundary, so feature/main and refs/heads/feature/main are
+# NOT matched. A branch named maintenance/domain/main-ci is NOT matched (the boundary
+# excludes substrings).
+#
+# (#480) The FULL-REF spelling `refs/heads/main|master` IS matched: an optional literal
+# `refs/heads/` prefix may sit between the left boundary and the branch word, so
+# `HEAD:refs/heads/main`, `feat:refs/heads/main`, a bare `refs/heads/main` and
+# `refs/heads/main:refs/heads/main` all deny. This was previously a deliberate carve-out
+# ("a non-obvious spelling, branch-protection backstop"); it was reversed because #466 made
+# safe-push emit the full-refspec shape routinely, so it is no longer non-obvious, and a
+# push-to-default deny that one spelling slips past is not a deny. It demands the EXACT
+# literal whole ref - no other prefix (`heads/main`, `refs/remotes/...`) is reconstructed
+# from git's refspec rules, and the right boundary is unchanged, so refs/heads/maintenance,
+# refs/heads/main-fix and refs/heads/feature/main stay ALLOWED. Known residual (pre-existing,
+# applies equally to the bare name): a `+` force-refspec prefix (`+main`, `+refs/heads/main`)
+# is not a boundary; `+HEAD:refs/heads/main` IS caught via the colon.
 has_main_dest() {
-  printf '%s' "$cmd" | grep -Eq '(^|[[:space:]:'\''"])(main|master)([[:space:]:'\''"]|$)'
+  printf '%s' "$cmd" | grep -Eq '(^|[[:space:]:'\''"])(refs/heads/)?(main|master)([[:space:]:'\''"]|$)'
 }
 
 # bare --force or -f, but NOT --force-with-lease (substring trap)
