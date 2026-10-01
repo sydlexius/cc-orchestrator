@@ -734,17 +734,38 @@ elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh' ]; then leg=plugin
 elif [ -f ~/.claude/scripts/safe-push.sh ]; then leg=stable
 else leg=none; fi
 gate_rc=2; push_rc=2
+# A fix round is by definition on a REVIEWED PR, so pass --stale-ok (#492): a refresh now would dismiss the
+# bot's prior approval and disturb the incremental-review delta, so safe-push pushes behind with a WARN
+# instead of refusing. --base <name> ONLY when the PR's base differs from the repo default branch.
+base_flag=""
+pr_base=$(gh pr view "$pr_number" --json baseRefName --jq .baseRefName 2>/dev/null || true)
+def_base=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+def_base="${def_base#origin/}"
+if [ -n "$pr_base" ] && [ -n "$def_base" ] && [ "$pr_base" != "$def_base" ]; then base_flag="--base $pr_base"
+elif [ -n "$pr_base" ] && [ -z "$def_base" ]; then base_flag="--base $pr_base"; fi
 [ "$leg" = repo ]   && { python3 scripts/gate-runner.py --receipt "$RECEIPT_PATH"; gate_rc=$?; }
 [ "$leg" = plugin ] && { python3 '${CLAUDE_PLUGIN_ROOT}/scripts/gate-runner.py' --receipt "$RECEIPT_PATH"; gate_rc=$?; }
 [ "$leg" = stable ] && { python3 ~/.claude/scripts/gate-runner.py --receipt "$RECEIPT_PATH"; gate_rc=$?; }
-[ "$gate_rc" = 0 ] && [ "$leg" = repo ]   && { bash scripts/safe-push.sh "$(git branch --show-current)"; push_rc=$?; }
-[ "$gate_rc" = 0 ] && [ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh' "$(git branch --show-current)"; push_rc=$?; }
-[ "$gate_rc" = 0 ] && [ "$leg" = stable ] && { bash ~/.claude/scripts/safe-push.sh "$(git branch --show-current)"; push_rc=$?; }
+[ "$gate_rc" = 0 ] && [ "$leg" = repo ]   && { bash scripts/safe-push.sh "$(git branch --show-current)" --stale-ok $base_flag; push_rc=$?; }
+[ "$gate_rc" = 0 ] && [ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh' "$(git branch --show-current)" --stale-ok $base_flag; push_rc=$?; }
+[ "$gate_rc" = 0 ] && [ "$leg" = stable ] && { bash ~/.claude/scripts/safe-push.sh "$(git branch --show-current)" --stale-ok $base_flag; push_rc=$?; }
 [ "$leg" = none ]   && echo "safe-push.sh not found (repo-local, plugin, or ~/.claude/scripts/); NOT pushing" >&2
 [ "$leg" != none ] && [ "$gate_rc" != 0 ] && echo "gate FAILED (gate_rc=$gate_rc); NOT pushing - fix, commit, re-run this block" >&2
 echo "gate_rc=$gate_rc push_rc=$push_rc leg=$leg"
 (exit "$push_rc")  # prep-pr-ok
 ```
+
+If the push printed the `WARN` that it went out BEHIND the base, the refresh is still owed (#492),
+and its ORDER matters: do it only AFTER this round's replies (Step 7) and resolves (Step 8) are
+done, because a HEAD-moving commit dismisses the bot's prior approval. Then run
+`gh pr update-branch "$pr_number"` (default merge-commit mode, NEVER `--rebase`: a rebase orphans
+every cited fix SHA), and RE-ARM `/pr-watch` on the new head (a watch armed before the refresh is
+stale). THEN bring the worktree current before ANY further commit: `git fetch origin && git merge --ff-only origin/<branch>`
+(update-branch adds a merge commit on the remote that the local branch lacks, so without this resync
+the next round's safe-push refuses the branch as diverged / not in local history). Under the CR
+auto-review-ON (reply-first, Step 8.5) variant the post-resolve update-branch moves HEAD and
+re-triggers a CR review, so prefer to defer the refresh to just before merge there. When the push
+printed no such WARN, nothing is owed.
 
 The trailing `# prep-pr-ok` satisfies the floor's push advisory; what backs it is the gate
 run on the line above it and safe-push's receipt check. Never pipe this block (a pipeline
@@ -968,6 +989,8 @@ freehand. Compute each field from the data already collected in earlier steps:
 | Branch | `git branch --show-current` |
 | Resolved | whether CR resolve was posted + Copilot/Greptile threads resolved |
 | Fix-scoped pass | Step 5.6: `not owed` / `cleared before push` / `LATE (pending)` |
+
+If the push printed the behind WARN: update-branch after Step 8, then resync the worktree (see Step 7 note).
 
 Assemble and print:
 
