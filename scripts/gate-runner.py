@@ -495,7 +495,9 @@ def _write_receipt(path, root, rc, records, pre):
         "commit_sha": pre_commit,
         "tree_sha": pre_tree,
         "worktree": root,
-        # verdict chosen HERE from the tool's own overall exit code.
+        # verdict chosen HERE: pass needs the tool's own exit code 0 AND no
+        # receipt invariant tripped (`reason` empty: clean before and after,
+        # tree unchanged). Do not reduce this to the exit code alone.
         "result": "pass" if (rc == 0 and not reason) else "fail",
         "steps": records,
         "producer": "gate-runner",
