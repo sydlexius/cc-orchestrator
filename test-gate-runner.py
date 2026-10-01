@@ -687,6 +687,31 @@ def test_receipt_review_round_498():
         r = _load_receipt(rpath) if os.path.isfile(rpath) else {}
         check("receipt(498): a non-pid .tmp look-alike is still dirt (fail)",
               r.get("result") == "fail")
+    # Round-2 review: a DIRECTORY named like the tmp file must not hide its
+    # contents (git reports it as one `name/` entry; realpath strips the slash).
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, "ok.sh", "#!/bin/sh\nexit 0\n", executable=True)
+        write(root, ".gates.toml", '[prep_pr]\ngate = "sh ok.sh"\n')
+        git_commit(root)
+        rpath = os.path.join(root, "receipt.json")
+        write(root, "receipt.json.tmp.123/payload.sh", "echo evil\n")
+        rc, out = run_runner(root, args=("--receipt", rpath))
+        r = _load_receipt(rpath) if os.path.isfile(rpath) else {}
+        check("receipt(498): a DIRECTORY named <receipt>.tmp.<n>/ is dirt (fail)",
+              r.get("result") == "fail")
+    # Round-2 review (M1): the untracked-DIR leg also ignores the tmp leftover.
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, "ok.sh", "#!/bin/sh\nexit 0\n", executable=True)
+        write(root, ".gates.toml", '[prep_pr]\ngate = "sh ok.sh"\n')
+        git_commit(root)
+        rpath = os.path.join(root, "out", "receipt.json")
+        write(root, "out/receipt.json.tmp.123", "{}")
+        rc, out = run_runner(root, args=("--receipt", rpath))
+        r = _load_receipt(rpath) if os.path.isfile(rpath) else {}
+        check("receipt(498): tmp leftover beside a receipt in an untracked dir (pass)",
+              r.get("result") == "pass")
 
 
 def test_receipt_snapshot_before_run_toctou():

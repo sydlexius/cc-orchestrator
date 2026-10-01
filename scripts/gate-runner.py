@@ -573,8 +573,18 @@ def _tree_dirty_excluding(root, receipt_path):
         # (`<receipt>.tmp.<pid>`; an interrupted write can leave one). Without
         # the tmp leg, one interrupted write inside the worktree turned every
         # later clean gate into result=fail (PR #498 review).
-        return p == rpath or (p.startswith(rpath + ".tmp.")
-                              and p[len(rpath) + 5:].isdigit())
+        # The tmp leg matches ONLY a plain FILE with an ASCII-digit suffix:
+        # git reports a whole untracked DIRECTORY as one `name/` entry, and
+        # realpath strips the slash, so without the isdir test a directory
+        # named `<receipt>.tmp.123/` would hide every file inside it.
+        # Accepted limit: a TRACKED file with that exact name is matched by
+        # path alone; only a receipt path inside the worktree is exposed, and
+        # the standard path lives under the git-dir, where status shows nothing.
+        if p == rpath:
+            return True
+        suffix = p[len(rpath) + 5:]
+        return (p.startswith(rpath + ".tmp.") and suffix.isascii()
+                and suffix.isdigit() and not os.path.isdir(p))
 
     dirty = []
     for rel in paths:
