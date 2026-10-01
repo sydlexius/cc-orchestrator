@@ -112,16 +112,25 @@ If either is exceeded, **stop** and say:
 > 1. **Split into multiple PRs by issue/concern (preferred).** Open
 >    follow-up issues for the unbundled work, scope this PR to one
 >    concern, drop the rest from the branch.
-> 2. **Override and proceed** (only if the size is truly cohesive — e.g.
+> 2. **Dependent stack (fallback only).** Only if the split cannot be
+>    clean (a later slice cannot compile or test without an earlier one):
+>    run this gate on EACH branch, then create the stack with
+>    `gh stack init/add/submit`, and say in each PR body why a clean split
+>    was impossible. Stacks are tolerated, not preferred; see the
+>    SKILL.md "STACKED PRS ARE TOLERATED, NOT PREFERRED" bullet.
+> 3. **Override and proceed** (only if the size is truly cohesive, e.g.
 >    a single protocol implementation that can't be partitioned without
 >    breaking atomicity). Provide a rationale; it will be captured in
 >    the PR body's Summary section.
 >
-> How do you want to proceed? (split / override <rationale>)"
+> How do you want to proceed? (split / stack / override <rationale>)"
 
 Wait for the answer.
 - If "split": stop. Do not run further gates. Help the user split if
   asked, but the default is to let them drive.
+- If "stack": stop; the dependent slices are cut first, then `/prep-pr`
+  runs on each branch (this gate re-runs per slice), and the lead agrees
+  the stack before `gh stack init/add/submit`.
 - If "override <rationale>": record the rationale verbatim, include it
   as a line in the Step 8b Summary section ("Size override: <rationale>"),
   and continue to Step 2.
