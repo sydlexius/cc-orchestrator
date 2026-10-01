@@ -640,6 +640,14 @@ clean-worktree check, so an unchanged committed tree skips re-running it
 `pr-unreplied-comments` steps are excluded (they flip at constant HEAD). See
 `skills/orchestrate/templates/gates.toml.md`.
 
+Parallel steps (#501): `[prep_pr] jobs = N` / `--jobs N` (CLI wins; absent or 1
+= the serial path, byte-identical) runs Form B steps concurrently, with output
+captured per step and printed in declaration order, and the first required
+failure killing every in-flight process group. A step marked `exclusive = true`
+runs with nothing else in flight. This repo sets `jobs = 4` (several worktrees
+often gate at once) with `test-orchestrate-steer` and `test-elmer-tick`
+exclusive; a consumer repo must audit its steps for shared state first.
+
 ```sh
 shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/orchestrate-authorize-merge.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh scripts/base-freshness.sh scripts/open-pr-staleness-sweep.sh scripts/run-paths.sh scripts/cr-quota-watch.sh scripts/elmer-enqueue.sh scripts/elmer-triage.sh scripts/elmer-tick.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
 ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py scripts/settings-scrub.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-ci-gates-lockstep.py test-steer-nudge-length.py test-helper-deploy-coverage.py test-jq-quoting.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-safe-push-freshness.py test-prep-pr-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py test-cr-quota-watch.py test-elmer-enqueue.py test-elmer-triage.py test-elmer-tick.py test-bash32-constructs.py test-settings-scrub.py

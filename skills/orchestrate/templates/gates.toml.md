@@ -60,10 +60,46 @@ Per-step keys:
 | `required`       | bool    | `true`  | `true` (or omitted): a non-zero exit is a HARD failure -- the runner stops and exits non-zero. `false`: a non-zero exit is a SOFT failure -- the runner prints `[FAIL]` (warn), keeps going, and does NOT fail the overall run on this step alone. |
 | `skip_if_absent` | string  | (none)  | A binary / tool name. If it is NOT found on `PATH` (`shutil.which`), the step is SKIPPED (`[SKIP] <name>: <tool> not on PATH`), not failed. For an optional linter/tool whose absence should not block. |
 | `skip_if`        | string  | (none)  | A glob (evaluated recursively from the repo root). If the glob matches ZERO files, the step is SKIPPED (`[SKIP] <name>: no files match <glob>`). Absence-based: skip when there is nothing to check (e.g. skip a UI lint when `web/**` matches nothing). |
+| `exclusive`      | bool    | `false` | Parallel runs only (see `jobs` below): the step starts only when no other step is in flight, and nothing else starts until it finishes. For a timing-sensitive or contention-sensitive step. A non-bool value exits 2. |
 | `pure`           | bool    | `false` | Opt into pure-oracle memoization (see below). Mark `true` ONLY for a step whose result is a pure function of the COMMITTED TREE -- a static analysis / self-contained test suite over tracked files that reads nothing else. It is an explicit allowlist: a step is memoizable ONLY if it declares `pure = true`. Default (`false`/omitted) = never memoized. |
 
 Predicate evaluation order: `skip_if_absent` and `skip_if` are both evaluated
 BEFORE the command runs. If either triggers a skip, `run` is not executed.
+
+### Parallel steps (`jobs`, #501)
+
+`[prep_pr] jobs = <int>` (default 1) or `gate-runner.py --jobs N` (the CLI wins;
+`--jobs 1` forces serial) runs up to N Form B steps at once. Absent or 1 keeps
+the serial path, byte-identical to a runner without this feature. Anything but a
+positive integer exits 2. Form A and the fallback chain ignore it and stay
+serial.
+
+**Before enabling `jobs`, AUDIT EVERY STEP FOR SHARED STATE.** Steps that were
+written to run alone can collide when run together: a shared `HOME` or config
+dir, fixed temp paths, a fixed port, a lock file, or anything that writes to the
+real repo or the real `~/.claude`. Fix the collision or mark the step
+`exclusive = true`. That is why `jobs` is opt-in.
+
+With `jobs` > 1:
+
+- All steps are validated before anything launches.
+- Steps launch in declaration order. A step blocked on capacity or on an
+  `exclusive` barrier holds back every later step (no reordering).
+- Skip predicates and memo lookups run in the runner before launch; a memo
+  entry is written on PASS only.
+- Each step gets `stdin` from `/dev/null`, and its stdout and stderr go, merged,
+  to a per-step temp file. A finished step prints as one block (its output, then
+  its usual `[PASS]`/`[FAIL]` line), strictly in declaration order: step k
+  prints only after steps 0..k-1.
+- The first REQUIRED failure stops new launches, sends SIGTERM to every in-flight
+  step's process group, then SIGKILL after a 3s grace. Cancelled steps print a
+  `[FAIL] <name> (cancelled, ...)` line, their partial output is discarded, and
+  they are recorded as failures (`"cancelled": true`). Then the runner logs
+  `HARD failure at <name> -- stopping.` and exits 1. A `required = false` failure
+  still warns and continues. Ctrl-C (or SIGTERM to the runner) kills every group.
+- The receipt is written only after every child has exited. `steps[]` stays in
+  declaration order; a fail receipt may include steps declared after the
+  failing one.
 
 ### Pure-oracle memoization (`pure = true` + `--memoize-dir`)
 
