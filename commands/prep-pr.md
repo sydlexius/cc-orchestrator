@@ -270,8 +270,10 @@ to it:
 #
 # --receipt writes a schema-validated `gate-receipt/v1` as a BYPRODUCT of the real
 # gate run (it never changes the gate's verdict or exit code; a receipt failure
-# only WARNs). The receipt binds this gate result to the exact commit it ran on,
-# which is what lets a later consumer verify a gate-pass instead of trusting a
+# only WARNs). The receipt records the commit and tree the run STARTED on, and
+# a pass requires that same `HEAD^{tree}`, clean, at both ends of the run (a
+# tree check, not a commit check; see the accepted mid-run window, #497), which
+# is what lets a later consumer verify a gate-pass instead of trusting a
 # claim -- see "What the receipt is for" below.
 # NOTE: `$(git rev-parse --git-dir)`, never a literal `.git/`. In a WORKTREE `.git`
 # is a FILE (it points at .git/worktrees/<name>), so a literal path is unwritable

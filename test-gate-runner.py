@@ -714,6 +714,74 @@ def test_receipt_review_round_498():
               r.get("result") == "pass")
 
 
+def test_receipt_unresolvable_head_removes_stale():
+    # #497: when the pre-run HEAD/tree cannot resolve (git missing, not a repo,
+    # no commit), no receipt is written -- and an OLDER pass at the path must
+    # not survive either, or a consumer reads it as this run's verdict.
+    # (a) direct: the unresolvable-snapshot branch of _write_receipt.
+    mod = _load_runner_module()
+    with tempfile.TemporaryDirectory() as root:
+        rpath = os.path.join(root, "r.json")
+        with open(rpath, "w") as f:
+            json.dump({"result": "pass"}, f)
+        mod._write_receipt(rpath, root, 0, [], (None, None, "git status failed"))
+        check("receipt(497 a): unresolvable HEAD removes an older pass",
+              not os.path.exists(rpath))
+    # (b) end-to-end: git absent from PATH, a pass receipt from an earlier run
+    # sits at the path. The gate still runs and its exit code is unchanged.
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, "ok.sh", "#!/bin/sh\nexit 0\n", executable=True)
+        write(root, ".gates.toml", '[prep_pr]\ngate = "sh ok.sh"\n')
+        git_commit(root)
+        rpath = os.path.join(root, ".git", "receipt.json")
+        rc, out = run_runner(root, args=("--receipt", rpath))
+        check("receipt(497 b): seeded a real pass receipt",
+              os.path.isfile(rpath) and _load_receipt(rpath).get("result") == "pass")
+        rc, out = run_runner(root, drop_tools=("git",), args=("--receipt", rpath))
+        check("receipt(497 b): git missing -> gate exit unchanged (0)", rc == 0)
+        check("receipt(497 b): git missing -> warns about skipping receipt",
+              "skipping gate receipt" in out)
+        check("receipt(497 b): git missing -> older pass receipt does not survive",
+              not os.path.exists(rpath))
+    # (c) the unlink itself FAILS (#510 review): it must warn, say so in the
+    # skip message, and never claim the stale pass is gone. os.unlink is forced
+    # to raise rather than chmod-ing a dir, which a root uid would ignore.
+    import io, contextlib
+    mod = _load_runner_module()
+    with tempfile.TemporaryDirectory() as root:
+        rpath = os.path.join(root, "r.json")
+        with open(rpath, "w") as f:
+            json.dump({"result": "pass"}, f)
+        real_unlink = mod.os.unlink
+        def _deny(p):
+            raise PermissionError(13, "Permission denied", p)
+        buf = io.StringIO()
+        mod.os.unlink = _deny
+        try:
+            with contextlib.redirect_stderr(buf):
+                mod._write_receipt(rpath, root, 0, [], (None, None, "git status failed"))
+        finally:
+            mod.os.unlink = real_unlink
+        err = buf.getvalue()
+        check("receipt(497 c): failed unlink warns with the path",
+              "could not remove older gate receipt" in err and rpath in err)
+        check("receipt(497 c): skip message admits the receipt could not be removed",
+              "could NOT be removed" in err)
+        check("receipt(497 c): failed unlink leaves the file (no false claim)",
+              os.path.exists(rpath))
+        mod.os.unlink = _deny
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                failed = mod._remove_stale(rpath)
+        finally:
+            mod.os.unlink = real_unlink
+        check("receipt(497 c): _remove_stale returns False when the unlink fails",
+              failed is False)
+        check("receipt(497 c): _remove_stale returns True when nothing is there",
+              mod._remove_stale(os.path.join(root, "nope.json")) is True)
+
+
 def test_receipt_snapshot_before_run_toctou():
     # #481 review round 1: HEAD/tree/dirtiness are sampled BEFORE the run too.
     # (a) a dirty tracked edit the gate itself discards mid-run must not pass.
@@ -1050,6 +1118,7 @@ def main():
         test_receipt_status_error_is_dirty,
         test_receipt_snapshot_before_run_toctou,
         test_receipt_review_round_498,
+        test_receipt_unresolvable_head_removes_stale,
         test_memoize_pure_step_skipped_second_run, test_memoize_dirty_worktree_reruns,
         test_memoize_untracked_input_reruns,
         test_memoize_impure_step_never_cached, test_memoize_failing_pure_not_cached,

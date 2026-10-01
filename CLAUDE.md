@@ -619,13 +619,18 @@ absent; #229): `--receipt <path>` writes a schema-validated `gate-receipt/v1`
 receipt (from `scripts/orchestrate_schemas.py`) as a BYPRODUCT of the real gate
 run - `{commit_sha, tree_sha, worktree, result, steps[], producer}`, atomic
 `os.replace`, FAIL-OPEN (a receipt failure never changes the gate exit code; a
-non-git dir just skips it). `result=pass` requires ALL of (#481): exit code 0, a
+non-git dir or a missing git writes none and, since #497, attempts to unlink any
+older receipt at the path, WARNing if that fails). `result=pass` requires ALL of (#481): exit code 0, a
 clean worktree BEFORE and AFTER the run, and an unchanged `HEAD^{tree}` across it
 (the receipt file and its `.tmp.<pid>` leftover are ignored; a `git status` error
 counts as dirty). Anything else is `result=fail`, carrying a `reason` when an
 invariant tripped, and any older receipt at the path is unlinked first on every
 non-pass, because the gate tested the working tree while the receipt binds
-`HEAD^{tree}`. `commit_sha`/`tree_sha` are the PRE-run values. The floor
+`HEAD^{tree}`. `commit_sha`/`tree_sha` are the PRE-run values. ACCEPTED WINDOW
+(#497): the checks are point-in-time, pre and post, so content that existed only
+MID-run (edited and reverted while the gate ran) is tested but never bound, and
+still passes; an isolated export of `HEAD^{tree}` would close it and was declined
+(needs a concurrent editor, outside the honest-actor model). The floor
 is NEVER taught to read the receipt. `--memoize-dir <dir>` opts into conservative
 PURE-oracle memoization: a `.gates.toml` step marked `pure = true` (explicit
 allowlist; default false) whose PASS is memoized keyed on `HEAD^{tree}` + a live
