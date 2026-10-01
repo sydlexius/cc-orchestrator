@@ -222,9 +222,14 @@ will: parse all unreplied bot comments, fix in one pass, reply in batch,
 and push once.
 
 After handle-review returns, check whether it actually pushed AND the
-remote received the new commit (per `feedback-use-safe-push` --
-handle-review's internal push uses raw `git push`, which can silently
-fail through pipe-swallow):
+remote received the new commit (a belt-and-braces check on top of
+handle-review's own gated push through `safe-push.sh`; a pipe-swallowed
+push can still read as success). Ordering note (#458): in the standing
+case (CR auto-review OFF) handle-review pushes first, then replies and
+resolves. Under the reply-first EXCEPTION (CR auto-review ON) it runs
+commit -> pass -> reply -> push -> guard-slice -> resolve: guard-slice
+needs the pushed SHA, so it runs AFTER the push and gates the resolve,
+not the replies:
 
 ```bash
 post_head=$(git -C "$worktree" rev-parse HEAD)

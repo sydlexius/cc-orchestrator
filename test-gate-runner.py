@@ -564,6 +564,157 @@ def test_receipt_result_fail_still_written():
               orchestrate_schemas.validate("gate-receipt/v1", r) == [])
 
 
+def test_receipt_dirty_tree_never_passes():
+    # #481 R7: a gate that ran on a DIRTY worktree must not leave a pass receipt
+    # (the receipt binds HEAD^{tree}, which the gate did not test).
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, "ok.sh", "#!/bin/sh\nexit 0\n", executable=True)
+        write(root, ".gates.toml", '[prep_pr]\ngate = "sh ok.sh"\n')
+        git_commit(root)
+        rpath = os.path.join(root, "receipt.json")
+        # Clean first: a real pass receipt exists (and is untracked: must not
+        # count as dirt itself).
+        rc, out = run_runner(root, args=("--receipt", rpath))
+        check("receipt(dirty): clean run passes", rc == 0)
+        check("receipt(dirty): clean run, untracked receipt ignored -> pass",
+              _load_receipt(rpath).get("result") == "pass")
+        # Re-run with the previous (untracked) receipt present: still a pass.
+        rc, out = run_runner(root, args=("--receipt", rpath))
+        check("receipt(dirty): re-run beside its own old receipt -> pass",
+              _load_receipt(rpath).get("result") == "pass")
+        # Now dirty the tree: untracked file.
+        write(root, "stray.txt", "x\n")
+        rc, out = run_runner(root, args=("--receipt", rpath))
+        check("receipt(dirty): gate exit unchanged (0)", rc == 0)
+        r = _load_receipt(rpath) if os.path.isfile(rpath) else {}
+        check("receipt(dirty): stale pass receipt does not survive",
+              r.get("result") != "pass")
+        check("receipt(dirty): result == fail with a stated reason",
+              r.get("result") == "fail" and bool(r.get("reason")))
+        check("receipt(dirty): still schema-valid",
+              orchestrate_schemas.validate("gate-receipt/v1", r) == [])
+        os.unlink(os.path.join(root, "stray.txt"))
+        # Tracked modification.
+        write(root, "ok.sh", "#!/bin/sh\nexit 0\n# edit\n", executable=True)
+        rc, out = run_runner(root, args=("--receipt", rpath))
+        r = _load_receipt(rpath)
+        check("receipt(dirty): tracked edit -> not pass", r.get("result") == "fail")
+
+
+def test_receipt_path_in_untracked_dir_not_dirty():
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, "ok.sh", "#!/bin/sh\nexit 0\n", executable=True)
+        write(root, ".gates.toml", '[prep_pr]\ngate = "sh ok.sh"\n')
+        git_commit(root)
+        rpath = os.path.join(root, "out", "receipt.json")
+        os.makedirs(os.path.dirname(rpath))
+        rc, out = run_runner(root, args=("--receipt", rpath))
+        check("receipt(untracked dir): rc 0", rc == 0)
+        check("receipt(untracked dir): receipt alone is not dirt -> pass",
+              os.path.isfile(rpath) and _load_receipt(rpath).get("result") == "pass")
+        rc, out = run_runner(root, args=("--receipt", rpath))
+        check("receipt(untracked dir): re-run beside its old receipt -> pass",
+              _load_receipt(rpath).get("result") == "pass")
+        write(root, "out/other.txt", "x\n")
+        rc, out = run_runner(root, args=("--receipt", rpath))
+        check("receipt(untracked dir): sibling untracked file IS dirt",
+              _load_receipt(rpath).get("result") == "fail")
+
+
+def test_receipt_status_error_is_dirty():
+    # Doubt = dirty: if `status` cannot run (corrupt index) there is no pass.
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, "ok.sh", "#!/bin/sh\nexit 0\n", executable=True)
+        write(root, ".gates.toml", '[prep_pr]\ngate = "sh ok.sh"\n')
+        git_commit(root)
+        rpath = os.path.join(root, "receipt.json")
+        with open(os.path.join(root, ".git", "index"), "wb") as f:
+            f.write(b"garbage-not-an-index")
+        rc, out = run_runner(root, args=("--receipt", rpath))
+        check("receipt(status error): gate exit unchanged (0)", rc == 0)
+        check("receipt(status error): receipt written (HEAD resolves)",
+              os.path.isfile(rpath))
+        r = _load_receipt(rpath) if os.path.isfile(rpath) else {}
+        check("receipt(status error): never a pass", r.get("result") == "fail")
+
+
+def test_receipt_snapshot_before_run_toctou():
+    # #481 review round 1: HEAD/tree/dirtiness are sampled BEFORE the run too.
+    # (a) a dirty tracked edit the gate itself discards mid-run must not pass.
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, "a.txt", "clean\n")
+        write(root, ".gates.toml",
+              '[prep_pr]\ngate = "git checkout -- a.txt"\n')
+        git_commit(root)
+        write(root, "a.txt", "BAD\n")
+        rpath = os.path.join(root, "receipt.json")
+        rc, out = run_runner(root, args=("--receipt", rpath))
+        r = _load_receipt(rpath) if os.path.isfile(rpath) else {}
+        check("receipt(toctou a): gate exit unchanged (0)", rc == 0)
+        check("receipt(toctou a): dirty-then-reverted is not a pass",
+              r.get("result") == "fail")
+        check("receipt(toctou a): reason names dirty-before-run",
+              "dirty-before-run" in r.get("reason", ""))
+    # (b) a commit made mid-run: the tree the gate started on is not the one
+    # a post-run read would bind.
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, "a.txt", "clean\n")
+        step = ("sh -c 'echo n > n.txt && git add n.txt && git -c "
+                "user.email=t@example.com -c user.name=t commit -q -m mid'")
+        write(root, ".gates.toml", f'[prep_pr]\ngate = "{step}"\n')
+        git_commit(root)
+        pre_head = git_head(root)
+        rpath = os.path.join(root, "receipt.json")
+        rc, out = run_runner(root, args=("--receipt", rpath))
+        r = _load_receipt(rpath) if os.path.isfile(rpath) else {}
+        check("receipt(toctou b): records the PRE-run commit",
+              r.get("commit_sha") == pre_head)
+        check("receipt(toctou b): gate exit unchanged (0)", rc == 0)
+        check("receipt(toctou b): mid-run commit is not a pass",
+              r.get("result") == "fail")
+        check("receipt(toctou b): reason names tree-changed-during-run",
+              "tree-changed-during-run" in r.get("reason", ""))
+        check("receipt(toctou b): still schema-valid",
+              orchestrate_schemas.validate("gate-receipt/v1", r) == [])
+    # (c) clean and unchanged: pass, bound to the PRE-run tree.
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, "ok.sh", "#!/bin/sh\nexit 0\n", executable=True)
+        write(root, ".gates.toml", '[prep_pr]\ngate = "sh ok.sh"\n')
+        git_commit(root)
+        pre_tree = subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=root, env=git_env(root),
+            capture_output=True, text=True, check=True).stdout.strip()
+        rpath = os.path.join(root, "receipt.json")
+        rc, out = run_runner(root, args=("--receipt", rpath))
+        r = _load_receipt(rpath)
+        check("receipt(toctou c): clean unchanged -> pass",
+              r.get("result") == "pass")
+        check("receipt(toctou c): tree_sha is the pre-run tree",
+              r.get("tree_sha") == pre_tree)
+        check("receipt(toctou c): commit_sha is the pre-run HEAD",
+              r.get("commit_sha") == git_head(root))
+
+
+    # (d) the gate itself dirties the tree: dirty-after-run, not a pass.
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, "a.txt", "clean\n")
+        write(root, ".gates.toml", '[prep_pr]\ngate = "touch stray.txt"\n')
+        git_commit(root)
+        rpath = os.path.join(root, "receipt.json")
+        rc, out = run_runner(root, args=("--receipt", rpath))
+        r = _load_receipt(rpath) if os.path.isfile(rpath) else {}
+        check("receipt(toctou d): dirtied-by-gate is not a pass",
+              r.get("result") == "fail"
+              and "dirty-after-run" in r.get("reason", ""))
+
+
 def test_receipt_steps_records_match():
     with tempfile.TemporaryDirectory() as root:
         git_init(root)
@@ -821,6 +972,10 @@ def main():
         test_receipt_schema_valid_on_pass, test_receipt_result_fail_still_written,
         test_receipt_steps_records_match, test_receipt_malformed_form_b_config_error,
         test_receipt_non_git_fail_open,
+        test_receipt_dirty_tree_never_passes,
+        test_receipt_path_in_untracked_dir_not_dirty,
+        test_receipt_status_error_is_dirty,
+        test_receipt_snapshot_before_run_toctou,
         test_memoize_pure_step_skipped_second_run, test_memoize_dirty_worktree_reruns,
         test_memoize_untracked_input_reruns,
         test_memoize_impure_step_never_cached, test_memoize_failing_pure_not_cached,
