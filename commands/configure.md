@@ -1,6 +1,6 @@
 ---
 description: "Preview and apply orchestrate-setup configure (floor hook, helpers, agents), then run doctor"
-argument-hint: "[--apply] [--no-steer] [--no-ctxmeter]"
+argument-hint: "[--apply] [--yes] [--no-steer] [--no-ctxmeter]"
 allowed-tools: ["Bash"]
 ---
 
@@ -27,9 +27,9 @@ Build `FLAGS` yourself by typing ONLY the literal names `--no-steer` and/or `--n
 ones present (empty otherwise). Never paste any user text into a command; `--apply` and `--yes`
 never go into `FLAGS` (Step 4 passes them itself).
 
-- No `--apply`: Step 3 shows the preview, then asks.
-- `--apply` present: Step 3 still runs and SHOWS the preview first; then go straight to Step 4
-  without asking. The typed `--apply` is the explicit yes; say so in one line.
+- Every run: Step 3 shows the preview, then asks ONE question; Step 4 runs only on an explicit yes.
+  A typed `--apply` (with or without `--yes`) does NOT skip the question: it only says the user
+  expects to apply, and the answer to the question after the preview is still the gate (#504).
 - `--yes` without `--apply` is rejected: it has no meaning on its own. With `--apply` it is redundant
   and harmless.
 
@@ -70,17 +70,24 @@ echo "preview rc=$rc leg=$leg"
 (exit "$rc")
 ```
 
-If `rc` is nonzero, show the output and stop; do not apply. Otherwise show the user the full
-preview. If configure reports that everything already matches (its "already has the floor hook ...
-match the bundled plugin copies" line), say so and stop, even when `--apply` was passed.
+Show the user the full preview output, whatever `rc` is. Then decide:
 
-Without `--apply`, ask exactly ONE question: "Apply these changes?" The Bash tool has no tty, so
-configure's own y/N cannot be answered; the user's reply here is the only gate. Proceed to Step 4
-ONLY on an explicit yes in this session. Anything else: stop, nothing applied.
+- `rc` 2 or higher, or a Python traceback, or `leg=none`: a real error. Stop; nothing to apply.
+- `rc` 1: NOT fatal by itself. A dry run returns 1 when it found something that needs attention,
+  most often a blanket `gh pr` allow-rule shadowing the merge gate that `--apply` would narrow
+  (`_narrow_merge_gate_shadows`). If the output shows a change `--apply` would make, continue to
+  the question. If it says the remaining item needs a HUMAN (a broader `gh *`/`*` shadow, or a file
+  that could not be scanned), say so plainly: applying will not fix that item.
+- `rc` 0 AND configure reports everything already matches (its "already has the floor hook ...
+  match the bundled plugin copies" line) AND no shadow was reported: say so and stop.
+
+Then ask exactly ONE question: "Apply these changes?" (even when `--apply` was passed). The Bash
+tool has no tty, so configure's own y/N cannot be answered; the user's reply here is the only gate.
+Proceed to Step 4 ONLY on an explicit yes in this session. Anything else: stop, nothing applied.
 
 ---
 
-## Step 4 -- Apply (after an explicit yes, or after the Step 3 preview when `--apply` was passed)
+## Step 4 -- Apply (only after an explicit yes to the Step 3 question)
 
 Substitute `FLAGS` for `<FLAGS>` (only `--no-steer` / `--no-ctxmeter`; `--apply --yes` is already in
 the command):
@@ -97,7 +104,9 @@ echo "apply rc=$rc leg=$leg"
 (exit "$rc")
 ```
 
-If `rc` is nonzero, report configure's output and stop (do not run doctor as if it applied).
+If `rc` is 2 or higher, report configure's output and stop (do not run doctor as if it applied).
+`rc` 1 after an apply means an item still needs a human (an unresolved broader shadow, a skipped
+or unwritable file): report which, then still run Step 5 so doctor shows the resulting state.
 
 ---
 
@@ -111,13 +120,18 @@ drc=2; out=""
 [ "$leg" = repo ]   && { out=$(python3 scripts/orchestrate-setup.py doctor 2>&1); drc=$?; }
 [ "$leg" = plugin ] && { out=$(python3 '${CLAUDE_PLUGIN_ROOT}/scripts/orchestrate-setup.py' doctor 2>&1); drc=$?; }
 [ "$leg" = none ]   && echo "orchestrate-setup.py not found (load via /orchestrate:configure)"
-printf '%s\n' "$out" | grep -E '^\[(FAIL|WARN)\]'
+if [ "$drc" -ne 0 ] && ! printf '%s\n' "$out" | grep -q '^\[FAIL\]'; then
+  printf '%s\n' "$out"
+else
+  printf '%s\n' "$out" | grep -E '^\[(FAIL|WARN)\]'
+fi
 echo "doctor rc=$drc leg=$leg"
 (exit "$drc")
 ```
 
-Show only the `[FAIL]` / `[WARN]` lines. Trust "none found" ONLY when `doctor rc=0`; a nonzero rc
-with no `[FAIL]` line means doctor itself failed, so show its full output. Some WARNs are standing
+Normally only the `[FAIL]` / `[WARN]` lines print. A nonzero rc with no `[FAIL]` line means doctor
+itself failed, and the block then prints its FULL output instead; report that as a doctor failure.
+Trust "none found" ONLY when `doctor rc=0`. Some WARNs are standing
 environment notes (for example tmux or Slack), not apply failures. Do not add a separate
 byte-compare: doctor's DIFFER check already covers deployed-vs-bundled drift (#292).
 
