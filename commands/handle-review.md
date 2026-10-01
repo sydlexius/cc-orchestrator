@@ -297,17 +297,30 @@ untriaged.
 ### Issue-level advisory handling
 
 If `--issue` surfaces a `github-actions[bot]` **docs-drift advisory**
-(workflow-posted, body begins with `<!-- docs-drift-bot -->`), treat it as a
-labelling decision rather than a code-fix finding:
+(workflow-posted, body begins with `<!-- docs-drift-bot -->`), it means the
+PR changed code that may affect documentation but shipped no docs change.
+On a high-risk surface the same comment is titled "merge blocked" and the
+check FAILS CI (a hard gate); the handling below is identical. The workflow
+also applies the `needs-docs-review` label. That label is a drift flag the
+workflow owns (set for the soft advisory too), not a reviewer instruction: no
+bot reviewer reads it. NEVER apply or remove `needs-docs-review` by hand; only
+the docs-drift workflow (or a similar action) manages it.
 
-- If the PR's user-visible behavior really did change but no `docs/` touch
-  is in the diff, add the docs touch in this round (the bot's intent).
-- If the PR is test-only, refactor, or otherwise has no user-visible change,
-  swap the `needs-docs-review` label to `docs: not-required` on this push.
-  The advisory clears when the label flips on the next push.
+- If the PR's user-visible behavior really did change, write the docs in this
+  round, under the path the workflow counts as docs (read its paths filter:
+  stillwater counts only `docs/site/src/**`, so a file elsewhere under
+  `docs/` does not clear it). The workflow clears the advisory and the label
+  itself on its next run.
+- Only if the PR is test-only, refactor, or otherwise has no user-visible
+  change, apply `docs: not-required` (the workflow's one sanctioned opt-out).
+  It also clears a "merge blocked" hard gate, so on a high-risk surface
+  confirm with the maintainer first. The workflow then clears the advisory and
+  the label itself on its next run.
 
 The advisory has no threaded-reply surface and no `@github-actions resolve`
-command -- it resolves itself when the next push satisfies the bot's rule.
+command -- it resolves itself on the next workflow run that satisfies the
+bot's rule (a push carrying the docs, or the `docs: not-required` label event,
+which re-runs it with no new commit).
 Do not categorise it under the bug/false-positive/etc. taxonomy.
 
 For other `github-actions[bot]` issue comments (release recaps, label-gate
