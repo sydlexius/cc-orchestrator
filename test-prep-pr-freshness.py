@@ -100,6 +100,49 @@ check("it documents the override channel", "override" in step.lower())
 check("the override rationale is carried into the PR body",
       "Base-freshness override" in step)
 
+print("\n== Step 7 / handle-review carry the verdict to safe-push (#492) ==")
+HR = os.path.join(REPO, "commands", "handle-review.md")
+hr_text = open(HR, encoding="utf-8").read()
+m7 = re.search(r"^## Step 7 -- Push\b.*?(?=^## Step 8\b)", text, re.S | re.M)
+step7 = m7.group(0) if m7 else ""
+LEG = re.compile(r'^.*\[ "\$leg" = (?:repo|plugin|stable) \].*safe-push\.sh.*$', re.M)
+push_lines7 = LEG.findall(step7)
+check("prep-pr Step 7 has the three safe-push exec legs", len(push_lines7) == 3)
+check("prep-pr Step 7 legs pass the stale flag and the base flag",
+      len(push_lines7) == 3 and all("$stale_flag" in ln and "$base_flag" in ln for ln in push_lines7))
+check("prep-pr Step 7 defaults stale_flag to EMPTY (set only on the reviewed WARN branch)",
+      re.search(r'^stale_flag=""', step7, re.M) is not None and "REVIEWED WARN branch" in step7)
+check("prep-pr Step 7 sets --stale-ok only via that carry-over (no hard-coded flag on a leg)",
+      all("--stale-ok" not in ln for ln in push_lines7) and 'stale_flag="--stale-ok"' in step7)
+check("prep-pr Step 7 passes --base ONLY when the base differs from the default branch",
+      'base_flag="--base $pr_base"' in step7 and '"$pr_base" != "$def_base"' in step7)
+check("prep-pr Step 7 resolves the PR base via baseRefName", "baseRefName" in step7)
+
+mh = re.search(r"GATED PUSH block.*?^```bash\n(.*?)^```", hr_text, re.S | re.M)
+hr_block = mh.group(1) if mh else ""
+hr_lines = LEG.findall(hr_block)
+check("handle-review gated push block has the three safe-push exec legs", len(hr_lines) == 3)
+check("handle-review legs ALL pass --stale-ok (a fix round is on a reviewed PR)",
+      len(hr_lines) == 3 and all("--stale-ok" in ln for ln in hr_lines))
+check("handle-review legs pass the base flag, resolved from baseRefName only when non-default",
+      len(hr_lines) == 3 and all("$base_flag" in ln for ln in hr_lines)
+      and "baseRefName" in hr_block and '"$pr_base" != "$def_base"' in hr_block)
+check("handle-review never hard-codes a base flag", "--base main" not in hr_text)
+check("handle-review runs gh pr update-branch AFTER replies + resolves, default mode",
+      'gh pr update-branch "$pr_number"' in hr_text and "AFTER this round's replies" in hr_text)
+check("handle-review forbids --rebase on that refresh", "NEVER `--rebase`" in hr_text)
+check("handle-review re-arms the watch on the new head", "RE-ARM `/pr-watch`" in hr_text)
+check("handle-review orders a worktree resync after update-branch (#492)",
+      "git fetch origin && git merge --ff-only origin/<branch>" in hr_text)
+import json as _json, os as _os
+_sch = _json.load(open(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                  "skills/orchestrate/templates/stack.schema.json")))
+check("stack.schema.json parses and declares stale_ok as boolean (#492)",
+      _sch["items"]["properties"].get("stale_ok", {}).get("type") == "boolean")
+for name, blk in (("prep-pr Step 7", step7), ("handle-review", hr_block)):
+    check(f"{name}: no double-quoted plugin-root or variable exec path (Helper exec paths)",
+          'bash "${CLAUDE_PLUGIN_ROOT}' not in blk and re.search(r'bash "\$(?!\()', blk) is None)
+
 print()
 if FAILS:
     print(f"FAILED ({len(FAILS)}):")

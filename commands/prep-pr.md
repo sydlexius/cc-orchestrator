@@ -827,13 +827,32 @@ elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh' ]; then leg=plugin
 elif [ -f ~/.claude/scripts/safe-push.sh ]; then leg=stable
 else leg=none; fi
 push_rc=2
-[ "$leg" = repo ]   && { bash scripts/safe-push.sh "$(git branch --show-current)"; push_rc=$?; }
-[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh' "$(git branch --show-current)"; push_rc=$?; }
-[ "$leg" = stable ] && { bash ~/.claude/scripts/safe-push.sh "$(git branch --show-current)"; push_rc=$?; }
+# Carry Step 1c's verdict here (#492; each fenced block is its OWN shell, so it is re-stated, not inherited).
+# stale_flag: set to --stale-ok ONLY when Step 1c took the REVIEWED WARN branch (review activity, or an
+# unreadable count). Left empty on every other path, so an unreviewed behind PR still hits safe-push's refusal.
+stale_flag=""
+# base_flag: --base <name> ONLY when the PR's base differs from the repo default branch (a backport/release
+# base); on a default-base PR safe-push resolves origin/HEAD itself and no flag is passed.
+base_flag=""
+pr_base=$(gh pr view --json baseRefName --jq .baseRefName 2>/dev/null || true)
+def_base=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+def_base="${def_base#origin/}"
+if [ -n "$pr_base" ] && [ -n "$def_base" ] && [ "$pr_base" != "$def_base" ]; then base_flag="--base $pr_base"
+elif [ -n "$pr_base" ] && [ -z "$def_base" ]; then base_flag="--base $pr_base"; fi
+[ "$leg" = repo ]   && { bash scripts/safe-push.sh "$(git branch --show-current)" $stale_flag $base_flag; push_rc=$?; }
+[ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh' "$(git branch --show-current)" $stale_flag $base_flag; push_rc=$?; }
+[ "$leg" = stable ] && { bash ~/.claude/scripts/safe-push.sh "$(git branch --show-current)" $stale_flag $base_flag; push_rc=$?; }
 [ "$leg" = none ]   && echo "safe-push.sh not found (repo-local, plugin, or ~/.claude/scripts/); NOT pushing" >&2
 echo "push_rc=$push_rc"
 (exit "$push_rc")  # prep-pr-ok
 ```
+
+**Step 1c carry-over (#492).** safe-push is git-only and cannot see review state, so it refuses a
+definitive BEHIND unless told otherwise. When Step 1c took the **reviewed WARN branch** (including an
+unreadable count), set `stale_flag="--stale-ok"` before running the block: the push then proceeds
+with a labeled `WARN` (count + "run `gh pr update-branch <n>` AFTER this round's replies + resolves,
+before merge"), which is exactly the refresh timing Step 1c already prescribed. After that update-branch, resync the worktree before any further commit (`git fetch origin && git merge --ff-only origin/<branch>`): the remote merge commit is absent locally and the next push would otherwise refuse as diverged. On the STOP branch
+(no PR / unreviewed) never set it. Do not set it to get past an unreviewed behind PR: refresh first.
 
 The trailing `# prep-pr-ok` is the floor guard's advisory override. The token itself is an
 INSTRUCTION-LEVEL assertion; what backs part of it is safe-push's gate-receipt check (#318),

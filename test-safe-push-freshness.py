@@ -155,6 +155,8 @@ rc, out, _, pushed = run(["feature-branch"], behind=3)
 check("behind -> non-zero exit (the push is refused)", rc != 0)
 check("the message names the behind count", "3" in out)
 check("the message names the override flag", "--stale-ok" in out)
+check("the refusal orders update-branch AFTER replies + resolves (#492)",
+      "AFTER" in out and "replies" in out and "resolves" in out)
 check("the message points at an ADDITIVE remedy", "merge" in out.lower())
 check("the message NEVER suggests --rebase (it orphans cited fix SHAs)", "--rebase" not in out)
 
@@ -162,6 +164,25 @@ print("\n== --stale-ok DECLARES intent and proceeds ==")
 rc, out, _, pushed = run(["feature-branch", "--stale-ok"], behind=3)
 check("behind + --stale-ok -> push proceeds (exit 0)", rc == 0)
 check("intent is still REPORTED, not silent", "stale" in out.lower() or "behind" in out.lower())
+
+print("\n== --stale-ok still MEASURES and WARNs on a definitive BEHIND (#492) ==")
+check("the WARN is labeled", "WARN" in out)
+check("the WARN carries the behind count", "3" in out and "behind" in out.lower())
+check("the WARN names the update-branch remedy", "gh pr update-branch" in out)
+check("the WARN orders the remedy AFTER replies + resolves, before merge",
+      "AFTER" in out and "replies" in out and "resolves" in out and "before merge" in out)
+check("the WARN never suggests --rebase", "--rebase" not in out)
+check("the old 'gate skipped' wording is gone (the gate now runs)", "gate skipped" not in out)
+rc, out_ok, gh_calls, pushed = run(["feature-branch", "--stale-ok"], behind=3)
+check("WARN path stays free of gh calls", gh_calls == "")
+rc, out_f, _, pushed = run(["feature-branch", "--stale-ok"], behind=0)
+check("--stale-ok + fresh -> exit 0, no WARN", rc == 0 and "WARN" not in out_f)
+rc, out_u, _, pushed = run(["feature-branch", "--stale-ok"], fetch_rc=1, behind=0)
+check("--stale-ok + unknown -> exit 0 and the unknown is REPORTED",
+      rc == 0 and "unknown" in out_u.lower() and "WARN" not in out_u)
+rc, out_b, _, pushed = run(["feature-branch", "--stale-ok", "--base", "release/1.2"], behind=2)
+check("--stale-ok + --base measures that base in the WARN",
+      rc == 0 and "release/1.2" in out_b and "WARN" in out_b)
 
 print("\n== --stale-ok is NOT forwarded to git push ==")
 check("--stale-ok never reaches the git push line", "--stale-ok" not in pushed)

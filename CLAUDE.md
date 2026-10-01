@@ -343,7 +343,11 @@ Runtime (`scripts/`; canonical source is this repo):
   `--base <name>` or `origin/HEAD` and never calls `gh`: a `gh` lookup would put a network
   dependency (and a rate-limit/auth failure mode) on the most-used script in the repo. So it
   cannot know whether a PR was reviewed, and the caller DECLARES intent with `--stale-ok`
-  (mirroring `--rewrite`). `--base` EXISTS SO THE OVERRIDE IS NOT THE ONLY EXIT: a backport off
+  (mirroring `--rewrite`). #492: `--stale-ok` no longer SKIPS the measurement, it downgrades a
+  definitive BEHIND to a labeled `WARN` (count + "`gh pr update-branch <n>` AFTER this round's
+  replies + resolves, before merge") and the push proceeds; the callers pass it where they know the
+  PR is reviewed (`/prep-pr` Step 7 carries Step 1c's reviewed-WARN verdict, `/handle-review`'s
+  gated push always does) and pass `--base` only for a non-default base. `--base` EXISTS SO THE OVERRIDE IS NOT THE ONLY EXIT: a backport off
   `release/1.2` measured against `origin/HEAD` yields a FALSE behind-count, and if the only escape
   were `--stale-ok`, backport authors would learn to reach for it reflexively - training an
   override to mean "dismiss the guard" rather than "the gate genuinely passed" (#345's corrosion).

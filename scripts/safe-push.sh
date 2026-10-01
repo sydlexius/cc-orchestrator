@@ -361,74 +361,80 @@ fi
 # BLOCKS ONLY ON A DEFINITIVE BEHIND (the helper's exit 1). Its exit 0 covers fresh AND
 # unknown by design, so an unreachable origin, a shallow clone, or an unresolvable base
 # DEGRADES to a report and never blocks a push.
-if [ "$stale_ok" -eq 1 ]; then
-  echo "safe-push: --stale-ok declared; base-freshness gate skipped for this push." >&2
+# --stale-ok (#492) DOWNGRADES a definitive BEHIND from a refusal to a labeled WARN; it no longer
+# SKIPS the measurement. A fix round on a reviewed PR must push behind (a refresh would dismiss
+# the bot's prior approval and orphan the incremental-review delta), but the caller still needs
+# the count and the ORDER of the remedy: refresh AFTER the round's replies + resolves.
+# Resolve the base git-only: an explicit --base wins, else the recorded default branch.
+# Never hard-coded, so a non-main base is correct by construction (the helper's contract).
+fresh_base="$base_override"
+if [ -z "$fresh_base" ]; then
+  fresh_base=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+  fresh_base="${fresh_base#origin/}"
+fi
+if [ -z "$fresh_base" ]; then
+  # origin/HEAD is commonly unset on a fresh clone. Say so and PROCEED: guessing `main`
+  # here would reintroduce exactly the hard-coded base the helper refuses to assume.
+  echo "safe-push: freshness: unknown - no base could be resolved (origin/HEAD unset; pass --base <name> to check)." >&2
 else
-  # Resolve the base git-only: an explicit --base wins, else the recorded default branch.
-  # Never hard-coded, so a non-main base is correct by construction (the helper's contract).
-  fresh_base="$base_override"
-  if [ -z "$fresh_base" ]; then
-    fresh_base=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
-    fresh_base="${fresh_base#origin/}"
-  fi
-  if [ -z "$fresh_base" ]; then
-    # origin/HEAD is commonly unset on a fresh clone. Say so and PROCEED: guessing `main`
-    # here would reintroduce exactly the hard-coded base the helper refuses to assume.
-    echo "safe-push: freshness: unknown - no base could be resolved (origin/HEAD unset; pass --base <name> to check)." >&2
+  bf=""
+  for cand in "$(dirname "$0")/base-freshness.sh" "${CLAUDE_PLUGIN_ROOT:-}/scripts/base-freshness.sh"; do
+    [ -f "$cand" ] && { bf="$cand"; break; }
+  done
+  if [ -z "$bf" ]; then
+    echo "safe-push: freshness: unknown - base-freshness.sh not found; skipping the check." >&2
   else
-    bf=""
-    for cand in "$(dirname "$0")/base-freshness.sh" "${CLAUDE_PLUGIN_ROOT:-}/scripts/base-freshness.sh"; do
-      [ -f "$cand" ] && { bf="$cand"; break; }
-    done
-    if [ -z "$bf" ]; then
-      echo "safe-push: freshness: unknown - base-freshness.sh not found; skipping the check." >&2
-    else
-      # Capture rather than inherit stdout: the helper's one labeled line is surfaced on
-      # stderr with safe-push's own prefix, keeping this wrapper's output shape stable.
-      #
-      # MEASURE THE BRANCH BEING PUSHED, NOT THE CHECKOUT (#457). safe-push pushes <branch> by
-      # NAME, so HEAD may be any other branch: measuring HEAD falsely refused a fresh branch
-      # pushed from a stale checkout and falsely passed a stale one pushed from a fresh checkout.
-      # The full refs/heads/ form is unambiguous for THIS rev-parse (a same-named tag cannot shadow
-      # it) and makes the helper's labeled line name the branch actually measured. The push below
-      # needs the same treatment separately (#466).
-      set +e
-      fresh_out=$(bash "$bf" "$fresh_base" "refs/heads/$branch" 2>&1)
-      fresh_rc=$?
-      set -e
-      case "$fresh_rc" in
-        1)
+    # Capture rather than inherit stdout: the helper's one labeled line is surfaced on
+    # stderr with safe-push's own prefix, keeping this wrapper's output shape stable.
+    #
+    # MEASURE THE BRANCH BEING PUSHED, NOT THE CHECKOUT (#457). safe-push pushes <branch> by
+    # NAME, so HEAD may be any other branch: measuring HEAD falsely refused a fresh branch
+    # pushed from a stale checkout and falsely passed a stale one pushed from a fresh checkout.
+    # The full refs/heads/ form is unambiguous for THIS rev-parse (a same-named tag cannot shadow
+    # it) and makes the helper's labeled line name the branch actually measured. The push below
+    # needs the same treatment separately (#466).
+    set +e
+    fresh_out=$(bash "$bf" "$fresh_base" "refs/heads/$branch" 2>&1)
+    fresh_rc=$?
+    set -e
+    case "$fresh_rc" in
+      1)
+        if [ "$stale_ok" -eq 1 ]; then
+          echo "safe-push: WARN - --stale-ok declared; pushing '$branch' BEHIND the base." >&2
+          echo "          $fresh_out" >&2
+          echo "          Run \`gh pr update-branch <n>\` AFTER this round's replies + resolves, before merge (default merge-commit mode, never a rebase), then resync: git fetch origin && git merge --ff-only origin/<branch>." >&2
+        else
           echo "safe-push: REFUSING a stale-base push of '$branch'." >&2
           echo "          $fresh_out" >&2
           echo "          Refresh ADDITIVELY, never with a rebase (a rewrite orphans every fix SHA cited in review replies):" >&2
           echo "            git merge origin/$fresh_base       # with '$branch' checked out" >&2
-          echo "            gh pr update-branch <n>            # for an OPEN PR (default merge-commit mode)" >&2
+          echo "            gh pr update-branch <n>            # for an OPEN PR, AFTER this round's replies + resolves (default merge-commit mode)" >&2
           echo "          Wrong base? Pass --base <name> (e.g. a backport's real base) - that is the fix, not the override." >&2
-          echo "          Deliberately uploading behind-base WIP? Re-run with --stale-ok to declare it." >&2
-          exit 1 ;;
-        0)
-          # fresh OR unknown - both non-blocking. Stay quiet on a plain 'fresh', but ALWAYS
-          # surface an unknown: a degraded answer is the one a caller most needs to see.
-          #
-          # MATCH THE FULL LABEL, NOT `*fresh*`. The word "freshness" CONTAINS "fresh", so the
-          # substring glob also matched `freshness: unknown - ...` and silently discarded every
-          # degraded report - the exact "reports nothing and is believed" failure this whole
-          # gate exists to prevent, hidden inside the gate itself. An exit-code-only assertion
-          # kept it green (CR caught it; harness assertion added alongside this fix).
-          case "$fresh_out" in
-            *"freshness: fresh"*) : ;;
-            *)
-              # An `if`, not `[ -n ... ] && echo`: under `set -euo pipefail` an empty
-              # $fresh_out makes the test the arm's LAST command, so the arm returns 1 and
-              # errexit kills a push that had passed every gate.
-              if [ -n "$fresh_out" ]; then
-                echo "safe-push: $fresh_out" >&2
-              fi ;;
-          esac ;;
-        *)
-          echo "safe-push: freshness: unknown - base-freshness.sh exited $fresh_rc; proceeding." >&2 ;;
-      esac
-    fi
+          echo "          Fix round on an already-reviewed PR? Re-run with --stale-ok: it pushes behind, WARNs, and leaves the refresh for after the replies + resolves." >&2
+          exit 1
+        fi ;;
+      0)
+        # fresh OR unknown - both non-blocking. Stay quiet on a plain 'fresh', but ALWAYS
+        # surface an unknown: a degraded answer is the one a caller most needs to see.
+        #
+        # MATCH THE FULL LABEL, NOT `*fresh*`. The word "freshness" CONTAINS "fresh", so the
+        # substring glob also matched `freshness: unknown - ...` and silently discarded every
+        # degraded report - the exact "reports nothing and is believed" failure this whole
+        # gate exists to prevent, hidden inside the gate itself. An exit-code-only assertion
+        # kept it green (CR caught it; harness assertion added alongside this fix).
+        case "$fresh_out" in
+          *"freshness: fresh"*) : ;;
+          *)
+            # An `if`, not `[ -n ... ] && echo`: under `set -euo pipefail` an empty
+            # $fresh_out makes the test the arm's LAST command, so the arm returns 1 and
+            # errexit kills a push that had passed every gate.
+            if [ -n "$fresh_out" ]; then
+              echo "safe-push: $fresh_out" >&2
+            fi ;;
+        esac ;;
+      *)
+        echo "safe-push: freshness: unknown - base-freshness.sh exited $fresh_rc; proceeding." >&2 ;;
+    esac
   fi
 fi
 
