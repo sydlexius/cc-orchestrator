@@ -123,6 +123,10 @@ check("prep-pr Step 7 never hard-codes --stale-ok on a leg (it is derived)",
 md = re.search(r'^stale_flag=""\n.*?^case "\$pr_activity".*?esac\n', step7, re.S | re.M)
 derive = md.group(0) if md else ""
 check("prep-pr Step 7 derives stale_flag in-block from the PR's review activity", bool(derive))
+# The stub gh below ignores its argv, so pin the QUERY statically: it must be Step 1c's own
+# predicate (reviews + comments), or the two steps silently disagree on "reviewed".
+check("prep-pr Step 7's activity query is Step 1c's predicate (reviews + comments)",
+      "(.reviews|length) + (.comments|length)" in derive and "reviews,comments" in derive)
 
 
 def run_derive(gh_body, gh_rc=0):
