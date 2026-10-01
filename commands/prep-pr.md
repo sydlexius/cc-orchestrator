@@ -114,10 +114,13 @@ If either is exceeded, **stop** and say:
 >    concern, drop the rest from the branch.
 > 2. **Dependent stack (fallback only).** Only if the split cannot be
 >    clean (a later slice cannot compile or test without an earlier one):
->    run this gate on EACH branch, then create the stack with
->    `gh stack init/add/submit`, and say in each PR body why a clean split
->    was impossible. Stacks are tolerated, not preferred; see the
->    SKILL.md "STACKED PRS ARE TOLERATED, NOT PREFERRED" bullet.
+>    run this gate on EACH branch, then the LEAD creates the stack with
+>    `gh stack init/add/submit`, and each PR body says why a clean split
+>    was impossible. `gh stack submit` bypasses safe-push (no receipt,
+>    freshness or one-branch check), so the lead authorizes that risk and
+>    re-checks every slice's freshness and receipt immediately before
+>    submit. Stacks are tolerated, not preferred; see the SKILL.md
+>    "STACKED PRS ARE TOLERATED, NOT PREFERRED" bullet.
 > 3. **Override and proceed** (only if the size is truly cohesive, e.g.
 >    a single protocol implementation that can't be partitioned without
 >    breaking atomicity). Provide a rationale; it will be captured in
@@ -130,7 +133,8 @@ Wait for the answer.
   asked, but the default is to let them drive.
 - If "stack": stop; the dependent slices are cut first, then `/prep-pr`
   runs on each branch (this gate re-runs per slice), and the lead agrees
-  the stack before `gh stack init/add/submit`.
+  the stack, re-checks each slice's freshness and receipt, and runs
+  `gh stack init/add/submit` itself (never through this command's push).
 - If "override <rationale>": record the rationale verbatim, include it
   as a line in the Step 8b Summary section ("Size override: <rationale>"),
   and continue to Step 2.
