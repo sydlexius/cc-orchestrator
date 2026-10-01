@@ -24,9 +24,11 @@ Run: python3 test-gate-runner.py
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                       "scripts", "gate-runner.py")
@@ -1094,6 +1096,299 @@ def test_memoize_off_by_default():
               "[MEMO]" not in out2 and rc1 == 0 and rc2 == 0)
 
 
+# --- Part C: opt-in parallel Form B (`jobs`, `exclusive`; #501) -------------
+#
+# Every instrumentation file (barriers, timestamps, pid files) lives in a
+# SEPARATE temp dir, never the worktree, so a receipt can still pass.
+
+_EMIT = """\
+import os, sys, time
+tag, me, other = sys.argv[1], sys.argv[2], sys.argv[3]
+open(me, "w").close()
+end = time.time() + 10
+while not os.path.exists(other) and time.time() < end:
+    time.sleep(0.005)
+for i in range(1000):
+    (sys.stdout if i % 2 else sys.stderr).write(f"{tag}-line {i}\\n")
+    sys.stdout.flush(); sys.stderr.flush()
+    if i % 50 == 0:
+        time.sleep(0.002)
+"""
+
+_SPAN = """\
+import sys, time
+path, dur = sys.argv[1], float(sys.argv[2])
+t0 = time.time(); time.sleep(dur); t1 = time.time()
+open(path, "w").write(f"{t0} {t1}\\n")
+"""
+
+
+def _steps_cfg(steps, jobs=None):
+    """Build a .gates.toml from (name, run, extra-toml) tuples."""
+    head = "[prep_pr]\n" + (f"jobs = {jobs}\n" if jobs is not None else "")
+    body = ""
+    for name, run, extra in steps:
+        body += (f"  [[prep_pr.steps]]\n  name = \"{name}\"\n"
+                 f"  run = '''{run}'''\n" + (f"  {extra}\n" if extra else ""))
+    return head + body
+
+
+def _gone(pid, *, group):
+    """True once the pid (or process group) no longer exists, waiting up to 3s
+    for the kernel/launchd to finish reaping."""
+    end = time.time() + 3
+    while time.time() < end:
+        try:
+            (os.killpg if group else os.kill)(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        time.sleep(0.05)
+    return False
+
+
+def _wait_file(path, timeout=10):
+    end = time.time() + timeout
+    while not os.path.exists(path) and time.time() < end:
+        time.sleep(0.01)
+    return os.path.exists(path)
+
+
+def _read_pid(path):
+    return int(open(path).read().strip()) if _wait_file(path, 5) else None
+
+
+def _norm(out):
+    return re.sub(r"\d+\.\ds\)", "N.Ns)", out)
+
+
+def test_parallel_serial_byte_identical():
+    """jobs absent, jobs = 1, and --jobs 1 overriding jobs = 4 all take the
+    serial path: identical output (durations normalized) and exit codes."""
+    steps = [("a", "echo out-a; echo err-a >&2", ""),
+             ("b", "exit 3", "required = false"),
+             ("c", "echo out-c", "")]
+    outs = []
+    for jobs, args in ((None, ()), (1, ()), (4, ("--jobs", "1"))):
+        with tempfile.TemporaryDirectory() as root:
+            git_init(root)
+            write(root, ".gates.toml", _steps_cfg(steps, jobs))
+            rc, out = run_runner(root, args=args)
+            outs.append((rc, _norm(out).replace(root, "<root>")))
+    check("#501: jobs absent / jobs=1 / --jobs 1 give identical serial output",
+          outs[0] == outs[1] == outs[2])
+    check("#501: serial path never announces jobs=", "jobs=" not in outs[0][1])
+
+
+def test_parallel_validation():
+    """Bad `jobs` (toml or CLI) or a non-bool `exclusive` exits 2, and the
+    parallel path launches NOTHING on a bad later step."""
+    with tempfile.TemporaryDirectory() as aux:
+        marker = os.path.join(aux, "ran")
+        for bad in ("0", "-1", "true", '"4"', "1.5"):
+            with tempfile.TemporaryDirectory() as root:
+                git_init(root)
+                write(root, ".gates.toml", _steps_cfg(
+                    [("a", f"touch {marker}", "")], jobs=bad))
+                rc, _ = run_runner(root)
+                check(f"#501: [prep_pr] jobs = {bad} -> exit 2", rc == 2)
+        for bad in (("--jobs", "0"), ("--jobs", "abc"), ("--jobs=-2",), ("--jobs",)):
+            with tempfile.TemporaryDirectory() as root:
+                git_init(root)
+                write(root, ".gates.toml", _steps_cfg([("a", "true", "")]))
+                rc, _ = run_runner(root, args=bad)
+                check(f"#501: {' '.join(bad)} -> exit 2", rc == 2)
+        for jobs in (4, None):   # parallel first: serial validates incrementally
+            with tempfile.TemporaryDirectory() as root:
+                git_init(root)
+                write(root, ".gates.toml", _steps_cfg(
+                    [("a", f"touch {marker}", ""),
+                     ("b", "true", "exclusive = 1")], jobs=jobs))
+                rc, out = run_runner(root)
+                check(f"#501: non-bool exclusive -> exit 2 (jobs={jobs})", rc == 2)
+                if jobs == 4:
+                    check("#501: parallel path launched nothing before "
+                          "rejecting the config", not os.path.exists(marker))
+
+
+def test_parallel_output_contiguous():
+    """Two steps run CONCURRENTLY (each waits for the other to start), each
+    writing 1000 lines alternating stdout/stderr. Each block prints whole, in
+    declaration order, followed by its own verdict line."""
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as aux:
+        git_init(root)
+        emit = write(aux, "emit.py", _EMIT)
+        sa, sb = os.path.join(aux, "a.started"), os.path.join(aux, "b.started")
+        write(root, ".gates.toml", _steps_cfg(
+            [("A", f"python3 {emit} A {sa} {sb}", ""),
+             ("B", f"python3 {emit} B {sb} {sa}", "")], jobs=2))
+        rc, out = run_runner(root)
+        lines = out.splitlines()
+        tags = [ln[0] for ln in lines if re.match(r"^[AB]-line \d+$", ln)]
+        check("#501: interleave: rc 0", rc == 0)
+        check("#501: interleave: all 2000 lines captured", len(tags) == 2000)
+        check("#501: interleave: each step's output is one contiguous block, "
+              "in declaration order", tags == ["A"] * 1000 + ["B"] * 1000)
+        ia = max(i for i, ln in enumerate(lines) if ln.startswith("A-line"))
+        ib = max(i for i, ln in enumerate(lines) if ln.startswith("B-line"))
+        check("#501: interleave: each block is followed by its own verdict",
+              lines[ia + 1].startswith("[PASS] A ")
+              and lines[ib + 1].startswith("[PASS] B "))
+
+
+def test_parallel_declaration_order():
+    """A later fast step that FINISHES first still prints after the earlier
+    slow step (the slow step does not end until the fast one has ended)."""
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as aux:
+        git_init(root)
+        done = os.path.join(aux, "fast.done")
+        write(root, ".gates.toml", _steps_cfg(
+            [("slow", f"while [ ! -e {done} ]; do sleep 0.02; done; echo SLOW-OUT", ""),
+             ("fast", f"echo FAST-OUT; touch {done}", "")], jobs=2))
+        rc, out = run_runner(root)
+        pos = [out.find(s) for s in ("SLOW-OUT", "[PASS] slow", "FAST-OUT", "[PASS] fast")]
+        check("#501: order: rc 0 (fast finished first, else slow would hang)", rc == 0)
+        check("#501: order: slow block + verdict print before the fast block",
+              -1 not in pos and pos == sorted(pos))
+
+
+def test_parallel_exclusive_overlaps_nothing():
+    """jobs = 4 over A, B, X(exclusive), C, D: X's run interval overlaps no
+    other step's, while the non-exclusive neighbours do overlap (control)."""
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as aux:
+        git_init(root)
+        span = write(aux, "span.py", _SPAN)
+        names = ["A", "B", "X", "C", "D"]
+        steps = [(n, f"python3 {span} {os.path.join(aux, n)} 0.4",
+                  "exclusive = true" if n == "X" else "") for n in names]
+        write(root, ".gates.toml", _steps_cfg(steps, jobs=4))
+        rc, out = run_runner(root)
+        iv = {}
+        for n in names:
+            p = os.path.join(aux, n)
+            if os.path.exists(p):
+                iv[n] = tuple(float(x) for x in open(p).read().split())
+
+        def overlap(a, b):
+            return iv[a][0] < iv[b][1] and iv[b][0] < iv[a][1]
+        check("#501: exclusive: rc 0 and every step ran", rc == 0 and len(iv) == 5)
+        check("#501: exclusive: X overlaps no other step",
+              len(iv) == 5 and not any(overlap("X", n) for n in "ABCD"))
+        check("#501: exclusive: control - A/B and C/D did run concurrently",
+              len(iv) == 5 and overlap("A", "B") and overlap("C", "D"))
+
+
+def test_parallel_fail_fast_kills_groups():
+    """A required failure while a `sleep 30` sibling runs: exit 1 well inside
+    the sleep, the sibling's whole process group (incl. a backgrounded
+    descendant) is gone, the failing output prints in full, nothing later
+    launches, and the receipt records the cancelled sibling as a failure."""
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as aux:
+        git_init(root)
+        pg, desc, later = (os.path.join(aux, n) for n in ("pgid", "desc", "later"))
+        sib = f"echo $$ > {pg}; sleep 30 & echo $! > {desc}; sleep 30"
+        boom = (f"while [ ! -s {desc} ]; do sleep 0.02; done; "
+                "i=0; while [ $i -lt 300 ]; do echo BOOM-$i; i=$((i+1)); done; exit 7")
+        write(root, ".gates.toml", _steps_cfg(
+            [("sib", sib, ""), ("boom", boom, ""), ("later", f"touch {later}", "")],
+            jobs=2))
+        git_commit(root)
+        rpath = os.path.join(root, ".git", "receipt.json")
+        t0 = time.time()
+        rc, out = run_runner(root, args=("--receipt", rpath))
+        took = time.time() - t0
+        pgid, dpid = _read_pid(pg), _read_pid(desc)
+        check("#501: fail-fast: exit 1", rc == 1)
+        check(f"#501: fail-fast: returns within the kill grace, not the 30s sleep "
+              f"({took:.1f}s)", took < 10)
+        check("#501: fail-fast: sibling process group is gone",
+              pgid is not None and _gone(pgid, group=True))
+        check("#501: fail-fast: backgrounded descendant is gone",
+              dpid is not None and _gone(dpid, group=False))
+        check("#501: fail-fast: failing step's output printed in full",
+              all(f"BOOM-{i}\n" in out for i in range(300)))
+        check("#501: fail-fast: HARD failure line names the failing step",
+              "gate-runner: HARD failure at 'boom' -- stopping." in out)
+        check("#501: fail-fast: nothing launched after the failure",
+              not os.path.exists(later))
+        r = _load_receipt(rpath) if os.path.isfile(rpath) else {}
+        check("#501: fail-fast: receipt result=fail, schema-valid",
+              r.get("result") == "fail"
+              and orchestrate_schemas.validate("gate-receipt/v1", r) == [])
+        check("#501: fail-fast: cancelled sibling recorded as a failure",
+              {"name": "sib", "result": "fail", "cancelled": True} in r.get("steps", []))
+        for pid in (pgid, dpid):   # never leak a sleeper if the kill was broken
+            if pid:
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
+
+def test_parallel_interrupt_kills_groups():
+    """SIGINT to the runner while a step holds: every process group is killed
+    and no pass receipt is written."""
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as aux:
+        git_init(root)
+        pg = os.path.join(aux, "pgid")
+        write(root, ".gates.toml", _steps_cfg(
+            [("hold", f"echo $$ > {pg}; sleep 30", ""), ("ok", "true", "")], jobs=2))
+        git_commit(root)
+        rpath = os.path.join(root, ".git", "receipt.json")
+        proc = subprocess.Popen([sys.executable, RUNNER, "--receipt", rpath],
+                                cwd=root, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        pgid = _read_pid(pg)
+        proc.send_signal(signal.SIGINT)
+        try:
+            rc = proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill(); rc = None
+        check("#501: SIGINT: runner exits non-zero promptly", rc not in (None, 0))
+        check("#501: SIGINT: the held step's process group is gone",
+              pgid is not None and _gone(pgid, group=True))
+        r = _load_receipt(rpath) if os.path.isfile(rpath) else {}
+        check("#501: SIGINT: no pass receipt", r.get("result") != "pass")
+        if pgid:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def test_parallel_receipt():
+    """jobs = 4, clean tree, all pass: result=pass with steps[] in declaration
+    order; and NO receipt exists while a child is still running."""
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as aux:
+        git_init(root)
+        go, held, f3 = (os.path.join(aux, n) for n in ("go", "held", "f3"))
+        write(root, ".gates.toml", _steps_cfg(
+            [("slow", f"touch {held}; while [ ! -e {go} ]; do sleep 0.02; done", ""),
+             ("f2", "true", ""), ("f3", f"touch {f3}", ""), ("f4", "true", "")],
+            jobs=4))
+        git_commit(root)
+        rpath = os.path.join(root, ".git", "receipt.json")
+        proc = subprocess.Popen([sys.executable, RUNNER, "--receipt", rpath],
+                                cwd=root, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        ready = _wait_file(held) and _wait_file(f3)
+        time.sleep(0.3)   # let the fast siblings be reaped
+        early = os.path.exists(rpath)
+        open(go, "w").close()
+        try:
+            rc = proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill(); rc = None
+        check("#501: receipt: no receipt while a child still runs",
+              ready and not early)
+        r = _load_receipt(rpath) if os.path.isfile(rpath) else {}
+        check("#501: receipt: jobs=4 all-pass clean tree -> result=pass",
+              rc == 0 and r.get("result") == "pass")
+        check("#501: receipt: steps[] in declaration order",
+              [s.get("name") for s in r.get("steps", [])] == ["slow", "f2", "f3", "f4"])
+
+
 def main():
     print("test-gate-runner.py")
     for fn in [
@@ -1123,6 +1418,11 @@ def main():
         test_memoize_untracked_input_reruns,
         test_memoize_impure_step_never_cached, test_memoize_failing_pure_not_cached,
         test_memoize_off_by_default,
+        test_parallel_serial_byte_identical, test_parallel_validation,
+        test_parallel_output_contiguous, test_parallel_declaration_order,
+        test_parallel_exclusive_overlaps_nothing,
+        test_parallel_fail_fast_kills_groups, test_parallel_interrupt_kills_groups,
+        test_parallel_receipt,
     ]:
         print(f"- {fn.__name__}")
         fn()
