@@ -223,11 +223,14 @@ looks_like_safe_push() {
 }
 is_push() { looks_like_git_push || looks_like_safe_push; }
 
-# main/master as a push DESTINATION: whole word, boundary = start/space/colon
-# (colon catches HEAD:main; slash deliberately excluded so feature/main is NOT a
-# false-positive - refs/heads/main is a non-obvious form, branch-protection backstop).
+# main/master as a push DESTINATION: whole word, boundary = start/space/colon/quote
+# (colon catches HEAD:main; slash deliberately excluded as a boundary so feature/main is
+# NOT a false-positive). #480: an optional literal refs/heads/ may sit between the
+# boundary and the name, so the full-ref spelling (HEAD:refs/heads/main, bare
+# refs/heads/main) is denied too - it is no longer a branch-protection-only carve-out.
+# refs/heads/feature/main and refs/heads/maintenance still do not match.
 has_main_dest() {
-  printf '%s' "$cmd" | grep -Eq '(^|[[:space:]:])(main|master)([[:space:]]|$)'
+  printf '%s' "$cmd" | grep -Eq '(^|[[:space:]:'\''"])(refs/heads/)?(main|master)([[:space:]:'\''"]|$)'
 }
 
 # --- (1) Tier-1 hard denies (ALWAYS) --------------------------------------
