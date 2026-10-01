@@ -641,6 +641,54 @@ def test_receipt_status_error_is_dirty():
         check("receipt(status error): never a pass", r.get("result") == "fail")
 
 
+def _load_runner_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("gate_runner_mod", RUNNER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_receipt_review_round_498():
+    # PR #498 review (CodeRabbit): a PLAIN gate failure on a clean tree (no
+    # `reason`) must also unlink an older pass, so if writing the fail receipt
+    # then fails, the stale pass cannot survive. Exercised directly: the write
+    # is stubbed to a no-op, which models "schema/write error after unlink".
+    mod = _load_runner_module()
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, "a.txt", "x\n")
+        git_commit(root)
+        rpath = os.path.join(root, ".git", "r.json")
+        with open(rpath, "w") as f:
+            json.dump({"result": "pass"}, f)
+        pre = mod._snapshot(root, rpath)
+        mod._atomic_write_json = lambda path, obj: None
+        mod._write_receipt(rpath, root, 1, [], pre)
+        check("receipt(498): clean-tree gate failure removes an older pass",
+              not os.path.exists(rpath))
+    # PR #498 review (Copilot): a leftover `<receipt>.tmp.<pid>` from an
+    # interrupted atomic write inside the worktree is not dirt.
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, "ok.sh", "#!/bin/sh\nexit 0\n", executable=True)
+        write(root, ".gates.toml", '[prep_pr]\ngate = "sh ok.sh"\n')
+        write(root, ".gitignore", "")
+        git_commit(root)
+        rpath = os.path.join(root, "receipt.json")
+        write(root, "receipt.json.tmp.12345", "{}")
+        rc, out = run_runner(root, args=("--receipt", rpath))
+        r = _load_receipt(rpath) if os.path.isfile(rpath) else {}
+        check("receipt(498): leftover .tmp.<pid> is not dirt (pass)",
+              r.get("result") == "pass")
+        # ...but a look-alike that is NOT the tmp pattern still counts.
+        write(root, "receipt.json.tmp.x", "{}")
+        rc, out = run_runner(root, args=("--receipt", rpath))
+        r = _load_receipt(rpath) if os.path.isfile(rpath) else {}
+        check("receipt(498): a non-pid .tmp look-alike is still dirt (fail)",
+              r.get("result") == "fail")
+
+
 def test_receipt_snapshot_before_run_toctou():
     # #481 review round 1: HEAD/tree/dirtiness are sampled BEFORE the run too.
     # (a) a dirty tracked edit the gate itself discards mid-run must not pass.
@@ -976,6 +1024,7 @@ def main():
         test_receipt_path_in_untracked_dir_not_dirty,
         test_receipt_status_error_is_dirty,
         test_receipt_snapshot_before_run_toctou,
+        test_receipt_review_round_498,
         test_memoize_pure_step_skipped_second_run, test_memoize_dirty_worktree_reruns,
         test_memoize_untracked_input_reruns,
         test_memoize_impure_step_never_cached, test_memoize_failing_pure_not_cached,

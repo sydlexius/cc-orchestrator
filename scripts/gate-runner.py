@@ -503,8 +503,10 @@ def _write_receipt(path, root, rc, records, pre):
     if reason:
         receipt["reason"] = reason + "; gate tested the working tree, not a clean unchanged HEAD^{tree}"
         warn("gate receipt written as result=fail (" + reason + ")")
-        # Belt-and-braces: if writing the fail receipt below itself fails
-        # (schema/write error), the older pass must not survive.
+    if receipt["result"] != "pass":
+        # Belt-and-braces, for EVERY non-pass (a plain gate failure on a clean
+        # tree included, PR #498 review): if writing the fail receipt below
+        # itself fails (schema/write error), the older pass must not survive.
         _remove_stale(path)
     try:
         import orchestrate_schemas
@@ -565,11 +567,19 @@ def _tree_dirty_excluding(root, receipt_path):
         return "git status failed"
     rroot = os.path.realpath(root)
     rpath = os.path.realpath(receipt_path)
-    own = {rpath}
+
+    def own(p):
+        # The receipt itself, or a leftover of _atomic_write_json's temp file
+        # (`<receipt>.tmp.<pid>`; an interrupted write can leave one). Without
+        # the tmp leg, one interrupted write inside the worktree turned every
+        # later clean gate into result=fail (PR #498 review).
+        return p == rpath or (p.startswith(rpath + ".tmp.")
+                              and p[len(rpath) + 5:].isdigit())
+
     dirty = []
     for rel in paths:
         ap = os.path.realpath(os.path.join(rroot, rel))
-        if ap in own:
+        if own(ap):
             continue
         if rel.endswith("/") and rpath.startswith(ap + os.sep):
             # untracked DIR holding the receipt: look inside for anything else.
@@ -586,7 +596,7 @@ def _tree_dirty_excluding(root, receipt_path):
             names = [n for n in lst.stdout.decode(
                 "utf-8", "surrogateescape").split("\0") if n]
             others = [n for n in names
-                      if os.path.realpath(os.path.join(rroot, n)) != rpath]
+                      if not own(os.path.realpath(os.path.join(rroot, n)))]
             if others:
                 dirty.append(others[0])
             continue

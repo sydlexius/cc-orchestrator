@@ -613,13 +613,15 @@ removed.
 Two optional gate-runner flags (both OFF by default, ZERO behavior change when
 absent; #229): `--receipt <path>` writes a schema-validated `gate-receipt/v1`
 receipt (from `scripts/orchestrate_schemas.py`) as a BYPRODUCT of the real gate
-run - `{commit_sha, tree_sha, worktree, result (pass|fail chosen from the tool's
-own exit code), steps[], producer}`, atomic `os.replace`, FAIL-OPEN (a receipt
-failure never changes the gate exit code; a non-git dir just skips it). #481: a
-DIRTY worktree (receipt path itself ignored; a `git status` error counts as dirty)
-never yields a pass - the receipt is written `result=fail` with a `reason`, and any
-older receipt at the path is unlinked first, because the gate tested the working
-tree while the receipt binds `HEAD^{tree}`. The floor
+run - `{commit_sha, tree_sha, worktree, result, steps[], producer}`, atomic
+`os.replace`, FAIL-OPEN (a receipt failure never changes the gate exit code; a
+non-git dir just skips it). `result=pass` requires ALL of (#481): exit code 0, a
+clean worktree BEFORE and AFTER the run, and an unchanged `HEAD^{tree}` across it
+(the receipt file and its `.tmp.<pid>` leftover are ignored; a `git status` error
+counts as dirty). Anything else is `result=fail`, carrying a `reason` when an
+invariant tripped, and any older receipt at the path is unlinked first on every
+non-pass, because the gate tested the working tree while the receipt binds
+`HEAD^{tree}`. `commit_sha`/`tree_sha` are the PRE-run values. The floor
 is NEVER taught to read the receipt. `--memoize-dir <dir>` opts into conservative
 PURE-oracle memoization: a `.gates.toml` step marked `pure = true` (explicit
 allowlist; default false) whose PASS is memoized keyed on `HEAD^{tree}` + a live
