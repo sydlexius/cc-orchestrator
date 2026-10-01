@@ -18,7 +18,10 @@ Run: python3 test-prep-pr-freshness.py
 """
 import os
 import re
+import shlex
+import subprocess
 import sys
+import tempfile
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 DOC = os.path.join(REPO, "commands", "prep-pr.md")
@@ -110,10 +113,35 @@ push_lines7 = LEG.findall(step7)
 check("prep-pr Step 7 has the three safe-push exec legs", len(push_lines7) == 3)
 check("prep-pr Step 7 legs pass the stale flag and the base flag",
       len(push_lines7) == 3 and all("$stale_flag" in ln and "$base_flag" in ln for ln in push_lines7))
-check("prep-pr Step 7 defaults stale_flag to EMPTY (set only on the reviewed WARN branch)",
-      re.search(r'^stale_flag=""', step7, re.M) is not None and "REVIEWED WARN branch" in step7)
-check("prep-pr Step 7 sets --stale-ok only via that carry-over (no hard-coded flag on a leg)",
-      all("--stale-ok" not in ln for ln in push_lines7) and 'stale_flag="--stale-ok"' in step7)
+check("prep-pr Step 7 never hard-codes --stale-ok on a leg (it is derived)",
+      all("--stale-ok" not in ln for ln in push_lines7))
+
+# #496 review (CR + Copilot): a stale_flag="" default followed by "the lead sets it" prose is
+# DEAD - each fenced block is its own shell, so nothing set outside reaches it. EXECUTE the
+# block's derivation lines (from `stale_flag=""` through the `case`) against a stubbed gh and
+# assert the resulting flag, so a revert to prose-only reddens here instead of passing a grep.
+md = re.search(r'^stale_flag=""\n.*?^case "\$pr_activity".*?esac\n', step7, re.S | re.M)
+derive = md.group(0) if md else ""
+check("prep-pr Step 7 derives stale_flag in-block from the PR's review activity", bool(derive))
+
+
+def run_derive(gh_body, gh_rc=0):
+    with tempfile.TemporaryDirectory() as d:
+        gh = os.path.join(d, "gh")
+        with open(gh, "w") as f:
+            f.write("#!/bin/sh\nprintf '%s' " + shlex.quote(gh_body) + "\nexit " + str(gh_rc) + "\n")
+        os.chmod(gh, 0o755)
+        env = dict(os.environ, PATH=d + os.pathsep + os.environ.get("PATH", ""))
+        r = subprocess.run(["bash", "-c", derive + '\nprintf "%s" "$stale_flag"'],
+                           capture_output=True, text=True, env=env)
+        return r.stdout
+
+
+if derive:
+    check("reviewed PR (activity 3) -> --stale-ok", run_derive("3") == "--stale-ok")
+    check("unreviewed PR (activity 0) -> empty, safe-push still refuses", run_derive("0") == "")
+    check("no PR (gh fails) -> empty", run_derive("", gh_rc=1) == "")
+    check("unreadable count (non-numeric) -> empty (fail closed)", run_derive("null") == "")
 check("prep-pr Step 7 passes --base ONLY when the base differs from the default branch",
       'base_flag="--base $pr_base"' in step7 and '"$pr_base" != "$def_base"' in step7)
 check("prep-pr Step 7 resolves the PR base via baseRefName", "baseRefName" in step7)

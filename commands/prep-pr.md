@@ -827,10 +827,15 @@ elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh' ]; then leg=plugin
 elif [ -f ~/.claude/scripts/safe-push.sh ]; then leg=stable
 else leg=none; fi
 push_rc=2
-# Carry Step 1c's verdict here (#492; each fenced block is its OWN shell, so it is re-stated, not inherited).
-# stale_flag: set to --stale-ok ONLY when Step 1c took the REVIEWED WARN branch (review activity, or an
-# unreadable count). Left empty on every other path, so an unreviewed behind PR still hits safe-push's refusal.
+# Re-derive Step 1c's REVIEWED predicate HERE (#492/#493): each fenced block is its OWN shell, so a
+# value set in Step 1c (or by the lead in prose) never reaches this block. stale_flag=--stale-ok ONLY
+# when a PR exists AND it has review activity (reviews + comments > 0) - the same predicate as Step
+# 1c's WARN branch. No PR, zero activity, or an unreadable read leaves it EMPTY, so safe-push still
+# refuses a definitive BEHIND there (fail closed: its refusal names --stale-ok, never a silent push).
 stale_flag=""
+pr_activity=$(gh pr view --json number,reviews,comments \
+  --jq '(.reviews|length) + (.comments|length)' 2>/dev/null || true)
+case "$pr_activity" in ''|*[!0-9]*) ;; 0) ;; *) stale_flag="--stale-ok" ;; esac
 # base_flag: --base <name> ONLY when the PR's base differs from the repo default branch (a backport/release
 # base); on a default-base PR safe-push resolves origin/HEAD itself and no flag is passed.
 base_flag=""
@@ -848,11 +853,13 @@ echo "push_rc=$push_rc"
 ```
 
 **Step 1c carry-over (#492).** safe-push is git-only and cannot see review state, so it refuses a
-definitive BEHIND unless told otherwise. When Step 1c took the **reviewed WARN branch** (including an
-unreadable count), set `stale_flag="--stale-ok"` before running the block: the push then proceeds
-with a labeled `WARN` (count + "run `gh pr update-branch <n>` AFTER this round's replies + resolves,
+definitive BEHIND unless told otherwise. The block above re-derives Step 1c's **reviewed WARN
+branch** itself (a PR with review activity) and sets `stale_flag="--stale-ok"` - nothing for the
+caller to set, so it cannot be forgotten. The push then proceeds with a labeled `WARN` (count + "run `gh pr update-branch <n>` AFTER this round's replies + resolves,
 before merge"), which is exactly the refresh timing Step 1c already prescribed. After that update-branch, resync the worktree before any further commit (`git fetch origin && git merge --ff-only origin/<branch>`): the remote merge commit is absent locally and the next push would otherwise refuse as diverged. On the STOP branch
-(no PR / unreviewed) never set it. Do not set it to get past an unreviewed behind PR: refresh first.
+(no PR / unreviewed) it stays empty. One deliberate difference from Step 1c: an UNREADABLE read here
+leaves it empty (safe-push refuses, fail closed) where Step 1c WARNs, because this block pushes. Never
+hand-edit the flag to get past an unreviewed behind PR: refresh first.
 
 The trailing `# prep-pr-ok` is the floor guard's advisory override. The token itself is an
 INSTRUCTION-LEVEL assertion; what backs part of it is safe-push's gate-receipt check (#318),
