@@ -714,6 +714,38 @@ def test_receipt_review_round_498():
               r.get("result") == "pass")
 
 
+def test_receipt_unresolvable_head_removes_stale():
+    # #497: when the pre-run HEAD/tree cannot resolve (git missing, not a repo,
+    # no commit), no receipt is written -- and an OLDER pass at the path must
+    # not survive either, or a consumer reads it as this run's verdict.
+    # (a) direct: the unresolvable-snapshot branch of _write_receipt.
+    mod = _load_runner_module()
+    with tempfile.TemporaryDirectory() as root:
+        rpath = os.path.join(root, "r.json")
+        with open(rpath, "w") as f:
+            json.dump({"result": "pass"}, f)
+        mod._write_receipt(rpath, root, 0, [], (None, None, "git status failed"))
+        check("receipt(497 a): unresolvable HEAD removes an older pass",
+              not os.path.exists(rpath))
+    # (b) end-to-end: git absent from PATH, a pass receipt from an earlier run
+    # sits at the path. The gate still runs and its exit code is unchanged.
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, "ok.sh", "#!/bin/sh\nexit 0\n", executable=True)
+        write(root, ".gates.toml", '[prep_pr]\ngate = "sh ok.sh"\n')
+        git_commit(root)
+        rpath = os.path.join(root, ".git", "receipt.json")
+        rc, out = run_runner(root, args=("--receipt", rpath))
+        check("receipt(497 b): seeded a real pass receipt",
+              os.path.isfile(rpath) and _load_receipt(rpath).get("result") == "pass")
+        rc, out = run_runner(root, drop_tools=("git",), args=("--receipt", rpath))
+        check("receipt(497 b): git missing -> gate exit unchanged (0)", rc == 0)
+        check("receipt(497 b): git missing -> warns about skipping receipt",
+              "skipping gate receipt" in out)
+        check("receipt(497 b): git missing -> older pass receipt does not survive",
+              not os.path.exists(rpath))
+
+
 def test_receipt_snapshot_before_run_toctou():
     # #481 review round 1: HEAD/tree/dirtiness are sampled BEFORE the run too.
     # (a) a dirty tracked edit the gate itself discards mid-run must not pass.
@@ -1050,6 +1082,7 @@ def main():
         test_receipt_status_error_is_dirty,
         test_receipt_snapshot_before_run_toctou,
         test_receipt_review_round_498,
+        test_receipt_unresolvable_head_removes_stale,
         test_memoize_pure_step_skipped_second_run, test_memoize_dirty_worktree_reruns,
         test_memoize_untracked_input_reruns,
         test_memoize_impure_step_never_cached, test_memoize_failing_pure_not_cached,

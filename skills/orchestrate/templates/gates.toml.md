@@ -105,6 +105,29 @@ toolchain within the memo window. A `shellcheck` / `ruff` / `python` version bum
 at a constant tree is NOT detected -- clear `<dir>` (or leave the toolchain fixed)
 across a memo window.
 
+### Gate receipt (`--receipt <path>`)
+
+`gate-runner.py --receipt <path>` (OFF by default) writes a `gate-receipt/v1`
+(shape in `schemas.md`) as a BYPRODUCT of the run; a receipt problem never
+changes the gate exit code.
+
+- `result = "pass"` needs ALL of: exit code 0, a clean worktree BEFORE the first
+  step and AFTER the last, and an unchanged `HEAD^{tree}` across the run (the
+  receipt file and its `.tmp.<pid>` leftover are not dirt; a git error is doubt,
+  so no pass). Anything else is `result = "fail"` with a `reason`, and an older
+  receipt at the path is unlinked first (#481).
+- When HEAD/tree cannot resolve (git missing, not a repo, no commit) no receipt
+  is written AND any older receipt at the path is unlinked, so a stale pass never
+  reads as this run's verdict (#497).
+- **What a pass does NOT guarantee (accepted window, #497):** the clean/unchanged
+  checks are point-in-time reads at the two ends of the run. Content that existed
+  only MID-run (a file edited and then reverted while the gate ran) is tested by
+  the steps but never bound by the receipt, and the run still passes. Closing
+  this means running the gate in an isolated export of `HEAD^{tree}`; that was
+  declined because it needs a concurrent editor (outside the honest-actor threat
+  model), costs a full extra checkout per run, and breaks gates that read
+  untracked config or caches from the live worktree.
+
 ---
 
 ## `[merge_pr]` section

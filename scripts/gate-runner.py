@@ -458,8 +458,14 @@ def _write_receipt(path, root, rc, records, pre):
     `pre` is the _snapshot taken BEFORE the gate ran."""
     pre_commit, pre_tree, pre_dirty = pre
     if not pre_commit or not pre_tree:
-        warn("cannot resolve HEAD/tree (not a git repo or no commit); "
-             "skipping gate receipt")
+        # #497: no receipt for this run, so an OLDER one at the path must not
+        # survive to be read as this run's verdict (git missing used to leave a
+        # stale pass in place). Only the exact path is removed, matching
+        # _remove_stale: a `.tmp.<pid>` leftover is never read as a receipt,
+        # and globbing tmp names could unlink a concurrent writer's in-flight file.
+        _remove_stale(path)
+        warn("cannot resolve HEAD/tree (git missing, not a git repo, or no "
+             "commit); skipping gate receipt and removing any older one")
         return
     # #481 R7 + review round 1 (TOCTOU): the receipt binds HEAD^{tree} but the
     # gate tested the WORKING tree. A pass therefore needs rc==0 AND a clean
@@ -470,11 +476,15 @@ def _write_receipt(path, root, rc, records, pre):
     # which also OVERWRITES any older pass at this path. The gate exit code is
     # untouched (the receipt stays a byproduct). The receipt records the PRE-run
     # commit/tree: that is what the gate tested.
-    # KNOWN WINDOW: these are two point-in-time reads, before the first step and
-    # after the last. An edit made AND undone between them (clean -> dirty ->
-    # clean while the gate runs) is invisible here. Closing it means running the
-    # gate against an exported checkout of HEAD^{tree}; that is out of scope and
-    # outside the honest-actor model (it needs a concurrent editor). See #497.
+    # ACCEPTED WINDOW (#497, decided not to close): these are two point-in-time
+    # reads, before the first step and after the last. A pass therefore says
+    # "HEAD^{tree} was clean and unchanged at both ends", NOT "every step read
+    # exactly HEAD^{tree}": content that existed only mid-run (clean -> dirty ->
+    # clean while the gate runs) is tested but never bound, and still passes.
+    # Closing it means running the gate in an exported checkout of HEAD^{tree};
+    # not adopted, because it needs a concurrent editor (outside the
+    # honest-actor model), costs a full extra checkout per run, and breaks
+    # gates that read untracked config or caches from the live worktree.
     reason = ""
     if pre_dirty:
         reason = "dirty-before-run: " + pre_dirty
@@ -530,8 +540,12 @@ def _remove_stale(path):
     fail receipt below cannot be written (e.g. schema or write error)."""
     try:
         os.unlink(path)
-    except OSError:
+    except FileNotFoundError:
         pass
+    except OSError as e:
+        # #497 review: a silent failure here (e.g. a read-only parent dir) let a
+        # stale pass survive while the caller's warning claimed it was removed.
+        warn(f"could not remove older gate receipt {path}: {e}")
 
 
 def _porcelain_paths(root):
