@@ -117,8 +117,10 @@ changes the gate exit code.
   so no pass). Anything else is `result = "fail"` with a `reason`, and an older
   receipt at the path is unlinked first (#481).
 - When HEAD/tree cannot resolve (git missing, not a repo, no commit) no receipt
-  is written AND any older receipt at the path is unlinked, so a stale pass never
-  reads as this run's verdict (#497).
+  is written AND the runner attempts to unlink any older receipt at the path, so
+  a stale pass does not read as this run's verdict (#497). The unlink is
+  best-effort: if it fails (for example a read-only directory) the runner WARNs
+  and says so, the older receipt remains, and the gate exit code is unchanged.
 - **What a pass does NOT guarantee (accepted window, #497):** the clean/unchanged
   checks are point-in-time reads at the two ends of the run. Content that existed
   only MID-run (a file edited and then reverted while the gate ran) is tested by

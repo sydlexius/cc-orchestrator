@@ -744,6 +744,42 @@ def test_receipt_unresolvable_head_removes_stale():
               "skipping gate receipt" in out)
         check("receipt(497 b): git missing -> older pass receipt does not survive",
               not os.path.exists(rpath))
+    # (c) the unlink itself FAILS (#510 review): it must warn, say so in the
+    # skip message, and never claim the stale pass is gone. os.unlink is forced
+    # to raise rather than chmod-ing a dir, which a root uid would ignore.
+    import io, contextlib
+    mod = _load_runner_module()
+    with tempfile.TemporaryDirectory() as root:
+        rpath = os.path.join(root, "r.json")
+        with open(rpath, "w") as f:
+            json.dump({"result": "pass"}, f)
+        real_unlink = mod.os.unlink
+        def _deny(p):
+            raise PermissionError(13, "Permission denied", p)
+        buf = io.StringIO()
+        mod.os.unlink = _deny
+        try:
+            with contextlib.redirect_stderr(buf):
+                mod._write_receipt(rpath, root, 0, [], (None, None, "git status failed"))
+        finally:
+            mod.os.unlink = real_unlink
+        err = buf.getvalue()
+        check("receipt(497 c): failed unlink warns with the path",
+              "could not remove older gate receipt" in err and rpath in err)
+        check("receipt(497 c): skip message admits the receipt could not be removed",
+              "could NOT be removed" in err)
+        check("receipt(497 c): failed unlink leaves the file (no false claim)",
+              os.path.exists(rpath))
+        mod.os.unlink = _deny
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                failed = mod._remove_stale(rpath)
+        finally:
+            mod.os.unlink = real_unlink
+        check("receipt(497 c): _remove_stale returns False when the unlink fails",
+              failed is False)
+        check("receipt(497 c): _remove_stale returns True when nothing is there",
+              mod._remove_stale(os.path.join(root, "nope.json")) is True)
 
 
 def test_receipt_snapshot_before_run_toctou():

@@ -619,8 +619,8 @@ absent; #229): `--receipt <path>` writes a schema-validated `gate-receipt/v1`
 receipt (from `scripts/orchestrate_schemas.py`) as a BYPRODUCT of the real gate
 run - `{commit_sha, tree_sha, worktree, result, steps[], producer}`, atomic
 `os.replace`, FAIL-OPEN (a receipt failure never changes the gate exit code; a
-non-git dir or a missing git writes none and, since #497, unlinks any older receipt
-at the path). `result=pass` requires ALL of (#481): exit code 0, a
+non-git dir or a missing git writes none and, since #497, attempts to unlink any
+older receipt at the path, WARNing if that fails). `result=pass` requires ALL of (#481): exit code 0, a
 clean worktree BEFORE and AFTER the run, and an unchanged `HEAD^{tree}` across it
 (the receipt file and its `.tmp.<pid>` leftover are ignored; a `git status` error
 counts as dirty). Anything else is `result=fail`, carrying a `reason` when an

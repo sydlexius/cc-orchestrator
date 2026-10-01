@@ -463,9 +463,10 @@ def _write_receipt(path, root, rc, records, pre):
         # stale pass in place). Only the exact path is removed, matching
         # _remove_stale: a `.tmp.<pid>` leftover is never read as a receipt,
         # and globbing tmp names could unlink a concurrent writer's in-flight file.
-        _remove_stale(path)
+        removed = _remove_stale(path)
         warn("cannot resolve HEAD/tree (git missing, not a git repo, or no "
-             "commit); skipping gate receipt and removing any older one")
+             "commit); skipping gate receipt"
+             + ("" if removed else " (an older receipt could NOT be removed; see above)"))
         return
     # #481 R7 + review round 1 (TOCTOU): the receipt binds HEAD^{tree} but the
     # gate tested the WORKING tree. A pass therefore needs rc==0 AND a clean
@@ -537,7 +538,9 @@ def _write_receipt(path, root, rc, records, pre):
 
 def _remove_stale(path):
     """Best-effort removal of an older receipt so it cannot survive if the
-    fail receipt below cannot be written (e.g. schema or write error)."""
+    fail receipt below cannot be written (e.g. schema or write error).
+    Returns True when no receipt remains at the path (removed, or none was
+    there), False when an existing one could not be removed (warned)."""
     try:
         os.unlink(path)
     except FileNotFoundError:
@@ -546,6 +549,8 @@ def _remove_stale(path):
         # #497 review: a silent failure here (e.g. a read-only parent dir) let a
         # stale pass survive while the caller's warning claimed it was removed.
         warn(f"could not remove older gate receipt {path}: {e}")
+        return False
+    return True
 
 
 def _porcelain_paths(root):
