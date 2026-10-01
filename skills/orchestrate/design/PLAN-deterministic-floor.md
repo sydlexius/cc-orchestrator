@@ -223,11 +223,14 @@ looks_like_safe_push() {
 }
 is_push() { looks_like_git_push || looks_like_safe_push; }
 
-# main/master as a push DESTINATION: whole word, boundary = start/space/colon
-# (colon catches HEAD:main; slash deliberately excluded so feature/main is NOT a
-# false-positive - refs/heads/main is a non-obvious form, branch-protection backstop).
+# main/master as a push DESTINATION: whole word, boundary = start/space/colon/quote
+# (colon catches HEAD:main; slash deliberately excluded as a boundary so feature/main is
+# NOT a false-positive). #480: an optional literal refs/heads/ may sit between the
+# boundary and the name, so the full-ref spelling (HEAD:refs/heads/main, bare
+# refs/heads/main) is denied too - it is no longer a branch-protection-only carve-out.
+# refs/heads/feature/main and refs/heads/maintenance still do not match.
 has_main_dest() {
-  printf '%s' "$cmd" | grep -Eq '(^|[[:space:]:])(main|master)([[:space:]]|$)'
+  printf '%s' "$cmd" | grep -Eq '(^|[[:space:]:'\''"])(refs/heads/)?(main|master)([[:space:]:'\''"]|$)'
 }
 
 # --- (1) Tier-1 hard denies (ALWAYS) --------------------------------------
@@ -698,4 +701,4 @@ The FLOOR gate also requires the hostile-critic pass (spec Testing strategy step
 
 **Type/name consistency:** matcher function names (`is_push`, `has_main_dest`, `has_bare_force`, `has_no_verify`, `is_gh_pr_merge`, `is_merge_api`, `marker_active`) are defined once and reused consistently; env vars `ORCHESTRATE_FLOOR_MARKER` / `ORCHESTRATE_FLOOR_TTL_HOURS` and the marker filename are consistent across guard, harness, and Task 7/8.
 
-**Known accepted limitations (from spec, not bugs):** `refs/heads/main` explicit-ref form and bare-push-on-main-checked-out-worktree evade (branch-protection backstop); Bash-tool-only coverage; adversarial evasion out of scope.
+**Known accepted limitations (from spec, not bugs):** `refs/heads/main` explicit-ref form (CLOSED by #480: now denied) and bare-push-on-main-checked-out-worktree evade (branch-protection backstop); Bash-tool-only coverage; adversarial evasion out of scope.

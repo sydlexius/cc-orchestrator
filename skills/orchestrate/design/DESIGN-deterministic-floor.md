@@ -323,6 +323,23 @@ Adopted design (#105 - what ships):
     branch named `maintenance` / `domain` is NOT (the word boundary excludes
     substrings). Implement as a boundary regex, not a positional-arg equality test
     (which would miss `HEAD:main`).
+  - (#480) the FULL-REF spelling is matched too: an optional literal `refs/heads/`
+    prefix may sit between the left boundary and `main|master`, so
+    `HEAD:refs/heads/main`, `feat:refs/heads/main`, a bare `refs/heads/main` and
+    `-u ... refs/heads/main:refs/heads/main` all deny, marker on or off. This
+    REVERSES an earlier deliberate carve-out that let the full ref through as "a
+    non-obvious spelling, branch-protection backstop". Reason: #466 made
+    `safe-push.sh` emit the full-refspec shape `refs/heads/<b>:refs/heads/<b>` as
+    its routine form, so the spelling is no longer non-obvious, and a
+    push-to-default deny that one honest spelling skips is not a deny. The match
+    demands the exact literal whole ref and reconstructs nothing else from git's
+    refspec rules: slash is still not a left boundary and the right boundary is
+    unchanged, so `feature/main`, `refs/heads/feature/main`,
+    `refs/heads/maintenance`, `refs/heads/main-fix`, `mainline` and safe-push's
+    full refspec for a non-default branch stay ALLOWED. Residual (pre-existing,
+    applies equally to the bare name): a `+` force-refspec prefix (`+main`,
+    `+refs/heads/main`) is not a boundary; `+HEAD:refs/heads/main` is caught via
+    the colon. Branch protection remains the backstop for that spelling.
   - the marker path default expands via `$HOME` (NOT a literal `~`, which does not
     expand inside a quoted variable default) (Finding F15).
 

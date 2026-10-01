@@ -35,7 +35,9 @@ under `scripts/`. The deterministic floor is intentionally NOT a plugin hook - i
 Runtime (`scripts/`; canonical source is this repo):
 
 - `scripts/orchestrate-guard.sh` - the single PreToolUse Bash deny authority (deterministic floor).
-  Tier-1 = general bash-safety, MARKER-INDEPENDENT (every session): push-to-main/master, bare
+  Tier-1 = general bash-safety, MARKER-INDEPENDENT (every session): push-to-main/master (the bare
+  name AND, since #480, the full-ref `refs/heads/main|master` spelling - safe-push's #466 shape -
+  as a whole ref, so `refs/heads/feature/main`/`refs/heads/maintenance` still pass), bare
   `--force`/`-f` (not `--force-with-lease`), `git ... --no-verify` (any accepting subcommand),
   `gh ... --admin` (admin-bypass on `pr merge`), and (#333) the COMMIT-SIGNING BYPASS -
   `--no-gpg-sign` or `-c commit.gpgsign=<false|no|off|0|empty>` on any signing-bearing
