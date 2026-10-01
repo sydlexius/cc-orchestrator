@@ -11,9 +11,12 @@
 # ubuntu); the harnesses + self-test run on both legs.
 name: CI
 
+# pull_request has NO base-branch filter on purpose: a stacked PR (gh stack) targets the
+# branch below it, not main, and a `branches: [main]` filter left it with no gate checks
+# until GitHub retargeted it after the lower PR merged (#503). push stays main-only, so a
+# feature-branch push is still covered once, by its PR's run, not twice.
 on:
   pull_request:
-    branches: [main]
   push:
     branches: [main]
   workflow_dispatch:
