@@ -5,10 +5,14 @@
 #
 # Schema: skills/orchestrate/templates/gates.toml.md
 # This mirrors the `## Gates` block in CLAUDE.md (kept in sync as human-readable
-# documentation). Form B (enumerate): each step runs in order; the runner stops
-# at the first required-step failure.
+# documentation). Form B (enumerate): steps launch in declaration order, up to
+# `jobs` at a time, and their output prints in declaration order; the first
+# required-step failure stops the run and cancels every in-flight step.
 
 [prep_pr]
+# #501: 4, not cpu_count(), because gates often run in 2-3 worktrees at once.
+# `--jobs 1` forces the serial path. Every harness was audited for shared state.
+jobs = 4
 
   [[prep_pr.steps]]
   name = "shellcheck"
@@ -50,6 +54,7 @@
   [[prep_pr.steps]]
   name = "test-orchestrate-steer"
   run = "python3 test-orchestrate-steer.py"
+  exclusive = true  # timing-sensitive perf check; runs with nothing else in flight
 
   [[prep_pr.steps]]
   name = "test-steer-nudge-length"
@@ -142,6 +147,7 @@
   [[prep_pr.steps]]
   name = "test-elmer-tick"
   run = "python3 test-elmer-tick.py"
+  exclusive = true  # contention can hide a real race in its 8-way lock test
 
   [[prep_pr.steps]]
   name = "test-pr-watch"

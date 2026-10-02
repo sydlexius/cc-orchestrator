@@ -13,8 +13,10 @@ exercises exactly this standalone mode.
 Config (`.gates.toml` at the repo root), `[prep_pr]` table, two mutually
 exclusive forms:
   - Form A: `gate = "<umbrella command>"`  -> run as one command.
-  - Form B: `steps = [ { name, run, required?, skip_if_absent?, skip_if? } ]`
-            -> run each in order with per-step skip predicates.
+  - Form B: `steps = [ { name, run, required?, skip_if_absent?, skip_if?,
+            exclusive? } ]` -> run each in order with per-step skip predicates.
+            Opt-in parallel: `[prep_pr] jobs = N` or `--jobs N` (CLI wins;
+            1 = the serial path, byte-identical to before #501).
 See skills/orchestrate/templates/gates.toml.md for the full schema.
 
 Fail-open fallback when `.gates.toml` is absent, in order:
@@ -41,8 +43,10 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 # So the sibling `orchestrate_schemas` module imports when gate-runner is run as
@@ -115,17 +119,32 @@ def _synth_records(rc):
     return [{"name": "gates", "result": "pass" if rc == 0 else "fail"}]
 
 
-def run_prep_pr(prep, root, memoize_dir=None):
-    """Run the [prep_pr] table. Return (exit_code, records)."""
+def _valid_jobs(value):
+    """A `jobs` value is a real positive int (bool is an int subclass: refused)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def run_prep_pr(prep, root, memoize_dir=None, cli_jobs=None):
+    """Run the [prep_pr] table. Return (exit_code, records). `cli_jobs` is the
+    already-validated `--jobs` value (None = not given); it overrides the
+    table's `jobs`, which is validated whenever present."""
     has_gate = "gate" in prep
     has_steps = "steps" in prep
     if has_gate and has_steps:
         warn("[prep_pr] sets BOTH `gate` and `steps`; they are mutually "
              "exclusive. Refusing to guess.")
         return 2, _synth_records(2)
+    if "jobs" in prep and not _valid_jobs(prep["jobs"]):
+        warn("[prep_pr].jobs must be a positive integer")
+        return 2, _synth_records(2)
+    jobs = cli_jobs if cli_jobs is not None else prep.get("jobs", 1)
     if has_gate:
+        if jobs > 1:
+            warn("`jobs` applies only to Form B `steps`; Form A runs serially")
         return run_form_a(prep["gate"], root)
     if has_steps:
+        if jobs > 1:
+            return run_form_b_parallel(prep["steps"], root, memoize_dir, jobs)
         return run_form_b(prep["steps"], root, memoize_dir)
     warn("[prep_pr] has neither `gate` nor `steps`; nothing to run.")
     return 0, _synth_records(0)
@@ -176,6 +195,9 @@ def run_form_b(steps, root, memoize_dir=None):
         if not isinstance(required, bool):
             warn(f"step {name!r} has invalid `required` (expected a boolean)")
             return 2, records
+        if not isinstance(step.get("exclusive", False), bool):
+            warn(f"step {name!r} has invalid `exclusive` (expected a boolean)")
+            return 2, records
         reason = _skip_reason(step, root)
         if reason:
             log(f"[SKIP] {name}: {reason}")
@@ -214,6 +236,284 @@ def run_form_b(steps, root, memoize_dir=None):
     if soft_failures:
         log(f"gate-runner: all required steps passed "
             f"({soft_failures} soft failure(s) warned, not blocking).")
+    else:
+        log("gate-runner: all steps passed.")
+    return 0, records
+
+
+# --- Parallel Form B (#501; opt-in via `jobs` > 1) ---------------------------
+#
+# ONE thread owns every child: a poll loop launches steps in declaration order
+# (bounded by `jobs` and the `exclusive` barrier), reaps them, and prints each
+# finished step's captured output as one whole block, strictly in declaration
+# order. Nothing here touches the serial path above, which stays byte-identical.
+
+KILL_GRACE_S = 3.0   # SIGTERM -> SIGKILL grace for cancelled process groups
+POLL_S = 0.02
+
+
+def _may_launch(running, jobs, exclusive):
+    """The launch gate. Nothing starts beside a running exclusive step; an
+    exclusive step starts only when nothing is in flight; else bounded by jobs."""
+    if any(e["exclusive"] for e in running.values()):
+        return False
+    if exclusive:
+        return not running
+    return len(running) < jobs
+
+
+def _killpg(pid, sig):
+    try:
+        os.killpg(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+_LAUNCH_SIGS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+def _group_alive(pgid):
+    """True while process group `pgid` still has a member we can signal. EPERM
+    means the pgid now belongs to someone else's processes: not ours, so gone."""
+    try:
+        os.killpg(pgid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def _prune_lingering(lingering):
+    """Drop every finished step's group that has emptied. An empty group can
+    never be re-joined, and dropping it promptly keeps the final sweep from
+    signalling a pgid the kernel has since recycled for an unrelated process."""
+    for pgid in [g for g in lingering if not _group_alive(g)]:
+        lingering.discard(pgid)
+
+
+def _terminate_groups(running, lingering=(), grace=KILL_GRACE_S):
+    """SIGTERM every in-flight step's process group AND every finished step's
+    still-populated group (`lingering`: a `sleep 30 &` left behind by a step
+    whose shell already exited), wait up to `grace` for all of them to empty,
+    then SIGKILL every group (unconditionally: a descendant that ignored SIGTERM
+    can outlive its group leader) and reap every direct child."""
+    procs = [e["proc"] for e in running.values()]
+    groups = [p.pid for p in procs] + list(lingering)
+    for g in groups:
+        _killpg(g, signal.SIGTERM)
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline and (
+            any(p.poll() is None for p in procs)
+            or any(_group_alive(g) for g in lingering)):
+        time.sleep(POLL_S)
+    for g in groups:
+        _killpg(g, signal.SIGKILL)
+    for p in procs:
+        p.wait()
+
+
+def _print_block(e):
+    """Print one finished step whole: its log lines, captured output, verdict."""
+    for line in e["pre"]:
+        log(line)
+    if e.get("out"):
+        sys.stdout.flush()
+        with open(e["out"], "rb") as f:
+            shutil.copyfileobj(f, sys.stdout.buffer)
+        sys.stdout.buffer.flush()
+    for line in e["post"]:
+        log(line)
+
+
+def _flush_ready(plan, printed):
+    """Print every consecutive finished step starting at index `printed`.
+    Returns the new `printed` index: step k prints only after 0..k-1."""
+    while printed < len(plan) and plan[printed]["state"] == "done":
+        _print_block(plan[printed])
+        printed += 1
+    return printed
+
+
+def _sigterm_to_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
+def run_form_b_parallel(steps, root, memoize_dir, jobs):
+    """Parallel Form B. Same return contract as run_form_b: (exit_code, records
+    in declaration order). Every step is validated BEFORE anything launches."""
+    if not isinstance(steps, list):
+        warn("[prep_pr].steps must be an array of step tables")
+        return 2, _synth_records(2)
+    log(f"gate-runner: .gates.toml Form B (enumerate) -> {len(steps)} step(s), "
+        f"jobs={jobs}")
+    plan = []
+    for i, step in enumerate(steps):
+        if not isinstance(step, dict):
+            warn(f"step #{i} is not a table; skipping")
+            continue
+        name = step.get("name") or f"step-{i}"
+        run = step.get("run")
+        if not isinstance(run, str) or not run.strip():
+            warn(f"step {name!r} has invalid `run` (expected a non-empty string)")
+            return 2, []
+        for key, default in (("required", True), ("exclusive", False)):
+            if not isinstance(step.get(key, default), bool):
+                warn(f"step {name!r} has invalid `{key}` (expected a boolean)")
+                return 2, []
+        plan.append({"idx": len(plan), "step": step, "name": name, "run": run,
+                     "required": step.get("required", True),
+                     "exclusive": step.get("exclusive", False),
+                     "state": "pending", "pre": [], "post": [], "out": None,
+                     "result": None, "memo": None, "checked": False})
+
+    capdir = tempfile.mkdtemp(prefix="gate-runner-")
+    running = {}
+    lingering = set()   # pgids of finished steps, swept on every exit path
+    nxt = printed = 0
+    hard = None
+    rc = 0
+    # SIGHUP joins SIGTERM: the groups run in their own sessions, so a hangup
+    # never reaches them and an unhandled one would orphan every group.
+    old_term = signal.signal(signal.SIGTERM, _sigterm_to_interrupt)
+    old_hup = signal.signal(signal.SIGHUP, _sigterm_to_interrupt)
+    try:
+        while True:
+            # Dispatch in declaration order. Skip predicates and memo lookups
+            # run here in the parent ONCE per step (`checked`), when it first
+            # reaches the head: a head blocked on capacity never re-runs them.
+            while hard is None and nxt < len(plan):
+                e = plan[nxt]
+                if not e["checked"]:
+                    e["checked"] = True
+                    reason = _skip_reason(e["step"], root)
+                    if reason:
+                        e["pre"].append(f"[SKIP] {e['name']}: {reason}")
+                        e["state"], e["result"] = "done", "skip"
+                        nxt += 1
+                        continue
+                    if memoize_dir and e["step"].get("pure", False) is True:
+                        tree = _memoizable_tree(root)
+                        if tree:
+                            e["memo"] = os.path.join(
+                                memoize_dir, _memo_key(tree, e["name"], e["run"]))
+                            if _memo_is_pass(e["memo"]):
+                                e["pre"].append(f"[MEMO] {e['name']}: cached "
+                                                f"pass (tree {tree[:7]})")
+                                e["state"], e["result"] = "done", "pass"
+                                nxt += 1
+                                continue
+                if not _may_launch(running, jobs, e["exclusive"]):
+                    break
+                e["out"] = os.path.join(capdir, f"{nxt}.out")
+                e["start"] = time.perf_counter()
+                # Block INT/TERM/HUP from Popen until the step is registered in
+                # `running`: a signal in between would otherwise raise before
+                # cleanup can see the new group, orphaning it. A pending signal
+                # is delivered when the mask is restored, after registration.
+                # The child inherits the blocked mask through fork/exec, so
+                # preexec_fn restores the caller's mask there, else the step
+                # could never receive the SIGTERM leg of cleanup.
+                prev = signal.pthread_sigmask(signal.SIG_BLOCK, _LAUNCH_SIGS)
+                try:
+                    try:
+                        with open(e["out"], "wb") as out:
+                            e["proc"] = subprocess.Popen(
+                                e["run"], shell=True, cwd=root,
+                                stdin=subprocess.DEVNULL, stdout=out,
+                                stderr=subprocess.STDOUT, start_new_session=True,
+                                preexec_fn=lambda: signal.pthread_sigmask(
+                                    signal.SIG_SETMASK, prev))
+                    except OSError as err:
+                        e["post"].append(
+                            f"[FAIL] {e['name']}: could not launch ({err}), "
+                            f"{time.perf_counter() - e['start']:.1f}s")
+                        e["state"], e["result"] = "done", "fail"
+                        if e["required"]:
+                            hard = e
+                        else:
+                            e["post"].append(f"[WARN] {e['name']}: soft failure "
+                                             "(required=false), continuing.")
+                        nxt += 1
+                        continue
+                    e["state"] = "running"
+                    running[nxt] = e
+                finally:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, prev)
+                nxt += 1
+            # Reap.
+            _prune_lingering(lingering)
+            for idx in list(running):
+                e = running[idx]
+                code = e["proc"].poll()
+                if code is None:
+                    continue
+                del running[idx]
+                # The leader is reaped, but a background descendant may still
+                # hold its group; keep that group for the final sweep.
+                lingering.add(e["proc"].pid)
+                ok = code == 0
+                e["post"].append(f"[{'PASS' if ok else 'FAIL'}] {e['name']} "
+                                 f"(exit {code}, "
+                                 f"{time.perf_counter() - e['start']:.1f}s)")
+                e["state"], e["result"] = "done", "pass" if ok else "fail"
+                if ok and e["memo"] is not None:
+                    _memo_write_pass(e["memo"])
+                elif not ok and e["required"]:
+                    if hard is None or e["idx"] < hard["idx"]:
+                        hard = e
+                elif not ok:
+                    e["post"].append(f"[WARN] {e['name']}: soft failure "
+                                     "(required=false), continuing.")
+            if hard is not None:
+                break
+            printed = _flush_ready(plan, printed)
+            if nxt >= len(plan) and not running:
+                break
+            time.sleep(POLL_S)
+    except KeyboardInterrupt:
+        rc = 130
+    finally:
+        # Ignore further INT/TERM/HUP while cleaning up: a second Ctrl-C inside
+        # the kill grace would otherwise abort it, orphaning the groups and
+        # leaking capdir. Restored after the rmtree.
+        masked = {s: signal.signal(s, signal.SIG_IGN)
+                  for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+        # Sweep on EVERY exit path, all-pass included: a finished step's stray
+        # background job is never wanted and must not outlive the run.
+        _prune_lingering(lingering)
+        if running or lingering:
+            _terminate_groups(running, lingering)
+            for e in running.values():
+                e["post"].append(f"[FAIL] {e['name']} (cancelled, "
+                                 f"{time.perf_counter() - e['start']:.1f}s)")
+                e["out"] = None   # partial output of a killed step: discarded
+                e["state"], e["result"] = "done", "fail"
+                e["cancelled"] = True
+            running.clear()
+        if rc == 0:
+            printed = _flush_ready(plan, printed)
+        shutil.rmtree(capdir, ignore_errors=True)
+        signal.signal(signal.SIGINT, masked[signal.SIGINT])
+        signal.signal(signal.SIGTERM, old_term)
+        signal.signal(signal.SIGHUP, old_hup)
+
+    records = []
+    for e in plan:
+        if e["state"] != "done":
+            continue   # never launched (after a stop): no record, as serial
+        rec = {"name": e["name"], "result": e["result"]}
+        if e.get("cancelled"):
+            rec["cancelled"] = True
+        records.append(rec)
+    if rc == 130:
+        log("gate-runner: interrupted -- all in-flight steps killed.")
+        return rc, records
+    if hard is not None:
+        log(f"gate-runner: HARD failure at {hard['name']!r} -- stopping.")
+        return 1, records
+    soft = sum(1 for e in plan if e["result"] == "fail")
+    if soft:
+        log(f"gate-runner: all required steps passed "
+            f"({soft} soft failure(s) warned, not blocking).")
     else:
         log("gate-runner: all steps passed.")
     return 0, records
@@ -656,10 +956,12 @@ def _atomic_write_json(path, obj):
 # --- Entry point ------------------------------------------------------------
 
 def _parse_args(argv):
-    """Parse the two optional flags. Returns (receipt_path, memoize_dir). Both
-    default None; unknown args are warned and ignored (never fatal)."""
+    """Parse the optional flags. Returns (receipt_path, memoize_dir, jobs). All
+    default None; unknown args are warned and ignored (never fatal). `jobs` is
+    the RAW --jobs string, validated in _run_gates so a bad value exits 2."""
     receipt_path = None
     memoize_dir = None
+    jobs = None
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -679,16 +981,30 @@ def _parse_args(argv):
             memoize_dir = argv[i]
         elif a.startswith("--memoize-dir="):
             memoize_dir = a[len("--memoize-dir="):]
+        elif a == "--jobs":
+            i += 1
+            jobs = argv[i] if i < len(argv) else ""
+        elif a.startswith("--jobs="):
+            jobs = a[len("--jobs="):]
         else:
             warn(f"unrecognized argument {a!r}; ignoring")
         i += 1
-    return receipt_path, memoize_dir
+    return receipt_path, memoize_dir, jobs
 
 
-def _run_gates(root, memoize_dir):
-    """Resolve config and run the gates. Return (exit_code, records)."""
+def _run_gates(root, memoize_dir, jobs=None):
+    """Resolve config and run the gates. Return (exit_code, records). `jobs` is
+    the raw --jobs string or None."""
+    if jobs is not None:
+        if not re.fullmatch(r"[0-9]+", jobs) or int(jobs) < 1:
+            warn(f"--jobs must be a positive integer (got {jobs!r})")
+            return 2, _synth_records(2)
+        jobs = int(jobs)
     config_path = os.path.join(root, CONFIG_NAME)
     if not os.path.isfile(config_path):
+        if jobs is not None and jobs > 1:
+            warn("`--jobs` applies only to Form B `steps`; the fallback chain "
+                 "runs serially")
         return fallback_chain(root)
     try:
         with open(config_path, "rb") as f:
@@ -702,15 +1018,15 @@ def _run_gates(root, memoize_dir):
         warn(f"{CONFIG_NAME} is present but has no valid [prep_pr] table; failing closed.")
         return 2, _synth_records(2)
     log(f"gate-runner: using {config_path}")
-    return run_prep_pr(prep, root, memoize_dir)
+    return run_prep_pr(prep, root, memoize_dir, jobs)
 
 
 def main(argv=None):
     argv = argv if argv is not None else sys.argv[1:]
-    receipt_path, memoize_dir = _parse_args(argv)
+    receipt_path, memoize_dir, jobs = _parse_args(argv)
     root = find_repo_root()
     pre = _snapshot(root, receipt_path) if receipt_path else None
-    rc, records = _run_gates(root, memoize_dir)
+    rc, records = _run_gates(root, memoize_dir, jobs)
     if receipt_path:
         _write_receipt(receipt_path, root, rc, records, pre)
     return rc
