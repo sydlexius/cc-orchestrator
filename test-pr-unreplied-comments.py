@@ -1876,7 +1876,7 @@ def main():
         g = nodes if isinstance(nodes, str) else gq(*nodes)
         return run(["--cr-unconfirmed"], inline=raw, graphql=g, **kw)
 
-    rc, out, err = cu([crc(1, "A", True), crc(2, "B", True)], [thr(1, False), thr(2, True, "coderabbitai")])
+    rc, out, err = cu([crc(1, "A", True), crc(2, "B", True)], [thr(1, False), thr(2, True, "coderabbitai[bot]")])
     check("cr-unconfirmed: all roots confirmed -> exit 0", rc == 0)
     check("cr-unconfirmed: all confirmed -> summary line, no finding lines",
           "all 2 CodeRabbit root comment(s) confirmed" in out and " | replied:" not in out)
@@ -1912,11 +1912,13 @@ def main():
     rc, out, err = cu([crc(1, "A", False)], [])
     check("cr-unconfirmed: unconfirmed root with no matching thread -> exit 2", rc == 2)
 
-    rc, out, err = cu([crc(1, "A", False), crc(2, "B", False)], [thr(1, True, "coderabbitai"), thr(2, True, "coderabbitai")])
+    # Live GraphQL reports resolvedBy.login WITH the [bot] suffix (verified on PR #530); the bare
+    # spelling is kept on thread 2 so the matcher's acceptance of both stays covered.
+    rc, out, err = cu([crc(1, "A", False), crc(2, "B", False)], [thr(1, True, "coderabbitai[bot]"), thr(2, True, "coderabbitai")])
     check("cr-unconfirmed canary: CR self-resolved, no marker anywhere -> exit 2 (not 1)", rc == 2)
     check("cr-unconfirmed canary: WARN on stderr names the count",
           "WARN: no CodeRabbit root carries the confirmation marker, but CodeRabbit resolved 2 thread(s) itself; the marker wording may have changed" in err)
-    rc, out, err = cu([crc(1, "A", False), crc(2, "B", True)], [thr(1, True, "coderabbitai"), thr(2, True, "coderabbitai")])
+    rc, out, err = cu([crc(1, "A", False), crc(2, "B", True)], [thr(1, True, "coderabbitai[bot]"), thr(2, True, "coderabbitai[bot]")])
     check("cr-unconfirmed: CR self-resolved unmarked root with a marker elsewhere -> listed, exit 1, no canary",
           rc == 1 and out.splitlines()[0].startswith("1 |") and "WARN: no CodeRabbit" not in err
           and "FORCE-RESOLVED" not in out)
