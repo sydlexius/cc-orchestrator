@@ -337,37 +337,43 @@ def run_form_b_parallel(steps, root, memoize_dir, jobs):
                      "required": step.get("required", True),
                      "exclusive": step.get("exclusive", False),
                      "state": "pending", "pre": [], "post": [], "out": None,
-                     "result": None, "memo": None})
+                     "result": None, "memo": None, "checked": False})
 
     capdir = tempfile.mkdtemp(prefix="gate-runner-")
     running = {}
     nxt = printed = 0
     hard = None
     rc = 0
+    # SIGHUP joins SIGTERM: the groups run in their own sessions, so a hangup
+    # never reaches them and an unhandled one would orphan every group.
     old_term = signal.signal(signal.SIGTERM, _sigterm_to_interrupt)
+    old_hup = signal.signal(signal.SIGHUP, _sigterm_to_interrupt)
     try:
         while True:
             # Dispatch in declaration order. Skip predicates and memo lookups
-            # run here in the parent, once, when a step reaches the head.
+            # run here in the parent ONCE per step (`checked`), when it first
+            # reaches the head: a head blocked on capacity never re-runs them.
             while hard is None and nxt < len(plan):
                 e = plan[nxt]
-                reason = _skip_reason(e["step"], root)
-                if reason:
-                    e["pre"].append(f"[SKIP] {e['name']}: {reason}")
-                    e["state"], e["result"] = "done", "skip"
-                    nxt += 1
-                    continue
-                if memoize_dir and e["step"].get("pure", False) is True:
-                    tree = _memoizable_tree(root)
-                    if tree:
-                        e["memo"] = os.path.join(
-                            memoize_dir, _memo_key(tree, e["name"], e["run"]))
-                        if _memo_is_pass(e["memo"]):
-                            e["pre"].append(f"[MEMO] {e['name']}: cached pass "
-                                            f"(tree {tree[:7]})")
-                            e["state"], e["result"] = "done", "pass"
-                            nxt += 1
-                            continue
+                if not e["checked"]:
+                    e["checked"] = True
+                    reason = _skip_reason(e["step"], root)
+                    if reason:
+                        e["pre"].append(f"[SKIP] {e['name']}: {reason}")
+                        e["state"], e["result"] = "done", "skip"
+                        nxt += 1
+                        continue
+                    if memoize_dir and e["step"].get("pure", False) is True:
+                        tree = _memoizable_tree(root)
+                        if tree:
+                            e["memo"] = os.path.join(
+                                memoize_dir, _memo_key(tree, e["name"], e["run"]))
+                            if _memo_is_pass(e["memo"]):
+                                e["pre"].append(f"[MEMO] {e['name']}: cached "
+                                                f"pass (tree {tree[:7]})")
+                                e["state"], e["result"] = "done", "pass"
+                                nxt += 1
+                                continue
                 if not _may_launch(running, jobs, e["exclusive"]):
                     break
                 e["out"] = os.path.join(capdir, f"{nxt}.out")
@@ -419,6 +425,11 @@ def run_form_b_parallel(steps, root, memoize_dir, jobs):
     except KeyboardInterrupt:
         rc = 130
     finally:
+        # Ignore further INT/TERM/HUP while cleaning up: a second Ctrl-C inside
+        # the kill grace would otherwise abort it, orphaning the groups and
+        # leaking capdir. Restored after the rmtree.
+        masked = {s: signal.signal(s, signal.SIG_IGN)
+                  for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
         if running:
             _terminate_groups(running)
             for e in running.values():
@@ -428,10 +439,12 @@ def run_form_b_parallel(steps, root, memoize_dir, jobs):
                 e["state"], e["result"] = "done", "fail"
                 e["cancelled"] = True
             running.clear()
-        signal.signal(signal.SIGTERM, old_term)
         if rc == 0:
             printed = _flush_ready(plan, printed)
         shutil.rmtree(capdir, ignore_errors=True)
+        signal.signal(signal.SIGINT, masked[signal.SIGINT])
+        signal.signal(signal.SIGTERM, old_term)
+        signal.signal(signal.SIGHUP, old_hup)
 
     records = []
     for e in plan:

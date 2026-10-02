@@ -85,7 +85,8 @@ With `jobs` > 1:
 - All steps are validated before anything launches.
 - Steps launch in declaration order. A step blocked on capacity or on an
   `exclusive` barrier holds back every later step (no reordering).
-- Skip predicates and memo lookups run in the runner before launch; a memo
+- Skip predicates and memo lookups run in the runner before launch, once per
+  step (a step held back at the head is not re-checked); a memo
   entry is written on PASS only.
 - Each step gets `stdin` from `/dev/null`, and its stdout and stderr go, merged,
   to a per-step temp file. A finished step prints as one block (its output, then
@@ -96,7 +97,12 @@ With `jobs` > 1:
   `[FAIL] <name> (cancelled, ...)` line, their partial output is discarded, and
   they are recorded as failures (`"cancelled": true`). Then the runner logs
   `HARD failure at <name> -- stopping.` and exits 1. A `required = false` failure
-  still warns and continues. Ctrl-C (or SIGTERM to the runner) kills every group.
+  still warns and continues. Ctrl-C (or SIGTERM or SIGHUP to the runner) kills
+  every group; further INT/TERM/HUP are ignored while that cleanup runs, so a
+  second Ctrl-C cannot cut it short. Steps run in their own sessions, so SIGKILL
+  to the runner (which cannot be handled) orphans every in-flight group. One
+  accepted gap: a signal landing in the instant between a step's launch and its
+  tracking leaves that one step unkilled.
 - The receipt is written only after every child has exited. `steps[]` stays in
   declaration order; a fail receipt may include steps declared after the
   failing one.

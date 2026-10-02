@@ -1327,8 +1327,13 @@ def test_parallel_fail_fast_kills_groups():
 
 
 def test_parallel_interrupt_kills_groups():
-    """SIGINT to the runner while a step holds: every process group is killed
-    and no pass receipt is written."""
+    for sig in (signal.SIGINT, signal.SIGHUP):
+        _interrupt_kills_groups(sig)
+
+
+def _interrupt_kills_groups(sig):
+    """SIGINT (or SIGHUP) to the runner while a step holds: every process group
+    is killed and no pass receipt is written."""
     with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as aux:
         git_init(root)
         pg = os.path.join(aux, "pgid")
@@ -1340,16 +1345,16 @@ def test_parallel_interrupt_kills_groups():
                                 cwd=root, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
         pgid = _read_pid(pg)
-        proc.send_signal(signal.SIGINT)
+        proc.send_signal(sig)
         try:
             rc = proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill(); rc = None
-        check("#501: SIGINT: runner exits non-zero promptly", rc not in (None, 0))
-        check("#501: SIGINT: the held step's process group is gone",
+        check(f"#501: {sig.name}: runner exits non-zero promptly", rc not in (None, 0))
+        check(f"#501: {sig.name}: the held step's process group is gone",
               pgid is not None and _gone(pgid, group=True))
         r = _load_receipt(rpath) if os.path.isfile(rpath) else {}
-        check("#501: SIGINT: no pass receipt", r.get("result") != "pass")
+        check(f"#501: {sig.name}: no pass receipt", r.get("result") != "pass")
         if pgid:
             try:
                 os.killpg(pgid, signal.SIGKILL)
@@ -1389,6 +1394,138 @@ def test_parallel_receipt():
               [s.get("name") for s in r.get("steps", [])] == ["slow", "f2", "f3", "f4"])
 
 
+def test_parallel_double_interrupt_term_ignoring():
+    """A step that IGNORES SIGTERM, then SIGINT and a second SIGINT inside the
+    kill grace: cleanup is not cut short, the SIGKILL leg reaps the group, and
+    no `gate-runner-*` capture dir leaks."""
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as aux:
+        git_init(root)
+        pg, tmp = os.path.join(aux, "pgid"), os.path.join(aux, "tmp")
+        os.makedirs(tmp)
+        write(root, ".gates.toml", _steps_cfg(
+            [("deaf", f"trap '' TERM; echo $$ > {pg}; sleep 60", ""),
+             ("ok", "true", "")], jobs=2))
+        proc = subprocess.Popen([sys.executable, RUNNER], cwd=root,
+                                env=dict(os.environ, TMPDIR=tmp),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        pgid = _read_pid(pg)
+        proc.send_signal(signal.SIGINT); time.sleep(1)
+        proc.send_signal(signal.SIGINT)
+        try:
+            _, err = proc.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill(); err = b""; proc.wait()
+        check("#501: double SIGINT: runner exits 130, no traceback",
+              proc.returncode == 130 and b"Traceback" not in err)
+        check("#501: double SIGINT: the TERM-ignoring group is gone (SIGKILL leg)",
+              pgid is not None and _gone(pgid, group=True))
+        check("#501: double SIGINT: no gate-runner-* temp dir leaked",
+              not [n for n in os.listdir(tmp) if n.startswith("gate-runner-")])
+        if pgid:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def test_parallel_soft_skip_memo():
+    """The parallel path honors `required = false`, both skip predicates, and
+    pure-step memoization (lookup, and a write on PASS only)."""
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as aux:
+        git_init(root)
+        later, sk1, sk2, pure = (os.path.join(aux, n)
+                                 for n in ("later", "sk1", "sk2", "pure"))
+        memo = os.path.join(aux, "memo")
+        write(root, ".gates.toml", _steps_cfg(
+            [("soft", "exit 3", "required = false\n  pure = true"),
+             ("absent", f"touch {sk1}", 'skip_if_absent = "no-such-tool-501"'),
+             ("nomatch", f"touch {sk2}", 'skip_if = "no-such-dir-501/**"'),
+             ("pure", f"touch {pure}", "pure = true"),
+             ("later", f"touch {later}", "")], jobs=2))
+        git_commit(root)
+        rc, out = run_runner(root, args=("--memoize-dir", memo))
+        check("#501: soft: rc 0 and later steps still run",
+              rc == 0 and os.path.exists(later))
+        check("#501: soft: [WARN] soft failure line",
+              "[WARN] soft: soft failure (required=false)" in out)
+        check("#501: skip: skip_if_absent and skip_if skip in parallel mode",
+              "[SKIP] absent:" in out and "[SKIP] nomatch:" in out
+              and not os.path.exists(sk1) and not os.path.exists(sk2))
+        check("#501: memo: exactly one entry written (PASS only, not the soft fail)",
+              os.path.isdir(memo) and len(os.listdir(memo)) == 1)
+        os.remove(pure)
+        rc2, out2 = run_runner(root, args=("--memoize-dir", memo))
+        check("#501: memo: second run is a [MEMO] hit and does not re-run",
+              rc2 == 0 and "[MEMO] pure:" in out2 and not os.path.exists(pure))
+
+
+class _FakeProc:
+    """Stands in for Popen: poll() returns None `holds` times, then `code`."""
+    def __init__(self, code, holds=0):
+        self.pid, self.code, self.holds = 999999, code, holds
+
+    def poll(self):
+        if self.holds:
+            self.holds -= 1; return None
+        return self.code
+
+    def wait(self):
+        return self.code
+
+
+def _inproc_parallel(steps, popen, jobs=2, patch=None):
+    """Run run_form_b_parallel in-process with Popen replaced. Returns
+    (rc, records, output)."""
+    import importlib.util, io, contextlib, types
+    spec = importlib.util.spec_from_file_location("gate_runner_par", RUNNER)
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    mod.subprocess = types.SimpleNamespace(Popen=popen, DEVNULL=subprocess.DEVNULL,
+                                           STDOUT=subprocess.STDOUT)
+    for k, v in (patch or {}).items():
+        setattr(mod, k, v(getattr(mod, k)))
+    buf = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+    with tempfile.TemporaryDirectory() as root, contextlib.redirect_stdout(buf), \
+            contextlib.redirect_stderr(buf):
+        rc, records = mod.run_form_b_parallel(steps, root, "/nonexistent-memo", jobs)
+        buf.flush()
+    return rc, records, buf.buffer.getvalue().decode()
+
+
+def test_parallel_launch_error_and_tiebreak():
+    def boom(*a, **k):
+        raise OSError("simulated launch failure")
+    rc, recs, out = _inproc_parallel(
+        [{"name": "ghost", "run": "x"}, {"name": "next", "run": "y"}], boom, jobs=1)
+    check("#501: launch OSError on a required step is a HARD failure",
+          rc == 1 and "HARD failure at 'ghost'" in out
+          and recs == [{"name": "ghost", "result": "fail"}])
+    rc, recs, out = _inproc_parallel(
+        [{"name": "a", "run": "x"}, {"name": "b", "run": "y"}],
+        lambda *a, **k: _FakeProc(1))
+    check("#501: simultaneous required failures name the earlier-declared step",
+          rc == 1 and "HARD failure at 'a'" in out)
+
+
+def test_parallel_head_checked_once():
+    """A head blocked on capacity for many polls runs its skip predicate and
+    memo lookup exactly once."""
+    calls = []
+
+    def count(fn):
+        def wrapped(step, *a):
+            calls.append((fn.__name__, step if isinstance(step, str) else step["name"]))
+            return fn(step, *a) if fn.__name__ == "_skip_reason" else None
+        return wrapped
+    steps = [{"name": n, "run": "x", "pure": True} for n in ("h1", "h2", "blocked")]
+    rc, _, _ = _inproc_parallel(steps, lambda *a, **k: _FakeProc(0, holds=10),
+                                patch={"_skip_reason": count, "_memoizable_tree": count})
+    skips = [c for c in calls if c == ("_skip_reason", "blocked")]
+    trees = [c for c in calls if c[0] == "_memoizable_tree"]
+    check("#501: blocked head: skip predicate ran once",
+          rc == 0 and len(skips) == 1)
+    check("#501: blocked head: memo lookup ran once per step", len(trees) == 3)
+
+
 def main():
     print("test-gate-runner.py")
     for fn in [
@@ -1422,7 +1559,9 @@ def main():
         test_parallel_output_contiguous, test_parallel_declaration_order,
         test_parallel_exclusive_overlaps_nothing,
         test_parallel_fail_fast_kills_groups, test_parallel_interrupt_kills_groups,
-        test_parallel_receipt,
+        test_parallel_receipt, test_parallel_double_interrupt_term_ignoring,
+        test_parallel_soft_skip_memo, test_parallel_launch_error_and_tiebreak,
+        test_parallel_head_checked_once,
     ]:
         print(f"- {fn.__name__}")
         fn()
