@@ -1886,7 +1886,7 @@ def main():
     check("cr-unconfirmed: one unconfirmed -> exit 1", rc == 1)
     check("cr-unconfirmed: exact line format (pipe in title scrubbed)",
           "7 | b.sh:42 | Keep the / read distinct | replied:no | resolved:no" in out.splitlines())
-    check("cr-unconfirmed: confirmed root not listed", not any(l.startswith("1 |") for l in out.splitlines()))
+    check("cr-unconfirmed: confirmed root not listed", not any(ln.startswith("1 |") for ln in out.splitlines()))
 
     rc, out, err = cu([], [])
     check("cr-unconfirmed: zero CR roots -> exit 0", rc == 0)
@@ -1936,7 +1936,7 @@ def main():
         check("cr-unconfirmed: reply by bot %s does not count as replied" % bl, "replied:no" in out)
     rc, out, err = cu([crc(1, "A", False), crc(13, "x", False, reply_to=1)], [thr(1, False)])
     check("cr-unconfirmed: a CR reply is not itself a root (one line only)",
-          len([l for l in out.splitlines() if " | replied:" in l]) == 1)
+          len([ln for ln in out.splitlines() if " | replied:" in ln]) == 1)
     lc = crc(1, "A", False); lc["body"] += "\nconfirmed as addressed"
     rc, out, err = cu([lc], [thr(1, False)])
     check("cr-unconfirmed: lowercase 'confirmed as addressed' does not confirm", rc == 1)
