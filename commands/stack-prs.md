@@ -105,10 +105,12 @@ and say, briefly:
   bypass for this stack.
 - It reuses an open PR for a branch that has one and CREATES the missing ones with the base
   chained to the slice below. If the PRs already belong to a stack, it appends.
-- **Draft state (verified from `gh stack link --help`).** link's help does NOT state whether new
-  PRs are drafts (unlike `gh stack submit --help`, which says `--auto` creates drafts). So
-  Step 3 READS each PR's draft state rather than assuming. `--open` "marks new AND EXISTING PRs as
-  ready for review": with `--open`, a draft PR you meant to keep draft is un-drafted too.
+- **Draft state.** link's help does not say, but measured on 2026-10-01 (#503, stack #520) link
+  creates new PRs as DRAFTS, like `gh stack submit --auto`. Step 3 still READS each PR's draft
+  state rather than assuming. A draft gets NO CodeRabbit review (CR skipped draft #514), and
+  `gh stack merge` refuses a stack containing one, so a PR must leave draft before its review
+  trigger and before merge. `--open` "marks new AND EXISTING PRs as ready for review": with
+  `--open`, a draft PR you meant to keep draft is un-drafted too.
 
 Then ask exactly ONE question: "Run this `gh stack link`?" Proceed ONLY on an explicit yes in this
 session. Anything else: STOP, nothing pushed.
@@ -143,7 +145,7 @@ Required, else STOP and report the mismatch:
   the branch of the slice below;
 - the remote head (`ls-remote`) equals the local tip, and equals `headRefOid`;
 - draft state is what was intended: without `--open`, any PR that came out ready is converted
-  with `gh pr ready <n> --undo` (link's draft default is undocumented, so this is the handling).
+  with `gh pr ready <n> --undo` (link's draft default is undocumented, so this guards a change).
 
 Report the stack number (from link's output, or the GitHub stack UI link on any PR) and every PR
 URL, bottom to top.
@@ -178,16 +180,26 @@ commit-style title, single-quoted, no trigger words; there is no title-file flag
 ## Step 5 -- Next steps (print for the lead)
 
 1. Watch each PR with `/pr-watch <n>`, one watch per PR, backgrounded.
-2. CodeRabbit reviews the BOTTOM PR only, and only when the maintainer triggers it. No agent and no
-   elmer queue entry ever posts a review trigger for any PR of a stack. (The #501 controlled test:
-   the maintainer may trigger the upper PR, naming the related PR in the trigger text.)
-3. Merge bottom-up, one PR at a time, through `/merge-pr` (its per-PR readiness oracle). Never
-   `gh stack merge`: it merges the whole stack atomically and the floor does not gate it (#516).
-4. After the lower PR merges, refresh the next PR with an ADDITIVE `gh pr update-branch <n>` (and
-   confirm its base retargeted to the trunk). Never `gh stack sync`, `rebase` or `push` once any PR
-   in the stack has a review: they force-push, which orphans cited fix SHAs and empties CR's
-   incremental-review delta.
-5. Fix rounds on a stack PR go through `/handle-review` on that PR's own worktree (safe-push path).
+2. A PR must be out of draft (`gh pr ready <n>`) before its review trigger: CR does not review a
+   draft. CodeRabbit reviews the BOTTOM PR only, and only when the maintainer triggers it. No
+   agent and no elmer queue entry ever posts a review trigger for any PR of a stack. (The #501
+   controlled test: the maintainer triggered the upper PR with "Related open PRs in this stack:
+   #N (...)"; CR used the hint and scoped its review to the upper PR's own diff.)
+3. Fix rounds on a stack PR go through `/handle-review` on that PR's own worktree (safe-push path).
+   Never `gh stack sync`, `rebase` or `push` once any PR in the stack has a review: they
+   force-push, which orphans cited fix SHAs and empties CR's incremental-review delta.
+4. When a lower PR's fix round conflicts with an upper PR (GitHub shows the upper PR
+   `CONFLICTING`), `gh pr update-branch` cannot fix it ("Cannot update PR branch due to
+   conflicts"). Resolve in the upper PR's worktree: `git merge origin/<lower-branch>`, resolve,
+   commit (a signed merge commit), push through safe-push. Additive: every SHA on the upper PR
+   survives. Without a conflict, refresh with a plain `gh pr update-branch <n>`.
+5. Merge, on the maintainer's go: run `ship-gate-preflight` on EVERY PR in the stack first; all
+   must PASS. Then `gh stack merge <stack> --squash` merges them as ordered per-PR squash commits
+   with no retarget step (measured, #503), or merge bottom-up through `/merge-pr`. `gh stack
+   merge` itself checks only open and not-draft (it merged a PR whose CI was still running), and
+   it is all-or-nothing: on a conflict it merges nothing. In a marker session the floor does not
+   gate it yet (#516), so there it runs only after the oracle passes on every PR. Neither path
+   deletes the merged PRs' remote branches: delete them and confirm with `git ls-remote`.
 
 ---
 
@@ -207,7 +219,13 @@ commit-style title, single-quoted, no trigger words; there is no title-file flag
   only hold for the tree they saw. Re-run Step 1 if anything moved.
 - **Bodies are self-contained.** `submit --auto` and link can both leave generated titles and empty
   bodies; Step 4 replaces them, and each body names its neighbors.
-- **Forbidden on a stack:** `gh stack merge` (#516); `gh stack sync/rebase/push` after any review;
-  a hand-made `gh pr create --base <other-branch>` (not a GitHub stack; nothing links the PRs).
+- **Conflicts are manual.** `gh stack merge` never resolves one; it refuses the whole stack. A
+  lower fix round that touches lines an upper slice also changed costs one hand resolution (a
+  merge commit) per affected upper PR, so slices on disjoint files are worth the effort.
+- **`gh stack merge` only after the oracle.** It is a good merge path (ordered squash commits, no
+  retarget), but it checks almost nothing itself; `ship-gate-preflight` must PASS on every PR.
+- **Forbidden on a stack:** `gh stack sync/rebase/push` after any review; `gh stack merge` before
+  every PR passes the oracle (#516); a hand-made `gh pr create --base <other-branch>` (not a
+  GitHub stack; nothing links the PRs).
 - **Record the outcome for #503** when the stack was a measured case (the #501 controlled test):
   what the review bots did with the stack context, and how many rounds each PR took.
