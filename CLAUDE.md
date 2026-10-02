@@ -395,14 +395,18 @@ Runtime (`scripts/`; canonical source is this repo):
 - `scripts/stack-preflight.sh` - READ-ONLY pre-link checker for `/orchestrate:stack-prs`. `gh stack
   link` pushes by itself and skips safe-push's checks, so this re-asks them per slice (bottom to top; a
   slice is a PR number if all digits, else a worktree dir - write a numeric path as `./42`): no slice,
-  at ANY position, may BE the trunk, the default branch (origin/HEAD, resolved even when `--base` names
-  another trunk, since the floor protects the default branch by NAME), `main`, `master` or `HEAD` (link
-  would push it past the floor; exit 2), every gh-derived ref reaches git fully qualified
-  (`refs/heads/<name>`, so `--upload-pack=` cannot parse as an option) - the command-line `--base` is
-  the one exception, a validated PLAIN branch name (dash-led, `HEAD` and `refs/*` refused) that
-  reaches base-freshness's fetch unqualified - clean worktree, passing receipt bound to the branch tree,
-  bottom slice fresh vs the trunk (`--base`, else origin/HEAD), each upper slice contains the lower tip,
-  PR slices OPEN and chained. Exit 0/1/2; any read failure or unknown freshness is 2, never a pass. Calls
+  at ANY position, may BE the trunk, the default branch (BOTH the LIVE one from `git ls-remote --symref
+  origin HEAD` and the cached origin/HEAD, which goes stale after a remote rename; resolved even when
+  `--base` names another trunk, since the floor protects the default branch by NAME), `main`, `master`
+  or `HEAD` (link would push it past the floor; exit 2). No gh-derived NAME reaches git: a PR slice's
+  head is fetched as `refs/pull/<n>/head` (n is the validated PR number, so fork PRs work and a
+  `--upload-pack=` headRefName never reaches git) and used only as a validated 40-hex SHA (validated by
+  explicit checks, never `assert`, which `python3 -O` strips) - the command-line `--base` is the one
+  name that does, a validated PLAIN branch name (dash-led, `HEAD` and `refs/*` refused) that reaches
+  base-freshness's fetch unqualified - clean worktree, passing receipt bound to the branch tree, bottom
+  slice fresh vs the trunk (`--base`, else the live default, else origin/HEAD), each upper slice
+  contains the lower tip, PR slices OPEN and chained, and every PR head RE-READ just before PASS (moved
+  or unreadable -> 2). Exit 0/1/2; any read failure or unknown freshness is 2, never a pass. Calls
   `base-freshness.sh` from its OWN directory, never the cwd. Not in HELPER_NAMES (plugin/repo legs only).
 - `scripts/cr-quota-watch.sh` - READ-ONLY surfacer for CodeRabbit's own quota announcements. It
   POSTS NOTHING, so it can never spend a review slot and needs no trigger authority (triggering a
