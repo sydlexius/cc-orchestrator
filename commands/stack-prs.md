@@ -14,7 +14,8 @@ result, and drafts the PR bodies. It never merges, never posts a review trigger,
 
 A slice is a PR number (all digits, checked FIRST) or a worktree path (an existing directory),
 listed BOTTOM TO TOP. A worktree path that is a bare number is read as a PR number, so write it
-`./42`. No slice may be the trunk branch itself. `--base <branch>` names the trunk the bottom PR targets (default: the branch `origin/HEAD`
+`./42`. No slice may be the trunk, the default branch (the one `origin/HEAD` points at, even when
+`--base` names another trunk), `main`, `master` or `HEAD`: link would push it past the floor. `--base <branch>` names the trunk the bottom PR targets (default: the branch `origin/HEAD`
 points at). `--open` marks the PRs ready for review instead of leaving them drafts.
 
 **Arguments:** $ARGUMENTS
@@ -27,7 +28,8 @@ Split `$ARGUMENTS` on whitespace. Accept ONLY these words, matched exactly and c
 
 - `--open` (at most once).
 - `--base` followed by ONE branch name (at most once). The name must be a plain branch: letters,
-  digits, `.`, `_`, `-`, `/` only, no leading `-`, no `..`, not ending in `/` or `.lock`.
+  digits, `.`, `_`, `-`, `/` only, no leading `-`, no `..`, not ending in `/` or `.lock`, not
+  `HEAD`, and not starting with `refs/`.
 - A slice, classified in this order (the same order `stack-preflight.sh` uses): an all-digits
   word is a PR number, even if a directory of that name exists; otherwise a word naming an
   EXISTING directory is a worktree slice (write a numeric path as `./42`). Check each candidate
@@ -50,7 +52,10 @@ for s in <SLICES>; do
     *) echo "slice ok (PR): #$s" ;;
   esac
 done
-b='<BASE or empty>'; [ -z "$b" ] || { git check-ref-format "refs/heads/$b" && echo "base ok: $b" || echo "base REJECTED: $b"; }
+b='<BASE or empty>'; [ -z "$b" ] || case "$b" in
+  -*|HEAD|refs/*) echo "base REJECTED: $b" ;;
+  *) git check-ref-format "refs/heads/$b" && echo "base ok: $b" || echo "base REJECTED: $b" ;;
+esac
 ```
 
 Any `REJECTED`: STOP.
@@ -128,7 +133,14 @@ session. Anything else: STOP, nothing pushed.
 ## Step 3 -- Link, then verify
 
 Re-run the Step 1 block first if anything moved since (a commit, a fetch, a minute of doubt);
-`pf_rc` must still be 0. Run link from a checkout of the SAME repository as the slices (the
+`pf_rc` must still be 0. Then, for each WORKTREE slice, record whether its branch already has a
+PR, BEFORE link runs (`<branch>` = the name the preflight printed in brackets):
+
+```bash
+gh pr list --head '<branch>' --state open --json number --jq 'length'
+```
+
+Keep the count per branch (`0` = no PR before link). A read failure: STOP, never link on doubt. Run link from a checkout of the SAME repository as the slices (the
 lead's main checkout or any slice worktree): link resolves branches and the `origin` remote from
 the current directory, so another repository's checkout would push or look up the wrong thing.
 `<LINKARGS>` is the single-quoted list from Step 2, unchanged. Then:
@@ -155,11 +167,12 @@ Required, else STOP and report the mismatch:
 - every PR is OPEN; the bottom PR's `baseRefName` is the trunk; each higher PR's `baseRefName` is
   the branch of the slice below;
 - the remote head (`ls-remote`) equals the local tip, and equals `headRefOid`;
-- draft state is what was intended: without `--open`, any PR that link CREATED in this run and
-  that came out ready is converted with `gh pr ready <n> --undo` (link's draft default is
-  undocumented, so this guards a change). NEVER re-draft an EXISTING PR passed as a slice, or one
-  link reused: it may already be ready and reviewed, and re-drafting it hides it from review.
-  Tell them apart by the Step 2 slice kind and link's output (created vs reused).
+- draft state is what was intended: without `--open`, a PR that came out ready is converted with
+  `gh pr ready <n> --undo` ONLY if its branch is a worktree slice whose pre-link count was `0`
+  (link CREATED it in this run; its draft default is undocumented, so this guards a change).
+  NEVER re-draft a PR passed as a PR-number slice, or one whose branch had a PR before link: it
+  may already be ready and reviewed, and re-drafting it hides it from review. The pre-link record
+  decides this, never a parse of link's output.
 
 Report the stack number (from link's output, or the GitHub stack UI link on any PR) and every PR
 URL, bottom to top.
