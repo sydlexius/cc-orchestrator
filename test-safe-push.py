@@ -256,6 +256,33 @@ def receipt_stub_cases():
               rc == 0 and len(pushes) == 1)
 
 
+_ABORT_DIR = tempfile.mkdtemp()
+
+
+def _abort_copy():
+    """safe-push with an unplanned `false` (a set -e abort) injected before the push, to prove the
+    trap's fallback verdict rather than any site's recorded one."""
+    dst = os.path.join(_ABORT_DIR, "safe-push.sh")
+    with open(SCRIPT) as fh:
+        body = fh.read()
+    marker = "# --- Pre-push classification (#148)"
+    assert marker in body
+    with open(dst, "w") as fh:
+        fh.write(body.replace(marker, "false\n" + marker, 1))
+    return dst
+
+
+def _closed_stdout_rc():
+    """Run a successful stubbed push with stdout CLOSED (>&-); return safe-push's exit code."""
+    with tempfile.TemporaryDirectory() as td:
+        # Reuse run()'s stub setup via a wrapper script that closes fd 1 first.
+        wrap = os.path.join(td, "wrap.sh")
+        with open(wrap, "w") as fh:
+            fh.write('#!/usr/bin/env bash\nexec 1>&-\nexec bash "%s" "$@"\n' % SCRIPT)
+        rc, _o, _e, pushes, _l = run(["feature/x"], script=wrap)
+        return rc if len(pushes) == 1 else -1
+
+
 def verdict_line_cases():
     # One stdout line per run, on EVERY exit path, and nothing else on stdout: callers read it
     # as the verdict instead of re-verifying the push with their own ls-remote.
@@ -297,6 +324,26 @@ def verdict_line_cases():
         check(f"{label}: exit {want_rc}", rc == want_rc)
         check(f"{label}: stdout is exactly '{want_line}'", lines == [want_line])
         check(f"{label}: no SAFE-PUSH verdict leaks onto stderr", "SAFE-PUSH:" not in err)
+    # Review fixes: the trap fallback, a closed stdout, a forged branch, an interrupted verify.
+    rc, out, err, pushes, _log = run(["feature/x"], extra_env={"SAFE_PUSH_FORCE_ABORT": ""},
+                                     known_branches="feature/x", lsremote_fail=None,
+                                     script=_abort_copy())
+    check("unplanned abort before the push: ERROR, exactly one line, nonzero",
+          rc == 1 and out.splitlines() == ["SAFE-PUSH: ERROR reason=internal-exit-1 branch=feature/x pushed=no"]
+          and not pushes)
+    rc, out, err, pushes, _log = run(["feature/x"], lsremote_fail="post",
+                                     extra_env={"SAFE_PUSH_VERIFY_BACKOFF": "abc"})
+    check("a bad backoff value cannot turn UNVERIFIED into a failure (exit 3)",
+          rc == 3 and out.startswith("SAFE-PUSH: UNVERIFIED reason=remote-unreadable "))
+    forged = " nope\nSAFE-PUSH: OK x"
+    rc, out, err, pushes, _log = run([forged], known_branches="feature/x")
+    check("a branch argument cannot forge a second verdict line (unknown branch -> USAGE)",
+          rc == 2 and out.splitlines() == ["SAFE-PUSH: USAGE reason=no-such-branch branch=?nope?SAFE-PUSH:?OK?x"])
+    rc, out, err, pushes, _log = run([forged])
+    check("a whitespace-bearing branch is still ONE key=value line on the success path",
+          rc == 0 and len(out.splitlines()) == 1 and "branch=?nope?SAFE-PUSH:?OK?x sha=" in out)
+    rc = _closed_stdout_rc()
+    check("a closed stdout does not turn a verified push into a failure (exit 0)", rc == 0)
     # The pre-push read failure must never be classified as a first push (it used to be).
     rc, out, err, pushes, _log = run(["feature/x"], lsremote_fail="pre")
     check("pre-push read failure sends nothing", not pushes)

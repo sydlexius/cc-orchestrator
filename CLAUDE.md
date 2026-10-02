@@ -376,9 +376,12 @@ Runtime (`scripts/`; canonical source is this repo):
   the bare name ambiguous) and ONE branch per call: a forwarded non-flag word (a second refspec) or
   `--all`/`--tags`/`--mirror` exits 2. A branch held by two worktrees, or mid-rebase in one, refuses.
   `/handle-review` pushes through it via one gated-push block.
-  VERDICT LINE: every run prints exactly ONE stdout line, from an EXIT trap so no path can skip it
-  (`SAFE-PUSH: OK|REFUSED|FAILED|USAGE|UNVERIFIED reason=<slug> branch=<b> ...`; all diagnostics stay
-  on stderr). It exists because agents kept following a verified push with their own `ls-remote`:
+  VERDICT LINE: every run (except `-h`) prints exactly ONE stdout line, from an EXIT trap so no path
+  can skip it (`SAFE-PUSH: OK|REFUSED|ERROR|FAILED|USAGE|UNVERIFIED reason=<slug> branch=<b> ...`;
+  all diagnostics stay on stderr). An exit no site recorded is ERROR (exit 1) before the push and
+  UNVERIFIED (exit 3) after it, never a guessed FAILED; a signal is given its conventional nonzero
+  code; the branch is sanitized so a newline cannot forge a second line; and a closed stdout never
+  turns a verified push into a failure. It exists because agents kept following a verified push with their own `ls-remote`:
   the success line was one stderr note among many. OK is printed only after the post-push
   `ls-remote` matched the pushed SHA, so it IS the verification. An UNREADABLE origin is never
   guessed: before the push it REFUSES (it used to classify as a first push), after the push it

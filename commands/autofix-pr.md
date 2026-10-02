@@ -232,6 +232,10 @@ commit -> pass -> reply -> push -> guard-slice -> resolve: guard-slice
 needs the pushed SHA, so it runs AFTER the push and gates the resolve,
 not the replies:
 
+This `ls-remote` is NOT the redundant re-verification the safe-push contract forbids: handle-review
+runs as a Skill, so its push's `SAFE-PUSH:` line never reaches this loop as a value it can read, and
+the remote ref is the only signal this layer has.
+
 ```bash
 post_head=$(git -C "$worktree" rev-parse HEAD)
 remote_head=$(git -C "$worktree" ls-remote origin "refs/heads/$head_ref" | cut -f1)

@@ -88,13 +88,16 @@
 #        on every retry), so whether the remote moved is unknown. Reconcile with
 #        `git ls-remote origin refs/heads/<branch>` before retrying; never blind-retry.
 #
-# VERDICT LINE: every run, on every exit path (an EXIT trap guarantees it), prints exactly ONE
-# line to STDOUT, and nothing else ever goes to stdout (all diagnostics are on stderr):
+# VERDICT LINE: every run except -h/--help (which prints usage only), on every exit path (an EXIT
+# trap guarantees it), prints exactly ONE line to STDOUT, and nothing else ever goes to stdout
+# (all diagnostics are on stderr):
 #   SAFE-PUSH: OK branch=<b> sha=<sha> verified=ls-remote      exit 0
 #   SAFE-PUSH: REFUSED reason=<slug> branch=<b> pushed=no      exit 1 (nothing was sent)
+#   SAFE-PUSH: ERROR reason=internal-exit-<n> ... pushed=no    exit 1 (unplanned abort, nothing sent)
 #   SAFE-PUSH: FAILED reason=<slug> branch=<b> remote=<sha|none> exit 1 (push ran, remote wrong)
 #   SAFE-PUSH: USAGE reason=<slug>                             exit 2
-#   SAFE-PUSH: UNVERIFIED reason=remote-unreadable branch=<b> sha=<sha>  exit 3
+#   SAFE-PUSH: UNVERIFIED reason=<slug> branch=<b> [sha=<sha>]  exit 3 (push ran, outcome unknown:
+#              origin unreadable, or the run was interrupted after the push)
 # OK IS THE REMOTE VERIFICATION. It is printed only after origin was re-read and holds the exact
 # SHA pushed, so a caller must NOT follow it with its own ls-remote / rev-parse / git status:
 # that re-derives a fact this script already proved. Re-check only when the result is LOST.
@@ -116,23 +119,40 @@ v_status=""
 v_reason=""
 v_extra=""
 branch=""
+pushed=0
+final_rc=0
 verdict() { v_status="$1"; v_reason="$2"; v_extra="${3:-}"; }
-# shellcheck disable=SC2329  # invoked indirectly via `trap emit_verdict EXIT` below
+# An exit no site recorded is an UNPLANNED abort. Before `git push` ran, nothing was sent (ERROR,
+# exit 1). AFTER it ran, whether origin moved is unknown, so it is UNVERIFIED (exit 3), never a
+# FAILED that invites a blind re-push of a push that may have landed.
+# shellcheck disable=SC2329  # invoked indirectly via the EXIT trap below
 emit_verdict() {
   local rc="$1"
+  final_rc="$rc"
   if [ -z "$v_status" ]; then
-    case "$rc" in
-      2) v_status=USAGE; v_reason=unspecified ;;
-      *) v_status=FAILED; v_reason="internal-exit-$rc" ;;
-    esac
+    if [ "$pushed" -eq 1 ]; then
+      v_status=UNVERIFIED; v_reason="interrupted-after-push-exit-$rc"; final_rc=3
+    elif [ "$rc" -eq 2 ]; then
+      v_status=USAGE; v_reason=unspecified
+    else
+      v_status=ERROR; v_reason="internal-exit-$rc"; v_extra="pushed=no"
+      [ "$rc" -eq 0 ] && final_rc=1
+    fi
   fi
   local line="SAFE-PUSH: $v_status"
   [ -n "$v_reason" ] && line="$line reason=$v_reason"
-  [ -n "$branch" ] && line="$line branch=$branch"
+  # The branch is caller-supplied text: whitespace or a control character in it (a newline could
+  # forge a second verdict line) is replaced, so the line stays ONE line of key=value fields.
+  [ -n "$branch" ] && line="$line branch=$(printf '%s' "$branch" | LC_ALL=C tr -c '[:graph:]' '?')"
   [ -n "$v_extra" ] && line="$line $v_extra"
-  printf '%s\n' "$line"
+  # Non-fatal: a closed or broken stdout must never turn a VERIFIED push into a reported failure.
+  printf '%s\n' "$line" 2>/dev/null || true
 }
-trap 'emit_verdict "$?"' EXIT
+trap 'emit_verdict "$?"; exit "$final_rc"' EXIT
+# A signal reaches the EXIT trap with $? == 0; give it the conventional nonzero code instead.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Repo-agnostic log location. `git rev-parse --git-dir` resolves correctly
 # for the main worktree (.git), linked worktrees (.git/worktrees/<name>),
@@ -572,6 +592,7 @@ esac
 # exists to prevent. (No pipe now, so `set -o pipefail` is neither needed nor used.)
 echo "safe-push: pushing $branch ($local_sha) to origin" >&2
 push_status=0
+pushed=1  # from here an unplanned exit is UNVERIFIED, never ERROR (see emit_verdict)
 #
 # FULL REFSPEC, NEVER THE BARE NAME (#466). A bare `git push origin <b>` resolves <b> as a SOURCE
 # ref, and a same-named TAG makes that ambiguous: git fails "src refspec <b> matches more than
@@ -609,7 +630,7 @@ for attempt in 1 2 3; do
   if remote_line=$(git ls-remote origin "refs/heads/$branch" 2>/dev/null); then
     remote_read=1; break
   fi
-  if [ "$attempt" -lt 3 ]; then sleep "${SAFE_PUSH_VERIFY_BACKOFF:-2}"; fi
+  if [ "$attempt" -lt 3 ]; then sleep "${SAFE_PUSH_VERIFY_BACKOFF:-2}" 2>/dev/null || sleep 2; fi
 done
 if [ "$remote_read" -ne 1 ]; then
   echo "safe-push: git push exited 0, but origin could not be read back to verify it (ls-remote failed 3x)." >&2
