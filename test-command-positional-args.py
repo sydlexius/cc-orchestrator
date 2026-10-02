@@ -15,7 +15,9 @@ import os
 import re
 import sys
 
-PATTERN = re.compile(r"\$[0-9]")
+# `\{?` also catches the braced form (`${1}`, `${2:-x}`): whether Claude Code substitutes it is
+# unverified, so it is refused on doubt. `$@`/`$#` carry no digit and are not known to be substituted.
+PATTERN = re.compile(r"\$\{?[0-9]")
 MIN_FILES = 10  # parse-sanity floor: an empty or wrong dir must not read as clean
 
 
