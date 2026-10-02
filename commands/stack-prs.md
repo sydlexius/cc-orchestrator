@@ -12,8 +12,9 @@ slice, shows the exact `gh stack link` it will run, runs it only on an explicit 
 result, and drafts the PR bodies. It never merges, never posts a review trigger, and never runs
 `gh stack submit/sync/rebase/push/merge`.
 
-A slice is a worktree path (an existing directory) or a PR number (all digits), listed BOTTOM TO
-TOP. `--base <branch>` names the trunk the bottom PR targets (default: the branch `origin/HEAD`
+A slice is a PR number (all digits, checked FIRST) or a worktree path (an existing directory),
+listed BOTTOM TO TOP. A worktree path that is a bare number is read as a PR number, so write it
+`./42`. No slice may be the trunk branch itself. `--base <branch>` names the trunk the bottom PR targets (default: the branch `origin/HEAD`
 points at). `--open` marks the PRs ready for review instead of leaving them drafts.
 
 **Arguments:** $ARGUMENTS
@@ -27,8 +28,11 @@ Split `$ARGUMENTS` on whitespace. Accept ONLY these words, matched exactly and c
 - `--open` (at most once).
 - `--base` followed by ONE branch name (at most once). The name must be a plain branch: letters,
   digits, `.`, `_`, `-`, `/` only, no leading `-`, no `..`, not ending in `/` or `.lock`.
-- A slice: an all-digits word (a PR number), or a word naming an EXISTING directory. Check each
-  candidate directory with the Step 0 block below, never by pasting it into another command.
+- A slice, classified in this order (the same order `stack-preflight.sh` uses): an all-digits
+  word is a PR number, even if a directory of that name exists; otherwise a word naming an
+  EXISTING directory is a worktree slice (write a numeric path as `./42`). Check each candidate
+  directory with the Step 0 block below, never by pasting it into another command. A word
+  containing a single quote is refused: every slice is single-quoted on a command line.
 
 Anything else (`--base=x`, `--force`, `-o`, a quoted or `;`-bearing word, a word that is neither an
 existing directory nor all digits) is rejected: name the word, show the argument hint, and STOP.
@@ -92,10 +96,14 @@ Show every line. `pf_rc=0` -> continue (report each `WARN`/`INFO`). Anything els
 ## Step 2 -- Show the plan, ask once
 
 Build `LINKARGS`: for each slice in order, the BRANCH name the preflight printed in brackets
-(worktree slice) or the PR number (PR slice). Show the command exactly:
+for a worktree slice, or the PR NUMBER for a PR slice (never the PR's branch name: the number
+binds link to the PR the preflight checked). Each item is SINGLE-QUOTED on the command line
+(`'feat/a' '42'`), and so is the `--base` value. A branch name containing a single quote cannot be
+quoted safely: STOP and report it (rename the branch), never escape around it. Show the command
+exactly:
 
 ```text
-gh stack link [--base <branch>] [--open] <LINKARGS>
+gh stack link [--base '<branch>'] [--open] '<slice-1>' '<slice-2>' ...
 ```
 
 and say, briefly:
@@ -120,7 +128,10 @@ session. Anything else: STOP, nothing pushed.
 ## Step 3 -- Link, then verify
 
 Re-run the Step 1 block first if anything moved since (a commit, a fetch, a minute of doubt);
-`pf_rc` must still be 0. Then:
+`pf_rc` must still be 0. Run link from a checkout of the SAME repository as the slices (the
+lead's main checkout or any slice worktree): link resolves branches and the `origin` remote from
+the current directory, so another repository's checkout would push or look up the wrong thing.
+`<LINKARGS>` is the single-quoted list from Step 2, unchanged. Then:
 
 ```bash
 gh stack link <BASEFLAG> <OPENFLAG> <LINKARGS>; echo "link_rc=$?"
@@ -144,8 +155,11 @@ Required, else STOP and report the mismatch:
 - every PR is OPEN; the bottom PR's `baseRefName` is the trunk; each higher PR's `baseRefName` is
   the branch of the slice below;
 - the remote head (`ls-remote`) equals the local tip, and equals `headRefOid`;
-- draft state is what was intended: without `--open`, any PR that came out ready is converted
-  with `gh pr ready <n> --undo` (link's draft default is undocumented, so this guards a change).
+- draft state is what was intended: without `--open`, any PR that link CREATED in this run and
+  that came out ready is converted with `gh pr ready <n> --undo` (link's draft default is
+  undocumented, so this guards a change). NEVER re-draft an EXISTING PR passed as a slice, or one
+  link reused: it may already be ready and reviewed, and re-drafting it hides it from review.
+  Tell them apart by the Step 2 slice kind and link's output (created vs reused).
 
 Report the stack number (from link's output, or the GitHub stack UI link on any PR) and every PR
 URL, bottom to top.
@@ -198,7 +212,8 @@ commit-style title, single-quoted, no trigger words; there is no title-file flag
    with no retarget step (measured, #503), or merge bottom-up through `/merge-pr`. `gh stack
    merge` itself checks only open and not-draft (it merged a PR whose CI was still running), and
    it is all-or-nothing: on a conflict it merges nothing. In a marker session the floor does not
-   gate it yet (#516), so there it runs only after the oracle passes on every PR. Neither path
+   gate it yet (#516), so there it runs only after the oracle passes on every PR; in a marker
+   session, prefer bottom-up `/merge-pr` until #516 lands. Neither path
    deletes the merged PRs' remote branches: delete them and confirm with `git ls-remote`.
 
 ---
@@ -219,6 +234,10 @@ commit-style title, single-quoted, no trigger words; there is no title-file flag
   only hold for the tree they saw. Re-run Step 1 if anything moved.
 - **Bodies are self-contained.** `submit --auto` and link can both leave generated titles and empty
   bodies; Step 4 replaces them, and each body names its neighbors.
+- **Stacking EXISTING PRs works, but link them before review.** PR-number slices are accepted,
+  and link retargets an upper PR's base onto the slice below. For a PR that was already reviewed,
+  that retarget changes the diff CodeRabbit's incremental review sees (the base moves under it).
+  Link existing PRs before their first review where possible.
 - **Conflicts are manual.** `gh stack merge` never resolves one; it refuses the whole stack. A
   lower fix round that touches lines an upper slice also changed costs one hand resolution (a
   merge commit) per affected upper PR, so slices on disjoint files are worth the effort.
