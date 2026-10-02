@@ -58,7 +58,7 @@ if [ "$current" = "main" ]; then
 else
   # Find which worktree (if any) has main checked out.
   main_wt=$(git worktree list --porcelain | awk '
-    /^worktree /{wt=$2}
+    /^worktree /{wt=$(2)}
     /^branch refs\/heads\/main$/{print wt; exit}
   ')
   if [ -z "$main_wt" ]; then
@@ -96,8 +96,8 @@ explain. Do not force-pull or merge.
 ```bash
 git worktree list --porcelain \
   | awk -v b="refs/heads/$branch" '
-      $1=="worktree"{wt=$2}
-      $1=="branch" && $2==b{print wt}
+      $(1)=="worktree"{wt=$(2)}
+      $(1)=="branch" && $(2)==b{print wt}
     '
 ```
 

@@ -49,9 +49,14 @@ The poll interval is not configurable -- the script polls every 30s. The `review
 
 ## Step 1 -- Resolve PR number
 
+Claude Code SUBSTITUTES `$<digit>` in a command body before any shell sees it, and its
+indexing is 0-based (`$0` is the FIRST argument; #507), so a bash-style `$1` here would bind
+the wrong argument. Parse `$ARGUMENTS` with `read` instead, and never write a bare
+`$<digit>` in a command body (awk fields use the `$(N)` form).
+
 ```bash
-pr_number="$1"
-timeout_secs="${2:-1800}"
+read -r pr_number timeout_secs _rest <<<"$ARGUMENTS"
+timeout_secs="${timeout_secs:-1800}"
 if [ -z "$pr_number" ]; then
   pr_number=$(gh pr view --json number --jq .number 2>/dev/null)
 fi

@@ -121,8 +121,8 @@ The user may provide:
    case "$target_version" in *-*) stable=0 ;; *) stable=1 ;; esac
    last_tag=$(git tag --list "${tag_prefix}*" --sort=-creatordate --merged origin/main \
      | awk -v p="$tag_prefix" -v stable="$stable" '
-         substr($0, 1, length(p)) != p { next }
-         { s = substr($0, length(p) + 1) }
+         substr($(0), 1, length(p)) != p { next }
+         { s = substr($(0), length(p) + 1) }
          s !~ /^[0-9]/ { next }
          stable && s ~ /-/ { next }
          { print; exit }')
