@@ -166,6 +166,47 @@ def case_trunk_slice(fx, script=SCRIPT):
     return fx.run(fx.clone, wt3, script=script)
 
 
+def case_default_bottom(fx, script=SCRIPT):
+    """--base release with the DEFAULT branch (origin/HEAD -> trunk) as the bottom slice."""
+    git(fx.clone, "push", "-q", "origin", "origin/trunk:refs/heads/release")
+    fx.receipt(fx.clone)
+    return fx.run("--base", "release", fx.clone, fx.wt1, script=script)
+
+
+def case_default_upper(fx, script=SCRIPT):
+    """--base release with the DEFAULT branch as an UPPER slice."""
+    git(fx.clone, "push", "-q", "origin", "origin/trunk:refs/heads/release")
+    fx.receipt(fx.clone)
+    return fx.run("--base", "release", fx.wt1, fx.clone, script=script)
+
+
+def case_trunk_upper(fx, script=SCRIPT):
+    """A worktree slice on the trunk in an UPPER position, normal base (origin/HEAD)."""
+    fx.receipt(fx.clone)
+    return fx.run(fx.wt1, fx.clone, script=script)
+
+
+def case_main_fallback(fx, script=SCRIPT):
+    """origin/HEAD unresolvable: a slice on `main` is still refused (--base trunk given)."""
+    git(fx.clone, "remote", "set-head", "origin", "--delete")
+    wtm = os.path.join(fx.td, "wtm")
+    git(fx.clone, "worktree", "add", "-q", "-b", "main", wtm, "s2")
+    fx.receipt(wtm)
+    return fx.run("--base", "trunk", fx.wt1, wtm, script=script)
+
+
+def case_base_head(fx, script=SCRIPT):
+    return fx.run("--base", "HEAD", fx.wt1, fx.wt2, script=script)
+
+
+def case_base_refs(fx, script=SCRIPT):
+    return fx.run("--base", "refs/heads/x", fx.wt1, fx.wt2, script=script)
+
+
+def case_base_dash(fx, script=SCRIPT):
+    return fx.run("--base", "-x", fx.wt1, fx.wt2, script=script)
+
+
 def case_upload_pack(fx, script=SCRIPT):
     """A PR headRefName shaped as a git option must never reach git as one."""
     marker = os.path.join(fx.td, "PWNED")
@@ -337,14 +378,33 @@ def main():
         res["refspec base"] = fx.run("--base", "a:b", fx.wt1, fx.wt2)[0]
         res["duplicate branch"] = fx.run(fx.wt1, fx.wt1)[0]
         res["mixed digits"] = fx.run(fx.wt1, "12a")[0]
-        res["dash-led base"] = fx.run("--base", "-x", fx.wt1, fx.wt2)[0]
         return res
     for k, v in scenario(usage).items():
         check(f"{k} -> 2", v == 2)
 
-    print("a slice that IS the trunk is refused (link would push the trunk)")
+    print("dash-led / HEAD / refs/* --base are refused by their OWN guards")
+    rc, out = scenario(case_base_dash)
+    check("dash-led base -> exit 2", rc == 2); check("dash guard message", "(leading '-')" in out)
+    rc, out = scenario(case_base_head)
+    check("--base HEAD -> exit 2", rc == 2); check("HEAD guard message", "HEAD and refs/* are refused" in out)
+    rc, out = scenario(case_base_refs)
+    check("--base refs/heads/x -> exit 2", rc == 2); check("refs guard message", "HEAD and refs/* are refused" in out)
+
+    print("a slice that IS a protected branch is refused (link would push it past the floor)")
     rc, out = scenario(case_trunk_slice)
     check("trunk slice -> exit 2", rc == 2); check("trunk named", "is the trunk branch 'trunk'" in out)
+    rc, out = scenario(case_default_bottom)
+    check("--base release, default branch at bottom -> exit 2", rc == 2)
+    check("default named (bottom)", "slice 1 " in out and "is the default branch 'trunk'" in out)
+    rc, out = scenario(case_default_upper)
+    check("--base release, default branch as upper slice -> exit 2", rc == 2)
+    check("default named (upper)", "slice 2 " in out and "is the default branch 'trunk'" in out)
+    rc, out = scenario(case_trunk_upper)
+    check("trunk worktree slice in upper position -> exit 2", rc == 2)
+    check("trunk named (upper)", "slice 2 " in out and "is the trunk branch 'trunk'" in out)
+    rc, out = scenario(case_main_fallback)
+    check("origin/HEAD unresolvable, slice on main -> exit 2", rc == 2)
+    check("main named as protected", "is a protected branch name 'main'" in out)
     def pr_trunk(fx):
         fx.pr(41, "trunk", "trunk"); fx.pr(42, "s1", "trunk")
         return fx.run("41", "42")
@@ -409,8 +469,29 @@ def main():
          '--is-ancestor "$prev" "${tip[k]}" 2>/dev/null; arc=0', case_ancestry_broken, rc_is(1)),
         ("gh failure falls through", 'failed (read failure is never a pass)"; undet; continue',
          'failed (read failure is never a pass)"; continue', case_gh_fail, rc_is(2)),
-        ("trunk-slice refusal removed", "(link would push the trunk)\" >&2; exit 2",
-         "(link would push the trunk)\" >&2", case_trunk_slice, rc_is(2)),
+        ("trunk-slice refusal removed", "(link would push it past the floor)\" >&2; exit 2",
+         "(link would push it past the floor)\" >&2", case_trunk_slice, rc_is(2)),
+        ("protected-slice check narrowed to $trunk only (bottom)",
+         'elif [ -n "$default_branch" ] && [ "$b" = "$default_branch" ]; then',
+         'elif false; then', case_default_bottom, rc_is(2)),
+        ("protected-slice check narrowed to $trunk only (upper)",
+         'elif [ -n "$default_branch" ] && [ "$b" = "$default_branch" ]; then',
+         'elif false; then', case_default_upper, rc_is(2)),
+        ("fixed-name refusal removed", "main|master|HEAD) why=", "__none__) why=",
+         case_main_fallback, rc_is(2)),
+        ("protected-slice check on slice 1 only (trunk upper)",
+         '  b="${branch[k]}"\n  [ -n "$b" ] || continue',
+         '  [ "$k" -eq 1 ] || continue\n  b="${branch[k]}"\n  [ -n "$b" ] || continue',
+         case_trunk_upper, rc_is(2)),
+        ("protected-slice check on slice 1 only (default upper)",
+         '  b="${branch[k]}"\n  [ -n "$b" ] || continue',
+         '  [ "$k" -eq 1 ] || continue\n  b="${branch[k]}"\n  [ -n "$b" ] || continue',
+         case_default_upper, rc_is(2)),
+        ("dash-led base guard removed",
+         "case \"$trunk\" in -*) echo \"stack-preflight: invalid --base '$trunk' (leading '-')\" >&2; usage ;; esac\n",
+         "", case_base_dash, lambda rc, out: "(leading '-')" in out),
+        ("HEAD/refs base guard removed", "in HEAD|refs/*) echo", "in __none__) echo",
+         case_base_head, lambda rc, out: "HEAD and refs/* are refused" in out),
         ("fetch refspec unqualified (the pre-fix line)", 'fetch --quiet origin "refs/heads/${branch[k]}"',
          'fetch --quiet origin "${branch[k]}"', case_upload_pack,
          lambda rc, out: "MARKER-EXISTS" not in out),

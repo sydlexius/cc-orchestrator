@@ -15,10 +15,17 @@
 #                            worktree path that is a bare number must be written ./42
 #   anything else         -> usage error (exit 2), as is a directory that cannot be entered
 #
-# No slice may BE the trunk (exit 2): link would push the local trunk branch, a push to the trunk
-# that never passes the floor. Every value that reaches git from gh output or the command line is
-# fully qualified (refs/heads/<name>) or a validated 40-hex SHA, so none can parse as an option
-# (a headRefName of `--upload-pack=<cmd>` would otherwise EXECUTE under `git fetch`).
+# No slice may BE a protected branch (exit 2): the trunk, the DEFAULT branch (whatever origin/HEAD
+# points at, resolved even when --base names another trunk), `main`, `master`, or `HEAD`. Link
+# would push that local branch, a push the floor never sees; the floor protects the default branch
+# by NAME, so refusing only the stack's own trunk let `--base release` smuggle the default branch
+# through as a slice. If origin/HEAD cannot be resolved, `main` and `master` are still refused.
+#
+# Option-shaped values: every gh-derived ref reaches git fully qualified (refs/heads/<name>) or as a
+# validated 40-hex SHA, so none can parse as an option (a headRefName of `--upload-pack=<cmd>`
+# would otherwise EXECUTE under `git fetch`). The COMMAND-LINE base is the one exception: it is a
+# validated PLAIN branch name (dash-led refused, `HEAD` and `refs/*` refused, check-ref-format
+# clean) and reaches base-freshness.sh's fetch UNQUALIFIED.
 #
 # --base <branch> names the stack TRUNK (the bottom slice's base). Default: the branch origin/HEAD
 # points at. Never a hard-coded `main`; an unresolvable trunk is exit 2 (pass --base).
@@ -99,12 +106,16 @@ done
 ctx_common=$(cd "$ctx" && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || {
   echo "stack-preflight: '$ctx' is not inside a git repository" >&2; exit 2; }
 
+# The DEFAULT branch is resolved ALWAYS, even when --base is given: it is what the floor protects
+# by name, so it is refused as a slice whatever the stack's trunk is. Empty when unresolvable.
+default_branch=$(git -C "$ctx" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+default_branch="${default_branch#origin/}"
 if [ -z "$trunk" ]; then
-  trunk=$(git -C "$ctx" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
-  trunk="${trunk#origin/}"
+  trunk="$default_branch"
   [ -n "$trunk" ] || { echo "stack-preflight: cannot resolve the trunk from origin/HEAD; pass --base <branch>" >&2; exit 2; }
 fi
 case "$trunk" in -*) echo "stack-preflight: invalid --base '$trunk' (leading '-')" >&2; usage ;; esac
+case "$trunk" in HEAD|refs/*) echo "stack-preflight: invalid --base '$trunk' (HEAD and refs/* are refused; name a plain branch)" >&2; usage ;; esac
 git check-ref-format "refs/heads/$trunk" >/dev/null 2>&1 || { echo "stack-preflight: invalid --base '$trunk'" >&2; usage; }
 echo "stack-preflight: trunk=$trunk slices=$n"
 
@@ -151,11 +162,19 @@ EOF
   fi
 done
 
-# A slice that IS the trunk would have link push the local trunk branch: a push to the trunk
-# that bypasses the floor. Refused outright, whatever the other checks would say.
+# A slice that IS a protected branch would have link push it: a push the floor never sees. Checked
+# at EVERY position, against the trunk AND the default branch AND the fixed names. Refused
+# outright, whatever the other checks would say.
 for k in $(seq 1 "$n"); do
-  if [ "${branch[k]}" = "$trunk" ]; then
-    echo "stack-preflight: slice $k ${label[k]} is the trunk branch '$trunk'; a slice must be a feature branch (link would push the trunk)" >&2; exit 2
+  b="${branch[k]}"
+  [ -n "$b" ] || continue
+  why=""
+  if [ "$b" = "$trunk" ]; then why="the trunk branch"
+  elif [ -n "$default_branch" ] && [ "$b" = "$default_branch" ]; then why="the default branch"
+  else case "$b" in main|master|HEAD) why="a protected branch name" ;; esac
+  fi
+  if [ -n "$why" ]; then
+    echo "stack-preflight: slice $k ${label[k]} is $why '$b'; a slice must be a feature branch (link would push it past the floor)" >&2; exit 2
   fi
 done
 
