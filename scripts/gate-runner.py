@@ -155,6 +155,17 @@ def run_prep_pr(prep, root, memoize_dir=None, cli_jobs=None, cli_skip=None):
              "that cannot honor it")
         return 2, _synth_records(2)
     if cli_skip and isinstance(prep["steps"], list):
+        # A NAME SELECTS STEPS ONLY UNDER --skip, so duplicates are refused only here (a consumer
+        # with a reused name and no --skip is unaffected). Two steps sharing a name would both
+        # match one --skip, so a copied block whose `run` was changed but not its `name` would
+        # leave CI silently (PR review of ci/parallel-harnesses). Unnamed steps count by their
+        # derived `step-<index>` name, which can collide with an explicit one.
+        all_names = [(s.get("name") or f"step-{i}") for i, s in enumerate(prep["steps"])
+                     if isinstance(s, dict)]
+        dupes = sorted({n for n in all_names if all_names.count(n) > 1})
+        if dupes:
+            warn(f"`--skip` needs unique step names; duplicated: {', '.join(dupes)}")
+            return 2, _synth_records(2)
         unknown = sorted(cli_skip - _step_names(prep["steps"]))
         if unknown:
             warn(f"`--skip` names no Form B step: {', '.join(unknown)}")

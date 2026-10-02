@@ -18,8 +18,10 @@ all 46 harnesses as SERIAL Actions steps (375s on macOS, 230s on ubuntu, nearly 
 subprocess-spawn cost), and the only way to parallelize them is to hand them to gate-runner,
 which already runs .gates.toml `jobs = 4` with `exclusive` barriers locally. So CI now runs
 `python3 scripts/gate-runner.py --jobs 4 --skip ...` once per OS leg. Two wins: wall time, and
-harness drift becomes IMPOSSIBLE rather than detected (a harness added to .gates.toml runs in
-CI with no ci.yml edit). What this harness checks for harnesses therefore changes from "the
+a harness added to .gates.toml runs in CI with no ci.yml edit, so there is no second list to
+drift. That holds only while each step has a unique, explicit name, because CI deselects steps
+by name (--skip): a reused name would deselect two. Both gate-runner (under --skip) and this
+harness refuse duplicate or missing names. What this harness checks for harnesses therefore changes from "the
 two lists agree" to "CI cannot silently stop running the derived list":
   - each OS leg (Linux, macOS) has exactly ONE gate-runner invocation, on a one-line `run:`,
     gated by an exact `if: runner.os == '<OS>'`, with no `continue-on-error`;
@@ -220,7 +222,17 @@ def gates_steps():
 
 
 steps = gates_steps()
-step_names = {s.get("name") for s in steps}
+# CI selects steps by NAME (--skip), so every step needs an EXPLICIT, UNIQUE name: a copied block
+# whose `run` changed but not its `name` would share a --skip and drop out of CI silently, and an
+# unnamed step's derived `step-<i>` shifts whenever a step is inserted above it.
+_unnamed = [s.get("run", "?") for s in steps if not s.get("name")]
+if _unnamed:
+    fail(f".gates.toml steps without an explicit `name` (CI --skip selects by name): {_unnamed}")
+_names = [s["name"] for s in steps]
+_dupes = sorted({n for n in _names if _names.count(n) > 1})
+if _dupes:
+    fail(f".gates.toml step names are not unique (one --skip would match several): {_dupes}")
+step_names = set(_names)
 gates_h = set()
 for step in steps:
     run = step.get("run", "").strip()
@@ -371,6 +383,10 @@ def _mutation_selftest():
          "continue-on-error"),
         ("odd condition", ci, "if: runner.os == 'macOS'\n        run: python3 scripts/gate-runner",
          "if: false\n        run: python3 scripts/gate-runner", "unrecognized condition"),
+        ("duplicate step name", gates, step_line, step_line + f'\n\n  [[prep_pr.steps]]\n  name = "ruff"\n  run = "python3 {victim}"',
+         "step names are not unique"),
+        ("unnamed step", gates, step_line, step_line + '\n\n  [[prep_pr.steps]]\n  run = "true"',
+         "without an explicit `name`"),
         ("shellcheck drift", ci, "scripts/stack-preflight.sh\n", "\n", "NOT linted by CI"),
         ("ruff drift", ci, "test-settings-scrub.py test-stack-preflight.py",
          "test-settings-scrub.py", "NOT linted by CI"),

@@ -1688,6 +1688,12 @@ def test_skip_refuses_doubt():
             ("empty name", _steps_cfg([("a", f"touch {marker}", "")]), ("--skip=",)),
             ("trailing --skip", _steps_cfg([("a", f"touch {marker}", "")]), ("--skip",)),
             ("Form A", f'[prep_pr]\ngate = "touch {marker}"\n', ("--skip", "gate")),
+            # Two steps sharing a name both match one --skip, so a copied block whose run was
+            # changed but not its name would leave CI silently. Refused, nothing runs.
+            ("duplicate step name", _steps_cfg([("a", "true", ""), ("a", f"touch {marker}", "")]),
+             ("--skip", "a")),
+            ("explicit name collides with a derived step-<i>",
+             _steps_cfg([("step-1", "true", ""), ("", f"touch {marker}", "")]), ("--skip", "step-1")),
             ("fallback chain", None, ("--skip", "a")),
         ]
         for label, cfg, args in cases:

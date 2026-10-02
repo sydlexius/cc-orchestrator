@@ -625,7 +625,9 @@ Runtime (`scripts/`; canonical source is this repo):
   "do not derive CI's list from `.gates.toml`" decision: CI ran all 46 harnesses as SERIAL
   Actions steps (375s macOS / 230s ubuntu, nearly all subprocess-spawn cost), so each OS leg
   now runs ONE `python3 scripts/gate-runner.py --jobs 4 --skip ...` step (same `exclusive`
-  barriers as local), and harness drift is IMPOSSIBLE rather than detected. The trade-off
+  barriers as local), so there is no second harness list to drift. That rests on unique,
+  explicit step names (CI deselects by name via `--skip`, and a reused name would deselect two),
+  which gate-runner refuses under `--skip` and this harness asserts. The trade-off
   accepted: CI depends on parsing `.gates.toml`. The harness now asserts CI CANNOT SILENTLY
   STOP running that list: exactly one gate-runner `run:` per leg under an exact
   `if: runner.os == 'Linux'|'macOS'` (or none), no `continue-on-error`, `--jobs N>=2`, the
