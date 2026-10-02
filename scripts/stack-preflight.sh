@@ -5,9 +5,11 @@
 # `gh stack link` pushes every branch by itself and so skips safe-push.sh's receipt, freshness
 # and one-branch checks; this script re-asks those questions for EVERY slice immediately before
 # the lead runs link. It never pushes, never calls a gh mutation, never touches a working tree or
-# index. Its only network ops are read-only: `gh pr view`, and a `git fetch` (base-freshness's,
-# plus one to bring a PR slice's head commit local) that may update the object DB and
-# remote-tracking refs, nothing else. Non-interactive: GIT_TERMINAL_PROMPT=0 + SSH BatchMode.
+# index. Its only network ops are read-only: `gh pr view` (once per PR slice, plus a head re-read
+# just before PASS), `git ls-remote --symref origin HEAD` (the LIVE default branch), and a
+# `git fetch` (base-freshness's, plus one to bring a PR slice's head commit local) that may update
+# the object DB and remote-tracking refs, nothing else. Non-interactive: GIT_TERMINAL_PROMPT=0 +
+# SSH BatchMode.
 #
 # Slices are given BOTTOM TO TOP. Each is detected, never guessed:
 #   all digits            -> a PR slice (`gh pr view <n>`), checked FIRST
@@ -15,20 +17,27 @@
 #                            worktree path that is a bare number must be written ./42
 #   anything else         -> usage error (exit 2), as is a directory that cannot be entered
 #
-# No slice may BE a protected branch (exit 2): the trunk, the DEFAULT branch (whatever origin/HEAD
-# points at, resolved even when --base names another trunk), `main`, `master`, or `HEAD`. Link
-# would push that local branch, a push the floor never sees; the floor protects the default branch
-# by NAME, so refusing only the stack's own trunk let `--base release` smuggle the default branch
-# through as a slice. If origin/HEAD cannot be resolved, `main` and `master` are still refused.
+# No slice may BE a protected branch (exit 2): the trunk, the DEFAULT branch (resolved even when
+# --base names another trunk, BOTH the live one from `git ls-remote --symref origin HEAD` AND the
+# cached origin/HEAD, which goes stale after a remote default-branch rename), `main`, `master`, or
+# `HEAD`. Link would push that local branch, a push the floor never sees; the floor protects the
+# default branch by NAME, so refusing only the stack's own trunk let `--base release` smuggle the
+# default branch through as a slice. A failed live read is not itself a stop (freshness already
+# fails closed on an unreachable origin): the cached value plus `main` and `master` still apply.
 #
-# Option-shaped values: every gh-derived ref reaches git fully qualified (refs/heads/<name>) or as a
-# validated 40-hex SHA, so none can parse as an option (a headRefName of `--upload-pack=<cmd>`
-# would otherwise EXECUTE under `git fetch`). The COMMAND-LINE base is the one exception: it is a
-# validated PLAIN branch name (dash-led refused, `HEAD` and `refs/*` refused, check-ref-format
-# clean) and reaches base-freshness.sh's fetch UNQUALIFIED.
+# Option-shaped values: no gh-derived NAME reaches git at all. A PR slice's head commit is fetched
+# as `refs/pull/<n>/head` (n = the validated all-digits PR number, so fork PRs work too) and is
+# otherwise used only as a validated 40-hex SHA; a headRefName of `--upload-pack=<cmd>` therefore
+# never reaches `git fetch`, where it would EXECUTE. The COMMAND-LINE base is the one name that
+# does: it is a validated PLAIN branch name (dash-led refused, `HEAD` and `refs/*` refused,
+# check-ref-format clean) and reaches base-freshness.sh's fetch UNQUALIFIED.
 #
-# --base <branch> names the stack TRUNK (the bottom slice's base). Default: the branch origin/HEAD
-# points at. Never a hard-coded `main`; an unresolvable trunk is exit 2 (pass --base).
+# --base <branch> names the stack TRUNK (the bottom slice's base). Default: the LIVE default
+# branch, else the cached origin/HEAD. Never a hard-coded `main`; an unresolvable trunk is exit 2
+# (pass --base).
+#
+# A PR slice's head is RE-READ just before PASS is reported; a failed re-read, or a head that moved
+# since the checks ran, is UNKNOWN (exit 2): the checks describe a commit link would not push.
 #
 # Checks, one labeled line each (`slice <k> <label>: <check>: PASS|FAIL|WARN|INFO|UNKNOWN - ...`):
 #   clean     worktree slices: no uncommitted or untracked changes.
@@ -107,11 +116,15 @@ ctx_common=$(cd "$ctx" && git rev-parse --path-format=absolute --git-common-dir 
   echo "stack-preflight: '$ctx' is not inside a git repository" >&2; exit 2; }
 
 # The DEFAULT branch is resolved ALWAYS, even when --base is given: it is what the floor protects
-# by name, so it is refused as a slice whatever the stack's trunk is. Empty when unresolvable.
+# by name, so it is refused as a slice whatever the stack's trunk is. Two readings, both refused:
+# the CACHED origin/HEAD (stale after a remote default-branch rename) and the LIVE remote HEAD.
+# Either is empty when unresolvable; a failed live read is not itself a stop (see the header).
 default_branch=$(git -C "$ctx" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
 default_branch="${default_branch#origin/}"
+live_default=$(git -C "$ctx" ls-remote --symref origin HEAD 2>/dev/null \
+  | awk '$1 == "ref:" && $3 == "HEAD" && $2 ~ /^refs\/heads\// { sub(/^refs\/heads\//, "", $2); print $2; exit }' || true)
 if [ -z "$trunk" ]; then
-  trunk="$default_branch"
+  trunk="${live_default:-$default_branch}"
   [ -n "$trunk" ] || { echo "stack-preflight: cannot resolve the trunk from origin/HEAD; pass --base <branch>" >&2; exit 2; }
 fi
 case "$trunk" in -*) echo "stack-preflight: invalid --base '$trunk' (leading '-')" >&2; usage ;; esac
@@ -136,25 +149,30 @@ for k in $(seq 1 "$n"); do
     if ! js=$(cd "$ctx" && gh pr view "${arg[k]}" --json headRefName,baseRefName,headRefOid,isDraft,state 2>/dev/null); then
       say "$k" "${label[k]}" pr "UNKNOWN - gh pr view ${arg[k]} failed (read failure is never a pass)"; undet; continue
     fi
+    # Explicit checks, never `assert`: python3 -O / PYTHONOPTIMIZE strips asserts, which would let
+    # a headRefOid of `HEAD` through as a "SHA". Any malformed field exits 1 -> UNKNOWN below.
     if ! fields=$(printf '%s' "$js" | python3 -c 'import json, re, sys
-d = json.load(sys.stdin)
-h, b, o, s = d["headRefName"], d["baseRefName"], d["headRefOid"], d["state"]
-assert all(isinstance(x, str) and x and "\t" not in x and "\n" not in x for x in (h, b, o, s))
-assert re.fullmatch("[0-9a-f]{40}", o) and isinstance(d["isDraft"], bool)
-print("\t".join((h, b, o, s, str(d["isDraft"]).lower())))' 2>/dev/null); then
+try:
+    d = json.load(sys.stdin)
+    h, b, o, s, dr = d["headRefName"], d["baseRefName"], d["headRefOid"], d["state"], d["isDraft"]
+except Exception:
+    sys.exit(1)
+if not all(isinstance(x, str) and x and "\t" not in x and "\n" not in x for x in (h, b, o, s)):
+    sys.exit(1)
+if not re.fullmatch("[0-9a-f]{40}", o) or not isinstance(dr, bool): sys.exit(1)
+print("\t".join((h, b, o, s, str(dr).lower())))' 2>/dev/null); then
       say "$k" "${label[k]}" pr "UNKNOWN - gh pr view ${arg[k]} returned unparseable JSON"; undet; continue
     fi
     IFS="$(printf '\t')" read -r f_head f_base f_oid f_state f_draft <<EOF
 $fields
 EOF
     branch[k]="$f_head"; prbase[k]="$f_base"; tip[k]="$f_oid"; prstate[k]="$f_state"; prdraft[k]="$f_draft"
-    # Bring the head commit local for ancestry (read-only fetch). The refspec is FULLY QUALIFIED
-    # and has no `:<dst>`, so it can neither parse as an option (`--upload-pack=<cmd>` passes
-    # check-ref-format and would execute) nor update a local ref.
+    # Bring the head commit local for ancestry (read-only fetch). The refspec is the PR's own
+    # `refs/pull/<n>/head` (n is all digits, validated at parse), so it works for a FORK PR whose
+    # branch is not on origin, and the gh-supplied headRefName (`--upload-pack=<cmd>` passes
+    # check-ref-format and would execute) never reaches git. No `:<dst>`, so no local ref moves.
     if ! git -C "$ctx" cat-file -e "${tip[k]}^{commit}" 2>/dev/null; then
-      if git check-ref-format "refs/heads/${branch[k]}" >/dev/null 2>&1; then
-        git -C "$ctx" fetch --quiet origin "refs/heads/${branch[k]}" >/dev/null 2>&1 || true
-      fi
+      git -C "$ctx" fetch --quiet origin "refs/pull/${arg[k]}/head" >/dev/null 2>&1 || true
       if ! git -C "$ctx" cat-file -e "${tip[k]}^{commit}" 2>/dev/null; then
         say "$k" "${label[k]}" pr "UNKNOWN - head commit ${tip[k]} is not available locally (fetch failed)"; undet; tip[k]=""
       fi
@@ -163,13 +181,14 @@ EOF
 done
 
 # A slice that IS a protected branch would have link push it: a push the floor never sees. Checked
-# at EVERY position, against the trunk AND the default branch AND the fixed names. Refused
-# outright, whatever the other checks would say.
+# at EVERY position, against the trunk AND both default-branch readings AND the fixed names.
+# Refused outright, whatever the other checks would say.
 for k in $(seq 1 "$n"); do
   b="${branch[k]}"
   [ -n "$b" ] || continue
   why=""
   if [ "$b" = "$trunk" ]; then why="the trunk branch"
+  elif [ -n "$live_default" ] && [ "$b" = "$live_default" ]; then why="the default branch"
   elif [ -n "$default_branch" ] && [ "$b" = "$default_branch" ]; then why="the default branch"
   else case "$b" in main|master|HEAD) why="a protected branch name" ;; esac
   fi
@@ -270,6 +289,27 @@ print("ok " + t.lower())' "$rc_path" 2>/dev/null)
     esac
   fi
 done
+
+# Re-read every PR slice's head just before reporting PASS: a push between the first read and now
+# means the checks above describe a commit link would NOT push. A failed or malformed re-read is
+# UNKNOWN too, never a pass.
+if [ "$worst" -eq 0 ]; then
+  for k in $(seq 1 "$n"); do
+    [ "${kind[k]}" = pr ] || continue
+    now=$(cd "$ctx" && gh pr view "${arg[k]}" --json headRefOid --jq .headRefOid 2>/dev/null) || now=""
+    case "$now" in
+      ''|*[!0-9a-f]*) head_ok=0 ;;
+      *) if [ "${#now}" -eq 40 ]; then head_ok=1; else head_ok=0; fi ;;
+    esac
+    if [ "$head_ok" -ne 1 ]; then
+      say "$k" "${label[k]} [${branch[k]}]" head "UNKNOWN - re-reading the head of #${arg[k]} failed or was malformed (read failure is never a pass)"; undet
+    elif [ "$now" != "${tip[k]}" ]; then
+      say "$k" "${label[k]} [${branch[k]}]" head "UNKNOWN - #${arg[k]} head moved from ${tip[k]:0:12} to ${now:0:12} during the checks (re-run)"; undet
+    else
+      say "$k" "${label[k]} [${branch[k]}]" head "PASS - unchanged at ${now:0:12}"
+    fi
+  done
+fi
 
 case "$worst" in
   0) echo "stack-preflight: PASS" ;;
