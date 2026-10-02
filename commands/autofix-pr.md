@@ -238,14 +238,27 @@ the remote ref is the only signal this layer has.
 
 ```bash
 post_head=$(git -C "$worktree" rev-parse HEAD)
-remote_head=$(git -C "$worktree" ls-remote origin "refs/heads/$head_ref" | cut -f1)
+# Capture ls-remote's OWN status before any parsing: piped through `cut`, a FAILED read exits 0 with
+# an empty remote_head, which then reads as "the commit did not reach origin" for a push that may
+# have landed (PR #530 review). A failed read is UNKNOWN, never "not pushed".
+if remote_line=$(git -C "$worktree" ls-remote origin "refs/heads/$head_ref" 2>/dev/null); then
+  remote_head=${remote_line%%$'\t'*}; remote_read=ok
+else
+  remote_head=""; remote_read=failed
+fi
+echo "post_head=$post_head remote_head=${remote_head:-<none>} remote_read=$remote_read"
 ```
+
+- `remote_read=failed` (and `post_head != pre_head`) -> whether the fix reached origin is
+  UNKNOWN. Print "round <round>: could not read origin/<head_ref> to confirm the push; reconcile
+  with `git ls-remote origin refs/heads/<head_ref>` (expect `<post_head>`) before any retry." and
+  exit with status **ABORT**. Never retry the push on an unread remote: it may have landed.
 
 - `post_head == pre_head` -> handle-review made no commits. Treat as
   **STALL** -- print "round <round>: handle-review made no commits;
   treating as stall." and fall through to the STALL branch.
-- `post_head != pre_head` AND `remote_head != post_head` -> a fix was
-  committed locally but did NOT reach origin. Print:
+- `post_head != pre_head` AND `remote_read=ok` AND `remote_head != post_head` -> a fix was
+  committed locally but did NOT reach origin (origin was READ and holds something else). Print:
   > "round <round>: local HEAD advanced to `<post_head>` but origin/<head_ref>
   > is still `<remote_head>`. This is the pipe-swallow silent-failure mode.
   > Retry the push manually via `cd <worktree> && bash <safe-push.sh> <head_ref>`, where

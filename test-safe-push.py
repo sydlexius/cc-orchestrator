@@ -101,6 +101,9 @@ GIT_STUB = (
     '    # "none" -> the ref is absent; anything else -> the ref exists but holds that SHA.\n'
     '    if [ "${POST_PUSH_REMOTE:-}" = "none" ]; then :\n'
     '    elif [ -n "${POST_PUSH_REMOTE:-}" ]; then printf "%s\\trefs/heads/x\\n" "$POST_PUSH_REMOTE"\n'
+    '    elif [ "${PUSH_RC:-0}" != 0 ] && [ "${PUSH_LANDED:-0}" != 1 ]; then\n'
+    '      # A rejected push leaves origin where it was (old ref, or no ref on a first push).\n'
+    '      if [ -n "${REMOTE_SHA:-}" ]; then printf "%s\\trefs/heads/x\\n" "$REMOTE_SHA"; fi\n'
     '    else printf "%s\\trefs/heads/x\\n" "$LOCAL_SHA"; fi\n'
     '  elif [ -n "${REMOTE_SHA:-}" ]; then\n'
     '    printf "%s\\trefs/heads/x\\n" "$REMOTE_SHA"\n'
@@ -259,16 +262,15 @@ def receipt_stub_cases():
 _ABORT_DIR = tempfile.mkdtemp()
 
 
-def _abort_copy():
-    """safe-push with an unplanned `false` (a set -e abort) injected before the push, to prove the
-    trap's fallback verdict rather than any site's recorded one."""
-    dst = os.path.join(_ABORT_DIR, "safe-push.sh")
+def _abort_copy(marker="# --- Pre-push classification (#148)", inject="false", name="safe-push.sh"):
+    """safe-push with `inject` placed before `marker`: by default an unplanned `false` (a set -e
+    abort) before the push, to prove the trap's fallback verdict rather than any site's recorded one."""
+    dst = os.path.join(_ABORT_DIR, name)
     with open(SCRIPT) as fh:
         body = fh.read()
-    marker = "# --- Pre-push classification (#148)"
-    assert marker in body
+    assert body.count(marker) == 1, marker
     with open(dst, "w") as fh:
-        fh.write(body.replace(marker, "false\n" + marker, 1))
+        fh.write(body.replace(marker, inject + "\n" + marker, 1))
     return dst
 
 
@@ -309,8 +311,13 @@ def verdict_line_cases():
          "SAFE-PUSH: REFUSED reason=unfetched branch=feature/x pushed=no"),
         ("pre-push read fails", ["feature/x"], dict(lsremote_fail="pre"), 1,
          "SAFE-PUSH: REFUSED reason=remote-unreadable branch=feature/x pushed=no"),
-        ("push exits nonzero", ["feature/x"], dict(push_rc=1), 1,
-         "SAFE-PUSH: FAILED reason=push-exit-1 branch=feature/x"),
+        ("push exits nonzero, origin unmoved", ["feature/x"], dict(push_rc=1), 1,
+         "SAFE-PUSH: FAILED reason=push-exit-1 branch=feature/x remote=none"),
+        ("push exits nonzero but origin DID update", ["feature/x"],
+         dict(push_rc=128, extra_env={"PUSH_LANDED": "1"}), 0,
+         "SAFE-PUSH: OK branch=feature/x sha=aaaa111 verified=ls-remote push-exit=128"),
+        ("push exits nonzero, origin unreadable", ["feature/x"], dict(push_rc=1, lsremote_fail="post"), 3,
+         "SAFE-PUSH: UNVERIFIED reason=remote-unreadable branch=feature/x sha=aaaa111"),
         ("ref absent after push", ["feature/x"], dict(post_push_remote="none"), 1,
          "SAFE-PUSH: FAILED reason=ref-absent branch=feature/x remote=none"),
         ("ref mismatch after push", ["feature/x"], dict(post_push_remote="bbbb222"), 1,
@@ -331,6 +338,23 @@ def verdict_line_cases():
     check("unplanned abort before the push: ERROR, exactly one line, nonzero",
           rc == 1 and out.splitlines() == ["SAFE-PUSH: ERROR reason=internal-exit-1 branch=feature/x pushed=no"]
           and not pushes)
+    after_push = _abort_copy(marker="# Independent verification:", name="abort-after-push.sh")
+    rc, out, err, pushes, _log = run(["feature/x"], script=after_push)
+    check("unplanned abort AFTER the push: UNVERIFIED, exit 3, exactly one line (never ERROR/FAILED)",
+          rc == 3 and len(pushes) == 1 and out.splitlines() ==
+          ["SAFE-PUSH: UNVERIFIED reason=interrupted-after-push-exit-1 branch=feature/x"])
+    # A signal after `verdict OK` (in the best-effort upstream config) must not yield OK + nonzero.
+    sig_after_ok = _abort_copy(marker="# What `-u` used to record.", inject="kill -TERM $$",
+                               name="signal-after-ok.sh")
+    rc, out, err, pushes, _log = run(["feature/x"], script=sig_after_ok)
+    check("a signal after a recorded OK still exits 0 (the verdict owns the exit code)",
+          rc == 0 and out.splitlines() == ["SAFE-PUSH: OK branch=feature/x sha=aaaa111 verified=ls-remote"])
+    sig_after_unv = _abort_copy(marker="  exit 3\nfi\nremote_sha=", inject="  kill -TERM $$",
+                                name="signal-after-unverified.sh")
+    rc, out, err, pushes, _log = run(["feature/x"], lsremote_fail="post", script=sig_after_unv)
+    check("a signal after a recorded UNVERIFIED still exits 3 (never the signal's 143)",
+          rc == 3 and out.splitlines() ==
+          ["SAFE-PUSH: UNVERIFIED reason=remote-unreadable branch=feature/x sha=aaaa111"])
     rc, out, err, pushes, _log = run(["feature/x"], lsremote_fail="post",
                                      extra_env={"SAFE_PUSH_VERIFY_BACKOFF": "abc"})
     check("a bad backoff value cannot turn UNVERIFIED into a failure (exit 3)",

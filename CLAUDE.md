@@ -381,7 +381,10 @@ Runtime (`scripts/`; canonical source is this repo):
   all diagnostics stay on stderr). An exit no site recorded is ERROR (exit 1) before the push and
   UNVERIFIED (exit 3) after it, never a guessed FAILED; a signal is given its conventional nonzero
   code; the branch is sanitized so a newline cannot forge a second line; and a closed stdout never
-  turns a verified push into a failure. It exists because agents kept following a verified push with their own `ls-remote`:
+  turns a verified push into a failure. A RECORDED verdict owns the exit code (a signal after OK
+  still exits 0). Origin is read after EVERY push, whatever `git push` exited: the remote updates
+  the ref before reporting status, so a lost response returns nonzero for a push that landed, and
+  that case is OK labeled `push-exit=<n>`, never FAILED. It exists because agents kept following a verified push with their own `ls-remote`:
   the success line was one stderr note among many. OK is printed only after the post-push
   `ls-remote` matched the pushed SHA, so it IS the verification. An UNREADABLE origin is never
   guessed: before the push it REFUSES (it used to classify as a first push), after the push it
