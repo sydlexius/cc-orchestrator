@@ -14,9 +14,16 @@ result, and drafts the PR bodies. It never merges, never posts a review trigger,
 
 A slice is a PR number (all digits, checked FIRST) or a worktree path (an existing directory),
 listed BOTTOM TO TOP. A worktree path that is a bare number is read as a PR number, so write it
-`./42`. No slice may be the trunk, the default branch (the one `origin/HEAD` points at, even when
-`--base` names another trunk), `main`, `master` or `HEAD`: link would push it past the floor. `--base <branch>` names the trunk the bottom PR targets (default: the branch `origin/HEAD`
-points at). `--open` marks the PRs ready for review instead of leaving them drafts.
+`./42`. No slice may be the trunk, the default branch (the LIVE remote default AND the cached
+`origin/HEAD`, which goes stale after a remote rename; even when `--base` names another trunk),
+`main`, `master` or `HEAD`: link would push it past the floor. `--base <branch>` names the trunk the
+bottom PR targets (default: the live remote default branch, else the cached `origin/HEAD`).
+`--open` marks the PRs ready for review instead of leaving them drafts.
+
+Every branch name this command interpolates into a command line (`<branch>`, `<lower-branch>`, a
+`--base` value, a link argument) is SINGLE-QUOTED, whether it came from a worktree or from a PR
+slice. A branch name containing a single quote cannot be quoted safely: STOP and report it (rename
+the branch), never escape around it.
 
 **Arguments:** $ARGUMENTS
 
@@ -75,6 +82,8 @@ Then state the policy check in two lines, and STOP if either fails:
 
 `stack-preflight.sh` is READ-ONLY (see its header). It is not deployed to `~/.claude/scripts/`,
 so there is no deployed leg; the leg rules are the "Helper exec paths" section of `prep-pr.md`.
+It fetches a PR slice's head as `refs/pull/<n>/head`, so a fork PR's slice works, and re-reads
+every PR head just before reporting PASS (a head that moved, or an unreadable re-read, is exit 2).
 
 ```bash
 if [ -f scripts/stack-preflight.sh ] && jq -e '.name == "orchestrate"' .claude-plugin/plugin.json >/dev/null 2>&1; then leg=repo
@@ -103,9 +112,8 @@ Show every line. `pf_rc=0` -> continue (report each `WARN`/`INFO`). Anything els
 Build `LINKARGS`: for each slice in order, the BRANCH name the preflight printed in brackets
 for a worktree slice, or the PR NUMBER for a PR slice (never the PR's branch name: the number
 binds link to the PR the preflight checked). Each item is SINGLE-QUOTED on the command line
-(`'feat/a' '42'`), and so is the `--base` value. A branch name containing a single quote cannot be
-quoted safely: STOP and report it (rename the branch), never escape around it. Show the command
-exactly:
+(`'feat/a' '42'`), and so is the `--base` value (the single-quote rule above applies). Show the
+command exactly:
 
 ```text
 gh stack link [--base '<branch>'] [--open] '<slice-1>' '<slice-2>' ...
@@ -150,15 +158,15 @@ gh stack link <BASEFLAG> <OPENFLAG> <LINKARGS>; echo "link_rc=$?"
 ```
 
 A nonzero `link_rc`: report its output and STOP. Do not retry blindly: a partial run may have
-pushed some branches and created some PRs. Reconcile first (`gh pr list --head <branch>` per
-slice, `git ls-remote origin <branch>`).
+pushed some branches and created some PRs. Reconcile first (`gh pr list --head '<branch>'` per
+slice, `git ls-remote origin 'refs/heads/<branch>'`).
 
 Verify, per slice (`<n>` = its PR number, `<branch>` its branch):
 
 ```bash
 gh pr view <n> --json number,url,state,isDraft,baseRefName,headRefName,headRefOid
-git ls-remote origin refs/heads/<branch>
-git rev-parse refs/heads/<branch>    # worktree slices only
+git ls-remote origin 'refs/heads/<branch>'
+git rev-parse 'refs/heads/<branch>'    # worktree slices only
 gh stack view --json 2>/dev/null || echo "gh stack view: no local tracking (expected after link)"
 ```
 
@@ -217,7 +225,7 @@ commit-style title, single-quoted, no trigger words; there is no title-file flag
    force-push, which orphans cited fix SHAs and empties CR's incremental-review delta.
 4. When a lower PR's fix round conflicts with an upper PR (GitHub shows the upper PR
    `CONFLICTING`), `gh pr update-branch` cannot fix it ("Cannot update PR branch due to
-   conflicts"). Resolve in the upper PR's worktree: `git merge origin/<lower-branch>`, resolve,
+   conflicts"). Resolve in the upper PR's worktree: `git merge 'origin/<lower-branch>'`, resolve,
    commit (a signed merge commit), push through safe-push. Additive: every SHA on the upper PR
    survives. Without a conflict, refresh with a plain `gh pr update-branch <n>`.
 5. Merge, on the maintainer's go: run `ship-gate-preflight` on EVERY PR in the stack first; all
