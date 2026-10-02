@@ -892,10 +892,18 @@ token to a push that skipped them. If a later step changed the tree, re-run the 
 Without `pipefail` a pipeline returns the LAST command's exit code, so a refusal (exit 1 or
 2) reads as 0 and the caller proceeds while the remote never moved - the exact pipe-swallow
 failure safe-push exists to remove, rebuilt one layer out (#432). Its own exit code IS the
-verdict (`push_rc` above: 0 pushed and verified, 1 refused/failed, 2 bad invocation), and
-its output is already short, so there is nothing to trim.
+verdict (`push_rc` above: 0 pushed and verified, 1 refused/failed, 2 bad invocation, 3
+UNVERIFIED), and its output is already short, so there is nothing to trim.
 
-Report the push result. If it fails (non-fast-forward, auth error, the remote
+**Do not re-verify a verified push.** safe-push prints exactly one stdout verdict line,
+`SAFE-PUSH: OK branch=<b> sha=<sha> verified=ls-remote` on success: it already re-read origin
+with `git ls-remote` and matched the exact SHA it pushed. Report that line as the push result;
+never follow it with your own `ls-remote`, `rev-parse origin/<b>`, `git status` or `git log
+origin/..` - that re-derives a proven fact. `SAFE-PUSH: UNVERIFIED` (exit 3: the push exited 0
+but origin could not be read back) is the ONE case to reconcile with the `git ls-remote` command
+it prints, before any retry.
+
+Report the push result (the `SAFE-PUSH:` line). If it fails (non-fast-forward, auth error, the remote
 ref did not move, `push_rc` non-zero, etc.), stop and explain -- do not retry
 automatically. A hook DENYING the block is `Step 7: NOT RUN`, a blocking stop (see
 **Hook-denied gate command** at the top of this file).

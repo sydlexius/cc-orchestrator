@@ -221,10 +221,11 @@ Invoke `/handle-review` via Skill with arg `<pr_number>`. handle-review
 will: parse all unreplied bot comments, fix in one pass, reply in batch,
 and push once.
 
-After handle-review returns, check whether it actually pushed AND the
-remote received the new commit (a belt-and-braces check on top of
-handle-review's own gated push through `safe-push.sh`; a pipe-swallowed
-push can still read as success). Ordering note (#458): in the standing
+After handle-review returns, check whether it pushed at all. This is NOT a
+re-verification of the push (safe-push's `SAFE-PUSH: OK` already proved the
+remote holds what it pushed); it answers a question safe-push cannot:
+whether handle-review made commits and reached its push step, rather than
+stopping before it. Ordering note (#458): in the standing
 case (CR auto-review OFF) handle-review pushes first, then replies and
 resolves. Under the reply-first EXCEPTION (CR auto-review ON) it runs
 commit -> pass -> reply -> push -> guard-slice -> resolve: guard-slice

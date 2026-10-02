@@ -78,11 +78,26 @@
 #        --stale-ok declared; --base <name> corrects a wrong base), was REFUSED for a
 #        missing/invalid/failing/stale gate receipt (#318; --ungated declares none), was REFUSED as a
 #        silent rewrite (no --rewrite/--rebased), the remote is
-#        ahead (diverged) and must be integrated first, or the remote tip is not
-#        in local history (run `git fetch origin` first so it can be classified)
+#        ahead (diverged) and must be integrated first, the remote tip is not
+#        in local history (run `git fetch origin` first so it can be classified), or origin
+#        could not be read BEFORE the push (refused, nothing sent)
 #   2 -- invalid invocation (a leading flag, a leading remote name, a forwarded non-flag word or
 #        ref-widening flag such as --all/--tags/--mirror: one branch per call) / not in a git
 #        repo / cannot resolve branch (the named local branch does not exist)
+#   3 -- UNVERIFIED: git push exited 0 but origin could not be READ afterwards (ls-remote failed
+#        on every retry), so whether the remote moved is unknown. Reconcile with
+#        `git ls-remote origin refs/heads/<branch>` before retrying; never blind-retry.
+#
+# VERDICT LINE: every run, on every exit path (an EXIT trap guarantees it), prints exactly ONE
+# line to STDOUT, and nothing else ever goes to stdout (all diagnostics are on stderr):
+#   SAFE-PUSH: OK branch=<b> sha=<sha> verified=ls-remote      exit 0
+#   SAFE-PUSH: REFUSED reason=<slug> branch=<b> pushed=no      exit 1 (nothing was sent)
+#   SAFE-PUSH: FAILED reason=<slug> branch=<b> remote=<sha|none> exit 1 (push ran, remote wrong)
+#   SAFE-PUSH: USAGE reason=<slug>                             exit 2
+#   SAFE-PUSH: UNVERIFIED reason=remote-unreadable branch=<b> sha=<sha>  exit 3
+# OK IS THE REMOTE VERIFICATION. It is printed only after origin was re-read and holds the exact
+# SHA pushed, so a caller must NOT follow it with its own ls-remote / rev-parse / git status:
+# that re-derives a fact this script already proved. Re-check only when the result is LOST.
 
 set -euo pipefail
 
@@ -91,12 +106,40 @@ case "${1:-}" in
   -h|--help) awk 'NR==1{next} /^#/{sub(/^#[[:space:]]?/,""); print; next} {exit}' "$0"; exit 0 ;;
 esac
 
+# --- VERDICT LINE ---------------------------------------------------------------------------
+# Callers kept re-verifying a verified push because the success line was one stderr note among
+# many and each failure path worded itself differently. One machine-readable stdout line per run,
+# emitted by an EXIT trap so NO exit path (including a set -e abort nobody anticipated) can skip
+# it. Each exit site records its outcome with `verdict`; an exit that recorded none is reported
+# as an internal failure rather than guessed into a success.
+v_status=""
+v_reason=""
+v_extra=""
+branch=""
+verdict() { v_status="$1"; v_reason="$2"; v_extra="${3:-}"; }
+emit_verdict() {
+  local rc="$1"
+  if [ -z "$v_status" ]; then
+    case "$rc" in
+      2) v_status=USAGE; v_reason=unspecified ;;
+      *) v_status=FAILED; v_reason="internal-exit-$rc" ;;
+    esac
+  fi
+  local line="SAFE-PUSH: $v_status"
+  [ -n "$v_reason" ] && line="$line reason=$v_reason"
+  [ -n "$branch" ] && line="$line branch=$branch"
+  [ -n "$v_extra" ] && line="$line $v_extra"
+  printf '%s\n' "$line"
+}
+trap 'emit_verdict "$?"' EXIT
+
 # Repo-agnostic log location. `git rev-parse --git-dir` resolves correctly
 # for the main worktree (.git), linked worktrees (.git/worktrees/<name>),
 # and submodules. Falls back gracefully if we're somehow not inside a repo.
 git_dir=$(git rev-parse --git-dir 2>/dev/null || true)
 if [ -z "$git_dir" ]; then
   echo "safe-push: not inside a git repository" >&2
+  verdict USAGE not-a-repo
   exit 2
 fi
 LOG="$git_dir/safe-push.log"
@@ -129,6 +172,7 @@ if [ -n "$branch" ]; then
   if [ "${branch#-}" != "$branch" ]; then
     echo "safe-push: first arg must be a branch name; origin and the upstream are handled automatically." >&2
     echo "           Usage: safe-push.sh <branch> [extra git-push flags]" >&2
+    branch=""; verdict USAGE leading-flag
     exit 2
   fi
   # git-push argument order (`safe-push.sh origin <branch>`) parsed `origin` as the BRANCH and
@@ -146,6 +190,7 @@ if [ -n "$branch" ]; then
       if { [ -n "${2:-}" ] && [ "${2#-}" = "$2" ]; } \
          || ! git rev-parse --verify "refs/heads/$branch" >/dev/null 2>&1; then
         echo "safe-push: '$branch' is a git remote, not a branch: the remote is implicit (origin); use: safe-push.sh <branch> [flags]" >&2
+        branch=""; verdict USAGE remote-name-as-branch
         exit 2
       fi ;;
   esac
@@ -156,6 +201,7 @@ if [ -z "$branch" ]; then
   branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)
   if [ -z "$branch" ]; then
     echo "safe-push: HEAD is detached and no branch argument given" >&2
+    verdict USAGE detached-head
     exit 2
   fi
 fi
@@ -186,6 +232,7 @@ while [ "$#" -gt 0 ]; do
       if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
         echo "safe-push: --base requires a branch NAME (e.g. --base release/1.2)." >&2
         echo "           Usage: safe-push.sh <branch> [--base <name>] [--stale-ok] [git-push flags]" >&2
+        verdict USAGE bad-args
         exit 2
       fi
       base_override="$2"; shift 2 ;;
@@ -195,17 +242,19 @@ while [ "$#" -gt 0 ]; do
     # Flags that take a SEPARATE value keep it; any other non-flag word is refused.
     -o|--push-option|--receive-pack|--exec|--repo)
       if [ "$#" -lt 2 ]; then
-        echo "safe-push: $1 requires a value." >&2; exit 2
+        echo "safe-push: $1 requires a value." >&2; verdict USAGE bad-args; exit 2
       fi
       push_args+=("$1" "$2"); shift 2 ;;
     --all|--branches|--mirror|--tags|--follow-tags|--delete|-d|--prune|--)
       echo "safe-push: '$1' would push (or delete) refs other than '$branch', which nothing here checks; refused." >&2
       echo "           Usage: safe-push.sh <branch> [flags] - one branch per call." >&2
+      verdict USAGE bad-args
       exit 2 ;;
     -*) push_args+=("$1"); shift ;;
     *)
       echo "safe-push: extra argument '$1' is not a flag: git would push it as a SECOND refspec, ungated; refused." >&2
       echo "           Usage: safe-push.sh <branch> [flags] - one branch per call." >&2
+      verdict USAGE bad-args
       exit 2 ;;
   esac
 done
@@ -213,6 +262,7 @@ done
 local_sha=$(git rev-parse --verify "refs/heads/$branch" 2>/dev/null || true)
 if [ -z "$local_sha" ]; then
   echo "safe-push: local branch 'refs/heads/$branch' does not exist" >&2
+  verdict USAGE no-such-branch
   exit 2
 fi
 
@@ -235,6 +285,7 @@ receipt_refuse() {
   echo "          the worktree holding the branch (what /prep-pr and the /handle-review Step 7 gated push run)." >&2
   echo "          No gate exists for this push (a repo without gate-runner, a deliberate human push)?" >&2
   echo "          Re-run with --ungated to declare it." >&2
+  verdict REFUSED receipt pushed=no
   exit 1
 }
 if [ "$ungated" -eq 1 ]; then
@@ -411,6 +462,7 @@ else
           echo "            gh pr update-branch <n>            # for an OPEN PR, AFTER this round's replies + resolves (default merge-commit mode)" >&2
           echo "          Wrong base? Pass --base <name> (e.g. a backport's real base) - that is the fix, not the override." >&2
           echo "          Fix round on an already-reviewed PR? Re-run with --stale-ok: it pushes behind, WARNs, and leaves the refresh for after the replies + resolves." >&2
+          verdict REFUSED stale-base pushed=no
           exit 1
         fi ;;
       0)
@@ -445,7 +497,13 @@ fi
 # independently bans bare --force/-f and push-to-main regardless of this flag, so
 # this only ADDS an additive-vs-rewrite signal the guard does not make; it never
 # injects a bare --force and never weakens the floor.
-pre_remote_line=$(git ls-remote origin "refs/heads/$branch" 2>/dev/null || true)
+# A FAILED read is not an absent ref: `|| true` here used to classify an unreachable origin as a
+# first push. Refuse instead - nothing has been sent, so retrying later is free.
+if ! pre_remote_line=$(git ls-remote origin "refs/heads/$branch" 2>/dev/null); then
+  echo "safe-push: cannot read origin (git ls-remote failed), so the push cannot be classified; nothing was pushed." >&2
+  verdict REFUSED remote-unreadable pushed=no
+  exit 1
+fi
 pre_remote_sha=${pre_remote_line%%$'\t'*}
 if [ -z "$pre_remote_sha" ]; then
   push_kind="first-push"
@@ -456,6 +514,7 @@ elif ! git cat-file -e "${pre_remote_sha}^{commit}" 2>/dev/null; then
   # to fetch. Fails safe: refuses rather than force-pushing blind.
   echo "safe-push: origin/'$branch' is at $pre_remote_sha, which is not in your local history." >&2
   echo "          Run 'git fetch origin' so the push can be classified additive-vs-rewrite, then re-run." >&2
+  verdict REFUSED unfetched pushed=no
   exit 1
 elif git merge-base --is-ancestor "$pre_remote_sha" "$local_sha" 2>/dev/null; then
   push_kind="fast-forward"
@@ -472,6 +531,7 @@ case "$push_kind" in
     echo "          This is NOT a rewrite; integrate first (git fetch + rebase/merge), then re-push." >&2
     echo "          local:  $local_sha" >&2
     echo "          remote: $pre_remote_sha" >&2
+    verdict REFUSED diverged pushed=no
     exit 1 ;;
   rewrite)
     if [ "$rewrite_intent" -ne 1 ]; then
@@ -479,6 +539,7 @@ case "$push_kind" in
       echo "          Refusing a silent rewrite. If it is intentional (rebase/amend/squash), re-run with --rewrite (or --rebased)." >&2
       echo "          local:  $local_sha" >&2
       echo "          remote: $pre_remote_sha" >&2
+      verdict REFUSED rewrite pushed=no
       exit 1
     fi
     # Intent declared: guarantee lease protection (append --force-with-lease if the
@@ -530,19 +591,39 @@ fi
 # any local cache (no `git fetch` needed) and returns the authoritative SHA
 # from origin. A "successful" push that somehow didn't update the ref (the
 # silent-failure mode this wrapper guards against) will show here.
-remote_line=$(git ls-remote origin "refs/heads/$branch" 2>/dev/null || true)
-remote_sha=${remote_line%%$'\t'*}
-
+#
+# A FAILED read is not an absent ref. `|| true` used to turn an unreadable origin into "origin has
+# no ref" - a definite FAILED for a push that may well have landed, inviting a blind re-push. Retry
+# a few times (a transient blip right after a push is the common case), then report UNVERIFIED
+# (exit 3) rather than guess either way.
 if [ "$push_status" -ne 0 ]; then
   echo "safe-push: git push exited $push_status" >&2
   emit_log_tail
+  verdict FAILED push-exit-$push_status
   exit 1
 fi
+
+remote_read=0
+for attempt in 1 2 3; do
+  if remote_line=$(git ls-remote origin "refs/heads/$branch" 2>/dev/null); then
+    remote_read=1; break
+  fi
+  if [ "$attempt" -lt 3 ]; then sleep "${SAFE_PUSH_VERIFY_BACKOFF:-2}"; fi
+done
+if [ "$remote_read" -ne 1 ]; then
+  echo "safe-push: git push exited 0, but origin could not be read back to verify it (ls-remote failed 3x)." >&2
+  echo "          Whether origin/$branch moved is UNKNOWN. Reconcile before any retry:" >&2
+  echo "            git ls-remote origin refs/heads/$branch    # expect $local_sha" >&2
+  verdict UNVERIFIED remote-unreadable "sha=$local_sha"
+  exit 3
+fi
+remote_sha=${remote_line%%$'\t'*}
 
 if [ -z "$remote_sha" ]; then
   echo "safe-push: git push exited 0 but origin has no '$branch' ref" >&2
   echo "          local $branch: $local_sha" >&2
   emit_log_tail
+  verdict FAILED ref-absent remote=none
   exit 1
 fi
 
@@ -551,10 +632,12 @@ if [ "$remote_sha" != "$local_sha" ]; then
   echo "          local:  $local_sha" >&2
   echo "          remote: $remote_sha" >&2
   emit_log_tail
+  verdict FAILED ref-mismatch "remote=$remote_sha"
   exit 1
 fi
 
 echo "safe-push: verified origin/$branch -> $remote_sha" >&2
+verdict OK "" "sha=$remote_sha verified=ls-remote"
 # What `-u` used to record. Best-effort: the push is already verified, so a config write failure
 # is reported, never turned into a push failure.
 if ! { git config "branch.$branch.remote" origin &&
