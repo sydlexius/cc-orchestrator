@@ -27,6 +27,7 @@ import json
 import os
 import pty
 import re
+import resource
 import subprocess
 import sys
 import tempfile
@@ -913,46 +914,72 @@ def main():
     # The ceiling is ENFORCED, not just asserted: the subprocess timeout IS the ceiling. run_steer
     # already turns a TimeoutExpired into rc 124 (a failing run, no traceback), so a hung scan fails
     # THROUGH this check after 10s instead of burning a 30s timeout per run.
+    # #501: the RATIO is now taken over the steer child's CPU TIME, not wall time. The #453 ratio
+    # still flaked 4 times on 2026-09-30 (10.1x, 9.9x, 8.3x, 9.0x), once with only light background
+    # load and no concurrent gate: min-of-3 interleaving cannot cancel load that lands on the full
+    # run's samples and not the baseline's, because WALL time measures the machine's load (time the
+    # child spent runnable but descheduled) as much as the scan. CPU time counts only cycles the
+    # child actually consumed, so a busy machine stretches wall while leaving CPU (nearly) flat.
+    # It is read as resource.getrusage(RUSAGE_CHILDREN) deltas (ru_utime + ru_stime) taken
+    # immediately around each run_steer call. RUSAGE_CHILDREN counts only REAPED descendants:
+    # subprocess.run reaps the steer child, and steer waits on its own children (jq, awk, ...)
+    # before it exits, so their CPU rolls up into it - measured, not assumed: a `bash -c 'awk ...'`
+    # whose work is all in the awk grandchild read cpu 0.63s vs wall 0.67s, and the 100k-line
+    # heredoc read cpu 0.85s vs wall 0.91s on an idle machine.
+    # The WALL ceiling stays: a hang burns wall, not CPU, so only the timeout can catch it.
+    # CPU_FLOOR guards the divisor. A whole steer run on a trivial input costs ~0.02s CPU and the
+    # quarter-size baselines here cost ~0.1-0.2s, so 0.05s never distorts a real baseline but keeps
+    # a coarse-grained or near-zero reading (CPU accounting is tick-sampled on some kernels) from
+    # inflating the ratio into a false red. It can only LOWER the ratio when it binds, so it is
+    # sized well below every real baseline: a floor that binds on a real run would hide a quadratic.
     PERF_CEILING = 10.0
+    CPU_FLOOR = 0.05
 
-    def timed(c):
-        t0 = time.time()
-        rc, err = run_steer({"command": c}, channel="stdin", timeout=PERF_CEILING)
-        return time.time() - t0, rc == 0 and not warned(err)
+    def child_cpu():
+        ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+        return ru.ru_utime + ru.ru_stime
+
+    def timed(c, timeout=PERF_CEILING):
+        """Run steer on command c. Returns (child cpu seconds, wall seconds, ok)."""
+        c0, w0 = child_cpu(), time.monotonic()
+        rc, err = run_steer({"command": c}, channel="stdin", timeout=timeout)
+        c1, w1 = child_cpu(), time.monotonic()
+        return c1 - c0, w1 - w0, rc == 0 and not warned(err)
     for label, build, n in (
             ("400KB of 'a' words", lambda k: "gh pr view 1 " + " ".join(["'a'"] * k) + " && echo create", 100000),
             ("50k $(a) substitutions", lambda k: "gh pr view 1 " + "$(a) " * k + "# create", 50000),
             ("100k-line heredoc", lambda k: "cat > f <<'EOF'\n" + "line x\n" * k + "EOF\ngh pr view 1 # create", 100000)):
         c_base, c_full = build(n // 4), build(n)
-        t_base = t_full = None; ok_base = ok_full = True
+        t_base = t_full = None; w_full = 0.0; ok_base = ok_full = True
         for _ in range(3):
-            dt, ok = timed(c_base); ok_base = ok_base and ok
+            dt, _w, ok = timed(c_base); ok_base = ok_base and ok
             t_base = dt if t_base is None else min(t_base, dt)
-            dt, ok = timed(c_full); ok_full = ok_full and ok
+            dt, w, ok = timed(c_full); ok_full = ok_full and ok
             t_full = dt if t_full is None else min(t_full, dt)
-            if dt >= PERF_CEILING:
+            w_full = max(w_full, w)
+            if w >= PERF_CEILING:
                 break  # already over the ceiling: more runs only burn CI time
-        ratio = t_full / max(t_base, 1e-3)
-        check(f"perf: {label} scales linearly, silent (4x input -> {ratio:.1f}x time, < 8x; "
-              f"{t_base:.2f}s -> {t_full:.2f}s, < {PERF_CEILING:.0f}s)",
-              ok_base and ok_full and ratio < 8.0 and t_full < PERF_CEILING)
+        ratio = t_full / max(t_base, CPU_FLOOR)
+        check(f"perf: {label} scales linearly, silent (4x input -> {ratio:.1f}x cpu, < 8x; "
+              f"{t_base:.2f}s -> {t_full:.2f}s cpu, wall < {PERF_CEILING:.0f}s)",
+              ok_base and ok_full and ratio < 8.0 and w_full < PERF_CEILING)
 
     # PERF: a long read chain never reaches awk (the prefilter), and one that does (every clause
     # carries `comment`) is scanned in ONE pass, not one fork per clause.
-    # The limit matches the 3.0s the linearity block above uses: run_steer measures the WHOLE
-    # subprocess (shell start, jq, the awk scan), so a loaded CI runner can blow a 1s bound while
-    # the scanner itself is fine. Correctness (exit 0, silent) stays unconditional; only the timing
-    # is runner-tolerant. dt is captured ONCE - measuring separately for the label and the assertion
-    # let a failure print a passing-looking number.
+    # #501: the 3s bound is on the steer child's CPU time, like the ratio above and for the same
+    # reason - a wall bound here is the same flake class (run_steer measures the WHOLE subprocess:
+    # shell start, jq, the awk scan, and on a loaded runner the time spent waiting for a core). A
+    # per-clause fork regression multiplies CPU, not just wall, so CPU still catches it. The wall
+    # timeout (PERF_CEILING) stays as the hang bound. Correctness (exit 0, silent) stays
+    # unconditional. dt is captured ONCE - measuring separately for the label and the assertion let
+    # a failure print a passing-looking number.
     for label, c in (
             ("300-clause read chain", " && ".join(f"gh pr view {i} --json title" for i in range(300))),
             ("300-clause prefilter-hit chain",
              " && ".join(f"gh pr view {i} --comments" for i in range(300)))):
-        t0 = time.time()
-        rc, err = run_steer({"command": c}, channel="stdin")
-        dt = time.time() - t0
-        check(f"perf: {label} scans in < 3s, silent, exit 0 ({dt:.2f}s)",
-              rc == 0 and not warned(err) and dt < 3.0)
+        dt, _w, ok = timed(c)
+        check(f"perf: {label} scans in < 3s cpu, silent, exit 0 ({dt:.2f}s cpu)",
+              ok and dt < 3.0)
 
     # ---- Rule 4: read-dedup advisory WARN (marker-independent, #226) ----
     # A 2nd+ Read of a path already read THIS session with UNCHANGED mtime/size warns; the first
