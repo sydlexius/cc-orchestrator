@@ -232,9 +232,9 @@ commit-style title, single-quoted, no trigger words; there is no title-file flag
    must PASS. Then `gh stack merge <stack> --squash` merges them as ordered per-PR squash commits
    with no retarget step (measured, #503), or merge bottom-up through `/merge-pr`. `gh stack
    merge` itself checks only open and not-draft (it merged a PR whose CI was still running), and
-   it is all-or-nothing: on a conflict it merges nothing. In a marker session the floor does not
-   gate it yet (#516), so there it runs only after the oracle passes on every PR; in a marker
-   session, prefer bottom-up `/merge-pr` until #516 lands. Neither path
+   it is all-or-nothing: on a conflict it merges nothing. In an orchestrate MARKER session, NEVER
+   `gh stack merge`: the floor does not gate it yet (#516), so it would bypass the per-PR
+   merge-auth token. There, merge bottom-up through `/merge-pr` ONLY, until #516 lands. Neither path
    deletes the merged PRs' remote branches: delete them and confirm with `git ls-remote`.
 
 ---
