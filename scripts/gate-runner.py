@@ -269,18 +269,44 @@ def _killpg(pid, sig):
         pass
 
 
-def _terminate_groups(running, grace=KILL_GRACE_S):
-    """SIGTERM every in-flight step's process group, wait up to `grace`, then
-    SIGKILL the groups (unconditionally: a descendant that ignored SIGTERM can
-    outlive its group leader) and reap every direct child."""
+_LAUNCH_SIGS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+def _group_alive(pgid):
+    """True while process group `pgid` still has a member we can signal. EPERM
+    means the pgid now belongs to someone else's processes: not ours, so gone."""
+    try:
+        os.killpg(pgid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def _prune_lingering(lingering):
+    """Drop every finished step's group that has emptied. An empty group can
+    never be re-joined, and dropping it promptly keeps the final sweep from
+    signalling a pgid the kernel has since recycled for an unrelated process."""
+    for pgid in [g for g in lingering if not _group_alive(g)]:
+        lingering.discard(pgid)
+
+
+def _terminate_groups(running, lingering=(), grace=KILL_GRACE_S):
+    """SIGTERM every in-flight step's process group AND every finished step's
+    still-populated group (`lingering`: a `sleep 30 &` left behind by a step
+    whose shell already exited), wait up to `grace` for all of them to empty,
+    then SIGKILL every group (unconditionally: a descendant that ignored SIGTERM
+    can outlive its group leader) and reap every direct child."""
     procs = [e["proc"] for e in running.values()]
-    for p in procs:
-        _killpg(p.pid, signal.SIGTERM)
+    groups = [p.pid for p in procs] + list(lingering)
+    for g in groups:
+        _killpg(g, signal.SIGTERM)
     deadline = time.monotonic() + grace
-    while any(p.poll() is None for p in procs) and time.monotonic() < deadline:
+    while time.monotonic() < deadline and (
+            any(p.poll() is None for p in procs)
+            or any(_group_alive(g) for g in lingering)):
         time.sleep(POLL_S)
-    for p in procs:
-        _killpg(p.pid, signal.SIGKILL)
+    for g in groups:
+        _killpg(g, signal.SIGKILL)
     for p in procs:
         p.wait()
 
@@ -341,6 +367,7 @@ def run_form_b_parallel(steps, root, memoize_dir, jobs):
 
     capdir = tempfile.mkdtemp(prefix="gate-runner-")
     running = {}
+    lingering = set()   # pgids of finished steps, swept on every exit path
     nxt = printed = 0
     hard = None
     rc = 0
@@ -378,31 +405,51 @@ def run_form_b_parallel(steps, root, memoize_dir, jobs):
                     break
                 e["out"] = os.path.join(capdir, f"{nxt}.out")
                 e["start"] = time.perf_counter()
+                # Block INT/TERM/HUP from Popen until the step is registered in
+                # `running`: a signal in between would otherwise raise before
+                # cleanup can see the new group, orphaning it. A pending signal
+                # is delivered when the mask is restored, after registration.
+                # The child inherits the blocked mask through fork/exec, so
+                # preexec_fn restores the caller's mask there, else the step
+                # could never receive the SIGTERM leg of cleanup.
+                prev = signal.pthread_sigmask(signal.SIG_BLOCK, _LAUNCH_SIGS)
                 try:
-                    with open(e["out"], "wb") as out:
-                        e["proc"] = subprocess.Popen(
-                            e["run"], shell=True, cwd=root,
-                            stdin=subprocess.DEVNULL, stdout=out,
-                            stderr=subprocess.STDOUT, start_new_session=True)
-                except OSError as err:
-                    e["post"].append(
-                        f"[FAIL] {e['name']}: could not launch ({err}), "
-                        f"{time.perf_counter() - e['start']:.1f}s")
-                    e["state"], e["result"] = "done", "fail"
-                    if e["required"]:
-                        hard = e
-                    nxt += 1
-                    continue
-                e["state"] = "running"
-                running[nxt] = e
+                    try:
+                        with open(e["out"], "wb") as out:
+                            e["proc"] = subprocess.Popen(
+                                e["run"], shell=True, cwd=root,
+                                stdin=subprocess.DEVNULL, stdout=out,
+                                stderr=subprocess.STDOUT, start_new_session=True,
+                                preexec_fn=lambda: signal.pthread_sigmask(
+                                    signal.SIG_SETMASK, prev))
+                    except OSError as err:
+                        e["post"].append(
+                            f"[FAIL] {e['name']}: could not launch ({err}), "
+                            f"{time.perf_counter() - e['start']:.1f}s")
+                        e["state"], e["result"] = "done", "fail"
+                        if e["required"]:
+                            hard = e
+                        else:
+                            e["post"].append(f"[WARN] {e['name']}: soft failure "
+                                             "(required=false), continuing.")
+                        nxt += 1
+                        continue
+                    e["state"] = "running"
+                    running[nxt] = e
+                finally:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, prev)
                 nxt += 1
             # Reap.
+            _prune_lingering(lingering)
             for idx in list(running):
                 e = running[idx]
                 code = e["proc"].poll()
                 if code is None:
                     continue
                 del running[idx]
+                # The leader is reaped, but a background descendant may still
+                # hold its group; keep that group for the final sweep.
+                lingering.add(e["proc"].pid)
                 ok = code == 0
                 e["post"].append(f"[{'PASS' if ok else 'FAIL'}] {e['name']} "
                                  f"(exit {code}, "
@@ -430,8 +477,11 @@ def run_form_b_parallel(steps, root, memoize_dir, jobs):
         # leaking capdir. Restored after the rmtree.
         masked = {s: signal.signal(s, signal.SIG_IGN)
                   for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
-        if running:
-            _terminate_groups(running)
+        # Sweep on EVERY exit path, all-pass included: a finished step's stray
+        # background job is never wanted and must not outlive the run.
+        _prune_lingering(lingering)
+        if running or lingering:
+            _terminate_groups(running, lingering)
             for e in running.values():
                 e["post"].append(f"[FAIL] {e['name']} (cancelled, "
                                  f"{time.perf_counter() - e['start']:.1f}s)")

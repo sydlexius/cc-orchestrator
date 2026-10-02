@@ -1155,8 +1155,21 @@ def _wait_file(path, timeout=10):
     return os.path.exists(path)
 
 
-def _read_pid(path):
-    return int(open(path).read().strip()) if _wait_file(path, 5) else None
+def _read_pid(path, timeout=5):
+    """The pid a step wrote to `path`, or None after `timeout`. The shell's
+    redirect creates (truncates) the file before `echo` writes it, so an empty
+    or partial read is retried rather than parsed."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with open(path) as f:
+                text = f.read().strip()
+            if text:
+                return int(text)
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.01)
+    return None
 
 
 def _norm(out):
@@ -1324,6 +1337,74 @@ def test_parallel_fail_fast_kills_groups():
                     os.killpg(pid, signal.SIGKILL)
                 except OSError:
                     pass
+
+
+def _leaker_run(name, follow_run, follow_extra=""):
+    """Run `leaker` (leaves `sleep 30 &` in its group, then exits 0) beside a
+    second step that waits for the leaker to be reaped first. Returns
+    (rc, out, took, pgid, dpid)."""
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as aux:
+        git_init(root)
+        pg, desc = os.path.join(aux, "pgid"), os.path.join(aux, "desc")
+        leak = f"echo $$ > {pg}; sleep 30 & echo $! > {desc}; exit 0"
+        follow = f"while [ ! -s {desc} ]; do sleep 0.02; done; sleep 0.5; {follow_run}"
+        write(root, ".gates.toml", _steps_cfg(
+            [("leaker", leak, ""), (name, follow, follow_extra)], jobs=2))
+        t0 = time.time()
+        rc, out = run_runner(root)
+        took = time.time() - t0
+        return rc, out, took, _read_pid(pg), _read_pid(desc)
+
+
+def _cleanup_pids(*pids):
+    for pid in pids:
+        if pid:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def test_parallel_sweeps_finished_groups():
+    """A step that already FINISHED (its shell exited 0) but left `sleep 30 &`
+    in its process group: that group is swept on a later required failure AND
+    on the all-pass path, and the runner still returns within the grace."""
+    rc, out, took, pgid, dpid = _leaker_run("boom", "exit 7")
+    try:
+        check("#501: finished-group sweep (fail-fast): leaker passed before the "
+              "failure, exit 1", rc == 1 and "[PASS] leaker" in out
+              and "HARD failure at 'boom'" in out)
+        check(f"#501: finished-group sweep (fail-fast): within the grace ({took:.1f}s)",
+              took < 10)
+        check("#501: finished-group sweep (fail-fast): leaker's group is gone",
+              pgid is not None and _gone(pgid, group=True))
+        check("#501: finished-group sweep (fail-fast): background descendant gone",
+              dpid is not None and _gone(dpid, group=False))
+    finally:
+        _cleanup_pids(pgid, dpid)
+    rc, out, took, pgid, dpid = _leaker_run("ok", "true")
+    try:
+        check("#501: finished-group sweep (all-pass): rc 0 within the grace "
+              f"({took:.1f}s)", rc == 0 and took < 10)
+        check("#501: finished-group sweep (all-pass): leaker's group is gone",
+              pgid is not None and _gone(pgid, group=True))
+    finally:
+        _cleanup_pids(pgid, dpid)
+
+
+def test_parallel_child_signal_mask_clean():
+    """The launch window blocks INT/TERM/HUP in the runner; a launched step must
+    NOT inherit that mask, or it could never receive cleanup's SIGTERM."""
+    probe = ("python3 -c 'import signal, sys; "
+             "sys.exit(3 if signal.pthread_sigmask(signal.SIG_BLOCK, []) & "
+             "{signal.SIGINT, signal.SIGTERM, signal.SIGHUP} else 0)'")
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, ".gates.toml", _steps_cfg(
+            [("probe", probe, ""), ("other", "true", "")], jobs=2))
+        rc, out = run_runner(root)
+        check("#501: launched step does not inherit the launch-window signal mask",
+              rc == 0 and "[PASS] probe" in out)
 
 
 def test_parallel_interrupt_kills_groups():
@@ -1500,10 +1581,42 @@ def test_parallel_launch_error_and_tiebreak():
           rc == 1 and "HARD failure at 'ghost'" in out
           and recs == [{"name": "ghost", "result": "fail"}])
     rc, recs, out = _inproc_parallel(
+        [{"name": "opt", "run": "x", "required": False},
+         {"name": "opt2", "run": "y", "required": False}], boom, jobs=1)
+    check("#501: launch OSError on an optional step warns and continues",
+          rc == 0
+          and "[WARN] opt: soft failure (required=false), continuing." in out
+          and "[WARN] opt2: soft failure (required=false), continuing." in out
+          and recs == [{"name": "opt", "result": "fail"},
+                       {"name": "opt2", "result": "fail"}])
+    rc, recs, out = _inproc_parallel(
         [{"name": "a", "run": "x"}, {"name": "b", "run": "y"}],
         lambda *a, **k: _FakeProc(1))
     check("#501: simultaneous required failures name the earlier-declared step",
           rc == 1 and "HARD failure at 'a'" in out)
+
+
+def test_parallel_launch_signal_mask():
+    """INT/TERM/HUP are blocked across Popen + registration, and the previous
+    mask is restored after a launch AND after a launch OSError."""
+    sigs = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
+    seen = []
+
+    def spy(ok):
+        def popen(*a, **k):
+            seen.append(signal.pthread_sigmask(signal.SIG_BLOCK, []) >= sigs)
+            if not ok:
+                raise OSError("simulated launch failure")
+            return _FakeProc(0)
+        return popen
+    before = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+    for ok in (True, False):
+        seen.clear()
+        _inproc_parallel([{"name": "s", "run": "x", "required": False}], spy(ok))
+        after = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        what = "launch" if ok else "launch OSError"
+        check(f"#501: signals blocked during Popen ({what})", seen == [True])
+        check(f"#501: signal mask restored after {what}", after == before)
 
 
 def test_parallel_head_checked_once():
@@ -1558,10 +1671,11 @@ def main():
         test_parallel_serial_byte_identical, test_parallel_validation,
         test_parallel_output_contiguous, test_parallel_declaration_order,
         test_parallel_exclusive_overlaps_nothing,
-        test_parallel_fail_fast_kills_groups, test_parallel_interrupt_kills_groups,
+        test_parallel_fail_fast_kills_groups, test_parallel_sweeps_finished_groups,
+        test_parallel_child_signal_mask_clean, test_parallel_interrupt_kills_groups,
         test_parallel_receipt, test_parallel_double_interrupt_term_ignoring,
         test_parallel_soft_skip_memo, test_parallel_launch_error_and_tiebreak,
-        test_parallel_head_checked_once,
+        test_parallel_launch_signal_mask, test_parallel_head_checked_once,
     ]:
         print(f"- {fn.__name__}")
         fn()

@@ -100,9 +100,10 @@ With `jobs` > 1:
   still warns and continues. Ctrl-C (or SIGTERM or SIGHUP to the runner) kills
   every group; further INT/TERM/HUP are ignored while that cleanup runs, so a
   second Ctrl-C cannot cut it short. Steps run in their own sessions, so SIGKILL
-  to the runner (which cannot be handled) orphans every in-flight group. One
-  accepted gap: a signal landing in the instant between a step's launch and its
-  tracking leaves that one step unkilled.
+  to the runner (which cannot be handled) orphans every in-flight group.
+- The runner sweeps (SIGTERM, then SIGKILL) the process group of every step it
+  launched on every exit path, all-pass included, so a step's stray background
+  job (`sleep 30 &`) never outlives the run.
 - The receipt is written only after every child has exited. `steps[]` stays in
   declaration order; a fail receipt may include steps declared after the
   failing one.
