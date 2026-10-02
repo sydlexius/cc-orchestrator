@@ -117,6 +117,7 @@ v_reason=""
 v_extra=""
 branch=""
 verdict() { v_status="$1"; v_reason="$2"; v_extra="${3:-}"; }
+# shellcheck disable=SC2329  # invoked indirectly via `trap emit_verdict EXIT` below
 emit_verdict() {
   local rc="$1"
   if [ -z "$v_status" ]; then
