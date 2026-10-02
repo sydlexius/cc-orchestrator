@@ -912,18 +912,35 @@ out before the push, and this resolve runs after the push once guard-slice passe
 
 ### CodeRabbit threads -- `@coderabbitai resolve`
 
-Post a single PR-level comment to resolve all addressed CR threads at once:
+Post `@coderabbitai resolve` ONLY once CodeRabbit itself is satisfied with every fix. CR signals
+that by EDITING its own root inline comment to append `Confirmed as addressed by @<login>` (an
+edit, not a reply), so check it mechanically first (literal helper path from Step 0; the
+`pr_number` shell variable is set per Step 0):
 
 ```bash
-bash HELPER_DIR/reply-comment.sh "$pr_number" '@coderabbitai resolve'
+bash HELPER_DIR/pr-unreplied-comments.sh --cr-unconfirmed "$pr_number"
 ```
 
-This tells CodeRabbit to mark all of its threads that have been replied to as
-resolved. CR resolve also covers review body findings -- CodeRabbit tracks its
+- **exit 0** (every CR root confirmed, or CR has no root comments): post the resolve:
+
+  ```bash
+  bash HELPER_DIR/reply-comment.sh "$pr_number" '@coderabbitai resolve'
+  ```
+
+- **exit 1** (the listed threads are not confirmed): do NOT post it yet. Read each listed
+  thread. CR has either not answered yet, or replied with a residual concern, which is a NEW
+  finding: disposition it FIX / DEFER / REBUT like any other, push, and re-run the check later.
+  A line ending `FORCE-RESOLVED?(by <login>)` is a thread someone other than CR resolved while
+  CR still has not confirmed it: raise it, never paper over it.
+- **exit 2** (could not determine, including the canary "no root carries the marker but CR
+  resolved N thread(s) itself", which means the marker wording may have changed): stop and
+  report. Never post the resolve on an unreadable state.
+
+CR resolve also covers review body findings -- CodeRabbit tracks its
 own outside-diff items and will mark them resolved when the underlying code
 changes appear on the next push.
 
-Report that CR resolve was requested.
+Report whether CR resolve was requested, or which threads are still unconfirmed.
 
 ### Copilot + Greptile + Codoki threads -- GraphQL resolve
 

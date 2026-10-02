@@ -192,7 +192,8 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         threads_json="__DEFAULT__", threads_fail=False, protection=None, comments=None,
         comments_fail=False, reviews=None, reviews_fail=False,
         rules_main=None, rules_base=None, rules_page2=None, rules_fail=False, default_branch_fail=False,
-        rules_main_fail=False, default_branch=None, unreplied_warn=False):
+        rules_main_fail=False, default_branch=None, unreplied_warn=False,
+        cr_unconf=None):
     """Invoke the oracle with stubbed gh + pr-unreplied-comments.sh + gh-react.sh.
     Returns (exit_code, stdout, stderr, argv) where argv is the recorded helper
     argv content (one line per invocation, read back from the log) -- used to
@@ -342,6 +343,19 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
                 f.write(
                     "#!/usr/bin/env bash\n"
                     "set -eu\n"
+                    "# --cr-unconfirmed (the CR confirmation advisory) is answered FIRST and logged to\n"
+                    "# its own file, so it never perturbs the argv/call-count bookkeeping below.\n"
+                    "case \" $* \" in *\" --cr-unconfirmed \"*)\n"
+                    "  printf '%s\\n' \"$*\" >> \"$HELPER_ARGV_LOG.cr\"\n"
+                    "  case \"${CR_UNCONF:-}\" in\n"
+                    "    unconfirmed) echo '101 | a.sh:1 | First finding | replied:no | resolved:no'; echo '102 | b.sh:2 | Second | replied:yes | resolved:no'; exit 1;;\n"
+                    "    force) echo '103 | c.sh:3 | Forced | replied:no | resolved:yes FORCE-RESOLVED?(by someone)'; exit 1;;\n"
+                    "    undetermined) echo 'WARN: no CodeRabbit root carries the confirmation marker' >&2; exit 2;;\n"
+                    "    crash) echo 'boom' >&2; exit 7;;\n"
+                    "    emptyone) exit 1;;\n"
+                    "    *) echo 'all confirmed'; exit 0;;\n"
+                    "  esac;;\n"
+                    "esac\n"
                     "# Record the received argv (one line per invocation) so the test can\n"
                     "# assert --allow-stale is passed and count retry attempts.\n"
                     "printf '%s\\n' \"$*\" >> \"$HELPER_ARGV_LOG\"\n"
@@ -451,6 +465,9 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         if gh_fail:
             env["GH_FAIL"] = "1"
         env["UNREPLIED_FINDINGS"] = str(unreplied_findings)
+        env.pop("CR_UNCONF", None)
+        if cr_unconf is not None:
+            env["CR_UNCONF"] = cr_unconf
         env.pop("UNREPLIED_WARN", None)
         if unreplied_warn:
             env["UNREPLIED_WARN"] = "1"
@@ -1017,6 +1034,44 @@ def main():
           rc_fail == rc_base == 0)
     check("#301p2: ...and says so as a NOTE rather than failing silently",
           "unverifiable" in out_fail or "unreadable" in out_fail)
+
+    print("== CR confirmation advisory (WARN/NOTE only, fail-OPEN) ==")
+    GREEN_CR = checkrun("ci", "COMPLETED", "SUCCESS")
+    def cr_run(mode, **kw):
+        return run(["1", "owner/repo"], fixture_json=rollup(GREEN_CR), unreplied_findings=0,
+                   reviews=json.dumps([{"commit_id": DEFAULT_SHA, "state": "APPROVED",
+                                        "submitted_at": "2026-01-01T00:00:00Z",
+                                        "user": {"login": "coderabbitai[bot]"}}]),
+                   cr_unconf=mode, **kw)
+    rc0, out0, _, _ = cr_run("ok")
+    rc1, out1, _, _ = cr_run("unconfirmed")
+    rc2, out2, _, _ = cr_run("undetermined")
+    rcc, outc, _, _ = cr_run("crash")
+    rcf, outf, _, _ = cr_run("force")
+    rce, oute, _, _ = cr_run("emptyone")
+    check("crconf: all confirmed -> plain PASS, no CR WARN/NOTE",
+          rc0 == 0 and "RESULT: PASS" in out0 and "CodeRabbit" not in out0 and "CR confirmation" not in out0)
+    check("crconf: unconfirmed -> WARN with the count on the PASS line",
+          "WARN: 2 CodeRabbit thread(s) not confirmed as addressed" in out1 and "RESULT: PASS" in out1)
+    check("crconf: undetermined (helper exit 2) -> NOTE on the PASS line",
+          "NOTE: CR confirmation state unreadable" in out2 and "RESULT: PASS" in out2)
+    check("crconf: helper crash (exit 7) -> NOTE, still PASS",
+          "NOTE: CR confirmation state unreadable" in outc and "RESULT: PASS" in outc)
+    check("crconf: exit 1 with no parseable lines -> NOTE (never a bare count of 0)",
+          "NOTE: CR confirmation state unreadable" in oute and "WARN: 0" not in oute)
+    check("crconf: FORCE-RESOLVED thread is named in the WARN",
+          "FORCE-RESOLVED" in outf and "103" in outf)
+    check("crconf: FAIL-OPEN - exit code identical across ok/unconfirmed/undetermined/crash/force",
+          rc0 == rc1 == rc2 == rcc == rcf == rce == 0)
+    strip = lambda o: o.split("[#1")[0].split(", headRefOid=")[0]
+    check("crconf: verdict text before the advisory is identical with and without unconfirmed threads",
+          strip(out0) == strip(out1) == strip(out2) == strip(outc))
+    # The advisory must not rescue or condemn a BLOCK: a blocked PR stays blocked.
+    rcb, outb, _, _ = run(["1", "owner/repo"], fixture_json=rollup(GREEN_CR), unreplied_findings=0,
+                          threads_json=threads_doc(unresolved=1), cr_unconf="unconfirmed")
+    check("crconf: a BLOCK stays a BLOCK (exit 2) with unconfirmed threads", rcb == 2)
+    rcm, outm, _, _ = run(["1", "owner/repo", "--diagnose"], fixture_json=diag_fixture(), cr_unconf="unconfirmed")
+    check("crconf: --diagnose output carries no CR advisory", "CodeRabbit thread" not in outm)
 
     print("== #263 Piece A: emit validated headRefOid on PASS ==")
     # PASS prints a parseable headRefOid=<sha> line, and it is the validated SHA.

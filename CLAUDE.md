@@ -300,6 +300,19 @@ Runtime (`scripts/`; canonical source is this repo):
   to make it "meaningful".
   The retired agent-judgment rules are archived in
   `skills/orchestrate/design/ARCHIVE-codoki-mechanisms.md`.
+- `pr-unreplied-comments.sh --cr-unconfirmed <pr> [repo]` (and its advisory use in `ship-gate-preflight.sh`):
+  the mechanical form of "post `@coderabbitai resolve` only once CR is satisfied". When CR verifies a fix
+  it EDITS its own ROOT inline comment to append `Confirmed as addressed by @<login>` (an edit, not a
+  reply); the mode lists every CR root lacking that ASCII text (case-sensitive, emoji ignored), one line
+  `<id> | <path>:<line> | <title> | replied:<yes|no> | resolved:<yes|no>` (replied = a non-bot reply; resolved
+  = GraphQL isResolved). EXIT 0 all confirmed (or zero CR roots), 1 some unconfirmed, 2 undetermined: any
+  gh/jq failure, malformed body, an unconfirmed root with no matching thread, OR the MARKER CANARY (CR
+  resolved N>=1 thread(s) itself yet no root carries the marker, so the wording may have changed; WARN on
+  stderr, never 1). A resolved-but-unconfirmed thread not resolved by CR is tagged `FORCE-RESOLVED?(by
+  <login>)`. A read failure never exits 0 (the "could not read" == "nothing to read" class). In
+  `ship-gate-preflight.sh` FULL mode it only appends a WARN (exit 1, naming force-resolved threads) or NOTE
+  (anything else) to the PASS line, like the #301 coverage advisory: verdict and exit code are fixed first.
+  `/handle-review` Step 8 gates the resolve post on it.
 - `scripts/prose-lint.sh` - the outward-draft prose-lint adapter (#219). A THIN wrapper over
   `~/Developer/prose-tooling`'s `bin/prose_check.py` (reuses, does NOT reimplement, the Markdown-aware
   LanguageTool client + house-style config), so the prose cc-orchestrator EMITS (issue/PR bodies,

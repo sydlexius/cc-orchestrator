@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # pr-unreplied-comments.sh -- List unreplied bot review comments on a PR
 #
-# Usage: pr-unreplied-comments.sh [--wait] [--count-only] [--full] [--latest-per-reviewer] [--coverage-only] [--allow-stale] [--check-resolved] [--audit] [--itemized] <pr_number> [repo]
+# Usage: pr-unreplied-comments.sh [--wait] [--count-only] [--full] [--latest-per-reviewer] [--coverage-only] [--allow-stale] [--check-resolved] [--audit] [--itemized] [--cr-unconfirmed] <pr_number> [repo]
 #
 # Options:
 #   --audit / --all        COMPLETE-COVERAGE audit mode (distinct from the default
@@ -60,6 +60,22 @@
 #                          by path+line via GraphQL). A REPORT, not a gate: a non-empty
 #                          list still exits 0. Mutually exclusive with --count-only /
 #                          --pending-only / --coverage-only / --audit (exits 1 on a bad combo).
+#
+#   --cr-unconfirmed       CODERABBIT CONFIRMATION screen. When CodeRabbit verifies a fix it EDITS
+#                          its own ROOT inline comment to append "Confirmed as addressed by
+#                          @<login>" (an edit, not a reply). Lists every CR ROOT inline comment
+#                          whose body lacks that ASCII text (case-sensitive), one line each:
+#                          "<comment-id> | <path>:<line> | <title ~60 chars> | replied:<yes|no> |
+#                          resolved:<yes|no>" (replied = a NON-bot reply exists in the thread;
+#                          resolved = GraphQL isResolved). A thread that is resolved but
+#                          unconfirmed and NOT resolved by coderabbitai gets a trailing
+#                          " FORCE-RESOLVED?(by <login>)". Exit 0 = every CR root confirmed
+#                          (zero CR roots included, said on stdout), 1 = at least one
+#                          unconfirmed, 2 = undetermined (ANY gh/jq failure, malformed body, an
+#                          unconfirmed root with no GraphQL thread, or the MARKER CANARY: CR
+#                          resolved N>=1 thread(s) itself yet NO CR root carries the marker, so
+#                          its wording may have changed -> WARN on stderr, never 1). A read
+#                          failure NEVER exits 0. Mutually exclusive with every other mode.
 #
 # Checks four comment types:
 #   1. Inline review comments (PR diff comments)      -- reply_type: "inline"   (use 3-arg reply-comment.sh)
@@ -213,6 +229,7 @@ allow_stale=false
 audit_mode=false
 check_resolved=false
 itemized=false
+cr_unconfirmed=false
 # Parse flags and positionals in ONE pass so a flag is recognized wherever it sits,
 # NOT only before the <pr> positional (#259). The prior leading-only loop stopped at
 # the first non-flag, so `<pr> --itemized` left `--itemized` as $2=[repo] -> a cryptic
@@ -232,6 +249,7 @@ while [ "$#" -gt 0 ]; do
     --audit|--all) audit_mode=true; shift ;;
     --check-resolved) check_resolved=true; shift ;;
     --itemized) itemized=true; shift ;;
+    --cr-unconfirmed) cr_unconfirmed=true; shift ;;
     --) shift; while [ "$#" -gt 0 ]; do positionals+=("$1"); shift; done ;;
     -*) echo "Unknown flag: $1 (a '-'-leading token is never accepted as <pr> or [repo])" >&2; exit 1 ;;
     *) positionals+=("$1"); shift ;;
@@ -241,6 +259,17 @@ set -- "${positionals[@]+"${positionals[@]}"}"
 if [ "$#" -gt 2 ]; then
   echo "Usage: too many positional arguments (expected <pr> [repo]); got: $*" >&2
   exit 1
+fi
+
+# --cr-unconfirmed is its own report with its own 0/1/2 contract; combining it with any other
+# mode is a usage error (exit 1, before any gh call).
+if [ "$cr_unconfirmed" = true ]; then
+  if [ "$count_only" = true ] || [ "$pending_only" = true ] || [ "$coverage_only" = true ] || \
+     [ "$audit_mode" = true ] || [ "$itemized" = true ] || [ "$check_resolved" = true ] || \
+     [ "$wait_mode" = true ] || [ "$full_mode" = true ] || [ "$latest_per_reviewer" = true ]; then
+    echo "Usage: --cr-unconfirmed is mutually exclusive with every other mode flag" >&2
+    exit 1
+  fi
 fi
 
 # --itemized is a human-readable one-line-per-finding CHECKLIST display mode; it is
@@ -320,8 +349,18 @@ fi
 INFO_MARKERS_RE="^[[:space:]]*<!--[[:space:]]*(${_validated})[[:space:]]*-->"
 
 pr_number="${1:?Usage: pr-unreplied-comments.sh [--wait] [--count-only] [--pending-only] [--latest-per-reviewer] [--itemized] <pr_number> [repo]}"
-repo="${2:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"
-me=$(gh api user --jq .login)
+if [ "$cr_unconfirmed" = true ]; then
+  # Its own 0/1/2 contract: a failed repo lookup must be 2 (undetermined), never gh's raw 1
+  # (which would read as "unconfirmed"), and it never needs the current user.
+  repo="${2:-}"
+  if [ -z "$repo" ]; then
+    repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner) || { echo "cr-unconfirmed: could not resolve repo" >&2; exit 2; }
+  fi
+  me=""
+else
+  repo="${2:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"
+  me=$(gh api user --jq .login)
+fi
 
 # --- Core function: count unreplied bot comments ---
 # THE `|| echo ""` IDIOM IS NOT UNIFORMLY WRONG, AND THE AUDIT MATTERS MORE THAN THE FIX.
@@ -647,7 +686,7 @@ fetch_review_thread_nodes() {
             pullRequest(number:$pr){
               reviewThreads(first:100,after:$cursor){
                 pageInfo{ hasNextPage endCursor }
-                nodes{ isResolved path line comments(first:1){ nodes{ fullDatabaseId author{ login } } } }
+                nodes{ isResolved resolvedBy{ login } path line comments(first:1){ nodes{ fullDatabaseId author{ login } } } }
               }
             }
           }
@@ -662,6 +701,69 @@ fetch_review_thread_nodes() {
   printf '%s\n' "$ftn_nodes"
   return 0
 }
+
+# --- CR-unconfirmed mode: which CodeRabbit roots lack the confirmation marker -----
+# READ-ONLY. Exit 0 all confirmed / 1 some unconfirmed / 2 undetermined. THE DEFECT CLASS
+# TO AVOID: "I could not read this" becoming "there is nothing to read" -> exit 0 -> the
+# caller posts `@coderabbitai resolve` on unverified fixes. So every read is captured and
+# its status checked, the shape of each input is asserted, and an unconfirmed root whose
+# thread cannot be found is UNDETERMINED, not "unresolved".
+if [ "$cr_unconfirmed" = true ]; then
+  cu_comments=$(gh api "repos/$repo/pulls/$pr_number/comments" --paginate 2>/dev/null | jq -s 'add // []' 2>/dev/null) || {
+    echo "cr-unconfirmed: could not read review comments for PR #$pr_number ($repo)" >&2; exit 2; }
+  echo "$cu_comments" | jq -e 'type == "array" and all(.[]; type == "object")' >/dev/null 2>&1 || {
+    echo "cr-unconfirmed: review comments are not a JSON array of objects" >&2; exit 2; }
+  cu_threads=$(fetch_review_thread_nodes) || {
+    echo "cr-unconfirmed: could not read review threads for PR #$pr_number ($repo)" >&2; exit 2; }
+  echo "$cu_threads" | jq -e 'type == "array" and all(.[]; type == "object")' >/dev/null 2>&1 || {
+    echo "cr-unconfirmed: review threads are not a JSON array of objects" >&2; exit 2; }
+  cu_result=$(jq -n --argjson c "$cu_comments" --argjson t "$cu_threads" --argjson bots "$BOT_LOGINS_JSON" '
+    def isbot($u): (($u.login // "") as $l | ($bots | index($l)) != null or ($bots | index($l + "[bot]")) != null)
+                   or (($u.type // "") == "Bot");
+    def iscr($l): ($l == "coderabbitai" or $l == "coderabbitai[bot]");
+    def title($b):
+      (($b | capture("\\*\\*(?<t>[^*\n]+)\\*\\*") | .t) //
+       ($b | split("\n") | map(select(test("\\S") and (test("^\\s*_") | not))) | .[0]) // "(untitled)")
+      | gsub("\\|"; "/") | gsub("[\\r\\n\\t]+"; " ") | .[0:60];
+    ($c | map(select((.in_reply_to_id == null) and iscr(.user.login // "")))) as $roots
+    | if ($roots | any(.body | type != "string")) then {error: "malformed CR root body"} else
+      ($t | map({key: ((.comments.nodes // [])[0].fullDatabaseId // "" | tostring), value: .}) | from_entries) as $tix
+      | ($roots | map(select(.body | contains("Confirmed as addressed")))) as $conf
+      | ($roots | map(select(.body | contains("Confirmed as addressed") | not))) as $unc
+      | ($roots | map(select(($tix[(.id | tostring)] // {}) as $th
+            | ($th.isResolved == true) and iscr($th.resolvedBy.login // "")))) as $crself
+      | if ($unc | any(($tix[(.id | tostring)]) == null)) then {error: "unconfirmed CR root without a matching review thread"}
+        else {roots: ($roots | length), confirmed: ($conf | length), crself: ($crself | length),
+          lines: ($unc | map(
+            . as $r
+            | $tix[($r.id | tostring)] as $th
+            | ($c | any(.[]; (.in_reply_to_id == $r.id) and (((.user // {}) | isbot(.)) | not))) as $rep
+            | ($th.resolvedBy.login // "unknown") as $by
+            | "\($r.id) | \($r.path // "?"):\($r.line // $r.original_line // "?") | \(title($r.body)) | replied:\(if $rep then "yes" else "no" end) | resolved:\(if $th.isResolved == true then "yes" else "no" end)"
+              + (if ($th.isResolved == true) and ((iscr($by)) | not) then " FORCE-RESOLVED?(by \($by))" else "" end)))} end
+    end') || { echo "cr-unconfirmed: could not evaluate comment/thread data" >&2; exit 2; }
+  cu_err=$(echo "$cu_result" | jq -r '.error // empty' 2>/dev/null) || { echo "cr-unconfirmed: unreadable evaluation result" >&2; exit 2; }
+  if [ -n "$cu_err" ]; then echo "cr-unconfirmed: $cu_err" >&2; exit 2; fi
+  cu_roots=$(echo "$cu_result" | jq -r '.roots') || exit 2
+  cu_conf=$(echo "$cu_result" | jq -r '.confirmed') || exit 2
+  cu_crself=$(echo "$cu_result" | jq -r '.crself') || exit 2
+  cu_lines=$(echo "$cu_result" | jq -r '.lines[]') || exit 2
+  case "$cu_roots$cu_conf$cu_crself" in *[!0-9]*|'') echo "cr-unconfirmed: non-numeric counts" >&2; exit 2 ;; esac
+  if [ "$cu_roots" -eq 0 ]; then
+    echo "PR #$pr_number: no CodeRabbit root inline comments; nothing to confirm."
+    exit 0
+  fi
+  if [ -n "$cu_lines" ]; then printf '%s\n' "$cu_lines"; fi
+  if [ "$cu_crself" -ge 1 ] && [ "$cu_conf" -eq 0 ]; then
+    echo "WARN: no CodeRabbit root carries the confirmation marker, but CodeRabbit resolved $cu_crself thread(s) itself; the marker wording may have changed" >&2
+    exit 2
+  fi
+  if [ -z "$cu_lines" ]; then
+    echo "PR #$pr_number: all $cu_roots CodeRabbit root comment(s) confirmed as addressed."
+    exit 0
+  fi
+  exit 1
+fi
 
 # --- Pending-only mode: just print pending bot reviewer count and exit ---
 if [ "$pending_only" = true ]; then
