@@ -10,9 +10,15 @@
 # remote-tracking refs, nothing else. Non-interactive: GIT_TERMINAL_PROMPT=0 + SSH BatchMode.
 #
 # Slices are given BOTTOM TO TOP. Each is detected, never guessed:
-#   an existing directory -> a WORKTREE slice (branch = `git -C <wt> branch --show-current`)
-#   all digits            -> a PR slice (`gh pr view <n>`)
-#   anything else         -> usage error (exit 2)
+#   all digits            -> a PR slice (`gh pr view <n>`), checked FIRST
+#   an existing directory -> a WORKTREE slice (branch = `git -C <wt> branch --show-current`); a
+#                            worktree path that is a bare number must be written ./42
+#   anything else         -> usage error (exit 2), as is a directory that cannot be entered
+#
+# No slice may BE the trunk (exit 2): link would push the local trunk branch, a push to the trunk
+# that never passes the floor. Every value that reaches git from gh output or the command line is
+# fully qualified (refs/heads/<name>) or a validated 40-hex SHA, so none can parse as an option
+# (a headRefName of `--upload-pack=<cmd>` would otherwise EXECUTE under `git fetch`).
 #
 # --base <branch> names the stack TRUNK (the bottom slice's base). Default: the branch origin/HEAD
 # points at. Never a hard-coded `main`; an unresolvable trunk is exit 2 (pass --base).
@@ -64,14 +70,16 @@ while [ "$#" -gt 0 ]; do
     -*) echo "stack-preflight: unknown flag '$1'" >&2; usage ;;
   esac
   n=$((n + 1))
-  if [ -d "$1" ]; then
-    kind[n]="wt"; arg[n]=$(cd "$1" && pwd)
-  else
-    case "$1" in
-      ''|*[!0-9]*) echo "stack-preflight: slice '$1' is neither an existing directory nor a PR number" >&2; usage ;;
-    esac
-    kind[n]="pr"; arg[n]="$1"
-  fi
+  # All digits is a PR number FIRST, even if a same-named directory exists (matches the command's
+  # Step 0); a worktree whose path is a bare number must be written ./42.
+  case "$1" in
+    ''|*[!0-9]*)
+      [ -d "$1" ] || { echo "stack-preflight: slice '$1' is neither an existing directory nor a PR number" >&2; usage; }
+      wt_abs=$(cd "$1" 2>/dev/null && pwd) && [ -n "$wt_abs" ] || {
+        echo "stack-preflight: slice '$1' is a directory that cannot be entered (permissions?)" >&2; usage; }
+      kind[n]="wt"; arg[n]="$wt_abs" ;;
+    *) kind[n]="pr"; arg[n]="$1" ;;
+  esac
   shift
 done
 [ "$n" -ge 2 ] || { echo "stack-preflight: a stack needs at least two slices (got $n)" >&2; usage; }
@@ -96,6 +104,7 @@ if [ -z "$trunk" ]; then
   trunk="${trunk#origin/}"
   [ -n "$trunk" ] || { echo "stack-preflight: cannot resolve the trunk from origin/HEAD; pass --base <branch>" >&2; exit 2; }
 fi
+case "$trunk" in -*) echo "stack-preflight: invalid --base '$trunk' (leading '-')" >&2; usage ;; esac
 git check-ref-format "refs/heads/$trunk" >/dev/null 2>&1 || { echo "stack-preflight: invalid --base '$trunk'" >&2; usage; }
 echo "stack-preflight: trunk=$trunk slices=$n"
 
@@ -128,15 +137,25 @@ print("\t".join((h, b, o, s, str(d["isDraft"]).lower())))' 2>/dev/null); then
 $fields
 EOF
     branch[k]="$f_head"; prbase[k]="$f_base"; tip[k]="$f_oid"; prstate[k]="$f_state"; prdraft[k]="$f_draft"
-    # Bring the head commit local for ancestry (read-only fetch; a validated plain branch name).
+    # Bring the head commit local for ancestry (read-only fetch). The refspec is FULLY QUALIFIED
+    # and has no `:<dst>`, so it can neither parse as an option (`--upload-pack=<cmd>` passes
+    # check-ref-format and would execute) nor update a local ref.
     if ! git -C "$ctx" cat-file -e "${tip[k]}^{commit}" 2>/dev/null; then
       if git check-ref-format "refs/heads/${branch[k]}" >/dev/null 2>&1; then
-        git -C "$ctx" fetch --quiet origin "${branch[k]}" >/dev/null 2>&1 || true
+        git -C "$ctx" fetch --quiet origin "refs/heads/${branch[k]}" >/dev/null 2>&1 || true
       fi
       if ! git -C "$ctx" cat-file -e "${tip[k]}^{commit}" 2>/dev/null; then
         say "$k" "${label[k]}" pr "UNKNOWN - head commit ${tip[k]} is not available locally (fetch failed)"; undet; tip[k]=""
       fi
     fi
+  fi
+done
+
+# A slice that IS the trunk would have link push the local trunk branch: a push to the trunk
+# that bypasses the floor. Refused outright, whatever the other checks would say.
+for k in $(seq 1 "$n"); do
+  if [ "${branch[k]}" = "$trunk" ]; then
+    echo "stack-preflight: slice $k ${label[k]} is the trunk branch '$trunk'; a slice must be a feature branch (link would push the trunk)" >&2; exit 2
   fi
 done
 

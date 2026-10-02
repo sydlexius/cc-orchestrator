@@ -394,7 +394,9 @@ Runtime (`scripts/`; canonical source is this repo):
   the report-only degradation is the normal path. No floor/guard change.
 - `scripts/stack-preflight.sh` - READ-ONLY pre-link checker for `/orchestrate:stack-prs`. `gh stack
   link` pushes by itself and skips safe-push's checks, so this re-asks them per slice (bottom to top; a
-  slice is a worktree dir or a PR number): clean worktree, passing receipt bound to the branch tree,
+  slice is a PR number if all digits, else a worktree dir - write a numeric path as `./42`): no slice
+  may BE the trunk (link would push it past the floor; exit 2), every gh-derived ref reaches git fully
+  qualified (`refs/heads/<name>`, so `--upload-pack=` cannot parse as an option), clean worktree, passing receipt bound to the branch tree,
   bottom slice fresh vs the trunk (`--base`, else origin/HEAD), each upper slice contains the lower tip,
   PR slices OPEN and chained. Exit 0/1/2; any read failure or unknown freshness is 2, never a pass. Calls
   `base-freshness.sh` from its OWN directory, never the cwd. Not in HELPER_NAMES (plugin/repo legs only).

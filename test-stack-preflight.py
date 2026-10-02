@@ -16,10 +16,12 @@ trunk comes from origin/HEAD, never a hard-coded name), and real worktrees per s
 stub first on PATH serving canned `pr view` JSON per number, or failing on demand.
 
 MUTATION PROOFS run against a temp COPY of the script (the repo file is never edited): each key
-assertion (receipt tree bind, ancestry, gh-failure fail-closed) must turn red when the matching
-line in the copy is broken, or the assertion is decorative.
+assertion (receipt tree bind, ancestry, gh-failure fail-closed, the trunk-slice refusal, the
+qualified fetch refspec, and every fail-closed UNKNOWN path) must turn red when the matching line
+in the copy is broken, or the assertion is decorative.
 
 Run: python3 test-stack-preflight.py
+     STACK_PREFLIGHT_BASH=/bin/bash python3 test-stack-preflight.py   (macOS bash 3.2)
 """
 import json
 import os
@@ -29,6 +31,8 @@ import sys
 import tempfile
 
 REPO = os.path.dirname(os.path.abspath(__file__))
+# The interpreter the script runs under; STACK_PREFLIGHT_BASH=/bin/bash proves macOS bash 3.2.
+BASH = os.environ.get("STACK_PREFLIGHT_BASH", "bash")
 SCRIPT = os.path.join(REPO, "scripts", "stack-preflight.sh")
 FRESH = os.path.join(REPO, "scripts", "base-freshness.sh")
 
@@ -114,7 +118,7 @@ class Fixture:
     def run(self, *args, script=SCRIPT, cwd=None, gh_fail=False):
         env = dict(os.environ, PATH=self.bindir + os.pathsep + os.environ["PATH"],
                    GH_DIR=self.ghdir, GH_FAIL="1" if gh_fail else "0")
-        r = subprocess.run(["bash", script, *args], cwd=cwd or self.clone, env=env,
+        r = subprocess.run([BASH, script, *args], cwd=cwd or self.clone, env=env,
                            capture_output=True, text=True, timeout=60)
         return r.returncode, r.stdout + r.stderr
 
@@ -150,6 +154,78 @@ def case_ancestry_broken(fx, script=SCRIPT):
 
 def case_gh_fail(fx, script=SCRIPT):
     return fx.run(fx.wt1, "41", script=script, gh_fail=True)
+
+
+def case_trunk_slice(fx, script=SCRIPT):
+    """The reviewer's repro: an UNPUSHED trunk commit, gated, passed as the bottom slice."""
+    fx.commit(fx.clone, "local.txt", "unpushed trunk commit")
+    fx.receipt(fx.clone)
+    wt3 = os.path.join(fx.td, "wt3")
+    git(fx.clone, "worktree", "add", "-q", "-b", "s3", wt3, "trunk")
+    fx.commit(wt3, "three.txt", "three"); fx.receipt(wt3)
+    return fx.run(fx.clone, wt3, script=script)
+
+
+def case_upload_pack(fx, script=SCRIPT):
+    """A PR headRefName shaped as a git option must never reach git as one."""
+    marker = os.path.join(fx.td, "PWNED")
+    up = os.path.join(fx.td, "up.sh")
+    with open(up, "w") as f:
+        f.write(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n")
+    os.chmod(up, 0o755)
+    with open(os.path.join(fx.ghdir, "42.json"), "w") as f:
+        json.dump({"headRefName": f"--upload-pack={up}", "baseRefName": "s1", "headRefOid": "c" * 40,
+                   "isDraft": True, "state": "OPEN"}, f)
+    rc, out = fx.run(fx.wt1, "42", script=script)
+    return rc, out + ("\nMARKER-EXISTS" if os.path.exists(marker) else "")
+
+
+def case_unreachable_origin(fx, script=SCRIPT):
+    git(fx.clone, "remote", "set-url", "origin", os.path.join(fx.td, "no-such-origin.git"))
+    return fx.run(fx.wt1, fx.wt2, script=script)
+
+
+def case_head_fetch_fail(fx, script=SCRIPT):
+    """PR head commit not local and not fetchable: slice 2 (top) so nothing above masks it."""
+    with open(os.path.join(fx.ghdir, "42.json"), "w") as f:
+        json.dump({"headRefName": "s2", "baseRefName": "s1", "headRefOid": "b" * 40,
+                   "isDraft": True, "state": "OPEN"}, f)
+    return fx.run(fx.wt1, "42", script=script)
+
+
+def case_foreign_repo(fx, script=SCRIPT):
+    """A worktree of a DIFFERENT clone carrying the very same commits: only the repo check stops it."""
+    other = os.path.join(fx.td, "other")
+    subprocess.run(["git", "clone", "-q", fx.clone, other], check=True, capture_output=True)
+    git(other, "checkout", "-q", "-b", "s2", "origin/s2")
+    fx.receipt(other)
+    return fx.run(fx.wt1, other, script=script)
+
+
+def case_detached(fx, script=SCRIPT):
+    git(fx.wt2, "checkout", "-q", "--detach")
+    return fx.run(fx.wt1, fx.wt2, script=script)
+
+
+def case_no_sibling(fx, script=SCRIPT):
+    lone = os.path.join(fx.td, "lone"); os.makedirs(lone)
+    copy = os.path.join(lone, "stack-preflight.sh"); shutil.copy(script, copy)
+    return fx.run(fx.wt1, fx.wt2, script=copy)
+
+
+def case_status_unreadable(fx, script=SCRIPT):
+    """Corrupt slice 2's index (not slice 1's: slice 1 is the git context the freshness fetch runs
+    in, and a corrupt index there also fails that fetch, which would mask this check)."""
+    with open(os.path.join(git(fx.wt2, "rev-parse", "--absolute-git-dir"), "index"), "wb") as f:
+        f.write(b"DIRC-corrupted-index")
+    return fx.run(fx.wt1, fx.wt2, script=script)
+
+
+def case_numeric_dir(fx, script=SCRIPT):
+    """A directory named 41 in the cwd: the bare number is still the PR (command's Step 0 order)."""
+    os.makedirs(os.path.join(fx.clone, "41"))
+    fx.pr(41, "s1", "trunk"); fx.pr(42, "s2", "s1")
+    return fx.run("41", "42", script=script)
 
 
 def main():
@@ -261,9 +337,59 @@ def main():
         res["refspec base"] = fx.run("--base", "a:b", fx.wt1, fx.wt2)[0]
         res["duplicate branch"] = fx.run(fx.wt1, fx.wt1)[0]
         res["mixed digits"] = fx.run(fx.wt1, "12a")[0]
+        res["dash-led base"] = fx.run("--base", "-x", fx.wt1, fx.wt2)[0]
         return res
     for k, v in scenario(usage).items():
         check(f"{k} -> 2", v == 2)
+
+    print("a slice that IS the trunk is refused (link would push the trunk)")
+    rc, out = scenario(case_trunk_slice)
+    check("trunk slice -> exit 2", rc == 2); check("trunk named", "is the trunk branch 'trunk'" in out)
+    def pr_trunk(fx):
+        fx.pr(41, "trunk", "trunk"); fx.pr(42, "s1", "trunk")
+        return fx.run("41", "42")
+    rc, out = scenario(pr_trunk)
+    check("PR slice whose head is the trunk -> exit 2", rc == 2)
+
+    print("an option-shaped PR headRefName never reaches git as an option")
+    rc, out = scenario(case_upload_pack)
+    check("upload-pack headRefName -> exit 2", rc == 2)
+    check("upload-pack command NOT executed", "MARKER-EXISTS" not in out)
+
+    print("fail-closed paths")
+    rc, out = scenario(case_unreachable_origin)
+    check("unreachable origin -> exit 2", rc == 2); check("fresh UNKNOWN", "UNKNOWN" in line(out, 1, "fresh"))
+    rc, out = scenario(case_head_fetch_fail)
+    check("head fetch failure -> exit 2", rc == 2); check("head UNKNOWN", "not available locally" in line(out, 2, "pr"))
+    rc, out = scenario(case_foreign_repo)
+    check("worktree of another repo -> exit 2", rc == 2); check("different repository named", "different repository" in out)
+    rc, out = scenario(case_detached)
+    check("detached HEAD -> exit 1", rc == 1); check("detached named", "detached HEAD" in line(out, 2, "branch"))
+    rc, out = scenario(case_no_sibling)
+    check("no sibling base-freshness.sh -> exit 2", rc == 2); check("missing sibling named", "not found beside" in line(out, 1, "fresh"))
+    rc, out = scenario(case_status_unreadable)
+    check("unreadable git status -> exit 2", rc == 2); check("clean UNKNOWN", "UNKNOWN" in line(out, 2, "clean"))
+
+    print("slice classification: all digits is a PR first")
+    rc, out = scenario(case_numeric_dir)
+    check("bare 41 with a dir named 41 -> PR slice, exit 0", rc == 0 and "(#41)" in out)
+    def dot_numeric(fx):
+        wt = os.path.join(fx.clone, "..", "77")
+        git(fx.clone, "worktree", "add", "-q", "-b", "s7", wt, "s2")
+        fx.commit(wt, "seven.txt", "seven"); fx.receipt(wt)
+        return fx.run(fx.wt1, fx.wt2, "../77")
+    rc, out = scenario(dot_numeric)
+    check("../77 (a path, not a number) -> worktree slice, exit 0", rc == 0 and "77) [s7]" in out)
+
+    print("an unenterable directory is a usage error")
+    def unenterable(fx):
+        d = os.path.join(fx.td, "locked"); os.makedirs(d); os.chmod(d, 0o600)
+        try:
+            return fx.run(fx.wt1, d)
+        finally:
+            os.chmod(d, 0o700)
+    rc, out = scenario(unenterable)
+    check("unenterable dir -> exit 2", rc == 2); check("clear message", "cannot be entered" in out)
 
     print("read-only: no slice is modified")
     def readonly(fx):
@@ -275,15 +401,36 @@ def main():
     check("refs unchanged and nothing pushed", scenario(readonly))
 
     print("mutation proofs (temp copy; the repo script is never edited)")
+    def rc_is(n):
+        return lambda rc, out: rc == n
     mutations = [
-        ("receipt tree bind removed", '"ok $want_tree")', 'ok\\ *)', case_receipt_stale, 1),
+        ("receipt tree bind removed", '"ok $want_tree")', 'ok\\ *)', case_receipt_stale, rc_is(1)),
         ("ancestry check inverted", '--is-ancestor "$prev" "${tip[k]}" 2>/dev/null; arc=$?',
-         '--is-ancestor "$prev" "${tip[k]}" 2>/dev/null; arc=0', case_ancestry_broken, 1),
+         '--is-ancestor "$prev" "${tip[k]}" 2>/dev/null; arc=0', case_ancestry_broken, rc_is(1)),
         ("gh failure falls through", 'failed (read failure is never a pass)"; undet; continue',
-         'failed (read failure is never a pass)"; continue', case_gh_fail, 2),
+         'failed (read failure is never a pass)"; continue', case_gh_fail, rc_is(2)),
+        ("trunk-slice refusal removed", "(link would push the trunk)\" >&2; exit 2",
+         "(link would push the trunk)\" >&2", case_trunk_slice, rc_is(2)),
+        ("fetch refspec unqualified (the pre-fix line)", 'fetch --quiet origin "refs/heads/${branch[k]}"',
+         'fetch --quiet origin "${branch[k]}"', case_upload_pack,
+         lambda rc, out: "MARKER-EXISTS" not in out),
+        ("unknown freshness passes", '(doubt is a STOP before link)"; undet ;;',
+         '(doubt is a STOP before link)"; ;;', case_unreachable_origin, rc_is(2)),
+        ("head-fetch failure passes", '(fetch failed)"; undet; tip[k]=""',
+         '(fetch failed)"; tip[k]=""', case_head_fetch_fail, rc_is(2)),
+        ("different-repo check removed", "than '$ctx'\" >&2; exit 2; }",
+         "than '$ctx'\" >&2; }", case_foreign_repo, rc_is(2)),
+        ("detached HEAD passes", 'no branch to link)"; fail; continue', 'no branch to link)"; continue',
+         case_detached, rc_is(1)),
+        ("missing sibling passes", '(gate did not run)"; undet; continue', '(gate did not run)"; continue',
+         case_no_sibling, rc_is(2)),
+        ("status read failure passes", 'cannot read git status"; undet', 'cannot read git status"',
+         case_status_unreadable, rc_is(2)),
+        ("directory checked before digits", "    ''|*[!0-9]*)\n      [ -d",
+         "    *)\n      [ -d", case_numeric_dir, lambda rc, out: rc == 0 and "(#41)" in out),
     ]
     with tempfile.TemporaryDirectory() as md:
-        for name, old, new, case, expected_rc in mutations:
+        for name, old, new, case, holds in mutations:
             src = open(SCRIPT).read()
             ok_anchor = src.count(old) == 1
             check(f"{name}: anchor found exactly once", ok_anchor)
@@ -294,8 +441,8 @@ def main():
             with open(mut, "w") as f:
                 f.write(src.replace(old, new))
             shutil.copy(FRESH, os.path.join(mdir, "base-freshness.sh"))
-            rc, _ = scenario(lambda fx: case(fx, script=mut))
-            check(f"{name}: mutant no longer exits {expected_rc} (got {rc})", rc != expected_rc)
+            rc, out = scenario(lambda fx: case(fx, script=mut))
+            check(f"{name}: mutant breaks the assertion (got rc={rc})", not holds(rc, out))
 
     print()
     if FAILS:
