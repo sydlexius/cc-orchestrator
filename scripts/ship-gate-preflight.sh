@@ -863,7 +863,7 @@ if [ "$findings" -gt 0 ]; then
   # failure mode for the one deterministic gate in the pipeline.
   echo "BLOCK: $findings actionable review-body finding(s) unaddressed on #$pr -- run '$helper --itemized --allow-stale $pr $repo' for the itemized breakdown." >&2
   echo "  TO CLEAR: address each finding, then ack its review BY ID:" >&2
-  echo "    reply-comment.sh --review <review-id> $pr \"<why it is addressed / the fix SHA>\"" >&2
+  echo "    reply-comment.sh $pr --review <review-id> \"<why it is addressed / the fix SHA>\"" >&2
   echo "  The review id is the ack token - a reply WITHOUT it does NOT clear the finding." >&2
   echo "RESULT: BLOCK -- $findings actionable review-body finding(s). [#$pr $repo]" >&2
   exit 2

@@ -25,6 +25,7 @@ Run: python3 test-ship-gate-preflight.py
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -549,8 +550,8 @@ def main():
     # be reverted and every test stayed green.)
     rc, out, err, _ = run(["1", "owner/repo"], fixture_json=ALL_GREEN, unreplied_findings=2)
     both = out + err
-    check("#289: a review-body BLOCK names the clearing action (reply-comment.sh --review)",
-          rc == 2 and "reply-comment.sh --review" in both)
+    check("#289: a review-body BLOCK names the clearing action (reply-comment.sh <pr> --review)",
+          rc == 2 and re.search(r"reply-comment\.sh \S+ --review", both))
     check("#289: the BLOCK says the review id is the ack token (a bare reply does NOT clear)",
           rc == 2 and "review id" in both.lower() and "does NOT clear" in both)
 

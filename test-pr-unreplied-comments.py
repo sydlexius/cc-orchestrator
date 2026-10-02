@@ -27,6 +27,7 @@ Run: python3 test-pr-unreplied-comments.py
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -783,7 +784,7 @@ def main():
     # Now it asserts the note states the condition the code ACTUALLY implements.
     check("itemized: review-body NOTE states the REAL clearing condition (ack by review id)",
           "NOTE:" in out and "REFERENCES THE REVIEW ID" in out
-          and "reply-comment.sh --review" in out
+          and re.search(r"reply-comment\.sh \S+ --review", out)
           and "re-review" not in out and "maintainer re-trigger" not in out)
     check("itemized: review-body exit 0", rc == 0)
 
@@ -1001,8 +1002,8 @@ def main():
     # this the finding is undiscoverable-in-practice and the lead overrides the gate.
     rc, out, err = run([], reviews=OUTSIDE_ONLY)
     both = out + err
-    check("#289: report names the clearing command (reply-comment.sh --review)",
-          "reply-comment.sh --review" in both)
+    check("#289: report names the clearing command (reply-comment.sh <pr> --review)",
+          re.search(r"reply-comment\.sh \S+ --review", both))
     check("#289: report names the REVIEW ID to ack", "4680966542" in both)
 
     # The wrong NOTE must be gone: the code does NOT implement 'the reviewer re-reviews a

@@ -60,10 +60,16 @@ third = per-round watch timeout in seconds (default 1800 = 30 min).
 
 ## Step 0 -- Parse inputs
 
+Claude Code SUBSTITUTES a dollar sign followed by a digit in a command body before any
+shell sees it, and its indexing is 0-based (the zero-numbered form is the FIRST argument;
+#507), so a bash-style positional reference here would bind the wrong argument. Parse
+`$ARGUMENTS` with `read` instead, and never write a dollar sign directly followed by a digit
+in a command body (awk fields use the `$(N)` form).
+
 ```bash
-pr_number="$1"
-max_rounds="${2:-6}"
-per_round_timeout="${3:-1800}"
+read -r pr_number max_rounds per_round_timeout _rest <<<"$ARGUMENTS"
+max_rounds="${max_rounds:-6}"
+per_round_timeout="${per_round_timeout:-1800}"
 ```
 
 If `pr_number` is empty, stop: "PR number required: /autofix-pr <PR#>".

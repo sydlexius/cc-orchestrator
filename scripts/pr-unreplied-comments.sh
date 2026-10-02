@@ -1257,7 +1257,7 @@ if [ "$review_body_findings" -gt 0 ]; then
     # from the block message, so the maintainer replied "fixed in <sha>" (no id), the gate
     # never cleared, and they overrode it.
     echo "TO CLEAR each finding above: address it, then ack the review BY ID -"
-    if ! echo "$review_bodies" | jq -r --arg pr "$pr_number" '.[] | "  reply-comment.sh --review \(.id) \($pr) \"<why it is addressed / the fix SHA>\""'; then
+    if ! echo "$review_bodies" | jq -r --arg pr "$pr_number" '.[] | "  reply-comment.sh \($pr) --review \(.id) \"<why it is addressed / the fix SHA>\""'; then
       echo "  (could not render the per-review ack commands - run '$0 --itemized $pr_number $repo' and ack each review id shown there)" >&2
     fi
     echo "(A reply WITHOUT the review id does NOT clear it - the id is the ack token.)"
@@ -1453,7 +1453,7 @@ if [ "$itemized" = true ]; then
   # IMPLEMENTED THAT, and the false claim is what made the maintainer override the gate on
   # stillwater #2424 instead of simply acking. The ack is agent-serviceable (#289).
   if [ "$review_body_count" -gt 0 ]; then
-    echo "NOTE: review-body findings have no inline thread to resolve. Each clears when a comment of yours REFERENCES THE REVIEW ID: reply-comment.sh --review <review-id> $pr_number \"<reply>\". A reply without the id does NOT clear it."
+    echo "NOTE: review-body findings have no inline thread to resolve. Each clears when a comment of yours REFERENCES THE REVIEW ID: reply-comment.sh $pr_number --review <review-id> \"<reply>\". A reply without the id does NOT clear it."
   fi
   exit 0
 fi

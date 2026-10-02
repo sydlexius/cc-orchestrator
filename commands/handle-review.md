@@ -237,7 +237,7 @@ THE REVIEW BY ID -- a comment of yours whose body REFERENCES the review id:
 
 ```bash
 # HELPER_DIR/ -> the literal path Step 0 printed; set review_id first (see "Shell variables" in Step 0).
-bash HELPER_DIR/reply-comment.sh --review "$review_id" "$pr_number" "<why it is addressed / the fix SHA>"
+bash HELPER_DIR/reply-comment.sh "$pr_number" --review "$review_id" "<why it is addressed / the fix SHA>"
 ```
 
 The review id is the ack token. A reply WITHOUT it does NOT clear the finding --
