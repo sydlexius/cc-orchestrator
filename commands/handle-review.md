@@ -785,6 +785,11 @@ echo "gate_rc=$gate_rc push_rc=$push_rc leg=$leg"
 (exit "$push_rc")  # prep-pr-ok
 ```
 
+The push's `SAFE-PUSH: OK ... verified=ls-remote` line (with `push_rc=0`) IS the remote
+verification: do not follow it with `ls-remote` / `rev-parse origin/<b>` / `git status`. Only
+`SAFE-PUSH: UNVERIFIED` (`push_rc=3`) is reconciled, with the `git ls-remote` it prints, before
+any retry.
+
 If the push printed the `WARN` that it went out BEHIND the base, the refresh is still owed (#492),
 and its ORDER matters: do it only AFTER this round's replies (Step 7) and resolves (Step 8) are
 done, because a HEAD-moving commit dismisses the bot's prior approval. Then run

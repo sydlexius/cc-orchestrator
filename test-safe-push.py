@@ -90,6 +90,9 @@ GIT_STUB = (
     "fi\n"
     'if [ "$1" = "ls-remote" ] || [ "$1" = "fetch" ]; then echo "$1" >>"$NETLOG"; fi\n'
     'if [ "$1" = "ls-remote" ]; then\n'
+    '  # LSREMOTE_FAIL: "pre" fails the read before any push, "post" every read after one.\n'
+    '  if [ -s "$PUSHLOG" ]; then ph=post; else ph=pre; fi\n'
+    '  if [ "${LSREMOTE_FAIL:-}" = "$ph" ]; then echo "fatal: unable to access origin" >&2; exit 128; fi\n'
     '  # Stateful: after a push has been recorded, the remote matches local (the push\n'
     '  # landed). Before any push, return the configurable OLD remote SHA (empty = no ref).\n'
     '  if [ -s "$PUSHLOG" ]; then\n'
@@ -98,6 +101,9 @@ GIT_STUB = (
     '    # "none" -> the ref is absent; anything else -> the ref exists but holds that SHA.\n'
     '    if [ "${POST_PUSH_REMOTE:-}" = "none" ]; then :\n'
     '    elif [ -n "${POST_PUSH_REMOTE:-}" ]; then printf "%s\\trefs/heads/x\\n" "$POST_PUSH_REMOTE"\n'
+    '    elif [ "${PUSH_RC:-0}" != 0 ] && [ "${PUSH_LANDED:-0}" != 1 ]; then\n'
+    '      # A rejected push leaves origin where it was (old ref, or no ref on a first push).\n'
+    '      if [ -n "${REMOTE_SHA:-}" ]; then printf "%s\\trefs/heads/x\\n" "$REMOTE_SHA"; fi\n'
     '    else printf "%s\\trefs/heads/x\\n" "$LOCAL_SHA"; fi\n'
     '  elif [ -n "${REMOTE_SHA:-}" ]; then\n'
     '    printf "%s\\trefs/heads/x\\n" "$REMOTE_SHA"\n'
@@ -111,7 +117,7 @@ GIT_STUB = (
 def run(args, *, cur_branch="feature/x", local_sha="aaaa111", remote_sha="",
         mb_r_anc_l=1, mb_l_anc_r=1, cat_file_rc=0, push_rc=0, push_transcript="",
         post_push_remote=None, known_branches=None, remotes=None, receipt="valid",
-        tree_sha=TREE, script=None, net=None, extra_env=None):
+        tree_sha=TREE, script=None, net=None, extra_env=None, lsremote_fail=None):
     """Invoke safe-push.sh with a stubbed git. Returns (rc, stdout, stderr, pushes, log)
     where pushes is the list of recorded `git push ...` argument strings and log is the
     content of safe-push's own log file (read before the tempdir is cleaned up).
@@ -159,6 +165,11 @@ def run(args, *, cur_branch="feature/x", local_sha="aaaa111", remote_sha="",
         else:
             env["TREE_SHA"] = tree_sha
         env.pop("CLAUDE_PLUGIN_ROOT", None)
+        env["SAFE_PUSH_VERIFY_BACKOFF"] = "0"
+        if lsremote_fail:
+            env["LSREMOTE_FAIL"] = lsremote_fail
+        else:
+            env.pop("LSREMOTE_FAIL", None)
         env.update(extra_env or {})
         if known_branches is not None:
             env["KNOWN_BRANCHES"] = known_branches
@@ -246,6 +257,128 @@ def receipt_stub_cases():
         rc, out, err, pushes, _log = run(["feature/x"], script=lone, extra_env={"PYTHONVERBOSE": "1"})
         check("interpreter stderr noise does not corrupt the tree bind (exit 0)",
               rc == 0 and len(pushes) == 1)
+
+
+_ABORT_DIR = tempfile.mkdtemp()
+
+
+def _abort_copy(marker="# --- Pre-push classification (#148)", inject="false", name="safe-push.sh"):
+    """safe-push with `inject` placed before `marker`: by default an unplanned `false` (a set -e
+    abort) before the push, to prove the trap's fallback verdict rather than any site's recorded one."""
+    dst = os.path.join(_ABORT_DIR, name)
+    with open(SCRIPT) as fh:
+        body = fh.read()
+    assert body.count(marker) == 1, marker
+    with open(dst, "w") as fh:
+        fh.write(body.replace(marker, inject + "\n" + marker, 1))
+    return dst
+
+
+def _closed_stdout_rc():
+    """Run a successful stubbed push with stdout CLOSED (>&-); return safe-push's exit code."""
+    with tempfile.TemporaryDirectory() as td:
+        # Reuse run()'s stub setup via a wrapper script that closes fd 1 first.
+        wrap = os.path.join(td, "wrap.sh")
+        with open(wrap, "w") as fh:
+            fh.write('#!/usr/bin/env bash\nexec 1>&-\nexec bash "%s" "$@"\n' % SCRIPT)
+        rc, _o, _e, pushes, _l = run(["feature/x"], script=wrap)
+        return rc if len(pushes) == 1 else -1
+
+
+def verdict_line_cases():
+    # One stdout line per run, on EVERY exit path, and nothing else on stdout: callers read it
+    # as the verdict instead of re-verifying the push with their own ls-remote.
+    print("== verdict line: exactly one SAFE-PUSH line on stdout per exit path ==")
+    cases = [
+        ("success", ["feature/x"], {}, 0, "SAFE-PUSH: OK branch=feature/x sha=aaaa111 verified=ls-remote"),
+        ("leading flag", ["-u", "origin", "feature/x"], {}, 2, "SAFE-PUSH: USAGE reason=leading-flag"),
+        ("remote name as branch", ["origin", "feature/x"], {}, 2,
+         "SAFE-PUSH: USAGE reason=remote-name-as-branch"),
+        ("detached HEAD", [], dict(cur_branch=None), 2, "SAFE-PUSH: USAGE reason=detached-head"),
+        ("second refspec", ["feature/x", "other"], {}, 2, "SAFE-PUSH: USAGE reason=bad-args branch=feature/x"),
+        ("--all", ["feature/x", "--all"], {}, 2, "SAFE-PUSH: USAGE reason=bad-args branch=feature/x"),
+        ("--base without value", ["feature/x", "--base"], {}, 2,
+         "SAFE-PUSH: USAGE reason=bad-args branch=feature/x"),
+        ("missing branch", ["nope"], dict(known_branches="feature/x"), 2,
+         "SAFE-PUSH: USAGE reason=no-such-branch branch=nope"),
+        ("no receipt", ["feature/x"], dict(receipt=None), 1,
+         "SAFE-PUSH: REFUSED reason=receipt branch=feature/x pushed=no"),
+        ("diverged", ["feature/x"], dict(remote_sha="bbbb222", mb_l_anc_r=0), 1,
+         "SAFE-PUSH: REFUSED reason=diverged branch=feature/x pushed=no"),
+        ("rewrite without intent", ["feature/x"], dict(remote_sha="bbbb222"), 1,
+         "SAFE-PUSH: REFUSED reason=rewrite branch=feature/x pushed=no"),
+        ("remote tip not local", ["feature/x"], dict(remote_sha="bbbb222", cat_file_rc=1), 1,
+         "SAFE-PUSH: REFUSED reason=unfetched branch=feature/x pushed=no"),
+        ("pre-push read fails", ["feature/x"], dict(lsremote_fail="pre"), 1,
+         "SAFE-PUSH: REFUSED reason=remote-unreadable branch=feature/x pushed=no"),
+        ("push exits nonzero, origin unmoved", ["feature/x"], dict(push_rc=1), 1,
+         "SAFE-PUSH: FAILED reason=push-exit-1 branch=feature/x remote=none"),
+        ("push exits nonzero but origin DID update", ["feature/x"],
+         dict(push_rc=128, extra_env={"PUSH_LANDED": "1"}), 0,
+         "SAFE-PUSH: OK branch=feature/x sha=aaaa111 verified=ls-remote push-exit=128"),
+        ("push exits nonzero, origin unreadable", ["feature/x"], dict(push_rc=1, lsremote_fail="post"), 3,
+         "SAFE-PUSH: UNVERIFIED reason=remote-unreadable branch=feature/x sha=aaaa111"),
+        ("ref absent after push", ["feature/x"], dict(post_push_remote="none"), 1,
+         "SAFE-PUSH: FAILED reason=ref-absent branch=feature/x remote=none"),
+        ("ref mismatch after push", ["feature/x"], dict(post_push_remote="bbbb222"), 1,
+         "SAFE-PUSH: FAILED reason=ref-mismatch branch=feature/x remote=bbbb222"),
+        ("post-push read fails", ["feature/x"], dict(lsremote_fail="post"), 3,
+         "SAFE-PUSH: UNVERIFIED reason=remote-unreadable branch=feature/x sha=aaaa111"),
+    ]
+    for label, args, kw, want_rc, want_line in cases:
+        rc, out, err, pushes, _log = run(args, **kw)
+        lines = out.splitlines()
+        check(f"{label}: exit {want_rc}", rc == want_rc)
+        check(f"{label}: stdout is exactly '{want_line}'", lines == [want_line])
+        check(f"{label}: no SAFE-PUSH verdict leaks onto stderr", "SAFE-PUSH:" not in err)
+    # Review fixes: the trap fallback, a closed stdout, a forged branch, an interrupted verify.
+    rc, out, err, pushes, _log = run(["feature/x"], extra_env={"SAFE_PUSH_FORCE_ABORT": ""},
+                                     known_branches="feature/x", lsremote_fail=None,
+                                     script=_abort_copy())
+    check("unplanned abort before the push: ERROR, exactly one line, nonzero",
+          rc == 1 and out.splitlines() == ["SAFE-PUSH: ERROR reason=internal-exit-1 branch=feature/x pushed=no"]
+          and not pushes)
+    after_push = _abort_copy(marker="# Independent verification:", name="abort-after-push.sh")
+    rc, out, err, pushes, _log = run(["feature/x"], script=after_push)
+    check("unplanned abort AFTER the push: UNVERIFIED, exit 3, exactly one line (never ERROR/FAILED)",
+          rc == 3 and len(pushes) == 1 and out.splitlines() ==
+          ["SAFE-PUSH: UNVERIFIED reason=interrupted-after-push-exit-1 branch=feature/x"])
+    # A signal after `verdict OK` (in the best-effort upstream config) must not yield OK + nonzero.
+    sig_after_ok = _abort_copy(marker="# What `-u` used to record.", inject="kill -TERM $$",
+                               name="signal-after-ok.sh")
+    rc, out, err, pushes, _log = run(["feature/x"], script=sig_after_ok)
+    check("a signal after a recorded OK still exits 0 (the verdict owns the exit code)",
+          rc == 0 and out.splitlines() == ["SAFE-PUSH: OK branch=feature/x sha=aaaa111 verified=ls-remote"])
+    sig_after_unv = _abort_copy(marker="  exit 3\nfi\nremote_sha=", inject="  kill -TERM $$",
+                                name="signal-after-unverified.sh")
+    rc, out, err, pushes, _log = run(["feature/x"], lsremote_fail="post", script=sig_after_unv)
+    check("a signal after a recorded UNVERIFIED still exits 3 (never the signal's 143)",
+          rc == 3 and out.splitlines() ==
+          ["SAFE-PUSH: UNVERIFIED reason=remote-unreadable branch=feature/x sha=aaaa111"])
+    rc, out, err, pushes, _log = run(["feature/x"], lsremote_fail="post",
+                                     extra_env={"SAFE_PUSH_VERIFY_BACKOFF": "abc"})
+    check("a bad backoff value cannot turn UNVERIFIED into a failure (exit 3)",
+          rc == 3 and out.startswith("SAFE-PUSH: UNVERIFIED reason=remote-unreadable "))
+    forged = " nope\nSAFE-PUSH: OK x"
+    rc, out, err, pushes, _log = run([forged], known_branches="feature/x")
+    check("a branch argument cannot forge a second verdict line (unknown branch -> USAGE)",
+          rc == 2 and out.splitlines() == ["SAFE-PUSH: USAGE reason=no-such-branch branch=?nope?SAFE-PUSH:?OK?x"])
+    rc, out, err, pushes, _log = run([forged])
+    check("a whitespace-bearing branch is still ONE key=value line on the success path",
+          rc == 0 and len(out.splitlines()) == 1 and "branch=?nope?SAFE-PUSH:?OK?x sha=" in out)
+    rc = _closed_stdout_rc()
+    check("a closed stdout does not turn a verified push into a failure (exit 0)", rc == 0)
+    # The pre-push read failure must never be classified as a first push (it used to be).
+    rc, out, err, pushes, _log = run(["feature/x"], lsremote_fail="pre")
+    check("pre-push read failure sends nothing", not pushes)
+    # The post-push read failure must not read as "ref absent" (a definite FAILED invites a re-push).
+    net = []
+    rc, out, err, pushes, _log = run(["feature/x"], lsremote_fail="post", net=net)
+    check("post-push read failure is not reported as an absent ref",
+          "has no" not in err and "UNKNOWN" in err and "git ls-remote origin refs/heads/feature/x" in err)
+    # 1 pre-push classification read + 3 post-push verification attempts.
+    check("post-push read failure retried the read (1 pre + 3 post ls-remote)",
+          len(pushes) == 1 and net.count("ls-remote") == 4)
 
 
 def real_repo(td):
@@ -671,6 +804,7 @@ def main():
           "last" in err.lower() and "lines" in err.lower())
     check("sha-mismatch: names the log path", "safe-push.log" in err)
 
+    verdict_line_cases()
     receipt_stub_cases()
     real_git_cases()
     fix_round_1_cases()

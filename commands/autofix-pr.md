@@ -221,26 +221,44 @@ Invoke `/handle-review` via Skill with arg `<pr_number>`. handle-review
 will: parse all unreplied bot comments, fix in one pass, reply in batch,
 and push once.
 
-After handle-review returns, check whether it actually pushed AND the
-remote received the new commit (a belt-and-braces check on top of
-handle-review's own gated push through `safe-push.sh`; a pipe-swallowed
-push can still read as success). Ordering note (#458): in the standing
+After handle-review returns, check whether it pushed at all. This is NOT a
+re-verification of the push (safe-push's `SAFE-PUSH: OK` already proved the
+remote holds what it pushed); it answers a question safe-push cannot:
+whether handle-review made commits and reached its push step, rather than
+stopping before it. Ordering note (#458): in the standing
 case (CR auto-review OFF) handle-review pushes first, then replies and
 resolves. Under the reply-first EXCEPTION (CR auto-review ON) it runs
 commit -> pass -> reply -> push -> guard-slice -> resolve: guard-slice
 needs the pushed SHA, so it runs AFTER the push and gates the resolve,
 not the replies:
 
+This `ls-remote` is NOT the redundant re-verification the safe-push contract forbids: handle-review
+runs as a Skill, so its push's `SAFE-PUSH:` line never reaches this loop as a value it can read, and
+the remote ref is the only signal this layer has.
+
 ```bash
 post_head=$(git -C "$worktree" rev-parse HEAD)
-remote_head=$(git -C "$worktree" ls-remote origin "refs/heads/$head_ref" | cut -f1)
+# Capture ls-remote's OWN status before any parsing: piped through `cut`, a FAILED read exits 0 with
+# an empty remote_head, which then reads as "the commit did not reach origin" for a push that may
+# have landed (PR #530 review). A failed read is UNKNOWN, never "not pushed".
+if remote_line=$(git -C "$worktree" ls-remote origin "refs/heads/$head_ref" 2>/dev/null); then
+  remote_head=${remote_line%%$'\t'*}; remote_read=ok
+else
+  remote_head=""; remote_read=failed
+fi
+echo "post_head=$post_head remote_head=${remote_head:-<none>} remote_read=$remote_read"
 ```
+
+- `remote_read=failed` (and `post_head != pre_head`) -> whether the fix reached origin is
+  UNKNOWN. Print "round <round>: could not read origin/<head_ref> to confirm the push; reconcile
+  with `git ls-remote origin refs/heads/<head_ref>` (expect `<post_head>`) before any retry." and
+  exit with status **ABORT**. Never retry the push on an unread remote: it may have landed.
 
 - `post_head == pre_head` -> handle-review made no commits. Treat as
   **STALL** -- print "round <round>: handle-review made no commits;
   treating as stall." and fall through to the STALL branch.
-- `post_head != pre_head` AND `remote_head != post_head` -> a fix was
-  committed locally but did NOT reach origin. Print:
+- `post_head != pre_head` AND `remote_read=ok` AND `remote_head != post_head` -> a fix was
+  committed locally but did NOT reach origin (origin was READ and holds something else). Print:
   > "round <round>: local HEAD advanced to `<post_head>` but origin/<head_ref>
   > is still `<remote_head>`. This is the pipe-swallow silent-failure mode.
   > Retry the push manually via `cd <worktree> && bash <safe-push.sh> <head_ref>`, where
