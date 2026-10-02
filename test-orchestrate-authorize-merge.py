@@ -81,7 +81,7 @@ def run(args, *, tmux="/tmp/tmux-x,1,0", ccsid=None, preflight_mode="pass", ttl_
     env.pop("CLAUDE_CODE_SESSION_ID", None)
     if ccsid is not None:
         env["CLAUDE_CODE_SESSION_ID"] = ccsid
-    p = subprocess.run(["bash", HELPER] + args, env=env, capture_output=True, text=True, timeout=15)
+    p = subprocess.run(["bash", HELPER] + args, env=env, capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
     return p.returncode, p.stdout, p.stderr, floor_dir, home
 
 
@@ -180,14 +180,14 @@ def main():
         cmd_ok = "gh " + "pr " + f"merge 265 --squash --match-head-commit {SHA}"
         p_ok = subprocess.run(["bash", guard], input=json.dumps(
             {"tool_name": "Bash", "tool_input": {"command": cmd_ok}}),
-            env=genv, capture_output=True, text=True, timeout=15)
+            env=genv, capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         check("#312 E2E: the token this helper armed is ACCEPTED by the real guard -> merge ALLOWED",
               p_ok.returncode == 0)
         # The bind still holds end-to-end: a DIFFERENT pr with the same token must be denied.
         cmd_bad = "gh " + "pr " + f"merge 999 --squash --match-head-commit {SHA}"
         p_bad = subprocess.run(["bash", guard], input=json.dumps(
             {"tool_name": "Bash", "tool_input": {"command": cmd_bad}}),
-            env=genv, capture_output=True, text=True, timeout=15)
+            env=genv, capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         check("#312 E2E: the same token does NOT authorize a DIFFERENT pr -> BLOCK",
               p_bad.returncode == 2)
     else:

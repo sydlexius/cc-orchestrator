@@ -185,7 +185,7 @@ def run(args, *, cur_branch="feature/x", local_sha="aaaa111", remote_sha="",
             env.pop("CUR_BRANCH", None)
 
         p = subprocess.run(["bash", script or SCRIPT] + args, env=env,
-                           capture_output=True, text=True, timeout=15)
+                           capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         pushes = []
         if os.path.exists(pushlog):
             with open(pushlog) as fh:

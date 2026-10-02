@@ -46,7 +46,7 @@ def run_wrapper(wrapper, args, extra_env=None, grep_shim=False):
         env.update(extra_env)
     try:
         p = subprocess.run(["bash", os.path.join(HERE, "scripts", wrapper), *args],
-                           env=env, capture_output=True, text=True, timeout=15)
+                           env=env, capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         rc = p.returncode
     except subprocess.TimeoutExpired:
         # Treat a hang as a failure of this case, not a harness crash.

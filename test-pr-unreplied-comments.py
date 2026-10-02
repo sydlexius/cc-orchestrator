@@ -148,7 +148,7 @@ def run(args, *, inline="[]", reviews="[]", issue="[]", graphql=None,
         if extra_env:
             env.update(extra_env)
         p = subprocess.run(["bash", SCRIPT] + args + ["123", "owner/repo"],
-                           env=env, capture_output=True, text=True, timeout=20)
+                           env=env, capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         return p.returncode, p.stdout, p.stderr
 
 
@@ -168,7 +168,7 @@ def run_argv(argv, *, inline="[]", reviews="[]", issue="[]", me="testuser"):
         env["REVIEWS_JSON"] = reviews
         env["ISSUE_JSON"] = issue
         env["COMMITTER_DATE"] = "2026-06-18T00:00:00Z"
-        p = subprocess.run(["bash", SCRIPT] + argv, env=env, capture_output=True, text=True, timeout=20)
+        p = subprocess.run(["bash", SCRIPT] + argv, env=env, capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         return p.returncode, p.stdout, p.stderr
 
 

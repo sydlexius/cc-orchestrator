@@ -620,11 +620,24 @@ Runtime (`scripts/`; canonical source is this repo):
   {} and passes - exactly how a drift guard becomes decorative, and the #330 lesson about a
   wrong pattern reading as a real defect); and a FILESYSTEM CROSS-CHECK, since the two lists
   can AGREE and both omit a script that exists. Stdlib only, no network.
-  #379 extends the same three checks to the `python3 test-*.py` HARNESS STEP lists, which had
-  drifted to 16 of 42 gated harnesses never run in CI (`test-orchestrate-authorize-merge.py`
-  among them). A harness kept out of CI needs a `CI_EXEMPT` entry with a WRITTEN REASON
-  (mirrors `FS_EXEMPT`); the default is a CI step, and the FS leg requires every `test-*.py`
-  on disk to be a `.gates.toml` step.
+  #379 extended the same checks to the `python3 test-*.py` HARNESS STEP lists (16 of 42 gated
+  harnesses never ran in CI). That half is now DERIVED, a deliberate REVERSAL of the original
+  "do not derive CI's list from `.gates.toml`" decision: CI ran all 46 harnesses as SERIAL
+  Actions steps (375s macOS / 230s ubuntu, nearly all subprocess-spawn cost), so each OS leg
+  now runs ONE `python3 scripts/gate-runner.py --jobs 4 --skip ...` step (same `exclusive`
+  barriers as local), and harness drift is IMPOSSIBLE rather than detected. The trade-off
+  accepted: CI depends on parsing `.gates.toml`. The harness now asserts CI CANNOT SILENTLY
+  STOP running that list: exactly one gate-runner `run:` per leg under an exact
+  `if: runner.os == 'Linux'|'macOS'` (or none), no `continue-on-error`, `--jobs N>=2`, the
+  matrix still `[ubuntu-latest, macos-latest]` (the required check names), each leg's `--skip`
+  set EQUAL to its `CI_SKIP` table (every entry a WRITTEN REASON naming a real step: lint on
+  both legs, `test-orchestrate-setup` on macOS), and no CI-run step `required = false` or
+  carrying `skip_if_absent`/`skip_if`. The FS leg still requires every `test-*.py` to be a
+  `.gates.toml` step. shellcheck/ruff keep their dedicated Linux CI steps (digest-pinned image,
+  Linux-only ruff), so their lists stay hand-maintained and keep all three checks. A 13-case
+  MUTATION SELF-TEST proves each check fails when its invariant breaks. gate-runner's
+  `--skip <name>` (repeatable, default off) exits 2 on a name matching no step, on Form A /
+  the fallback chain, and beside `--receipt` (a receipt must attest the whole gate).
 - `test-orchestrate-{guard,resources,setup}.py`, `test-planner-classify.py`, `test-gh-wrappers.py` -
   the proof harnesses (kept at repo root; dev tooling, not shipped in the skill).
 
@@ -675,7 +688,8 @@ captured per step and printed in declaration order, and the first required
 failure killing every in-flight process group. A step marked `exclusive = true`
 runs with nothing else in flight. This repo sets `jobs = 4` (several worktrees
 often gate at once) with `test-orchestrate-steer` and `test-elmer-tick`
-exclusive; a consumer repo must audit its steps for shared state first.
+exclusive; a consumer repo must audit its steps for shared state first. CI runs
+the same steps the same way (`--jobs 4`, minus a lockstep-checked `--skip` set).
 
 ```sh
 shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/orchestrate-authorize-merge.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh scripts/base-freshness.sh scripts/open-pr-staleness-sweep.sh scripts/run-paths.sh scripts/cr-quota-watch.sh scripts/elmer-enqueue.sh scripts/elmer-triage.sh scripts/elmer-tick.sh scripts/stack-preflight.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)

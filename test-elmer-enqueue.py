@@ -70,7 +70,7 @@ def pr_json(head=SHA_A, state="OPEN"):
 
 def run(args, *, receipt_obj="__default__", pr=None, api_fail=False,
         repo_fail=False, home=None, write_receipt=True, raw_receipt=None,
-        timeout=30, close_fd=None):
+        timeout=120, close_fd=None):  # load-tolerant: CI runs harnesses 4-wide
     """Invoke enqueue with a stubbed gh + isolated ELMER_HOME.
 
     Returns (rc, stdout, stderr, inbox_entries, home_dir_kept_alive)."""

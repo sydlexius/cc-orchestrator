@@ -93,7 +93,7 @@ def run(args, *, inline="[]", reviews="[]", issue="[]", me="testuser",
         env["REPO_VIEW"] = repo_view
         env["GH_CALLLOG"] = calllog
         p = subprocess.run(["bash", SCRIPT] + args, env=env,
-                           capture_output=True, text=True, timeout=20)
+                           capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         calls = ""
         try:
             with open(calllog) as f:

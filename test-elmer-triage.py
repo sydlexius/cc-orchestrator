@@ -127,7 +127,7 @@ def run(args, *, status_out=STATUS_LINE, status_rc=0, findings_out=FINDINGS,
         full = ["bash", "-c", 'exec "$@" >&-', "sh"] + full
     elif close_fd == 2:
         full = ["bash", "-c", 'exec "$@" 2>&-', "sh"] + full
-    p = subprocess.run(full, env=env, capture_output=True, text=True, timeout=30)
+    p = subprocess.run(full, env=env, capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
     tdir = os.path.join(elmer_home, "triage")
     entries = sorted(os.listdir(tdir)) if os.path.isdir(tdir) else []
     return p.returncode, p.stdout, p.stderr, entries, elmer_home

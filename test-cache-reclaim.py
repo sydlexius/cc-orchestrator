@@ -74,7 +74,7 @@ def run(args, extra_env=None, cwd=None):
         env.update(extra_env)
     try:
         p = subprocess.run(["bash", WRAPPER, *args], env=env, capture_output=True,
-                           text=True, timeout=20, cwd=cwd)
+                           text=True, timeout=120, cwd=cwd)  # load-tolerant: CI runs harnesses 4-wide
         rc, out = p.returncode, p.stdout + p.stderr
     except subprocess.TimeoutExpired:
         rc, out = 124, "TIMEOUT"

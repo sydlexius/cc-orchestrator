@@ -105,7 +105,7 @@ def run(args, *, comments="[]", oracle_rc=2, oracle_absent=False, api_fail=False
         if api_fail:
             env["GH_API_FAIL"] = "1"
 
-        p = subprocess.run([SCRIPT] + args, env=env, capture_output=True, text=True, timeout=20)
+        p = subprocess.run([SCRIPT] + args, env=env, capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         return p.returncode, p.stdout, p.stderr
 
 

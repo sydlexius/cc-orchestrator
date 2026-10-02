@@ -131,7 +131,7 @@ def run(args, *, origin_head="main", behind=0, fetch_rc=0):
         # no receipt rather than forge one; the receipt leg is covered in test-safe-push.py.
         # Inserted AFTER the first positional so `--base` with no value stays the last word.
         r = subprocess.run(
-            ["bash", SCRIPT, *args[:1], "--ungated", *args[1:]], capture_output=True, text=True, env=env, cwd=td, timeout=30
+            ["bash", SCRIPT, *args[:1], "--ungated", *args[1:]], capture_output=True, text=True, env=env, cwd=td, timeout=120  # load-tolerant: CI runs harnesses 4-wide
         )
         gh_calls = ""
         if os.path.exists(ghlog):

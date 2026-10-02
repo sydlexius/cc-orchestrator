@@ -81,7 +81,7 @@ def cli(schema, obj):
         json.dump(obj, f); path = f.name
     try:
         p = subprocess.run([sys.executable, MODULE_PATH, "--validate", schema, path],
-                           capture_output=True, text=True, timeout=20)
+                           capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         return p.returncode, p.stdout + p.stderr
     finally:
         os.unlink(path)

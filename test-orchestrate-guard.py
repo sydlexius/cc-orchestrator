@@ -106,7 +106,7 @@ def run_guard(command, *, marker_active, channel, tmux=DEFAULT_TMUX, ccsid=None,
             elif channel == "env":
                 env["TOOL_INPUT"] = json.dumps({"command": command})
         p = subprocess.run([GUARD], input=stdin_data, env=env,
-                           capture_output=True, text=True, timeout=5)
+                           capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         return p.returncode, p.stdout, p.stderr
 
 
@@ -651,7 +651,7 @@ def main():
     for _cmd in ("git" + " push origin refs/tags/v1.30.0", "git" + " push origin --tags"):
         rc, _stdout, _stderr = run_guard(_cmd, marker_active=False, channel="stdin")
         expect(f"#345: named remedy '{_cmd}' is exempt", rc, "allow")
-    _sr = subprocess.run([GUARD, "--self-test"], capture_output=True, text=True, timeout=30)
+    _sr = subprocess.run([GUARD, "--self-test"], capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
     if _sr.returncode != 0:
         FAILS.append(f"#345: --self-test failed (rc={_sr.returncode}): {_sr.stderr.strip()[:300]}")
         print(f"  [FAIL] #345: --self-test rc={_sr.returncode}")
@@ -806,7 +806,7 @@ def main():
         _env312.pop("TOOL_INPUT", None)
         _p312 = subprocess.run(["bash", GUARD], env=_env312, capture_output=True, text=True,
                                input=json.dumps({"tool_name": "Bash",
-                                                 "tool_input": {"command": MERGE_CMD}}), timeout=15)
+                                                 "tool_input": {"command": MERGE_CMD}}), timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         expect("#312: marker armed under ccsid but guard sees $TMUX -> STILL gated "
                "(arm/check asymmetry closed)", _p312.returncode, "block")
 
@@ -839,7 +839,7 @@ def main():
         _env.update({"ORCHESTRATE_FLOOR_DIR": _fd, "ORCHESTRATE_FLOOR_TTL_HOURS": "24",
                      "TMUX": DEFAULT_TMUX, "CLAUDE_CODE_SESSION_ID": "tok-sess"})
         _env.pop("TOOL_INPUT", None)
-        _p = subprocess.run([GUARD], env=_env, capture_output=True, text=True, timeout=15,
+        _p = subprocess.run([GUARD], env=_env, capture_output=True, text=True, timeout=120,  # load-tolerant: CI runs harnesses 4-wide
                             input=json.dumps({"tool_name": "Bash",
                                               "tool_input": {"command": MERGE312}}))
         expect("#312 piece-b: an EXPIRED first-candidate token does NOT shadow a VALID second "
@@ -848,7 +848,7 @@ def main():
         # authorizes -> BLOCK. Trying all candidates must widen nothing.
         json.dump({"pr": 42, "head_sha": "d" * 40, "expiry": int(time.time()) + 600},
                   open(os.path.join(_auth, "ccsid_" + _key("tok-sess")), "w"))
-        _p = subprocess.run([GUARD], env=_env, capture_output=True, text=True, timeout=15,
+        _p = subprocess.run([GUARD], env=_env, capture_output=True, text=True, timeout=120,  # load-tolerant: CI runs harnesses 4-wide
                             input=json.dumps({"tool_name": "Bash",
                                               "tool_input": {"command": MERGE312}}))
         expect("#312 piece-b: NO candidate token valid (SHA mismatch) -> still BLOCK "
@@ -869,7 +869,7 @@ def main():
     # short-circuit, every fragment is independently load-bearing, and the live use site
     # interpolates the derived union rather than a hand-written literal.
     _ac = subprocess.run([GUARD, "--assert-coverage"], capture_output=True, text=True,
-                         timeout=30)
+                         timeout=120)  # load-tolerant: CI runs harnesses 4-wide
     if _ac.returncode != 0:
         FAILS.append(f"#324: --assert-coverage failed (rc={_ac.returncode}): "
                      f"{(_ac.stderr or _ac.stdout).strip()[:300]}")
@@ -946,7 +946,7 @@ def main():
             # timeout: a MUTANT guard is deliberately broken, so it is exactly the code most
             # likely to hang. Without this a bad mutation stalls CI instead of failing it.
             _r = subprocess.run([_mp, "--assert-coverage"], capture_output=True, text=True,
-                                timeout=30)
+                                timeout=120)  # load-tolerant: CI runs harnesses 4-wide
             _caught = _r.returncode != 0
             if _must_catch is None:
                 # Detection is grep-implementation-dependent for this mutant (see its comment);
@@ -974,7 +974,7 @@ def main():
                     ["bash", _mp], input=json.dumps(
                         {"tool_name": "Bash",
                          "tool_input": {"command": "git " + "push origin " + "main"}}),
-                    capture_output=True, text=True, env=_penv, timeout=15)
+                    capture_output=True, text=True, env=_penv, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
                 if _live.returncode != 2:
                     FAILS.append(
                         f"#324 mutation '{_label}' [{_plabel}]: the mutant ALLOWED a Tier-1 "

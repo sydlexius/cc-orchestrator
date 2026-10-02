@@ -73,7 +73,7 @@ def run(args, tooling_dir, stdin=None, extra_env=None):
         env.update(extra_env)
     try:
         p = subprocess.run(["bash", WRAPPER, *args], env=env, input=stdin,
-                           capture_output=True, text=True, timeout=15)
+                           capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         rc, out, err = p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired:
         rc, out, err = 124, "", "TIMEOUT"

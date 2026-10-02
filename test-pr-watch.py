@@ -244,7 +244,7 @@ def run(*, labels="[]", checks="[]", reviews="[]", codoki_rc=0,
             env["PR_WATCH_BLOCKING_REVIEWERS"] = blocking_reviewers
 
         p = subprocess.run(["bash", script, "123", "owner/repo", str(timeout_secs)],
-                           env=env, capture_output=True, text=True, timeout=30)
+                           env=env, capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         if want_polls:
             rpath = os.path.join(state_dir, "reviews")
             polls = int(open(rpath).read()) if os.path.exists(rpath) else 0

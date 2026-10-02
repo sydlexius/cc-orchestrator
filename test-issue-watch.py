@@ -263,7 +263,7 @@ check("timeout: exit 1 with 'timeout: waited' on stderr", rc == 1 and "timeout: 
 
 # --- setup errors ---
 def run_raw(extra):
-    p = subprocess.run(["bash", SCRIPT] + extra, capture_output=True, text=True, timeout=30)
+    p = subprocess.run(["bash", SCRIPT] + extra, capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
     return p.returncode, p.stdout, p.stderr
 
 rc, out, err = run_raw(["--author"])
@@ -284,7 +284,7 @@ with tempfile.TemporaryDirectory() as td:
     os.chmod(os.path.join(bind, "gh"), 0o755)
     env = dict(os.environ)
     env["PATH"] = bind
-    p = subprocess.run([shutil.which("bash"), SCRIPT, ISSUE, REPO], capture_output=True, text=True, env=env, timeout=30)
+    p = subprocess.run([shutil.which("bash"), SCRIPT, ISSUE, REPO], capture_output=True, text=True, env=env, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
     check("setup: jq missing exits 2 with a clear error (not a silent timeout)",
           p.returncode == 2 and "jq" in p.stderr)
 
