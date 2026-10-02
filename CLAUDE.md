@@ -301,15 +301,19 @@ Runtime (`scripts/`; canonical source is this repo):
   The retired agent-judgment rules are archived in
   `skills/orchestrate/design/ARCHIVE-codoki-mechanisms.md`.
 - `pr-unreplied-comments.sh --cr-unconfirmed <pr> [repo]` (and its advisory use in `ship-gate-preflight.sh`):
-  the mechanical form of "post `@coderabbitai resolve` only once CR is satisfied". When CR verifies a fix
-  it EDITS its own ROOT inline comment to append `Confirmed as addressed by @<login>` (an edit, not a
-  reply); the mode lists every CR root lacking that ASCII text (case-sensitive, emoji ignored), one line
-  `<id> | <path>:<line> | <title> | replied:<yes|no> | resolved:<yes|no>` (replied = a non-bot reply; resolved
-  = GraphQL isResolved). EXIT 0 all confirmed (or zero CR roots), 1 some unconfirmed, 2 undetermined: any
-  gh/jq failure, malformed body, an unconfirmed root with no matching thread, OR the MARKER CANARY (CR
-  resolved N>=1 thread(s) itself yet no root carries the marker, so the wording may have changed; WARN on
-  stderr, never 1). A resolved-but-unconfirmed thread not resolved by CR is tagged `FORCE-RESOLVED?(by
-  <login>)`. A read failure never exits 0 (the "could not read" == "nothing to read" class). In
+  the mechanical form of "post `@coderabbitai resolve` only once CR is satisfied". CR signals that in TWO
+  ways and both count: after verifying a FIX it EDITS its own ROOT inline comment to append `Confirmed as
+  addressed by @<login>` (an edit, not a reply); after ACCEPTING A REBUTTAL it resolves the thread ITSELF
+  and adds NO marker. The mode lists every CR root satisfied by neither (marker absent, case-sensitive
+  ASCII, AND not resolved by coderabbitai), one line `<id> | <path>:<line> | <title> | replied:<yes|no> |
+  resolved:<yes|no>` (replied = a non-bot reply; resolved = GraphQL isResolved). EXIT 0 all satisfied (or
+  zero CR roots), 1 some unsatisfied, 2 undetermined: any gh/jq failure, malformed body, or an unsatisfied
+  root with no matching thread. A resolved-but-unsatisfied thread (resolved by someone other than CR) is
+  tagged `FORCE-RESOLVED?(by <login>)`. THE RULE WAS CORRECTED BY A LIVE SWEEP of 36 real PRs across three
+  repos: the first version treated only the marker as satisfaction, plus a "CR self-resolved but no marker
+  anywhere = wording changed" canary; both misfired on accepted rebuttals (#509, #522, canticle#1233), so the
+  canary was removed. A stub harness alone could not have found this; run a read-only mode against real PRs
+  before trusting its predicate. A read failure never exits 0 (the "could not read" == "nothing to read" class). In
   `ship-gate-preflight.sh` FULL mode it only appends a WARN (exit 1, naming force-resolved threads) or NOTE
   (anything else) to the PASS line, like the #301 coverage advisory: verdict and exit code are fixed first.
   `/handle-review` Step 8 gates the resolve post on it.

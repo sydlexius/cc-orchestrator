@@ -1879,7 +1879,7 @@ def main():
     rc, out, err = cu([crc(1, "A", True), crc(2, "B", True)], [thr(1, False), thr(2, True, "coderabbitai[bot]")])
     check("cr-unconfirmed: all roots confirmed -> exit 0", rc == 0)
     check("cr-unconfirmed: all confirmed -> summary line, no finding lines",
-          "all 2 CodeRabbit root comment(s) confirmed" in out and " | replied:" not in out)
+          "all 2 CodeRabbit root comment(s) satisfied" in out and " | replied:" not in out)
 
     rc, out, err = cu([crc(1, "A", True), crc(7, "Keep the | read distinct", False, path="b.sh", line=42)],
                       [thr(1, False), thr(7, False)])
@@ -1914,14 +1914,21 @@ def main():
 
     # Live GraphQL reports resolvedBy.login WITH the [bot] suffix (verified on PR #530); the bare
     # spelling is kept on thread 2 so the matcher's acceptance of both stays covered.
+    # An ACCEPTED REBUTTAL: CR resolves the thread itself and adds NO marker (live: #509, #522,
+    # canticle#1233). That is SATISFIED, not unconfirmed, and never a "marker reworded" alarm.
     rc, out, err = cu([crc(1, "A", False), crc(2, "B", False)], [thr(1, True, "coderabbitai[bot]"), thr(2, True, "coderabbitai")])
-    check("cr-unconfirmed canary: CR self-resolved, no marker anywhere -> exit 2 (not 1)", rc == 2)
-    check("cr-unconfirmed canary: WARN on stderr names the count",
-          "WARN: no CodeRabbit root carries the confirmation marker, but CodeRabbit resolved 2 thread(s) itself; the marker wording may have changed" in err)
+    check("cr-unconfirmed: CR-resolved roots with no marker anywhere are satisfied -> exit 0", rc == 0)
+    check("cr-unconfirmed: an accepted rebuttal raises no marker-wording alarm",
+          "WARN" not in err and "marker wording" not in err and " | replied:" not in out)
+    rc, out, err = cu([crc(1, "A", False)], [thr(1, True, "coderabbitai[bot]")])
+    check("cr-unconfirmed: canticle#1233 shape (one CR-resolved rebuttal, no marker) -> exit 0",
+          rc == 0 and "all 1 CodeRabbit root comment(s) satisfied" in out)
     rc, out, err = cu([crc(1, "A", False), crc(2, "B", True)], [thr(1, True, "coderabbitai[bot]"), thr(2, True, "coderabbitai[bot]")])
-    check("cr-unconfirmed: CR self-resolved unmarked root with a marker elsewhere -> listed, exit 1, no canary",
-          rc == 1 and out.splitlines()[0].startswith("1 |") and "WARN: no CodeRabbit" not in err
-          and "FORCE-RESOLVED" not in out)
+    check("cr-unconfirmed: a CR-resolved unmarked root beside a marked one -> both satisfied, exit 0",
+          rc == 0 and " | replied:" not in out)
+    rc, out, err = cu([crc(1, "A", False), crc(2, "B", False)], [thr(1, True, "coderabbitai[bot]"), thr(2, False)])
+    check("cr-unconfirmed: CR-resolved + an open unmarked root -> only the open one listed, exit 1",
+          rc == 1 and len(out.splitlines()) == 1 and out.splitlines()[0].startswith("2 |"))
 
     rc, out, err = cu([crc(1, "A", False)], [thr(1, True, "sydlexius")])
     check("cr-unconfirmed: resolved by a human + unconfirmed -> FORCE-RESOLVED? tell",

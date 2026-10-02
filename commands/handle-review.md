@@ -932,9 +932,11 @@ bash HELPER_DIR/pr-unreplied-comments.sh --cr-unconfirmed "$pr_number"
   finding: disposition it FIX / DEFER / REBUT like any other, push, and re-run the check later.
   A line ending `FORCE-RESOLVED?(by <login>)` is a thread someone other than CR resolved while
   CR still has not confirmed it: raise it, never paper over it.
-- **exit 2** (could not determine, including the canary "no root carries the marker but CR
-  resolved N thread(s) itself", which means the marker wording may have changed): stop and
-  report. Never post the resolve on an unreadable state.
+- **exit 2** (could not determine: a gh/jq read failure or malformed data): stop and report.
+  Never post the resolve on an unreadable state.
+
+"Satisfied" is the marker (CR verified a FIX) OR a thread CR resolved itself (CR ACCEPTED a
+rebuttal, which carries no marker). A thread CR resolved is never listed.
 
 CR resolve also covers review body findings -- CodeRabbit tracks its
 own outside-diff items and will mark them resolved when the underlying code

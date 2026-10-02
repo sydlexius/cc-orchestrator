@@ -61,21 +61,28 @@
 #                          list still exits 0. Mutually exclusive with --count-only /
 #                          --pending-only / --coverage-only / --audit (exits 1 on a bad combo).
 #
-#   --cr-unconfirmed       CODERABBIT CONFIRMATION screen. When CodeRabbit verifies a fix it EDITS
+#   --cr-unconfirmed       CODERABBIT SATISFACTION screen. CR signals it is satisfied with a thread
+#                          in ONE OF TWO WAYS, and both count: (a) after verifying a FIX it EDITS
 #                          its own ROOT inline comment to append "Confirmed as addressed by
-#                          @<login>" (an edit, not a reply). Lists every CR ROOT inline comment
-#                          whose body lacks that ASCII text (case-sensitive), one line each:
+#                          @<login>" (an edit, not a reply); (b) after ACCEPTING A REBUTTAL it
+#                          resolves the thread ITSELF and adds NO marker (measured across 36 live
+#                          PRs: #509/#522/canticle#1233 withdrawals carry no marker). Lists every CR
+#                          ROOT inline comment satisfied by NEITHER (marker absent, case-sensitive
+#                          ASCII match, AND not resolved by coderabbitai), one line each:
 #                          "<comment-id> | <path>:<line> | <title ~60 chars> | replied:<yes|no> |
 #                          resolved:<yes|no>" (replied = a NON-bot reply exists in the thread;
 #                          resolved = GraphQL isResolved). A thread that is resolved but
 #                          unconfirmed and NOT resolved by coderabbitai gets a trailing
-#                          " FORCE-RESOLVED?(by <login>)". Exit 0 = every CR root confirmed
+#                          " FORCE-RESOLVED?(by <login>)". Exit 0 = every CR root satisfied
 #                          (zero CR roots included, said on stdout), 1 = at least one
-#                          unconfirmed, 2 = undetermined (ANY gh/jq failure, malformed body, an
-#                          unconfirmed root with no GraphQL thread, or the MARKER CANARY: CR
-#                          resolved N>=1 thread(s) itself yet NO CR root carries the marker, so
-#                          its wording may have changed -> WARN on stderr, never 1). A read
-#                          failure NEVER exits 0. Mutually exclusive with every other mode.
+#                          unsatisfied, 2 = undetermined (ANY gh/jq failure, malformed body, or an
+#                          unsatisfied root with no GraphQL thread). A read failure NEVER exits 0.
+#                          NO MARKER-WORDING CANARY: an earlier "CR self-resolved but no marker
+#                          anywhere" alarm was REMOVED, because (b) above makes exactly that a
+#                          normal accepted rebuttal, not a reworded marker (it misfired live on
+#                          canticle#1233). If CR rewords the marker, fixed threads it has not yet
+#                          resolved will list as unsatisfied: fail toward NOT posting the resolve.
+#                          Mutually exclusive with every other mode.
 #
 # Checks four comment types:
 #   1. Inline review comments (PR diff comments)      -- reply_type: "inline"   (use 3-arg reply-comment.sh)
@@ -730,12 +737,13 @@ if [ "$cr_unconfirmed" = true ]; then
       | gsub("\\|"; "/") | gsub("[\\r\\n\\t]+"; " ") | .[0:60];
     ($c | map(select((.in_reply_to_id == null) and iscr(.user.login // "")))) as $roots
     | ($t | map({key: ((.comments.nodes // [])[0].fullDatabaseId // "" | tostring), value: .}) | from_entries) as $tix
-      | ($roots | map(select(.body | contains("Confirmed as addressed")))) as $conf
-      | ($roots | map(select(.body | contains("Confirmed as addressed") | not))) as $unc
-      | ($roots | map(select(($tix[(.id | tostring)] // {}) as $th
-            | ($th.isResolved == true) and iscr($th.resolvedBy.login // "")))) as $crself
-      | if ($unc | any(($tix[(.id | tostring)]) == null)) then {error: "unconfirmed CR root without a matching review thread"}
-        else {roots: ($roots | length), confirmed: ($conf | length), crself: ($crself | length),
+      # Satisfied = the marker (CR verified a fix) OR CR resolved the thread itself (CR accepted
+      # a rebuttal, which carries no marker). Unsatisfied = neither.
+      | def crresolved($r): ($tix[($r.id | tostring)] // {}) as $th
+            | ($th.isResolved == true) and iscr($th.resolvedBy.login // "");
+      ($roots | map(select((.body | contains("Confirmed as addressed") | not) and (crresolved(.) | not)))) as $unc
+      | if ($unc | any(($tix[(.id | tostring)]) == null)) then {error: "unsatisfied CR root without a matching review thread"}
+        else {roots: ($roots | length),
           lines: ($unc | map(
             . as $r
             | $tix[($r.id | tostring)] as $th
@@ -747,21 +755,15 @@ if [ "$cr_unconfirmed" = true ]; then
   cu_err=$(echo "$cu_result" | jq -r '.error // empty' 2>/dev/null) || { echo "cr-unconfirmed: unreadable evaluation result" >&2; exit 2; }
   if [ -n "$cu_err" ]; then echo "cr-unconfirmed: $cu_err" >&2; exit 2; fi
   cu_roots=$(echo "$cu_result" | jq -r '.roots') || exit 2
-  cu_conf=$(echo "$cu_result" | jq -r '.confirmed') || exit 2
-  cu_crself=$(echo "$cu_result" | jq -r '.crself') || exit 2
   cu_lines=$(echo "$cu_result" | jq -r '.lines[]') || exit 2
-  case "$cu_roots$cu_conf$cu_crself" in *[!0-9]*|'') echo "cr-unconfirmed: non-numeric counts" >&2; exit 2 ;; esac
+  case "$cu_roots" in *[!0-9]*|'') echo "cr-unconfirmed: non-numeric counts" >&2; exit 2 ;; esac
   if [ "$cu_roots" -eq 0 ]; then
     echo "PR #$pr_number: no CodeRabbit root inline comments; nothing to confirm."
     exit 0
   fi
   if [ -n "$cu_lines" ]; then printf '%s\n' "$cu_lines"; fi
-  if [ "$cu_crself" -ge 1 ] && [ "$cu_conf" -eq 0 ]; then
-    echo "WARN: no CodeRabbit root carries the confirmation marker, but CodeRabbit resolved $cu_crself thread(s) itself; the marker wording may have changed" >&2
-    exit 2
-  fi
   if [ -z "$cu_lines" ]; then
-    echo "PR #$pr_number: all $cu_roots CodeRabbit root comment(s) confirmed as addressed."
+    echo "PR #$pr_number: all $cu_roots CodeRabbit root comment(s) satisfied (confirmed fix or CR-resolved)."
     exit 0
   fi
   exit 1
