@@ -717,6 +717,9 @@ if [ "$cr_unconfirmed" = true ]; then
     echo "cr-unconfirmed: could not read review threads for PR #$pr_number ($repo)" >&2; exit 2; }
   echo "$cu_threads" | jq -e 'type == "array" and all(.[]; type == "object")' >/dev/null 2>&1 || {
     echo "cr-unconfirmed: review threads are not a JSON array of objects" >&2; exit 2; }
+  # A CR root whose .body is not a string needs no explicit guard: `contains` on null/number
+  # ERRORS, jq exits nonzero, and the `||` below turns that into exit 2 (mutation-proved: an
+  # explicit type check here survived deletion, so it was dead code reading as safety).
   cu_result=$(jq -n --argjson c "$cu_comments" --argjson t "$cu_threads" --argjson bots "$BOT_LOGINS_JSON" '
     def isbot($u): (($u.login // "") as $l | ($bots | index($l)) != null or ($bots | index($l + "[bot]")) != null)
                    or (($u.type // "") == "Bot");
@@ -726,8 +729,7 @@ if [ "$cr_unconfirmed" = true ]; then
        ($b | split("\n") | map(select(test("\\S") and (test("^\\s*_") | not))) | .[0]) // "(untitled)")
       | gsub("\\|"; "/") | gsub("[\\r\\n\\t]+"; " ") | .[0:60];
     ($c | map(select((.in_reply_to_id == null) and iscr(.user.login // "")))) as $roots
-    | if ($roots | any(.body | type != "string")) then {error: "malformed CR root body"} else
-      ($t | map({key: ((.comments.nodes // [])[0].fullDatabaseId // "" | tostring), value: .}) | from_entries) as $tix
+    | ($t | map({key: ((.comments.nodes // [])[0].fullDatabaseId // "" | tostring), value: .}) | from_entries) as $tix
       | ($roots | map(select(.body | contains("Confirmed as addressed")))) as $conf
       | ($roots | map(select(.body | contains("Confirmed as addressed") | not))) as $unc
       | ($roots | map(select(($tix[(.id | tostring)] // {}) as $th
@@ -741,7 +743,7 @@ if [ "$cr_unconfirmed" = true ]; then
             | ($th.resolvedBy.login // "unknown") as $by
             | "\($r.id) | \($r.path // "?"):\($r.line // $r.original_line // "?") | \(title($r.body)) | replied:\(if $rep then "yes" else "no" end) | resolved:\(if $th.isResolved == true then "yes" else "no" end)"
               + (if ($th.isResolved == true) and ((iscr($by)) | not) then " FORCE-RESOLVED?(by \($by))" else "" end)))} end
-    end') || { echo "cr-unconfirmed: could not evaluate comment/thread data" >&2; exit 2; }
+    ') || { echo "cr-unconfirmed: could not evaluate comment/thread data" >&2; exit 2; }
   cu_err=$(echo "$cu_result" | jq -r '.error // empty' 2>/dev/null) || { echo "cr-unconfirmed: unreadable evaluation result" >&2; exit 2; }
   if [ -n "$cu_err" ]; then echo "cr-unconfirmed: $cu_err" >&2; exit 2; fi
   cu_roots=$(echo "$cu_result" | jq -r '.roots') || exit 2
