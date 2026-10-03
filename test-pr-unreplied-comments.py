@@ -82,6 +82,8 @@ def emit(data, raw=False):
 if args[:2] == ["api", "user"]:
     emit('{"login":"%s"}' % ME)
 if args[:2] == ["api", "graphql"]:
+    if os.environ.get("GRAPHQL_FAIL", "") == "1":
+        sys.stderr.write("gh: graphql failure\n"); sys.exit(1)
     # Paginated GraphQL: the script passes `-F cursor=null` (or `-f cursor=null`)
     # for the first page and `-f cursor=<endCursor>` to advance. Serve GRAPHQL for
     # the first page; serve GRAPHQL_NEXT (when set) for any non-null cursor so a
@@ -101,6 +103,8 @@ for a in args:
 if endpoint.endswith("/reviews"):
     emit(REVIEWS)
 if endpoint.endswith("/comments") and "/pulls/" in endpoint:
+    if os.environ.get("INLINE_FAIL", "") == "1":
+        sys.stderr.write("gh: inline failure\n"); sys.exit(1)
     emit(INLINE)
 if endpoint.endswith("/comments") and "/issues/" in endpoint:
     # ISSUE_RAW=1 mirrors real gh on an error: the body goes to STDOUT with the --jq
@@ -1844,6 +1848,199 @@ def main():
     rc_p, out_p, _ = run(["--count-only"], reviews=OUTSIDE_ONLY, issue=ack_page2)
     check("--count-only: page-2 ack-by-review-id comment still clears the finding (count 0)",
           rc_p == 0 and out_p.strip() == "0")
+
+
+    print("== --cr-unconfirmed: CodeRabbit satisfaction mode ==")
+    CONF = "Confirmed as addressed"
+
+    def crc(cid, title, confirmed, path="a.sh", line=10, login="coderabbitai[bot]", reply_to=None, utype=None):
+        body = "_Major_ | _Quick win_\n\n**%s**\n\ndetail text" % title
+        if confirmed:
+            body += "\n\n✅ %s by @maint" % CONF
+        u = {"login": login}
+        if utype:
+            u["type"] = utype
+        return {"id": cid, "user": u, "in_reply_to_id": reply_to, "path": path,
+                "line": line, "original_line": line, "body": body}
+
+    def thr(cid, resolved, by=None):
+        return {"isResolved": resolved, "path": "a.sh", "line": 10,
+                "resolvedBy": ({"login": by} if by else None),
+                "comments": {"nodes": [{"fullDatabaseId": str(cid), "author": {"login": "coderabbitai"}}]}}
+
+    def gq(*nodes):
+        return json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": list(nodes)}}}}})
+
+    def cu(comments, nodes, **kw):
+        raw = comments if isinstance(comments, str) else json.dumps(comments)
+        g = nodes if isinstance(nodes, str) else gq(*nodes)
+        return run(["--cr-unconfirmed"], inline=raw, graphql=g, **kw)
+
+    rc, out, err = cu([crc(1, "A", True), crc(2, "B", True)], [thr(1, False), thr(2, True, "coderabbitai[bot]")])
+    check("cr-unconfirmed: all roots confirmed -> exit 0", rc == 0)
+    check("cr-unconfirmed: all confirmed -> summary line, no finding lines",
+          "all 2 CodeRabbit root comment(s) satisfied" in out and " | replied:" not in out)
+
+    rc, out, err = cu([crc(1, "A", True), crc(7, "Keep the | read distinct", False, path="b.sh", line=42)],
+                      [thr(1, False), thr(7, False)])
+    check("cr-unconfirmed: one unconfirmed -> exit 1", rc == 1)
+    check("cr-unconfirmed: exact line format (pipe in title scrubbed)",
+          "7 | b.sh:42 | Keep the / read distinct | replied:no | resolved:no" in out.splitlines())
+    check("cr-unconfirmed: confirmed root not listed", not any(ln.startswith("1 |") for ln in out.splitlines()))
+
+    rc, out, err = cu([], [])
+    check("cr-unconfirmed: zero CR roots -> exit 0", rc == 0)
+    check("cr-unconfirmed: zero CR roots says so", "no CodeRabbit root" in out)
+
+    rc, out, err = cu([crc(5, "Copilot only", False, login="Copilot")], [thr(5, False)])
+    check("cr-unconfirmed: non-CR roots ignored -> exit 0", rc == 0)
+
+    rc, out, err = run(["--cr-unconfirmed"], inline="[]", graphql=gq(), extra_env={"INLINE_FAIL": "1"})
+    check("cr-unconfirmed: comments read failure -> exit 2 (never 0)", rc == 2)
+    rc, out, err = run(["--cr-unconfirmed"], inline=json.dumps([crc(1, "A", True)]), graphql=gq(),
+                       extra_env={"GRAPHQL_FAIL": "1"})
+    check("cr-unconfirmed: graphql read failure -> exit 2 (never 0)", rc == 2)
+    rc, out, err = cu("this is not json", [])
+    check("cr-unconfirmed: malformed comments JSON -> exit 2", rc == 2)
+    rc, out, err = cu('{"a":1}', [])
+    check("cr-unconfirmed: comments JSON not an array -> exit 2", rc == 2)
+    rc, out, err = cu([crc(1, "A", False)], "not json at all")
+    check("cr-unconfirmed: malformed graphql JSON -> exit 2", rc == 2)
+    bad = crc(1, "A", False); bad["body"] = None
+    rc, out, err = cu([bad], [thr(1, False)])
+    check("cr-unconfirmed: CR root with null body -> exit 2 (malformed)", rc == 2)
+    rc, out, err = cu([crc(1, "A", False)], [])
+    check("cr-unconfirmed: unconfirmed root with no matching thread -> exit 2", rc == 2)
+
+    def crr(cid, root, text, at, login="coderabbitai[bot]"):
+        return {"id": cid, "user": {"login": login}, "in_reply_to_id": root, "path": "a.sh",
+                "line": 10, "original_line": 10, "body": text, "created_at": at}
+
+    ACCEPT = "Understood, thanks for the context.\n\n✅ Review thread resolved."
+    OPEN = "Thanks, but this does not address it. This finding remains open."
+
+    # resolvedBy confers NOTHING (live: `@coderabbitai resolve` makes CR resolve EVERY thread, PR #521).
+    # #521 shape: CR-resolved, no marker, CR's last reply says "remains open" -> UNSATISFIED, exit 1.
+    rc, out, err = cu([crc(1, "A", False), crr(21, 1, OPEN, "2026-10-02T04:15:14Z")],
+                      [thr(1, True, "coderabbitai[bot]")])
+    check("cr-unconfirmed: #521 shape (CR-resolved, last reply 'remains open') -> exit 1", rc == 1)
+    check("cr-unconfirmed: #521 shape is listed with the RESOLVED-BY-CR-BUT-UNCONFIRMED tag",
+          out.startswith("1 | ") and out.rstrip().endswith("resolved:yes RESOLVED-BY-CR-BUT-UNCONFIRMED")
+          and "FORCE-RESOLVED" not in out)
+    # CR-resolved with NO reply and NO marker: resolvedBy alone never satisfies.
+    rc, out, err = cu([crc(1, "A", False)], [thr(1, True, "coderabbitai[bot]"), ])
+    check("cr-unconfirmed: CR-resolved with no reply and no marker -> exit 1", rc == 1)
+    rc, out, err = cu([crc(1, "A", False)], [thr(1, True, "coderabbitai")])
+    check("cr-unconfirmed: bare coderabbitai resolver, no reply, no marker -> exit 1", rc == 1)
+    # FINDING 3: reopened/unresolved thread whose resolvedBy is still CR is never satisfied.
+    rc, out, err = cu([crc(1, "A", False)], [thr(1, False, "coderabbitai[bot]")])
+    check("cr-unconfirmed: isResolved:false + resolvedBy CR -> exit 1",
+          rc == 1 and "resolved:no" in out and "RESOLVED-BY-CR" not in out and "FORCE-RESOLVED" not in out)
+    # Accepted rebuttal: CR's latest reply carries "Review thread resolved" (live: #509, #522, canticle#1233).
+    rc, out, err = cu([crc(1, "A", False), crr(21, 1, ACCEPT, "2026-10-02T04:15:14Z")],
+                      [thr(1, True, "coderabbitai[bot]")])
+    check("cr-unconfirmed: rebuttal accepted ('Review thread resolved' last) -> exit 0",
+          rc == 0 and "all 1 CodeRabbit root comment(s) satisfied" in out)
+    # A latest reply carrying BOTH phrases is not an acceptance ("remains open" vetoes).
+    # Full acceptance LINE (so the line match passes) plus the veto phrase elsewhere in the body.
+    BOTH = "✅ Review thread resolved.\n\nOn reflection this finding remains open."
+    rc, out, err = cu([crc(1, "A", False), crr(21, 1, BOTH, "2026-10-02T04:15:14Z")],
+                      [thr(1, True, "coderabbitai[bot]")])
+    check("cr-unconfirmed: reply with 'Review thread resolved' AND 'remains open' -> exit 1", rc == 1)
+    # Satisfaction comes from the reply, not the resolution state.
+    rc, out, err = cu([crc(1, "A", False), crr(21, 1, ACCEPT, "2026-10-02T04:15:14Z")], [thr(1, False)])
+    check("cr-unconfirmed: accepted rebuttal on an unresolved thread -> exit 0", rc == 0)
+    # Only the LATEST CR reply counts, by created_at, regardless of array order.
+    rc, out, err = cu([crc(1, "A", False), crr(22, 1, OPEN, "2026-10-02T05:00:00Z"),
+                       crr(21, 1, ACCEPT, "2026-10-02T04:00:00Z")], [thr(1, True, "coderabbitai[bot]")])
+    check("cr-unconfirmed: older accept then newer 'remains open' -> exit 1", rc == 1)
+    rc, out, err = cu([crc(1, "A", False), crr(22, 1, OPEN, "2026-10-02T04:00:00Z"),
+                       crr(21, 1, ACCEPT, "2026-10-02T05:00:00Z")], [thr(1, True, "coderabbitai[bot]")])
+    check("cr-unconfirmed: older 'remains open' then newer accept -> exit 0", rc == 0)
+    # A reply by someone else never satisfies, even carrying the phrase.
+    rc, out, err = cu([crc(1, "A", False), crr(21, 1, ACCEPT, "2026-10-02T04:15:14Z", login="sydlexius")],
+                      [thr(1, True, "coderabbitai[bot]")])
+    check("cr-unconfirmed: non-CR reply quoting the phrase does not satisfy -> exit 1", rc == 1)
+    # Case-sensitive ASCII match.
+    rc, out, err = cu([crc(1, "A", False), crr(21, 1, "review thread resolved", "2026-10-02T04:15:14Z")], [thr(1, True, "coderabbitai[bot]")])
+    check("cr-unconfirmed: lowercase 'review thread resolved' does not satisfy -> exit 1", rc == 1)
+    # A reply on one root never satisfies a different root.
+    rc, out, err = cu([crc(1, "A", False), crc(2, "B", False), crr(21, 1, ACCEPT, "2026-10-02T04:15:14Z")],
+                      [thr(1, True, "coderabbitai[bot]"), thr(2, True, "coderabbitai[bot]")])
+    check("cr-unconfirmed: accept on root 1 leaves root 2 listed -> exit 1",
+          rc == 1 and len(out.splitlines()) == 1 and out.splitlines()[0].startswith("2 |"))
+    # Marker still satisfies beside an accepted rebuttal.
+    rc, out, err = cu([crc(1, "A", False), crc(2, "B", True), crr(21, 1, ACCEPT, "2026-10-02T04:15:14Z")],
+                      [thr(1, True, "coderabbitai[bot]"), thr(2, True, "coderabbitai[bot]")])
+    check("cr-unconfirmed: marker root beside an accepted rebuttal -> exit 0", rc == 0 and " | replied:" not in out)
+    # WHOLE-LINE match (round-2 F1): a phrase merely QUOTED in a code block never satisfies.
+    quoted = crc(1, "A", False); quoted["body"] += "\n\n```\nrg -n 'Confirmed as addressed' scripts/\n```"
+    rc, out, err = cu([quoted], [thr(1, False)])
+    check("cr-unconfirmed: root quoting 'Confirmed as addressed' in a code block -> exit 1", rc == 1)
+    GREP = "```\nrg -n 'Review thread resolved' scripts/\n```\n\nThe gap still exists."
+    rc, out, err = cu([crc(1, "A", False), crr(21, 1, GREP, "2026-10-02T04:15:14Z")], [thr(1, False)])
+    check("cr-unconfirmed: CR reply grepping 'Review thread resolved' -> exit 1", rc == 1)
+    # PR #533 review: an EXACT marker/acceptance line inside a fenced code block never counts.
+    fenced = crc(1, "A", False); fenced["body"] += "\n\n```text\n✅ Confirmed as addressed by @maint\n```"
+    rc, out, err = cu([fenced], [thr(1, False)])
+    check("cr-unconfirmed: exact marker line inside a fenced block -> exit 1", rc == 1)
+    FACC = "Example output:\n\n```\n✅ Review thread resolved.\n```\n\nStill an issue."
+    rc, out, err = cu([crc(1, "A", False), crr(21, 1, FACC, "2026-10-02T04:15:14Z")], [thr(1, False)])
+    check("cr-unconfirmed: exact acceptance line inside a fenced block -> exit 1", rc == 1)
+    # An unterminated fence swallows the rest of the body (fail toward unsatisfied).
+    open_fence = crc(1, "A", False); open_fence["body"] += "\n\n```\n✅ Confirmed as addressed by @maint"
+    rc, out, err = cu([open_fence], [thr(1, False)])
+    check("cr-unconfirmed: marker after an unterminated fence -> exit 1", rc == 1)
+    # Anchored at BOTH ends, column 0, non-empty login.
+    for label, line in (("trailing annotation", "✅ Confirmed as addressed by @maint (example)"),
+                        ("empty login", "✅ Confirmed as addressed by @"),
+                        ("indented (Markdown code)", "    ✅ Confirmed as addressed by @maint")):
+        b = crc(1, "A", False); b["body"] += "\n\n" + line
+        rc, out, err = cu([b], [thr(1, False)])
+        check("cr-unconfirmed: marker with %s -> exit 1" % label, rc == 1)
+    # The real marker still satisfies, trailing whitespace tolerated.
+    real = crc(1, "A", False); real["body"] += "\n\n✅ Confirmed as addressed by @sydlexius  "
+    rc, out, err = cu([real], [thr(1, False)])
+    check("cr-unconfirmed: real marker line (trailing spaces) -> exit 0", rc == 0)
+    # PR #533 review: CR roots but an EMPTY thread list means the thread read failed -> exit 2.
+    rc, out, err = cu([crc(1, "A", True)], [])
+    check("cr-unconfirmed: CR roots present but zero review threads -> exit 2 (never 0)", rc == 2)
+    # PR #533 review: a missing <pr_number> is a usage error -> exit 2, never 1.
+    # run() always appends a PR number, so invoke the script bare (the check fires before any gh call).
+    p = subprocess.run(["bash", SCRIPT, "--cr-unconfirmed"], capture_output=True, text=True, timeout=120)
+    check("cr-unconfirmed: missing pr_number -> exit 2", p.returncode == 2)
+    # Ordering (round-2 F2): a same-second tie breaks on id; a missing created_at sorts NEWEST.
+    rc, out, err = cu([crc(1, "A", False), crr(22, 1, OPEN, "2026-10-02T04:00:00Z"),
+                       crr(21, 1, ACCEPT, "2026-10-02T04:00:00Z")], [thr(1, False)])
+    check("cr-unconfirmed: same-second tie -> higher id ('remains open') wins -> exit 1", rc == 1)
+    undated = crr(22, 1, OPEN, None); del undated["created_at"]
+    rc, out, err = cu([crc(1, "A", False), undated, crr(21, 1, ACCEPT, "2026-10-02T04:00:00Z")], [thr(1, False)])
+    check("cr-unconfirmed: undated 'remains open' reply outranks a dated accept -> exit 1", rc == 1)
+
+    rc, out, err = cu([crc(1, "A", False)], [thr(1, True, "sydlexius")])
+    check("cr-unconfirmed: resolved by a human + unconfirmed -> FORCE-RESOLVED? tell",
+          rc == 1 and "resolved:yes FORCE-RESOLVED?(by sydlexius)" in out)
+    rc, out, err = cu([crc(1, "A", False)], [thr(1, False)])
+    check("cr-unconfirmed: unresolved -> no force tell", "FORCE-RESOLVED" not in out)
+
+    human = crc(11, "r", False, login="sydlexius", reply_to=1)
+    rc, out, err = cu([crc(1, "A", False), human], [thr(1, False)])
+    check("cr-unconfirmed: human reply -> replied:yes", "replied:yes" in out)
+    for bl, ut in (("coderabbitai[bot]", None), ("Copilot", None), ("someapp", "Bot")):
+        rep = crc(12, "r", False, login=bl, reply_to=1, utype=ut)
+        rc, out, err = cu([crc(1, "A", False), rep], [thr(1, False)])
+        check("cr-unconfirmed: reply by bot %s does not count as replied" % bl, "replied:no" in out)
+    rc, out, err = cu([crc(1, "A", False), crc(13, "x", False, reply_to=1)], [thr(1, False)])
+    check("cr-unconfirmed: a CR reply is not itself a root (one line only)",
+          len([ln for ln in out.splitlines() if " | replied:" in ln]) == 1)
+    lc = crc(1, "A", False); lc["body"] += "\nconfirmed as addressed"
+    rc, out, err = cu([lc], [thr(1, False)])
+    check("cr-unconfirmed: lowercase 'confirmed as addressed' does not confirm", rc == 1)
+    nl = crc(1, "A", False); nl["line"] = None; nl["original_line"] = 99
+    rc, out, err = cu([nl], [thr(1, False)])
+    check("cr-unconfirmed: null line falls back to original_line", "a.sh:99" in out)
+    rc, out, err = run(["--cr-unconfirmed", "--audit"])
+    check("cr-unconfirmed + --audit -> exit 2 (usage; never 1 = unsatisfied)", rc == 2)
 
     print()
     if FAILS:

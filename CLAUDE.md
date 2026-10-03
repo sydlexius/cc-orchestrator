@@ -300,6 +300,28 @@ Runtime (`scripts/`; canonical source is this repo):
   to make it "meaningful".
   The retired agent-judgment rules are archived in
   `skills/orchestrate/design/ARCHIVE-codoki-mechanisms.md`.
+- `pr-unreplied-comments.sh --cr-unconfirmed <pr> [repo]` (and its advisory use in `ship-gate-preflight.sh`):
+  the mechanical form of "post `@coderabbitai resolve` only once CR is satisfied". A CR ROOT is satisfied
+  iff EITHER (a) its body has a whole line `✅ Confirmed as addressed by @<login>` (CR EDITS its own root
+  after verifying a FIX), OR (b) CR's LATEST reply in that thread (in_reply_to_id == root, coderabbitai[bot],
+  greatest created_at, then id) has a whole line `✅ Review thread resolved.` AND does not say `remains open`
+  (CR's explicit acceptance of a REBUTTAL). Both lines must start at column 0 and sit OUTSIDE any fenced
+  code block, case-sensitive: CR quotes code verbatim, so a substring match counted a quoted phrase. GraphQL `resolvedBy` confers NOTHING, and WHY: CR-resolved was DROPPED as a
+  satisfaction signal because `@coderabbitai resolve` makes CR resolve EVERY thread, including ones it just
+  said are still open (live: PR #521, last CR reply "This finding remains open."), which made the mode report
+  all-satisfied on exactly the case it exists for. `resolvedBy` now only feeds tags. The mode lists every
+  unsatisfied root, one line `<id> | <path>:<line> | <title> | replied:<yes|no> | resolved:<yes|no>`, plus
+  ` FORCE-RESOLVED?(by <login>)` (resolved by someone other than CR) or ` RESOLVED-BY-CR-BUT-UNCONFIRMED`
+  (resolved by CR, the #521 shape). EXIT 0 all satisfied (or zero CR roots), 1 some unsatisfied, 2
+  undetermined (any gh/jq failure, malformed body, an unsatisfied root with no matching thread) or a USAGE
+  error (never 1, which means "unsatisfied"). THE PREDICATE WAS CORRECTED TWICE BY LIVE DATA: a sweep of 36
+  real PRs killed the marker-only rule and its wording canary (accepted rebuttals #509, #522, canticle#1233
+  carry no marker), then #521 killed the resolvedBy-confers-satisfaction rule. A stub harness alone could not
+  have found either; run a read-only mode against real PRs
+  before trusting its predicate. A read failure never exits 0 (the "could not read" == "nothing to read" class). In
+  `ship-gate-preflight.sh` FULL mode it only appends a WARN (exit 1, naming force-resolved threads, "not yet satisfied") or NOTE
+  (anything else) to the PASS line, like the #301 coverage advisory: verdict and exit code are fixed first.
+  `/handle-review` Step 8 gates the resolve post on it.
 - `scripts/prose-lint.sh` - the outward-draft prose-lint adapter (#219). A THIN wrapper over
   `~/Developer/prose-tooling`'s `bin/prose_check.py` (reuses, does NOT reimplement, the Markdown-aware
   LanguageTool client + house-style config), so the prose cc-orchestrator EMITS (issue/PR bodies,

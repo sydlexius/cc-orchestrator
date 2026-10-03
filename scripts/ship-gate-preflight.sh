@@ -1148,9 +1148,40 @@ else
   coverage_note=" NOTE: review coverage unverifiable (reviews read failed; advisory only, verdict unchanged)."
 fi
 
+# --- CR SATISFACTION (ADVISORY, fail-OPEN, NEVER gates) ----------------------
+# A CR root is satisfied when CR edited it to append "Confirmed as addressed" (verified fix) OR
+# its latest thread reply says "Review thread resolved" without "remains open" (accepted
+# rebuttal); `pr-unreplied-comments.sh --cr-unconfirmed` lists the roots that are NOT yet satisfied. Surfaced as a
+# WARN (exit 1) or NOTE (exit 2 / any other outcome) on the PASS line ONLY. The verdict and
+# exit code are fixed before this runs and nothing below can change them: an advisory that can
+# flip a verdict is not advisory, and "could not read it" must never read as "nothing wrong".
+# A thread resolved by someone other than CR while unconfirmed (FORCE-RESOLVED?) is named, and so
+# is one CR resolved without accepting it (RESOLVED-BY-CR-BUT-UNCONFIRMED, the #521 shape).
+cr_note=""
+cr_out=""
+cr_rc=0
+cr_out="$("$helper" --cr-unconfirmed "$pr" "$repo" 2>/dev/null)" || cr_rc=$?
+case "$cr_rc" in
+  0) : ;;
+  1)
+    cr_n="$(printf '%s\n' "$cr_out" | grep -c ' | replied:' || true)"
+    case "$cr_n" in
+      ''|*[!0-9]*|0) cr_note=" NOTE: CR satisfaction state unreadable (advisory only; verdict unchanged)." ;;
+      *)
+        cr_note=" WARN: ${cr_n} CodeRabbit thread(s) not yet satisfied (advisory only; do not post '@coderabbitai resolve' yet)."
+        cr_force="$(printf '%s\n' "$cr_out" | grep 'FORCE-RESOLVED?' | cut -d' ' -f1 | paste -sd, - || true)"
+        [ -n "$cr_force" ] && cr_note="${cr_note} FORCE-RESOLVED? thread(s): ${cr_force}."
+        # CR resolved these WITHOUT accepting them (the #521 shape): `@coderabbitai resolve` was
+        # already posted, so read the thread and treat CR's last reply as an open finding.
+        cr_crres="$(printf '%s\n' "$cr_out" | grep 'RESOLVED-BY-CR-BUT-UNCONFIRMED' | cut -d' ' -f1 | paste -sd, - || true)"
+        [ -n "$cr_crres" ] && cr_note="${cr_note} Resolved by CR but not accepted (read CR's last reply as an open finding): ${cr_crres}." ;;
+    esac ;;
+  *) cr_note=" NOTE: CR satisfaction state unreadable (advisory only; verdict unchanged)." ;;
+esac
+
 # BEHIND is a PASS here (base-freshness is out of scope) but must be VISIBLE, not silent.
 merge_note=""
 [ "$merge_state" = "BEHIND" ] && merge_note=" (BEHIND base - out of this oracle's scope; refresh before merging)"
 
-echo "RESULT: PASS -- all checks green, 0 actionable review-body findings, reviewDecision=${review_decision:-<none>}${review_note}, 0 unresolved review threads, mergeStateStatus=${merge_state}${merge_note}, Codoki root ack ${ack_verdict}, headRefOid=${head_sha}.${coverage_note} [#$pr $repo]"
+echo "RESULT: PASS -- all checks green, 0 actionable review-body findings, reviewDecision=${review_decision:-<none>}${review_note}, 0 unresolved review threads, mergeStateStatus=${merge_state}${merge_note}, Codoki root ack ${ack_verdict}, headRefOid=${head_sha}.${coverage_note}${cr_note} [#$pr $repo]"
 exit 0

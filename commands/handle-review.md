@@ -912,18 +912,57 @@ out before the push, and this resolve runs after the push once guard-slice passe
 
 ### CodeRabbit threads -- `@coderabbitai resolve`
 
-Post a single PR-level comment to resolve all addressed CR threads at once:
+Post `@coderabbitai resolve` ONLY once CodeRabbit itself is satisfied with every thread. A CR
+root is satisfied when (a) CR EDITED it to append the line `✅ Confirmed as addressed by @<login>` (a
+verified FIX), or (b) CR's LATEST reply in the thread has the line `✅ Review thread resolved.` and
+does not say `remains open` (an accepted REBUTTAL). Each must be a whole line outside a code block. A thread merely RESOLVED by CR is NOT satisfied: `@coderabbitai resolve`
+makes CR resolve every thread, including ones it just said are still open (#521). Check it
+mechanically first (literal helper path from Step 0; the `pr_number` shell variable is set per
+Step 0):
 
 ```bash
-bash HELPER_DIR/reply-comment.sh "$pr_number" '@coderabbitai resolve'
+bash HELPER_DIR/pr-unreplied-comments.sh --cr-unconfirmed "$pr_number"
 ```
 
-This tells CodeRabbit to mark all of its threads that have been replied to as
-resolved. CR resolve also covers review body findings -- CodeRabbit tracks its
+- **exit 0** (every CR root satisfied, or CR has no root comments): post the resolve:
+
+  ```bash
+  bash HELPER_DIR/reply-comment.sh "$pr_number" '@coderabbitai resolve'
+  ```
+
+- **exit 1** (the listed threads are not yet satisfied): do NOT post it yet. CR adds its marker or
+  reply roughly 15-30s AFTER your reply, so exit 1 within about a minute of the replies is
+  EXPECTED. Re-run the check with this ONE block, passed as a `run_in_background: true` command
+  (never foreground). It is a bounded re-check of a single helper, not a watch, and it is the
+  only loop this step sanctions; do not improvise another:
+
+  ```bash
+  rc=2
+  for _try in 1 2 3 4 5; do
+    sleep 30
+    rc=0; bash HELPER_DIR/pr-unreplied-comments.sh --cr-unconfirmed "$pr_number" || rc=$?
+    [ "$rc" -eq 1 ] || break
+  done
+  echo "cr-unconfirmed: rc=$rc"
+  ```
+
+  When it completes, READ ITS OUTPUT FILE for the `cr-unconfirmed: rc=<n>` line and act on that
+  number, never on the notification's exit code (that is the wrapper's, not the helper's). If
+  the line says `rc=1`, read
+  each listed thread: a residual concern is a NEW finding, so disposition it FIX / DEFER / REBUT
+  like any other and push; do NOT post the resolve. A line ending `FORCE-RESOLVED?(by <login>)`
+  is a thread someone other than CR resolved, and one ending `RESOLVED-BY-CR-BUT-UNCONFIRMED`
+  is one CR resolved without accepting it: raise either, never paper over it.
+  Exit 1 with NO listed thread lines means a bad or stale helper (for example a deployed copy
+  without the flag): treat it as exit 2.
+- **exit 2** (could not determine: a gh/jq read failure, malformed data, or a usage error): stop
+  and report. Never post the resolve on an unreadable state.
+
+CR resolve also covers review body findings -- CodeRabbit tracks its
 own outside-diff items and will mark them resolved when the underlying code
 changes appear on the next push.
 
-Report that CR resolve was requested.
+Report whether CR resolve was requested, or which threads are still not satisfied.
 
 ### Copilot + Greptile + Codoki threads -- GraphQL resolve
 
