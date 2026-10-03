@@ -350,6 +350,7 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
                     "  case \"${CR_UNCONF:-}\" in\n"
                     "    unconfirmed) echo '101 | a.sh:1 | First finding | replied:no | resolved:no'; echo '102 | b.sh:2 | Second | replied:yes | resolved:no'; exit 1;;\n"
                     "    force) echo '103 | c.sh:3 | Forced | replied:no | resolved:yes FORCE-RESOLVED?(by someone)'; exit 1;;\n"
+                    "    crres) echo '104 | d.sh:4 | CR closed it | replied:yes | resolved:yes RESOLVED-BY-CR-BUT-UNCONFIRMED'; exit 1;;\n"
                     "    undetermined) echo 'WARN: no CodeRabbit root carries the confirmation marker' >&2; exit 2;;\n"
                     "    crash) echo 'boom' >&2; exit 7;;\n"
                     "    emptyone) exit 1;;\n"
@@ -1054,13 +1055,16 @@ def main():
     check("crconf: unconfirmed -> WARN with the count on the PASS line",
           "WARN: 2 CodeRabbit thread(s) not yet satisfied" in out1 and "RESULT: PASS" in out1)
     check("crconf: undetermined (helper exit 2) -> NOTE on the PASS line",
-          "NOTE: CR confirmation state unreadable" in out2 and "RESULT: PASS" in out2)
+          "NOTE: CR satisfaction state unreadable" in out2 and "RESULT: PASS" in out2)
     check("crconf: helper crash (exit 7) -> NOTE, still PASS",
-          "NOTE: CR confirmation state unreadable" in outc and "RESULT: PASS" in outc)
+          "NOTE: CR satisfaction state unreadable" in outc and "RESULT: PASS" in outc)
     check("crconf: exit 1 with no parseable lines -> NOTE (never a bare count of 0)",
-          "NOTE: CR confirmation state unreadable" in oute and "WARN: 0" not in oute)
+          "NOTE: CR satisfaction state unreadable" in oute and "WARN: 0" not in oute)
     check("crconf: FORCE-RESOLVED thread is named in the WARN",
           "FORCE-RESOLVED" in outf and "103" in outf)
+    rcr, outr, _, _ = cr_run("crres")
+    check("crconf: RESOLVED-BY-CR-BUT-UNCONFIRMED thread is named in the WARN, still PASS",
+          rcr == 0 and "Resolved by CR but not accepted" in outr and "104" in outr and "RESULT: PASS" in outr)
     check("crconf: FAIL-OPEN - exit code identical across ok/unconfirmed/undetermined/crash/force",
           rc0 == rc1 == rc2 == rcc == rcf == rce == 0)
     strip = lambda o: o.split("[#1")[0].split(", headRefOid=")[0]

@@ -63,11 +63,12 @@
 #
 #   --cr-unconfirmed       CODERABBIT SATISFACTION screen. Lists every CR ROOT inline comment CR is
 #                          NOT yet satisfied with. A root is SATISFIED iff EITHER (a) its body
-#                          contains "Confirmed as addressed" (CR EDITS its own root after verifying
+#                          has a line "✅ Confirmed as addressed by @..." (CR EDITS its own root after verifying
 #                          a FIX), OR (b) CR's LATEST reply in that thread (in_reply_to_id == root,
-#                          author coderabbitai[bot], greatest created_at) contains "Review thread
-#                          resolved" AND does NOT contain "remains open" (CR's explicit acceptance
-#                          of a REBUTTAL). Matching is case-sensitive ASCII. GraphQL resolvedBy
+#                          author coderabbitai[bot], greatest created_at, then id) has a line
+#                          "✅ Review thread resolved." AND does NOT contain "remains open" (CR's
+#                          explicit acceptance of a REBUTTAL). Both are WHOLE-LINE, case-sensitive
+#                          matches, so text that merely QUOTES a phrase never counts. GraphQL resolvedBy
 #                          does NOT confer satisfaction: it was DROPPED as a signal because
 #                          `@coderabbitai resolve` makes CR resolve EVERY thread, including ones it
 #                          just said are still open (live: cc-orchestrator PR #521, whose last CR
@@ -742,12 +743,17 @@ if [ "$cr_unconfirmed" = true ]; then
       # Satisfied = (a) the root body carries the marker (a verified fix), OR (b) the LATEST CR
       # reply in the thread says "Review thread resolved" and NOT "remains open" (an accepted
       # rebuttal). GraphQL resolvedBy confers NOTHING: `@coderabbitai resolve` makes CR resolve
-      # EVERY thread, including ones it just said are still open (PR #521).
+      # EVERY thread, including ones it just said are still open (PR #521). Both signals are matched as
+      # a WHOLE LINE (CR writes each on its own line, emoji first): a substring match let a code block
+      # that merely QUOTES a phrase (the "Script executed" / "Analysis chain" blocks of CR quote code
+      # verbatim, and the docs of this tool contain both phrases) read as satisfied. "Latest" orders
+      # by created_at then id; a missing created_at sorts NEWEST, so a reply of unknown age is the
+      # one that counts (fail toward unsatisfied).
       | def lastcr($r): [$c[] | select((.in_reply_to_id == $r.id) and iscr(.user.login // ""))]
-            | sort_by(.created_at // "") | last // null;
+            | sort_by([(.created_at // "9999"), .id]) | last // null;
       def accepted($r): (lastcr($r)) as $l
-            | ($l != null) and (($l.body // "") | (contains("Review thread resolved") and (contains("remains open") | not)));
-      ($roots | map(select((.body | contains("Confirmed as addressed") | not) and (accepted(.) | not)))) as $unc
+            | ($l != null) and (($l.body // "") | (test("(?m)^\\s*✅ Review thread resolved\\.?\\s*$") and (contains("remains open") | not)));
+      ($roots | map(select((.body | test("(?m)^\\s*✅ Confirmed as addressed by @") | not) and (accepted(.) | not)))) as $unc
       | if ($unc | any(($tix[(.id | tostring)]) == null)) then {error: "unsatisfied CR root without a matching review thread"}
         else {roots: ($roots | length),
           lines: ($unc | map(

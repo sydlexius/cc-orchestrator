@@ -1916,7 +1916,7 @@ def main():
         return {"id": cid, "user": {"login": login}, "in_reply_to_id": root, "path": "a.sh",
                 "line": 10, "original_line": 10, "body": text, "created_at": at}
 
-    ACCEPT = "Understood, thanks for the context.\n\n✅ Review thread resolved"
+    ACCEPT = "Understood, thanks for the context.\n\n✅ Review thread resolved."
     OPEN = "Thanks, but this does not address it. This finding remains open."
 
     # resolvedBy confers NOTHING (live: `@coderabbitai resolve` makes CR resolve EVERY thread, PR #521).
@@ -1942,7 +1942,8 @@ def main():
     check("cr-unconfirmed: rebuttal accepted ('Review thread resolved' last) -> exit 0",
           rc == 0 and "all 1 CodeRabbit root comment(s) satisfied" in out)
     # A latest reply carrying BOTH phrases is not an acceptance ("remains open" vetoes).
-    BOTH = "Review thread resolved by the bot, but this finding remains open."
+    # Full acceptance LINE (so the line match passes) plus the veto phrase elsewhere in the body.
+    BOTH = "✅ Review thread resolved.\n\nOn reflection this finding remains open."
     rc, out, err = cu([crc(1, "A", False), crr(21, 1, BOTH, "2026-10-02T04:15:14Z")],
                       [thr(1, True, "coderabbitai[bot]")])
     check("cr-unconfirmed: reply with 'Review thread resolved' AND 'remains open' -> exit 1", rc == 1)
@@ -1972,6 +1973,20 @@ def main():
     rc, out, err = cu([crc(1, "A", False), crc(2, "B", True), crr(21, 1, ACCEPT, "2026-10-02T04:15:14Z")],
                       [thr(1, True, "coderabbitai[bot]"), thr(2, True, "coderabbitai[bot]")])
     check("cr-unconfirmed: marker root beside an accepted rebuttal -> exit 0", rc == 0 and " | replied:" not in out)
+    # WHOLE-LINE match (round-2 F1): a phrase merely QUOTED in a code block never satisfies.
+    quoted = crc(1, "A", False); quoted["body"] += "\n\n```\nrg -n 'Confirmed as addressed' scripts/\n```"
+    rc, out, err = cu([quoted], [thr(1, False)])
+    check("cr-unconfirmed: root quoting 'Confirmed as addressed' in a code block -> exit 1", rc == 1)
+    GREP = "```\nrg -n 'Review thread resolved' scripts/\n```\n\nThe gap still exists."
+    rc, out, err = cu([crc(1, "A", False), crr(21, 1, GREP, "2026-10-02T04:15:14Z")], [thr(1, False)])
+    check("cr-unconfirmed: CR reply grepping 'Review thread resolved' -> exit 1", rc == 1)
+    # Ordering (round-2 F2): a same-second tie breaks on id; a missing created_at sorts NEWEST.
+    rc, out, err = cu([crc(1, "A", False), crr(22, 1, OPEN, "2026-10-02T04:00:00Z"),
+                       crr(21, 1, ACCEPT, "2026-10-02T04:00:00Z")], [thr(1, False)])
+    check("cr-unconfirmed: same-second tie -> higher id ('remains open') wins -> exit 1", rc == 1)
+    undated = crr(22, 1, OPEN, None); del undated["created_at"]
+    rc, out, err = cu([crc(1, "A", False), undated, crr(21, 1, ACCEPT, "2026-10-02T04:00:00Z")], [thr(1, False)])
+    check("cr-unconfirmed: undated 'remains open' reply outranks a dated accept -> exit 1", rc == 1)
 
     rc, out, err = cu([crc(1, "A", False)], [thr(1, True, "sydlexius")])
     check("cr-unconfirmed: resolved by a human + unconfirmed -> FORCE-RESOLVED? tell",

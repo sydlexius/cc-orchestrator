@@ -932,9 +932,23 @@ bash HELPER_DIR/pr-unreplied-comments.sh --cr-unconfirmed "$pr_number"
 
 - **exit 1** (the listed threads are not yet satisfied): do NOT post it yet. CR adds its marker or
   reply roughly 15-30s AFTER your reply, so exit 1 within about a minute of the replies is
-  EXPECTED. Re-run the check in the BACKGROUND (`run_in_background: true`), bounded: up to ~5
-  checks about 30s apart, stopping at the first exit 0. A backgrounded bounded re-check is
-  allowed; a FOREGROUND sleep loop is forbidden. If it is still exit 1 after the bound, read
+  EXPECTED. Re-run the check with this ONE block, passed as a `run_in_background: true` command
+  (never foreground). It is a bounded re-check of a single helper, not a watch, and it is the
+  only loop this step sanctions; do not improvise another:
+
+  ```bash
+  rc=2
+  for _try in 1 2 3 4 5; do
+    sleep 30
+    rc=0; bash HELPER_DIR/pr-unreplied-comments.sh --cr-unconfirmed "$pr_number" || rc=$?
+    [ "$rc" -eq 1 ] || break
+  done
+  echo "cr-unconfirmed: rc=$rc"
+  ```
+
+  When it completes, READ ITS OUTPUT FILE for the `cr-unconfirmed: rc=<n>` line and act on that
+  number, never on the notification's exit code (that is the wrapper's, not the helper's). If
+  the line says `rc=1`, read
   each listed thread: a residual concern is a NEW finding, so disposition it FIX / DEFER / REBUT
   like any other and push; do NOT post the resolve. A line ending `FORCE-RESOLVED?(by <login>)`
   is a thread someone other than CR resolved, and one ending `RESOLVED-BY-CR-BUT-UNCONFIRMED`
