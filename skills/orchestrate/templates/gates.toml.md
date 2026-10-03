@@ -116,7 +116,9 @@ printing `[SKIP] <name>: --skip`. It exists so a CI workflow can run the gate's
 steps through the runner while leaving a step to a dedicated CI step (this repo's
 CI skips `shellcheck` and `ruff`, which it runs from a digest-pinned image). It
 fails closed on doubt, exiting 2 before running anything when a name matches no
-step (a stale caller after a rename), when a name is empty, under Form A or the
+step (a stale caller after a rename), when a name is empty, when two steps share
+a name (including a derived `step-<i>` that collides with an explicit name, since
+one `--skip` would then match both), under Form A or the
 fallback chain (nothing to skip by name), and beside `--receipt` (a receipt must
 attest the whole gate, never a subset).
 

@@ -1076,7 +1076,7 @@ def _run_gates(root, memoize_dir, jobs=None, skip=None):
 def main(argv=None):
     argv = argv if argv is not None else sys.argv[1:]
     receipt_path, memoize_dir, jobs, skip = _parse_args(argv)
-    if receipt_path and skip is not None:
+    if receipt_path is not None and skip is not None:
         # A receipt attests that the gate PASSED; one written by a run that
         # skipped steps on request would attest to less than the gate. CI (the
         # one --skip caller) never writes a receipt, so refuse the pair.

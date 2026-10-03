@@ -125,6 +125,8 @@ def gates_step_run(name):
     except (OSError, ValueError) as e:
         fail(f"cannot read/parse .gates.toml: {e}")
     for step in data.get("prep_pr", {}).get("steps", []):
+        if not isinstance(step, dict):
+            fail(".gates.toml [prep_pr].steps has an entry that is not a table")
         if step.get("name") == name:
             run = step.get("run", "")
             if not run:
@@ -218,7 +220,12 @@ def gates_steps():
     steps = data.get("prep_pr", {}).get("steps", [])
     if not isinstance(steps, list):
         fail(".gates.toml [prep_pr].steps is not an array")
-    return [s for s in steps if isinstance(s, dict)]
+    # Fail closed on a non-table entry: gate-runner warns and skips it, so dropping it here
+    # would let a malformed step vanish from both the gate and this check.
+    bad = [i for i, s in enumerate(steps) if not isinstance(s, dict)]
+    if bad:
+        fail(f".gates.toml [prep_pr].steps entries that are not tables (index): {bad}")
+    return steps
 
 
 steps = gates_steps()

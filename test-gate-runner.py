@@ -1716,6 +1716,10 @@ def test_skip_refuses_doubt():
             check("--skip + --receipt -> exit 2", rc == 2)
             check("--skip + --receipt -> no receipt written", not os.path.exists(rpath))
             check("--skip + --receipt -> nothing ran", not os.path.exists(marker))
+            # An explicit EMPTY receipt path is still a --receipt: a truthiness test let it through.
+            rc, _ = run_runner(root, args=("--skip", "a", "--receipt="))
+            check("--skip + --receipt= (empty) -> exit 2", rc == 2)
+            check("--skip + --receipt= (empty) -> nothing ran", not os.path.exists(marker))
 
 
 def main():
