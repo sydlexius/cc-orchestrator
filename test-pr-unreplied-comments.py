@@ -1941,6 +1941,11 @@ def main():
                       [thr(1, True, "coderabbitai[bot]")])
     check("cr-unconfirmed: rebuttal accepted ('Review thread resolved' last) -> exit 0",
           rc == 0 and "all 1 CodeRabbit root comment(s) satisfied" in out)
+    # A latest reply carrying BOTH phrases is not an acceptance ("remains open" vetoes).
+    BOTH = "Review thread resolved by the bot, but this finding remains open."
+    rc, out, err = cu([crc(1, "A", False), crr(21, 1, BOTH, "2026-10-02T04:15:14Z")],
+                      [thr(1, True, "coderabbitai[bot]")])
+    check("cr-unconfirmed: reply with 'Review thread resolved' AND 'remains open' -> exit 1", rc == 1)
     # Satisfaction comes from the reply, not the resolution state.
     rc, out, err = cu([crc(1, "A", False), crr(21, 1, ACCEPT, "2026-10-02T04:15:14Z")], [thr(1, False)])
     check("cr-unconfirmed: accepted rebuttal on an unresolved thread -> exit 0", rc == 0)
