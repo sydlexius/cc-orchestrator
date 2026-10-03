@@ -169,7 +169,7 @@ def run(args, *, open_prs="", views=None, views_recheck=None, view_rcs=None, beh
             env[f"VIEW_RC_{n}"] = str(rc)
 
         p = subprocess.run(["bash", script_to_run] + args, env=env,
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         calls = []
         if os.path.exists(ghlog):
             with open(ghlog) as fh:

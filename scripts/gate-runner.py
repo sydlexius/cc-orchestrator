@@ -17,6 +17,8 @@ exclusive forms:
             exclusive? } ]` -> run each in order with per-step skip predicates.
             Opt-in parallel: `[prep_pr] jobs = N` or `--jobs N` (CLI wins;
             1 = the serial path, byte-identical to before #501).
+            Opt-in `--skip <name>` (repeatable) skips named Form B steps;
+            CI uses it to leave lint to its dedicated pinned steps.
 See skills/orchestrate/templates/gates.toml.md for the full schema.
 
 Fail-open fallback when `.gates.toml` is absent, in order:
@@ -124,10 +126,20 @@ def _valid_jobs(value):
     return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
-def run_prep_pr(prep, root, memoize_dir=None, cli_jobs=None):
+def _step_names(steps):
+    """The names a `--skip` can target, derived exactly as both Form B paths
+    derive them (`name`, else `step-<index>`)."""
+    return {(s.get("name") or f"step-{i}") for i, s in enumerate(steps)
+            if isinstance(s, dict)}
+
+
+def run_prep_pr(prep, root, memoize_dir=None, cli_jobs=None, cli_skip=None):
     """Run the [prep_pr] table. Return (exit_code, records). `cli_jobs` is the
     already-validated `--jobs` value (None = not given); it overrides the
-    table's `jobs`, which is validated whenever present."""
+    table's `jobs`, which is validated whenever present. `cli_skip` is the
+    `--skip` name set (None = not given): every name must match a Form B step,
+    else exit 2, because a skip that names nothing is a stale caller that would
+    silently run (or, after a rename, silently stop skipping) the wrong set."""
     has_gate = "gate" in prep
     has_steps = "steps" in prep
     if has_gate and has_steps:
@@ -138,14 +150,35 @@ def run_prep_pr(prep, root, memoize_dir=None, cli_jobs=None):
         warn("[prep_pr].jobs must be a positive integer")
         return 2, _synth_records(2)
     jobs = cli_jobs if cli_jobs is not None else prep.get("jobs", 1)
+    if cli_skip and not has_steps:
+        warn("`--skip` applies only to Form B `steps`; refusing to run a gate "
+             "that cannot honor it")
+        return 2, _synth_records(2)
+    if cli_skip and isinstance(prep["steps"], list):
+        # A NAME SELECTS STEPS ONLY UNDER --skip, so duplicates are refused only here (a consumer
+        # with a reused name and no --skip is unaffected). Two steps sharing a name would both
+        # match one --skip, so a copied block whose `run` was changed but not its `name` would
+        # leave CI silently (PR review of ci/parallel-harnesses). Unnamed steps count by their
+        # derived `step-<index>` name, which can collide with an explicit one.
+        all_names = [(s.get("name") or f"step-{i}") for i, s in enumerate(prep["steps"])
+                     if isinstance(s, dict)]
+        dupes = sorted({n for n in all_names if all_names.count(n) > 1})
+        if dupes:
+            warn(f"`--skip` needs unique step names; duplicated: {', '.join(dupes)}")
+            return 2, _synth_records(2)
+        unknown = sorted(cli_skip - _step_names(prep["steps"]))
+        if unknown:
+            warn(f"`--skip` names no Form B step: {', '.join(unknown)}")
+            return 2, _synth_records(2)
     if has_gate:
         if jobs > 1:
             warn("`jobs` applies only to Form B `steps`; Form A runs serially")
         return run_form_a(prep["gate"], root)
     if has_steps:
         if jobs > 1:
-            return run_form_b_parallel(prep["steps"], root, memoize_dir, jobs)
-        return run_form_b(prep["steps"], root, memoize_dir)
+            return run_form_b_parallel(prep["steps"], root, memoize_dir, jobs,
+                                       cli_skip)
+        return run_form_b(prep["steps"], root, memoize_dir, cli_skip)
     warn("[prep_pr] has neither `gate` nor `steps`; nothing to run.")
     return 0, _synth_records(0)
 
@@ -160,8 +193,10 @@ def run_form_a(gate, root):
     return rc, _synth_records(rc)
 
 
-def _skip_reason(step, root):
+def _skip_reason(step, root, name=None, cli_skip=None):
     """Return a skip reason string if the step should be skipped, else None."""
+    if cli_skip and name in cli_skip:
+        return "--skip"
     tool = step.get("skip_if_absent")
     if tool and shutil.which(tool) is None:
         return f"{tool} not on PATH"
@@ -173,7 +208,7 @@ def _skip_reason(step, root):
     return None
 
 
-def run_form_b(steps, root, memoize_dir=None):
+def run_form_b(steps, root, memoize_dir=None, cli_skip=None):
     """Run the ordered steps. Return (exit_code, records) where records is a list
     of {name, result in pass|fail|skip} in step order (for the gate receipt)."""
     records = []
@@ -198,7 +233,7 @@ def run_form_b(steps, root, memoize_dir=None):
         if not isinstance(step.get("exclusive", False), bool):
             warn(f"step {name!r} has invalid `exclusive` (expected a boolean)")
             return 2, records
-        reason = _skip_reason(step, root)
+        reason = _skip_reason(step, root, name, cli_skip)
         if reason:
             log(f"[SKIP] {name}: {reason}")
             records.append({"name": name, "result": "skip"})
@@ -337,7 +372,7 @@ def _sigterm_to_interrupt(signum, frame):
     raise KeyboardInterrupt
 
 
-def run_form_b_parallel(steps, root, memoize_dir, jobs):
+def run_form_b_parallel(steps, root, memoize_dir, jobs, cli_skip=None):
     """Parallel Form B. Same return contract as run_form_b: (exit_code, records
     in declaration order). Every step is validated BEFORE anything launches."""
     if not isinstance(steps, list):
@@ -384,7 +419,7 @@ def run_form_b_parallel(steps, root, memoize_dir, jobs):
                 e = plan[nxt]
                 if not e["checked"]:
                     e["checked"] = True
-                    reason = _skip_reason(e["step"], root)
+                    reason = _skip_reason(e["step"], root, e["name"], cli_skip)
                     if reason:
                         e["pre"].append(f"[SKIP] {e['name']}: {reason}")
                         e["state"], e["result"] = "done", "skip"
@@ -956,12 +991,15 @@ def _atomic_write_json(path, obj):
 # --- Entry point ------------------------------------------------------------
 
 def _parse_args(argv):
-    """Parse the optional flags. Returns (receipt_path, memoize_dir, jobs). All
-    default None; unknown args are warned and ignored (never fatal). `jobs` is
-    the RAW --jobs string, validated in _run_gates so a bad value exits 2."""
+    """Parse the optional flags. Returns (receipt_path, memoize_dir, jobs,
+    skip). All default None; unknown args are warned and ignored (never fatal).
+    `jobs` is the RAW --jobs string, validated in _run_gates so a bad value
+    exits 2. `skip` is the list of raw --skip values (None when never given),
+    likewise validated in _run_gates."""
     receipt_path = None
     memoize_dir = None
     jobs = None
+    skip = None
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -986,15 +1024,25 @@ def _parse_args(argv):
             jobs = argv[i] if i < len(argv) else ""
         elif a.startswith("--jobs="):
             jobs = a[len("--jobs="):]
+        elif a == "--skip":
+            i += 1
+            skip = (skip or []) + [argv[i] if i < len(argv) else ""]
+        elif a.startswith("--skip="):
+            skip = (skip or []) + [a[len("--skip="):]]
         else:
             warn(f"unrecognized argument {a!r}; ignoring")
         i += 1
-    return receipt_path, memoize_dir, jobs
+    return receipt_path, memoize_dir, jobs, skip
 
 
-def _run_gates(root, memoize_dir, jobs=None):
+def _run_gates(root, memoize_dir, jobs=None, skip=None):
     """Resolve config and run the gates. Return (exit_code, records). `jobs` is
-    the raw --jobs string or None."""
+    the raw --jobs string or None; `skip` the raw --skip list or None."""
+    if skip is not None:
+        if any(not s.strip() for s in skip):
+            warn("--skip requires a step name")
+            return 2, _synth_records(2)
+        skip = frozenset(skip)
     if jobs is not None:
         if not re.fullmatch(r"[0-9]+", jobs) or int(jobs) < 1:
             warn(f"--jobs must be a positive integer (got {jobs!r})")
@@ -1002,6 +1050,10 @@ def _run_gates(root, memoize_dir, jobs=None):
         jobs = int(jobs)
     config_path = os.path.join(root, CONFIG_NAME)
     if not os.path.isfile(config_path):
+        if skip:
+            warn("`--skip` applies only to Form B `steps`; the fallback chain "
+                 "cannot honor it")
+            return 2, _synth_records(2)
         if jobs is not None and jobs > 1:
             warn("`--jobs` applies only to Form B `steps`; the fallback chain "
                  "runs serially")
@@ -1018,15 +1070,22 @@ def _run_gates(root, memoize_dir, jobs=None):
         warn(f"{CONFIG_NAME} is present but has no valid [prep_pr] table; failing closed.")
         return 2, _synth_records(2)
     log(f"gate-runner: using {config_path}")
-    return run_prep_pr(prep, root, memoize_dir, jobs)
+    return run_prep_pr(prep, root, memoize_dir, jobs, skip)
 
 
 def main(argv=None):
     argv = argv if argv is not None else sys.argv[1:]
-    receipt_path, memoize_dir, jobs = _parse_args(argv)
+    receipt_path, memoize_dir, jobs, skip = _parse_args(argv)
+    if receipt_path is not None and skip is not None:
+        # A receipt attests that the gate PASSED; one written by a run that
+        # skipped steps on request would attest to less than the gate. CI (the
+        # one --skip caller) never writes a receipt, so refuse the pair.
+        warn("`--skip` cannot be combined with `--receipt`: a receipt must "
+             "attest the whole gate")
+        return 2
     root = find_repo_root()
     pre = _snapshot(root, receipt_path) if receipt_path else None
-    rc, records = _run_gates(root, memoize_dir, jobs)
+    rc, records = _run_gates(root, memoize_dir, jobs, skip)
     if receipt_path:
         _write_receipt(receipt_path, root, rc, records, pre)
     return rc

@@ -131,7 +131,7 @@ def run(args, *, issue="[]", reactions="[]", reactions_by_id=None, gh_fail=False
             env["GH_FAIL"] = "1"
         env.update(extra_env or {})
         p = subprocess.run(["bash", WRAPPER] + args, env=env,
-                           capture_output=True, text=True, timeout=20)
+                           capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         posted = []
         if os.path.exists(log):
             with open(log, "rb") as f:

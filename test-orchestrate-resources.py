@@ -41,7 +41,7 @@ def run(args, *, env_overrides=None, tmux="/tmp/tmux-test,1,0", ccsid=None):
     if env_overrides:
         env.update(env_overrides)
     p = subprocess.run([sys.executable, SCRIPT, *args], env=env,
-                       capture_output=True, text=True, timeout=30)
+                       capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
     return p.returncode, p.stdout, p.stderr
 
 

@@ -107,7 +107,7 @@ def run(args, *, behind="0", fetch_rc=0, base_ref_rc=0, head_ref_rc=0,
             env.pop("GIT_SSH_COMMAND", None)
 
         p = subprocess.run(["bash", SCRIPT] + args, env=env,
-                           capture_output=True, text=True, timeout=15)
+                           capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         log = ""
         if os.path.exists(fetchlog):
             with open(fetchlog) as fh:

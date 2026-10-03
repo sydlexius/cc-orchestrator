@@ -60,7 +60,7 @@ def run_meter(session_id="s", tool_input=None, tool_response=None, *, ctxmeter_d
             "tool_response": tool_response if tool_response is not None else "",
         })
     p = subprocess.run([METER], input=stdin_data, env=env,
-                       capture_output=True, text=True, timeout=10)
+                       capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
     return p.returncode, p.stderr, p.stdout
 
 
@@ -84,7 +84,7 @@ def main():
     print("orchestrate-context-meter.sh harness")
 
     # --self-test passes.
-    p = subprocess.run([METER, "--self-test"], capture_output=True, text=True, timeout=10)
+    p = subprocess.run([METER, "--self-test"], capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
     check("--self-test exits 0 and reports PASS", p.returncode == 0 and "PASS" in p.stdout)
 
     # ---- accumulation below the warn threshold -> silent ----

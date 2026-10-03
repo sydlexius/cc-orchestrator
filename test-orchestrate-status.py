@@ -138,7 +138,7 @@ def run(args, *, prlist="[]", views=None, unreplied=None, unreplied_fail=None,
             env["UNREPLIED_FAIL_%s" % n] = "1"
 
         p = subprocess.run(["bash", SCRIPT] + args, env=env,
-                           capture_output=True, text=True, timeout=20)
+                           capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         LAST_RUN.update(args=args, rc=p.returncode, stderr=p.stderr)
         import json
         gh_calls = [json.loads(ln) for ln in open(gh_log).read().splitlines() if ln]

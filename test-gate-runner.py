@@ -1639,6 +1639,89 @@ def test_parallel_head_checked_once():
     check("#501: blocked head: memo lookup ran once per step", len(trees) == 3)
 
 
+# --- Part D: opt-in `--skip <name>` (CI leaves lint to its own pinned steps) --
+
+def test_skip_named_steps_serial_and_parallel():
+    """`--skip` skips exactly the named steps on BOTH Form B paths, prints a
+    `[SKIP] <name>: --skip` line, and still runs every other step."""
+    with tempfile.TemporaryDirectory() as aux:
+        for jobs in (None, 4):
+            marks = {n: os.path.join(aux, f"{n}-{jobs}") for n in ("a", "b", "c")}
+            with tempfile.TemporaryDirectory() as root:
+                git_init(root)
+                write(root, ".gates.toml", _steps_cfg(
+                    [(n, f"touch {m}", "") for n, m in marks.items()], jobs))
+                rc, out = run_runner(root, args=("--skip", "a", "--skip=c"))
+                check(f"--skip: exit 0 (jobs={jobs})", rc == 0)
+                check(f"--skip: named steps did not run (jobs={jobs})",
+                      not os.path.exists(marks["a"]) and not os.path.exists(marks["c"]))
+                check(f"--skip: unnamed step still ran (jobs={jobs})",
+                      os.path.exists(marks["b"]))
+                check(f"--skip: [SKIP] lines name the flag (jobs={jobs})",
+                      "[SKIP] a: --skip" in out and "[SKIP] c: --skip" in out)
+
+
+def test_skip_absent_is_byte_identical():
+    """No `--skip` -> output identical to a runner that never heard of it: no
+    step reports a `--skip` reason and every step runs."""
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, ".gates.toml", _steps_cfg([("a", "echo out-a", ""),
+                                               ("b", "echo out-b", "")]))
+        rc, out = run_runner(root)
+        check("--skip absent: exit 0, both steps run",
+              rc == 0 and "[PASS] a" in out and "[PASS] b" in out)
+        check("--skip absent: no --skip reason anywhere", "--skip" not in out)
+
+
+def test_skip_refuses_doubt():
+    """Every --skip that cannot be honored exactly exits 2 and runs NOTHING: a
+    name matching no step (a stale caller, or a renamed step), an empty name, a
+    Form A gate, the fallback chain, and a --receipt (which must attest the
+    whole gate)."""
+    with tempfile.TemporaryDirectory() as aux:
+        marker = os.path.join(aux, "ran")
+        cases = [
+            ("unknown name", _steps_cfg([("a", f"touch {marker}", "")]), ("--skip", "nope")),
+            ("unknown name, parallel", _steps_cfg([("a", f"touch {marker}", "")], 4),
+             ("--skip", "nope")),
+            ("empty name", _steps_cfg([("a", f"touch {marker}", "")]), ("--skip=",)),
+            ("trailing --skip", _steps_cfg([("a", f"touch {marker}", "")]), ("--skip",)),
+            ("Form A", f'[prep_pr]\ngate = "touch {marker}"\n', ("--skip", "gate")),
+            # Two steps sharing a name both match one --skip, so a copied block whose run was
+            # changed but not its name would leave CI silently. Refused, nothing runs.
+            ("duplicate step name", _steps_cfg([("a", "true", ""), ("a", f"touch {marker}", "")]),
+             ("--skip", "a")),
+            ("explicit name collides with a derived step-<i>",
+             _steps_cfg([("step-1", "true", ""), ("", f"touch {marker}", "")]), ("--skip", "step-1")),
+            ("fallback chain", None, ("--skip", "a")),
+        ]
+        for label, cfg, args in cases:
+            with tempfile.TemporaryDirectory() as root:
+                git_init(root)
+                if cfg is None:
+                    write(root, "Makefile", f"gate:\n\ttouch {marker}\n")
+                else:
+                    write(root, ".gates.toml", cfg)
+                rc, _ = run_runner(root, args=args)
+                check(f"--skip refused ({label}) -> exit 2", rc == 2)
+                check(f"--skip refused ({label}) -> nothing ran",
+                      not os.path.exists(marker))
+        with tempfile.TemporaryDirectory() as root:
+            git_init(root)
+            write(root, ".gates.toml", _steps_cfg([("a", f"touch {marker}", "")]))
+            git_commit(root)
+            rpath = os.path.join(aux, "receipt.json")
+            rc, _ = run_runner(root, args=("--skip", "a", "--receipt", rpath))
+            check("--skip + --receipt -> exit 2", rc == 2)
+            check("--skip + --receipt -> no receipt written", not os.path.exists(rpath))
+            check("--skip + --receipt -> nothing ran", not os.path.exists(marker))
+            # An explicit EMPTY receipt path is still a --receipt: a truthiness test let it through.
+            rc, _ = run_runner(root, args=("--skip", "a", "--receipt="))
+            check("--skip + --receipt= (empty) -> exit 2", rc == 2)
+            check("--skip + --receipt= (empty) -> nothing ran", not os.path.exists(marker))
+
+
 def main():
     print("test-gate-runner.py")
     for fn in [
@@ -1676,6 +1759,8 @@ def main():
         test_parallel_receipt, test_parallel_double_interrupt_term_ignoring,
         test_parallel_soft_skip_memo, test_parallel_launch_error_and_tiebreak,
         test_parallel_launch_signal_mask, test_parallel_head_checked_once,
+        test_skip_named_steps_serial_and_parallel, test_skip_absent_is_byte_identical,
+        test_skip_refuses_doubt,
     ]:
         print(f"- {fn.__name__}")
         fn()

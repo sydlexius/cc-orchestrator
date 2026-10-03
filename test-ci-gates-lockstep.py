@@ -1,23 +1,40 @@
 #!/usr/bin/env python3
-"""Lockstep harness: the CI lint enumerations must match .gates.toml's (issue #364).
+"""Lockstep harness: CI must lint and run exactly what .gates.toml gates (#364, #379).
 
-THE BUG THIS EXISTS TO PREVENT. `.gates.toml` and `.github/workflows/ci.yml` each carry a
-HAND-MAINTAINED list of what to lint, and nothing compared them. They drifted to the point
-where CI shellchecked 28 of the 37 scripts the local gate covered - including
-`orchestrate-authorize-merge.sh`, which arms the merge-auth token the security floor reads.
-A shellcheck error in any of the other nine passed CI silently.
+THE BUG THIS EXISTS TO PREVENT. `.gates.toml` and `.github/workflows/ci.yml` each carried a
+HAND-MAINTAINED list of what to lint and which harnesses to run, and nothing compared them.
+They drifted to the point where CI shellchecked 28 of the 37 scripts the local gate covered
+- including `orchestrate-authorize-merge.sh`, which arms the merge-auth token the security
+floor reads - and ran only 26 of 42 gated harnesses (#379).
 
 WHY A HARNESS AND NOT A ONE-TIME RE-SYNC. Re-syncing by hand fixes today's drift and
-guarantees tomorrow's: the next script added to `.gates.toml` gets forgotten exactly as
-those nine were. The repo has solved this shape twice already - `test-version-lockstep.py`
-for the SKILL.md/plugin.json pair, and the `#284` exact-count assertion for HELPER_NAMES -
-so this copies that pattern rather than inventing one.
+guarantees tomorrow's. The repo has solved this shape twice already - `test-version-lockstep.py`
+for the SKILL.md/plugin.json pair, and the `#284` exact-count assertion for HELPER_NAMES.
 
-WHY NOT DERIVE CI's LIST FROM .gates.toml. That makes drift impossible, but CI would then
-depend on parsing repo config at CI time, and `ci.yml` would lose its self-contained,
-digest-pinned shape. Duplication-plus-detection matches existing practice here.
+THE HARNESS LIST IS NOW DERIVED, NOT DUPLICATED (a deliberate REVERSAL). This header used to
+say "WHY NOT DERIVE CI's LIST FROM .gates.toml": deriving makes drift impossible, but CI would
+then depend on parsing repo config at CI time. The maintainer accepted that trade-off: CI ran
+all 46 harnesses as SERIAL Actions steps (375s on macOS, 230s on ubuntu, nearly all of it
+subprocess-spawn cost), and the only way to parallelize them is to hand them to gate-runner,
+which already runs .gates.toml `jobs = 4` with `exclusive` barriers locally. So CI now runs
+`python3 scripts/gate-runner.py --jobs 4 --skip ...` once per OS leg. Two wins: wall time, and
+a harness added to .gates.toml runs in CI with no ci.yml edit, so there is no second list to
+drift. That holds only while each step has a unique, explicit name, because CI deselects steps
+by name (--skip): a reused name would deselect two. Both gate-runner (under --skip) and this
+harness refuse duplicate or missing names. What this harness checks for harnesses therefore changes from "the
+two lists agree" to "CI cannot silently stop running the derived list":
+  - each OS leg (Linux, macOS) has exactly ONE gate-runner invocation, on a one-line `run:`,
+    gated by an exact `if: runner.os == '<OS>'`, with no `continue-on-error`;
+  - it passes `--jobs N` (N >= 2; that is the point of the change);
+  - its `--skip` set equals that leg's CI_SKIP table EXACTLY, both directions, and every
+    CI_SKIP entry carries a written reason and names a real .gates.toml step;
+  - no step CI runs is `required = false` or carries a `skip_if_absent` / `skip_if`
+    predicate, each of which would let it pass CI without running or failing.
 
-THREE CHECKS, because two of them can pass while the invariant is broken:
+THE LINT LISTS STAY HAND-MAINTAINED. CI's shellcheck runs from a digest-pinned image and
+ruff is installed on Linux only, so those two steps keep their dedicated CI steps (and are
+`--skip`ped from gate-runner). Their lists still get the original three checks, because two
+of them can pass while the invariant is broken:
   1. SET EQUALITY, BOTH DIRECTIONS. A one-way check misses a CI-only entry, which is a
      stale path that lints nothing and looks like coverage.
   2. A PARSE-SANITY FLOOR. An empty or truncated parse compares {} against {} and passes,
@@ -26,17 +43,17 @@ THREE CHECKS, because two of them can pass while the invariant is broken:
      as missing. Assert the parse before trusting the verdict.)
   3. A FILESYSTEM CROSS-CHECK. Set equality only proves the two lists agree - they can
      agree and both omit a script that exists. Every `scripts/*.sh` must be linted
-     somewhere, or the drift guard blesses a shared blind spot.
+     somewhere, and every `test-*.py` must be a .gates.toml step.
 
-#379 applies the same three checks to the `python3 test-*.py` HARNESS STEP lists, which had
-drifted to 16 of 42 gated harnesses never running in CI. A harness legitimately kept out of
-CI goes in CI_EXEMPT with a written reason; the default is a CI step.
+A MUTATION SELF-TEST at the end re-runs this file against fixture copies with ONE invariant
+broken per case and requires each to fail with its check's message.
 
 Stdlib only, no network. Run: python3 test-ci-gates-lockstep.py
 """
 import glob
 import os
 import re
+import shlex
 import sys
 
 try:
@@ -54,13 +71,27 @@ CI = os.path.join(ROOT, ".github", "workflows", "ci.yml")
 # An entry here is a decision to leave a file unlinted, so it must not be silently editable.
 FS_EXEMPT: dict[str, str] = {}
 
-# Harnesses .gates.toml runs but CI deliberately does NOT, each with a written reason (#379).
-# The default is a CI step; an entry here is a decision that a gated harness goes unchecked
-# on every PR, so it needs a reason a reviewer can dispute (live network, live `gh` auth,
-# machine-local tooling that no stub replaces). Empty today: every gated harness at #379
-# stubs its externals (gh / git / preflight / npm / cargo / df / prose-tooling via PATH or env).
-CI_EXEMPT: dict[str, str] = {}
-
+# The .gates.toml steps CI's gate-runner invocation deliberately `--skip`s, PER OS LEG, each
+# with a written reason. The default is that CI runs every step; an entry here is a decision
+# that a gated step goes unchecked on that leg, so it needs a reason a reviewer can dispute.
+# ci.yml's --skip set must equal this table exactly (both directions), so neither side can
+# change alone.
+_LINT_REASON = ("run by a dedicated Linux CI step instead (shellcheck from the digest-pinned "
+                "koalaman image, ruff installed Linux-only); its list is lockstepped below")
+CI_SKIP: dict[str, dict[str, str]] = {
+    "Linux": {
+        "shellcheck": _LINT_REASON,
+        "ruff": _LINT_REASON,
+    },
+    "macOS": {
+        "shellcheck": _LINT_REASON,
+        "ruff": _LINT_REASON,
+        "test-orchestrate-setup": (
+            "the setup/doctor harness exercises HOST-COUPLED wiring (settings cascade, tmux, "
+            "guard execution, git repo state) that diverges on a fresh macOS runner - "
+            "env-coupling, not a shipped-code bug - so it runs on the Linux leg only"),
+    },
+}
 
 def fail(msg):
     sys.exit(f"FAIL: {msg}")
@@ -68,7 +99,7 @@ def fail(msg):
 
 # An exemption is only as good as its written reason: an empty or whitespace-only one would
 # silently drop coverage while this guard still passed, so reject it before any set math.
-for _label, _exempt in (("FS_EXEMPT", FS_EXEMPT), ("CI_EXEMPT", CI_EXEMPT)):
+for _label, _exempt in [("FS_EXEMPT", FS_EXEMPT)] + [(f"CI_SKIP[{o}]", t) for o, t in CI_SKIP.items()]:
     _blank = sorted(k for k, v in _exempt.items() if not isinstance(v, str) or not v.strip())
     if _blank:
         fail(f"{_label} entries without a written reason -> {_blank}")
@@ -94,6 +125,8 @@ def gates_step_run(name):
     except (OSError, ValueError) as e:
         fail(f"cannot read/parse .gates.toml: {e}")
     for step in data.get("prep_pr", {}).get("steps", []):
+        if not isinstance(step, dict):
+            fail(".gates.toml [prep_pr].steps has an entry that is not a table")
         if step.get("name") == name:
             run = step.get("run", "")
             if not run:
@@ -110,7 +143,7 @@ def ci_text():
         fail(f"cannot read ci.yml: {e}")
 
 
-print("CI <-> .gates.toml lint + harness lockstep (#364, #379)")
+print("CI <-> .gates.toml lint lockstep + gate-runner wiring (#364, #379)")
 
 ci_src = ci_text()
 
@@ -171,65 +204,56 @@ if stale:
     fail(f"shellcheck targets that no longer exist on disk: {stale}")
 print("  [ok  ] no shellcheck target is missing from disk")
 
-# --- harness STEP lists (#379) ------------------------------------------------------------
-# The lint lists were not the only hand-maintained pair. The `python3 test-*.py` steps drifted
-# the same way: 16 of 42 gated harnesses never ran in CI, test-orchestrate-authorize-merge.py
-# (the merge-auth token writer the floor reads) among them, and the elmer stat-order defect
-# shipped CI-green for exactly that reason. Same three-part shape as above: parse floor first,
-# set equality both directions (minus written exemptions), then a filesystem cross-check.
+# --- harness steps: .gates.toml is the ONE list (#379, then derived) -------------------
 # A harness counts only when its step RUNS it: the whole run string must be exactly
 # `python3 test-<name>.py`. A text match would count `echo python3 test-x.py`, which runs
 # nothing; any other run string mentioning a harness is an unsupported shape and fails.
 HARNESS_STEP_RE = re.compile(r"python3\s+(test-[\w.-]+\.py)")
 
 
-def gates_harnesses():
+def gates_steps():
     try:
         with open(GATES, "rb") as fh:
             data = tomllib.load(fh)
     except (OSError, ValueError) as e:
         fail(f"cannot read/parse .gates.toml: {e}")
-    out = set()
-    for step in data.get("prep_pr", {}).get("steps", []):
-        run = step.get("run", "").strip()
-        m = HARNESS_STEP_RE.fullmatch(run)
-        if m:
-            out.add(m.group(1))
-        elif re.search(r"python3\s+test-", run):
-            fail(f".gates.toml step '{step.get('name')}' names a harness in an unsupported shape "
-                 f"(only a bare `python3 test-<name>.py` counts as running it): {run!r}")
-    return out
+    steps = data.get("prep_pr", {}).get("steps", [])
+    if not isinstance(steps, list):
+        fail(".gates.toml [prep_pr].steps is not an array")
+    # Fail closed on a non-table entry: gate-runner warns and skips it, so dropping it here
+    # would let a malformed step vanish from both the gate and this check.
+    bad = [i for i, s in enumerate(steps) if not isinstance(s, dict)]
+    if bad:
+        fail(f".gates.toml [prep_pr].steps entries that are not tables (index): {bad}")
+    return steps
 
 
-gates_h = gates_harnesses()
-# Only `run:` lines count: a harness named in a CI comment is not a harness CI runs.
-ci_h = set(re.findall(r"^\s*run:\s*python3\s+(test-[\w.-]+\.py)\s*$", ci_src, re.M))
+steps = gates_steps()
+# CI selects steps by NAME (--skip), so every step needs an EXPLICIT, UNIQUE name: a copied block
+# whose `run` changed but not its `name` would share a --skip and drop out of CI silently, and an
+# unnamed step's derived `step-<i>` shifts whenever a step is inserted above it.
+_unnamed = [s.get("run", "?") for s in steps if not s.get("name")]
+if _unnamed:
+    fail(f".gates.toml steps without an explicit `name` (CI --skip selects by name): {_unnamed}")
+_names = [s["name"] for s in steps]
+_dupes = sorted({n for n in _names if _names.count(n) > 1})
+if _dupes:
+    fail(f".gates.toml step names are not unique (one --skip would match several): {_dupes}")
+step_names = set(_names)
+gates_h = set()
+for step in steps:
+    run = step.get("run", "").strip()
+    m = HARNESS_STEP_RE.fullmatch(run)
+    if m:
+        gates_h.add(m.group(1))
+    elif re.search(r"python3\s+test-", run):
+        fail(f".gates.toml step '{step.get('name')}' names a harness in an unsupported shape "
+             f"(only a bare `python3 test-<name>.py` counts as running it): {run!r}")
 
-for label, s in (("gates harness steps", gates_h), ("ci harness steps", ci_h)):
-    if len(s) < 10:
-        fail(f"{label} parsed only {len(s)} entries - the parse broke; fix it rather than "
-             f"the lists (an empty-vs-empty comparison passes and proves nothing)")
-print(f"  [ok  ] harness parses are non-degenerate ({len(gates_h)}/{len(ci_h)})")
-
-problems = []
-stale_exempt = sorted(set(CI_EXEMPT) - gates_h)
-if stale_exempt:
-    problems.append(f"CI_EXEMPT names harnesses .gates.toml does not run -> {stale_exempt}")
-exempt_but_run = sorted(set(CI_EXEMPT) & ci_h)
-if exempt_but_run:
-    problems.append(f"CI_EXEMPT names harnesses CI DOES run (drop the exemption) -> "
-                    f"{exempt_but_run}")
-only_gates = sorted(gates_h - ci_h - set(CI_EXEMPT))
-if only_gates:
-    problems.append(f"harness: in .gates.toml but NOT run by CI -> {only_gates}")
-only_ci = sorted(ci_h - gates_h)
-if only_ci:
-    problems.append(f"harness: in ci.yml but NOT in .gates.toml -> {only_ci}")
-if problems:
-    fail("the CI and .gates.toml harness step lists have drifted:\n  " + "\n  ".join(problems)
-         + "\n\nAdd a `harness - <name>` step to ci.yml (or a CI_EXEMPT entry with a written "
-           "reason). Do not delete from .gates.toml to make this pass.")
-print(f"  [ok  ] harness step lists match in both directions ({len(CI_EXEMPT)} exempt)")
+if len(gates_h) < 10 or len(steps) < 10:
+    fail(f"gates parsed only {len(steps)} steps / {len(gates_h)} harnesses - the parse broke; "
+         f"fix it rather than the config (an empty parse passes and proves nothing)")
+print(f"  [ok  ] harness parse is non-degenerate ({len(steps)} steps, {len(gates_h)} harnesses)")
 
 h_on_disk = {os.path.basename(p) for p in glob.glob(os.path.join(ROOT, "test-*.py"))}
 ungated = sorted(h_on_disk - gates_h)
@@ -240,8 +264,100 @@ if missing:
     fail(f"harness steps that no longer exist on disk: {missing}")
 print(f"  [ok  ] every test-*.py is a gate step ({len(h_on_disk)} on disk)")
 
+# --- CI runs .gates.toml through gate-runner on BOTH legs ---------------------------------
+# Split ci.yml into step blocks (each starts at a `- name:` list item) and find every block
+# whose run line invokes gate-runner. The shapes accepted are deliberately narrow: an
+# unrecognized `if:` or a multi-line `run: |` is a FAILURE, never a guess.
+OS_IF_RE = re.compile(r"^\s*if:\s*runner\.os\s*==\s*'(Linux|macOS)'\s*$")
+blocks = re.split(r"^(?=\s*- name:)", ci_src, flags=re.M)
+invocations: dict[str, list[list[str]]] = {"Linux": [], "macOS": []}
+for block in blocks:
+    # Matches any INVOCATION spelling (`python3 scripts/...`, `./scripts/...`, `python ...`),
+    # not the bare filename, which the ruff step lints as a target.
+    if not re.search(r"(python3?\s+|\./)scripts/gate-runner\.py", block):
+        continue
+    if not re.search(r"^\s*- name:", block, re.M):
+        continue   # the preamble before the first step (comments only)
+    body = [ln for ln in block.split("\n") if ln.strip() and not ln.strip().startswith("#")]
+    name = body[0].strip()
+    runs = [ln for ln in body if re.match(r"^\s*run:", ln)]
+    if len(runs) != 1 or not re.match(r"^\s*run:\s*python3 scripts/gate-runner\.py(\s|$)", runs[0]):
+        fail(f"ci.yml step `{name}` mentions gate-runner.py but is not a one-line "
+             f"`run: python3 scripts/gate-runner.py ...` (unsupported shape)")
+    if any(re.match(r"^\s*continue-on-error:", ln) for ln in body):
+        fail(f"ci.yml step `{name}` sets continue-on-error, so the harnesses can fail "
+             f"without failing CI")
+    ifs = [ln for ln in body if re.match(r"^\s*if:", ln)]
+    if len(ifs) > 1:
+        fail(f"ci.yml step `{name}` has more than one `if:`")
+    if ifs:
+        m = OS_IF_RE.match(ifs[0])
+        if not m:
+            fail(f"ci.yml step `{name}` has an unrecognized condition {ifs[0].strip()!r}; "
+                 f"only `if: runner.os == 'Linux'` / `'macOS'` is accepted")
+        legs = [m.group(1)]
+    else:
+        legs = ["Linux", "macOS"]
+    argv = shlex.split(runs[0].split("run:", 1)[1])[2:]
+    for leg in legs:
+        invocations[leg].append(argv)
 
-# --- mutation self-test: each harness-step check must be able to FAIL -----------------------
+if not re.search(r"^\s*os:\s*\[ubuntu-latest,\s*macos-latest\]\s*$", ci_src, re.M):
+    fail("ci.yml's matrix is not exactly `os: [ubuntu-latest, macos-latest]`; the required "
+         "checks `gates (ubuntu-latest)` / `gates (macos-latest)` depend on it")
+
+problems = []
+for leg, found in invocations.items():
+    if len(found) != 1:
+        problems.append(f"{leg}: expected exactly one gate-runner invocation, found {len(found)} "
+                        f"(no gate-runner invocation for {leg} means CI stopped running the "
+                        f"harnesses there)")
+        continue
+    argv = found[0]
+    jobs, skip, i = None, set(), 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--jobs", "--skip") and i + 1 < len(argv):
+            val = argv[i + 1]; i += 2
+        elif a.startswith(("--jobs=", "--skip=")):
+            a, val = a.split("=", 1); i += 1
+        else:
+            problems.append(f"{leg}: unexpected gate-runner argument {a!r}")
+            break
+        if a == "--jobs":
+            jobs = val
+        else:
+            skip.add(val)
+    if not (jobs and jobs.isdigit() and int(jobs) >= 2):
+        problems.append(f"{leg}: gate-runner is not run with `--jobs N` (N >= 2); got {jobs!r}")
+    want = set(CI_SKIP[leg])
+    if skip - want:
+        problems.append(f"{leg}: ci.yml --skips steps CI_SKIP gives no reason for -> "
+                        f"{sorted(skip - want)}")
+    if want - skip:
+        problems.append(f"{leg}: CI_SKIP lists steps ci.yml does not --skip -> "
+                        f"{sorted(want - skip)}")
+    not_steps = sorted(want - step_names)
+    if not_steps:
+        problems.append(f"{leg}: CI_SKIP names no .gates.toml step -> {not_steps}")
+    for step in steps:
+        if step.get("name") in skip:
+            continue
+        if step.get("required", True) is not True:
+            problems.append(f"{leg}: step '{step.get('name')}' is required = false, so CI "
+                            f"cannot fail on it")
+        for pred in ("skip_if_absent", "skip_if"):
+            if step.get(pred):
+                problems.append(f"{leg}: step '{step.get('name')}' has {pred}, so CI can pass "
+                                f"it without running it (--skip it with a CI_SKIP reason)")
+if problems:
+    fail("CI's gate-runner wiring does not run the gated harnesses as required:\n  "
+         + "\n  ".join(problems))
+print(f"  [ok  ] both legs run gate-runner with --jobs; --skip sets match CI_SKIP "
+      f"(Linux {len(CI_SKIP['Linux'])}, macOS {len(CI_SKIP['macOS'])})")
+
+
+# --- mutation self-test: each check must be able to FAIL ----------------------------------
 # A drift guard that cannot fail is decorative. Re-run this file against a fixture copy of the
 # repo with ONE invariant broken, and require a non-zero exit carrying that check's message.
 # Skipped inside a fixture run (LOCKSTEP_ROOT set) so it never recurses.
@@ -252,21 +368,42 @@ def _mutation_selftest():
 
     victim = sorted(gates_h)[0]
     step_line = f'run = "python3 {victim}"'
-    ci_line = f"run: python3 {victim}"
+    linux_run = "run: python3 scripts/gate-runner.py --jobs 4 --skip shellcheck --skip ruff\n"
+    mac_run = ("run: python3 scripts/gate-runner.py --jobs 4 --skip shellcheck --skip ruff "
+               "--skip test-orchestrate-setup\n")
+    gates, ci = ".gates.toml", ".github/workflows/ci.yml"
     cases = [
         # (label, file to mutate, old text, new text, message the failure must carry).
-        # "gates step removed" also drops the harness file from the fixture, or the filesystem
-        # cross-check would fire first and the case would prove the wrong check.
-        ("gates step removed", ".gates.toml", step_line, 'run = "true"', "in ci.yml but NOT in .gates.toml"),
-        ("ci step removed", ".github/workflows/ci.yml", ci_line, "run: true", "in .gates.toml but NOT run by CI"),
-        ("echo'd harness", ".gates.toml", step_line, f'run = "echo python3 {victim}"', "unsupported shape"),
+        ("gates step removed", gates, step_line, 'run = "true"', "runs NONE of them"),
+        ("echo'd harness", gates, step_line, f'run = "echo python3 {victim}"', "unsupported shape"),
+        ("soft harness", gates, step_line, step_line + "\n  required = false", "required = false"),
+        ("predicated harness", gates, step_line, step_line + '\n  skip_if_absent = "nope"',
+         "has skip_if_absent"),
+        ("linux leg dropped", ci, linux_run, "run: true\n", "no gate-runner invocation for Linux"),
+        ("mac leg dropped", ci, mac_run, "run: true\n", "no gate-runner invocation for macOS"),
+        ("jobs dropped", ci, mac_run, mac_run.replace("--jobs 4 ", ""), "--jobs N"),
+        ("extra skip", ci, linux_run, linux_run.replace("ruff", f"ruff --skip {victim[:-3]}"),
+         "CI_SKIP gives no reason"),
+        ("skip dropped", ci, mac_run, mac_run.replace(" --skip test-orchestrate-setup", ""),
+         "CI_SKIP lists steps ci.yml does not --skip"),
+        ("continue-on-error", ci, linux_run, linux_run + "        continue-on-error: true\n",
+         "continue-on-error"),
+        ("odd condition", ci, "if: runner.os == 'macOS'\n        run: python3 scripts/gate-runner",
+         "if: false\n        run: python3 scripts/gate-runner", "unrecognized condition"),
+        ("duplicate step name", gates, step_line, step_line + f'\n\n  [[prep_pr.steps]]\n  name = "ruff"\n  run = "python3 {victim}"',
+         "step names are not unique"),
+        ("unnamed step", gates, step_line, step_line + '\n\n  [[prep_pr.steps]]\n  run = "true"',
+         "without an explicit `name`"),
+        ("shellcheck drift", ci, "scripts/stack-preflight.sh\n", "\n", "NOT linted by CI"),
+        ("ruff drift", ci, "test-settings-scrub.py test-stack-preflight.py",
+         "test-settings-scrub.py", "NOT linted by CI"),
     ]
     with tempfile.TemporaryDirectory() as tmp:
         for label, rel, old, new, want in [(None, None, None, None, None)] + cases:
             fx = os.path.join(tmp, label.replace(" ", "-").replace("'", "") if label else "clean")
             os.makedirs(os.path.join(fx, ".github", "workflows"))
             os.makedirs(os.path.join(fx, "scripts"))
-            for f in (".gates.toml", os.path.join(".github", "workflows", "ci.yml")):
+            for f in (gates, ci):
                 shutil.copy(os.path.join(ROOT, f), os.path.join(fx, f))
             for p in glob.glob(os.path.join(ROOT, "scripts", "*.sh")) + glob.glob(os.path.join(ROOT, "test-*.py")):
                 dst = os.path.join(fx, os.path.relpath(p, ROOT))
@@ -276,11 +413,9 @@ def _mutation_selftest():
                 with open(path, encoding="utf-8") as fh:
                     text = fh.read()
                 if text.count(old) != 1:
-                    fail(f"mutation self-test: '{old}' is not a single line in {rel}; update the case")
+                    fail(f"mutation self-test: {old!r} is not unique in {rel}; update the case")
                 with open(path, "w", encoding="utf-8") as fh:
                     fh.write(text.replace(old, new))
-                if label == "gates step removed":
-                    os.remove(os.path.join(fx, victim))
             r = subprocess.run([sys.executable, os.path.abspath(__file__)], capture_output=True,
                                text=True, env={**os.environ, "LOCKSTEP_ROOT": fx})
             out = r.stdout + r.stderr
@@ -297,4 +432,4 @@ def _mutation_selftest():
 if not os.environ.get("LOCKSTEP_ROOT"):
     _mutation_selftest()
 
-print("\nok: the CI and .gates.toml lint + harness enumerations are in lockstep")
+print("\nok: CI lints in lockstep with .gates.toml and runs its harnesses via gate-runner")

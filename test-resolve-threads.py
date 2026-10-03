@@ -48,7 +48,7 @@ def run(args):
         env["GH_LOG"] = log
         try:
             p = subprocess.run(["bash", WRAPPER, *args], env=env, capture_output=True,
-                               text=True, timeout=15)
+                               text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
             rc, out = p.returncode, p.stdout + p.stderr
         except subprocess.TimeoutExpired:
             rc, out = 124, "TIMEOUT"

@@ -124,7 +124,7 @@ def run(args, *, ls_remote="", default_branch="main", open_heads="",
         if ls_remote_fail:
             env["GIT_LSREMOTE_FAIL"] = "1"
 
-        p = subprocess.run([SCRIPT] + args, env=env, capture_output=True, text=True, timeout=20)
+        p = subprocess.run([SCRIPT] + args, env=env, capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         deletes = ""
         if os.path.exists(del_log):
             with open(del_log) as fh:

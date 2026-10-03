@@ -105,208 +105,30 @@ jobs:
         if: runner.os == 'Linux'
         run: ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/prefs-coverage.py scripts/settings-scrub.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-ci-gates-lockstep.py test-steer-nudge-length.py test-helper-deploy-coverage.py test-jq-quoting.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-safe-push-freshness.py test-prep-pr-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py test-cr-quota-watch.py test-elmer-enqueue.py test-elmer-triage.py test-elmer-tick.py test-bash32-constructs.py test-settings-scrub.py test-stack-preflight.py test-command-positional-args.py
 
-      # Platform-sensitive: run on BOTH macOS (BSD stat) and Linux (GNU stat).
-      # Must invoke via ./ so the self-test's "$0" re-invocation resolves
-      # (bash orchestrate-guard.sh would make $0 a bare name -> 127).
-      - name: guard self-test
-        run: ./scripts/orchestrate-guard.sh --self-test
-
-      # Advisory steering hook (#95): self-test is platform-sensitive (BSD/GNU stat in
-      # marker_active), so run on both runners alongside the guard self-test.
-      - name: steer self-test
-        run: ./scripts/orchestrate-steer.sh --self-test
-
-      # HARNESS STEPS: test-ci-gates-lockstep.py (#379) reads these as one-line
-      # `run: python3 test-<name>.py` entries and requires the set to equal the
-      # .gates.toml harness steps. Keep that exact one-line form (no `./`, no `run: |`
-      # block), and do not gate a harness with `if:` or `continue-on-error` without
-      # recording why: the lockstep check cannot see either.
-      - name: harness - guard
-        run: python3 test-orchestrate-guard.py
-
-      - name: harness - steer
-        run: python3 test-orchestrate-steer.py
-
-      - name: harness - steer nudge length
-        run: python3 test-steer-nudge-length.py
-
-      - name: harness - helper deploy coverage
-        run: python3 test-helper-deploy-coverage.py
-
-      - name: harness - resources
-        run: python3 test-orchestrate-resources.py
-
-      # Pure classification logic (planner role, #11) - platform-independent, runs on both.
-      - name: harness - planner-classify
-        run: python3 test-planner-classify.py
-
-      # Base-freshness wiring (#329/#330): safe-push's git-only gate (stubs git AND
-      # asserts no gh is ever invoked) plus the /prep-pr prose wiring. Host-independent.
-      - name: harness - safe-push-freshness
-        run: python3 test-safe-push-freshness.py
-
-      - name: harness - prep-pr-freshness
-        run: python3 test-prep-pr-freshness.py
-
-      # CI <-> .gates.toml lint lockstep (#364): the two enumerations are hand-maintained
-      # and had drifted to 28-of-37 shellcheck coverage. Fails when they disagree either way.
-      - name: harness - ci-gates-lockstep
-        run: python3 test-ci-gates-lockstep.py
-
-      # #463 early signal: grep for bash-4-only syntax shellcheck does not flag. The runtime
-      # guard is the macOS bash 3.2 shim above; this names the file:line before a harness fails.
-      - name: harness - bash32-constructs
-        run: python3 test-bash32-constructs.py
-
-      # #507: Claude Code substitutes a dollar-digit token in a command body before any shell runs.
-      - name: harness - command-positional-args
-        run: python3 test-command-positional-args.py
-
-      # jq single-quote integrity: an apostrophe inside a single-quoted jq program
-      # closes the shell quote. A PAIR of them re-opens it, so `bash -n` passes while
-      # the program is silently corrupted -- which is why this needs its own gate
-      # rather than a comment. Bit twice in #376, once inside the warning comment.
-      - name: harness - jq-quoting
-        run: python3 test-jq-quoting.py
-
-      # P3-F gh-* wrappers (#24): black-box, stubs gh via PATH - platform-independent.
-      - name: harness - gh-wrappers
-        run: python3 test-gh-wrappers.py
-
-      # Ship-gate oracle (#110): stubs gh + pr-unreplied-comments.sh via PATH/$HOME -
-      # deterministic, host-independent, platform-independent. Runs on both.
-      - name: harness - ship-gate-preflight
-        run: python3 test-ship-gate-preflight.py
-
-      # pr-unreplied-comments.sh (#132 outside-diff count + --audit; #93 staleness):
-      # stubs gh (and GraphQL) via PATH, applies --jq with the real jq. Host-independent.
-      - name: harness - pr-unreplied-comments
-        run: python3 test-pr-unreplied-comments.py
-
-      # pr-read-comments.sh optional [owner/repo] positional (#144): stubs gh via
-      # PATH + a call-log, asserts slug-vs-comment-id disambiguation. Host-independent.
-      - name: harness - pr-read-comments
-        run: python3 test-pr-read-comments.py
-
-      # safe-push.sh branch-arg validation (#35): stubs git via PATH, records pushes.
-      - name: harness - safe-push
-        run: python3 test-safe-push.py
-
-      # pr-watch.sh CR-skip + Codoki settlement wiring (#34, #110): stubs gh + the
-      # Codoki oracle; PR_WATCH_POLL_INTERVAL=0 drives the loop deterministically.
-      - name: harness - pr-watch
-        run: python3 test-pr-watch.py
-
-      # The setup/doctor harness exercises HOST-COUPLED wiring (settings cascade, tmux,
-      # guard execution, git repo state). On a fresh macOS runner doctor behaves differently
-      # than on the dev mac or the ubuntu runner - env-coupling on the runner, not a
-      # shipped-code bug - so run it on Linux only. macOS still covers the portability-
-      # sensitive guard (incl. the BSD stat -f branch) + resources harnesses + self-test
-      # above. The macOS-runner doctor divergence is tracked separately for root-cause.
-      - name: harness - setup
+      # HARNESSES + SELF-TESTS: run through gate-runner from .gates.toml, 4 wide.
+      # The serial one-step-per-harness list cost 375s on macOS / 230s on ubuntu, all of it
+      # subprocess spawn cost (no sleeps), so running the harnesses in parallel is the win.
+      # .gates.toml is now the ONE list: a harness added there runs in CI with no ci.yml edit,
+      # so the two can no longer drift. `exclusive = true` steps (steer's timing check,
+      # elmer-tick's lock race) still run alone, exactly as they do locally.
+      #
+      # --skip is the ONLY way a .gates.toml step stays out of CI, and every --skip here is
+      # checked by test-ci-gates-lockstep.py against its CI_SKIP table (each entry carries a
+      # written reason). gate-runner refuses a --skip that names no step, so a renamed step
+      # fails the run instead of silently re-entering or leaving CI.
+      #   shellcheck, ruff: run above by the dedicated Linux steps (digest-pinned image, not a
+      #     host shellcheck of whatever version the runner image ships).
+      #   test-orchestrate-setup (macOS only): the setup/doctor harness exercises HOST-COUPLED
+      #     wiring (settings cascade, tmux, guard execution, git repo state) that diverges on a
+      #     fresh macOS runner - env-coupling, not a shipped-code bug - so it stays Linux-only.
+      #
+      # Keep each invocation on ONE `run:` line with no continue-on-error: the lockstep
+      # harness parses exactly that shape and fails if either OS leg stops running it.
+      # The macOS leg runs after the bash 3.2 shim above, so every harness sees /bin/bash 3.2.
+      - name: harnesses + self-tests (gate-runner, Linux)
         if: runner.os == 'Linux'
-        run: python3 test-orchestrate-setup.py
+        run: python3 scripts/gate-runner.py --jobs 4 --skip shellcheck --skip ruff
 
-      # Maildir feedback store (#149): temp-dir isolated, stubs nothing (real bash
-      # mktemp/mv), incl. a 25-way concurrency test. Host-independent.
-      - name: harness - feedback
-        run: python3 test-orchestrate-feedback.py
-
-      # Version lockstep: SKILL.md **Version** == plugin.json "version". Platform-independent.
-      - name: harness - version-lockstep
-        run: python3 test-version-lockstep.py
-
-      # stale-branch-sweep.sh (#137) + codoki-quota-watch.sh (#70): stub gh/git via
-      # PATH, host-independent. Wired here for parity with the CLAUDE.md gate list
-      # (the #138 PR added the harnesses to CLAUDE.md but not to this workflow).
-      - name: harness - stale-branch-sweep
-        run: python3 test-stale-branch-sweep.py
-
-      - name: harness - codoki-quota-watch
-        run: python3 test-codoki-quota-watch.py
-
-      # gate-runner.py (#169): builds throwaway git repos in temp dirs, drives
-      # .gates.toml Form A/B + the fail-open fallback chain via a controlled PATH.
-      # Host-independent, platform-independent.
-      - name: harness - gate-runner
-        run: python3 test-gate-runner.py
-
-      # The elmer harnesses (the unattended review requester): enqueue/triage/tick.
-      # PLATFORM-SENSITIVE and therefore on BOTH legs, which is the whole point of
-      # wiring them here - the tick reads a lock's mtime and inode via stat, and a
-      # BSD-first `stat -f` order silently succeeds-with-garbage on GNU coreutils, so
-      # stale-lock recovery never fired on Linux. That defect shipped CI-green purely
-      # because these three lived in .gates.toml only and the ubuntu leg never ran
-      # them. Every dependency (gh, the quota helper, the composed read-only helpers)
-      # is stubbed via PATH/$ELMER_* and the maildir is a temp dir, so nothing here
-      # touches the network or the real queue.
-      - name: harness - cr-quota-watch
-        run: python3 test-cr-quota-watch.py
-
-      - name: harness - elmer-enqueue
-        run: python3 test-elmer-enqueue.py
-
-      - name: harness - elmer-triage
-        run: python3 test-elmer-triage.py
-
-      - name: harness - elmer-tick
-        run: python3 test-elmer-tick.py
-
-      # #379: gated harnesses CI never ran (16 of 42). The ci-gates-lockstep harness now
-      # fails on any gated harness missing here unless it carries a written CI_EXEMPT
-      # reason. Each stubs its externals (gh / git / preflight / npm / cargo / df /
-      # prose-tooling via PATH or env), so none needs network or machine-local tooling.
-      # authorize-merge arms the merge-auth token the security floor reads.
-      - name: harness - authorize-merge
-        run: python3 test-orchestrate-authorize-merge.py
-
-      - name: harness - context-meter
-        run: python3 test-orchestrate-context-meter.py
-
-      - name: harness - status
-        run: python3 test-orchestrate-status.py
-
-      - name: harness - schemas
-        run: python3 test-orchestrate-schemas.py
-
-      - name: harness - finding-channel
-        run: python3 test-finding-channel.py
-
-      - name: harness - gh-react
-        run: python3 test-gh-react.py
-
-      - name: harness - patch-coverage
-        run: python3 test-patch-coverage.py
-
-      - name: harness - run-paths
-        run: python3 test-run-paths.py
-
-      - name: harness - cleanup-worktree
-        run: python3 test-cleanup-worktree.py
-
-      - name: harness - issue-watch
-        run: python3 test-issue-watch.py
-
-      - name: harness - prefs-coverage
-        run: python3 test-prefs-coverage.py
-
-      - name: harness - prose-lint
-        run: python3 test-prose-lint.py
-
-      - name: harness - resolve-threads
-        run: python3 test-resolve-threads.py
-
-      - name: harness - cache-reclaim
-        run: python3 test-cache-reclaim.py
-
-      - name: harness - settings-scrub
-        run: python3 test-settings-scrub.py
-
-      - name: harness - base-freshness
-        run: python3 test-base-freshness.py
-
-      - name: harness - open-pr-staleness-sweep
-        run: python3 test-open-pr-staleness-sweep.py
-
-      - name: harness - stack-preflight
-        run: python3 test-stack-preflight.py
+      - name: harnesses + self-tests (gate-runner, macOS)
+        if: runner.os == 'macOS'
+        run: python3 scripts/gate-runner.py --jobs 4 --skip shellcheck --skip ruff --skip test-orchestrate-setup

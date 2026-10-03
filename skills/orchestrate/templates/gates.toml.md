@@ -108,6 +108,20 @@ With `jobs` > 1:
   declaration order; a fail receipt may include steps declared after the
   failing one.
 
+### Skipping named steps (`--skip <name>`)
+
+`gate-runner.py --skip <name>` (repeatable; OFF by default, absent = ZERO behavior
+change) skips the named Form B steps on both the serial and parallel paths, each
+printing `[SKIP] <name>: --skip`. It exists so a CI workflow can run the gate's
+steps through the runner while leaving a step to a dedicated CI step (this repo's
+CI skips `shellcheck` and `ruff`, which it runs from a digest-pinned image). It
+fails closed on doubt, exiting 2 before running anything when a name matches no
+step (a stale caller after a rename), when a name is empty, when two steps share
+a name (including a derived `step-<i>` that collides with an explicit name, since
+one `--skip` would then match both), under Form A or the
+fallback chain (nothing to skip by name), and beside `--receipt` (a receipt must
+attest the whole gate, never a subset).
+
 ### Pure-oracle memoization (`pure = true` + `--memoize-dir`)
 
 `gate-runner.py --memoize-dir <dir>` (OFF by default; absent = ZERO behavior

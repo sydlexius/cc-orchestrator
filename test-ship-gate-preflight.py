@@ -468,7 +468,7 @@ def run(args, *, fixture_json, gh_fail=False, unreplied_findings=0,
         if codoki_ack_fail:
             env["CODOKI_ACK_FAIL"] = "1"
 
-        p = subprocess.run([ORACLE] + args, env=env, capture_output=True, text=True, timeout=30)
+        p = subprocess.run([ORACLE] + args, env=env, capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         try:
             argv_log = open(argfile).read()
         except OSError:

@@ -219,7 +219,7 @@ def run(args, *, env_overrides=None, tmux=True):
     if env_overrides:
         env.update(env_overrides)
     p = subprocess.run([sys.executable, SCRIPT, *args], env=env,
-                       capture_output=True, text=True, timeout=30)
+                       capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
     return p.returncode, p.stdout + p.stderr
 
 
@@ -2052,7 +2052,7 @@ def _run_checks():
         # The deployed setup script is callable: `init` subcommand exits 0 against it.
         p = subprocess.run([sys.executable, sdest, "init"],
                            env={**isolated_env(), "ORCHESTRATE_SETTINGS_FILES": i1},
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         check("#162: the deployed setup script is callable (init exits 0)", p.returncode == 0)
 
         # Idempotent: a second --apply adds no duplicate SessionStart entry (still exactly one).
@@ -2264,7 +2264,7 @@ def _run_checks():
         env5["ORCHESTRATE_BUNDLED_STEER"] = "/nonexistent/steer-bundled.sh"  # steer isolation (#95)
         env5["ORCHESTRATE_STEER"] = "/nonexistent/steer-deployed.sh"
         p5 = subprocess.run([sys.executable, SCRIPT, "configure", "--apply"], env=env5,
-                            input="n\n", capture_output=True, text=True, timeout=30)
+                            input="n\n", capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         check("#71: declining the narrow y/N leaves the file unchanged (no bak)",
               "aborted" in (p5.stdout + p5.stderr)
               and blanket in json.load(open(ncfg5))["permissions"]["allow"]
@@ -2445,7 +2445,7 @@ def _run_checks():
             def run_hook(file_path):
                 payload = json.dumps({"tool_input": {"file_path": file_path, "content": "x"}})
                 p = subprocess.run(["/bin/sh", hook_path], input=payload,
-                                    capture_output=True, text=True, timeout=15)
+                                    capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
                 return p.returncode, p.stdout + p.stderr
 
             rc, out = run_hook("/tmp/probe.pem")
@@ -2466,7 +2466,7 @@ def _run_checks():
                     os.symlink(src, os.path.join(nojq, tool))
             p = subprocess.run(["/bin/sh", hook_path],
                                input=json.dumps({"tool_input": {"file_path": "/tmp/probe.txt"}}),
-                               capture_output=True, text=True, timeout=15,
+                               capture_output=True, text=True, timeout=120,  # load-tolerant: CI runs harnesses 4-wide
                                env={"PATH": nojq})
             check("#484 CR: corrected template with jq MISSING -> fails closed (exit 2)",
                   p.returncode == 2 and "jq missing" in p.stderr)
@@ -2478,7 +2478,7 @@ def _run_checks():
             payload = json.dumps({"tool_input": {"file_path": "/tmp/probe.txt",
                                                    "content": "AWS_SECRET_ACCESS_KEY=xyz"}})
             p = subprocess.run(["/bin/sh", hook_path], input=payload,
-                                capture_output=True, text=True, timeout=15)
+                                capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
             check("#327 H3: a secret-shaped CONTENT in a harmless-named file is NOT caught "
                   "(the hook is path-suffix-only, matching the corrected comment)",
                   p.returncode == 0)
@@ -2792,7 +2792,7 @@ def _run_checks():
         fns = ""
         for _fn in ("_sanitize_key", "_session_keys"):
             fns += subprocess.run(["sed", "-n", f"/^{_fn}()/,/^}}/p", _real_guard],
-                                  capture_output=True, text=True, timeout=15).stdout + "\n"
+                                  capture_output=True, text=True, timeout=120).stdout + "\n"  # load-tolerant: CI runs harnesses 4-wide
         env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "CLAUDE_CODE_SESSION_ID")}
         env.update(env_extra)
         # Take the first line in PYTHON, not via `| head -1`: a pipeline returns the LAST
@@ -2800,7 +2800,7 @@ def _run_checks():
         # fail-closed assertion below would silently pass. (`set -o pipefail` is not the fix
         # either - head closing the pipe can SIGPIPE the producer on a multi-key session.)
         p = subprocess.run(["bash", "-c", f'set -u\n{fns}\n_session_keys'],
-                           env=env, capture_output=True, text=True, timeout=15)
+                           env=env, capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         lines = [ln for ln in p.stdout.splitlines() if ln.strip()]
         return (p.returncode, lines[0].strip() if lines else "")
 
@@ -2878,7 +2878,7 @@ def _run_checks():
                 env["ORCHESTRATE_FLOOR_DIR"] = _floor_e2e
                 env.update(env_extra)
                 return subprocess.run(["bash", _real_guard], input=payload, env=env,
-                                      capture_output=True, text=True, timeout=15).returncode
+                                      capture_output=True, text=True, timeout=120).returncode  # load-tolerant: CI runs harnesses 4-wide
 
             check("#312 E2E: non-tmux session WITH a ccsid-keyed marker -> guard HARD-DENIES the merge",
                   _run_guard(_merge_payload, {"CLAUDE_CODE_SESSION_ID": _ccsid}) == 2)
@@ -3045,7 +3045,7 @@ def check_default_deploy_path_follows_home():
                     "ORCHESTRATE_AGENTS_DIR": "/nonexistent/agents-deployed",
                     "ORCHESTRATE_PROJECT_AGENTS_DIR": "/nonexistent/project-agents"})
         p = subprocess.run([sys.executable, SCRIPT, "configure", "--apply", "--yes"], env=env,
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         fresh_scripts = os.path.join(fresh_home, ".claude", "scripts")
         check("HOME isolation: configure's DEFAULT deploy targets follow $HOME (guard + pr-watch.sh "
               f"land in a fresh temp home; rc={p.returncode})",

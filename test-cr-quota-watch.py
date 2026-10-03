@@ -219,7 +219,7 @@ def run(args, *, comments="[]", api_fail=False, repo_fail=False, pulls=None, per
         if fail_pr is not None:
             env["GH_FAIL_PR"] = str(fail_pr)
 
-        p = subprocess.run([SCRIPT] + args, env=env, capture_output=True, text=True, timeout=30)
+        p = subprocess.run([SCRIPT] + args, env=env, capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
         GH_LOG[:] = open(log).read().splitlines() if os.path.exists(log) else []
         return p.returncode, p.stdout, p.stderr
 
