@@ -302,10 +302,11 @@ Runtime (`scripts/`; canonical source is this repo):
   `skills/orchestrate/design/ARCHIVE-codoki-mechanisms.md`.
 - `pr-unreplied-comments.sh --cr-unconfirmed <pr> [repo]` (and its advisory use in `ship-gate-preflight.sh`):
   the mechanical form of "post `@coderabbitai resolve` only once CR is satisfied". A CR ROOT is satisfied
-  iff EITHER (a) its body contains `Confirmed as addressed` (CR EDITS its own root after verifying a FIX),
-  OR (b) CR's LATEST reply in that thread (in_reply_to_id == root, coderabbitai[bot], greatest created_at)
-  contains `Review thread resolved` AND NOT `remains open` (CR's explicit acceptance of a REBUTTAL);
-  case-sensitive ASCII. GraphQL `resolvedBy` confers NOTHING, and WHY: CR-resolved was DROPPED as a
+  iff EITHER (a) its body has a whole line `✅ Confirmed as addressed by @<login>` (CR EDITS its own root
+  after verifying a FIX), OR (b) CR's LATEST reply in that thread (in_reply_to_id == root, coderabbitai[bot],
+  greatest created_at, then id) has a whole line `✅ Review thread resolved.` AND does not say `remains open`
+  (CR's explicit acceptance of a REBUTTAL). Both lines must start at column 0 and sit OUTSIDE any fenced
+  code block, case-sensitive: CR quotes code verbatim, so a substring match counted a quoted phrase. GraphQL `resolvedBy` confers NOTHING, and WHY: CR-resolved was DROPPED as a
   satisfaction signal because `@coderabbitai resolve` makes CR resolve EVERY thread, including ones it just
   said are still open (live: PR #521, last CR reply "This finding remains open."), which made the mode report
   all-satisfied on exactly the case it exists for. `resolvedBy` now only feeds tags. The mode lists every

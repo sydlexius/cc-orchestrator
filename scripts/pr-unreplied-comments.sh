@@ -68,7 +68,8 @@
 #                          author coderabbitai[bot], greatest created_at, then id) has a line
 #                          "✅ Review thread resolved." AND does NOT contain "remains open" (CR's
 #                          explicit acceptance of a REBUTTAL). Both are WHOLE-LINE, case-sensitive
-#                          matches, so text that merely QUOTES a phrase never counts. GraphQL resolvedBy
+#                          matches at column 0 outside fenced code, with a non-empty login, so text
+#                          that merely QUOTES a phrase never counts. GraphQL resolvedBy
 #                          does NOT confer satisfaction: it was DROPPED as a signal because
 #                          `@coderabbitai resolve` makes CR resolve EVERY thread, including ones it
 #                          just said are still open (live: cc-orchestrator PR #521, whose last CR
@@ -358,6 +359,11 @@ fi
 # Anchored + terminated: the marker must be the leading, complete HTML comment of the body.
 INFO_MARKERS_RE="^[[:space:]]*<!--[[:space:]]*(${_validated})[[:space:]]*-->"
 
+if [ "$cr_unconfirmed" = true ] && [ -z "${1:-}" ]; then
+  # Its own contract reserves exit 1 for "unsatisfied"; the ${1:?} below would exit 1 here.
+  echo "Usage: pr-unreplied-comments.sh --cr-unconfirmed <pr_number> [repo]" >&2
+  exit 2
+fi
 pr_number="${1:?Usage: pr-unreplied-comments.sh [--wait] [--count-only] [--pending-only] [--latest-per-reviewer] [--itemized] <pr_number> [repo]}"
 if [ "$cr_unconfirmed" = true ]; then
   # Its own 0/1/2 contract: a failed repo lookup must be 2 (undetermined), never gh's raw 1
@@ -744,17 +750,22 @@ if [ "$cr_unconfirmed" = true ]; then
       # reply in the thread says "Review thread resolved" and NOT "remains open" (an accepted
       # rebuttal). GraphQL resolvedBy confers NOTHING: `@coderabbitai resolve` makes CR resolve
       # EVERY thread, including ones it just said are still open (PR #521). Both signals are matched as
-      # a WHOLE LINE (CR writes each on its own line, emoji first): a substring match let a code block
+      # a WHOLE LINE at column 0 (CR writes each on its own line, emoji first, never indented),
+      # outside any fenced code block: a substring match let a code block
       # that merely QUOTES a phrase (the "Script executed" / "Analysis chain" blocks of CR quote code
       # verbatim, and the docs of this tool contain both phrases) read as satisfied. "Latest" orders
       # by created_at then id; a missing created_at sorts NEWEST, so a reply of unknown age is the
       # one that counts (fail toward unsatisfied).
-      | def lastcr($r): [$c[] | select((.in_reply_to_id == $r.id) and iscr(.user.login // ""))]
+      | def unfenced: gsub("(?s)```.*?(```|$)"; "");
+      def marker: unfenced | test("(?m)^✅ Confirmed as addressed by @[^\\s]+\\s*$");
+      def acceptance: unfenced | test("(?m)^✅ Review thread resolved\\.?\\s*$");
+      def lastcr($r): [$c[] | select((.in_reply_to_id == $r.id) and iscr(.user.login // ""))]
             | sort_by([(.created_at // "9999"), .id]) | last // null;
       def accepted($r): (lastcr($r)) as $l
-            | ($l != null) and (($l.body // "") | (test("(?m)^\\s*✅ Review thread resolved\\.?\\s*$") and (contains("remains open") | not)));
-      ($roots | map(select((.body | test("(?m)^\\s*✅ Confirmed as addressed by @") | not) and (accepted(.) | not)))) as $unc
-      | if ($unc | any(($tix[(.id | tostring)]) == null)) then {error: "unsatisfied CR root without a matching review thread"}
+            | ($l != null) and (($l.body // "") | (acceptance and (contains("remains open") | not)));
+      ($roots | map(select((.body | marker | not) and (accepted(.) | not)))) as $unc
+      | if (($roots | length) > 0 and ($t | length) == 0) then {error: "CR root comments exist but the review-thread read returned none"}
+        elif ($unc | any(($tix[(.id | tostring)]) == null)) then {error: "unsatisfied CR root without a matching review thread"}
         else {roots: ($roots | length),
           lines: ($unc | map(
             . as $r

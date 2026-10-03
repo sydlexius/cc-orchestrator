@@ -913,9 +913,9 @@ out before the push, and this resolve runs after the push once guard-slice passe
 ### CodeRabbit threads -- `@coderabbitai resolve`
 
 Post `@coderabbitai resolve` ONLY once CodeRabbit itself is satisfied with every thread. A CR
-root is satisfied when (a) CR EDITED it to append `Confirmed as addressed by @<login>` (a verified
-FIX), or (b) CR's LATEST reply in the thread says `Review thread resolved` without `remains open`
-(an accepted REBUTTAL). A thread merely RESOLVED by CR is NOT satisfied: `@coderabbitai resolve`
+root is satisfied when (a) CR EDITED it to append the line `✅ Confirmed as addressed by @<login>` (a
+verified FIX), or (b) CR's LATEST reply in the thread has the line `✅ Review thread resolved.` and
+does not say `remains open` (an accepted REBUTTAL). Each must be a whole line outside a code block. A thread merely RESOLVED by CR is NOT satisfied: `@coderabbitai resolve`
 makes CR resolve every thread, including ones it just said are still open (#521). Check it
 mechanically first (literal helper path from Step 0; the `pr_number` shell variable is set per
 Step 0):

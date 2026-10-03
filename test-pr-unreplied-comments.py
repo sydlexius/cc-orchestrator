@@ -1980,6 +1980,35 @@ def main():
     GREP = "```\nrg -n 'Review thread resolved' scripts/\n```\n\nThe gap still exists."
     rc, out, err = cu([crc(1, "A", False), crr(21, 1, GREP, "2026-10-02T04:15:14Z")], [thr(1, False)])
     check("cr-unconfirmed: CR reply grepping 'Review thread resolved' -> exit 1", rc == 1)
+    # PR #533 review: an EXACT marker/acceptance line inside a fenced code block never counts.
+    fenced = crc(1, "A", False); fenced["body"] += "\n\n```text\n✅ Confirmed as addressed by @maint\n```"
+    rc, out, err = cu([fenced], [thr(1, False)])
+    check("cr-unconfirmed: exact marker line inside a fenced block -> exit 1", rc == 1)
+    FACC = "Example output:\n\n```\n✅ Review thread resolved.\n```\n\nStill an issue."
+    rc, out, err = cu([crc(1, "A", False), crr(21, 1, FACC, "2026-10-02T04:15:14Z")], [thr(1, False)])
+    check("cr-unconfirmed: exact acceptance line inside a fenced block -> exit 1", rc == 1)
+    # An unterminated fence swallows the rest of the body (fail toward unsatisfied).
+    open_fence = crc(1, "A", False); open_fence["body"] += "\n\n```\n✅ Confirmed as addressed by @maint"
+    rc, out, err = cu([open_fence], [thr(1, False)])
+    check("cr-unconfirmed: marker after an unterminated fence -> exit 1", rc == 1)
+    # Anchored at BOTH ends, column 0, non-empty login.
+    for label, line in (("trailing annotation", "✅ Confirmed as addressed by @maint (example)"),
+                        ("empty login", "✅ Confirmed as addressed by @"),
+                        ("indented (Markdown code)", "    ✅ Confirmed as addressed by @maint")):
+        b = crc(1, "A", False); b["body"] += "\n\n" + line
+        rc, out, err = cu([b], [thr(1, False)])
+        check("cr-unconfirmed: marker with %s -> exit 1" % label, rc == 1)
+    # The real marker still satisfies, trailing whitespace tolerated.
+    real = crc(1, "A", False); real["body"] += "\n\n✅ Confirmed as addressed by @sydlexius  "
+    rc, out, err = cu([real], [thr(1, False)])
+    check("cr-unconfirmed: real marker line (trailing spaces) -> exit 0", rc == 0)
+    # PR #533 review: CR roots but an EMPTY thread list means the thread read failed -> exit 2.
+    rc, out, err = cu([crc(1, "A", True)], [])
+    check("cr-unconfirmed: CR roots present but zero review threads -> exit 2 (never 0)", rc == 2)
+    # PR #533 review: a missing <pr_number> is a usage error -> exit 2, never 1.
+    # run() always appends a PR number, so invoke the script bare (the check fires before any gh call).
+    p = subprocess.run(["bash", SCRIPT, "--cr-unconfirmed"], capture_output=True, text=True, timeout=120)
+    check("cr-unconfirmed: missing pr_number -> exit 2", p.returncode == 2)
     # Ordering (round-2 F2): a same-second tie breaks on id; a missing created_at sorts NEWEST.
     rc, out, err = cu([crc(1, "A", False), crr(22, 1, OPEN, "2026-10-02T04:00:00Z"),
                        crr(21, 1, ACCEPT, "2026-10-02T04:00:00Z")], [thr(1, False)])
