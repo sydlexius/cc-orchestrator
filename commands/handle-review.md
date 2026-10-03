@@ -912,37 +912,43 @@ out before the push, and this resolve runs after the push once guard-slice passe
 
 ### CodeRabbit threads -- `@coderabbitai resolve`
 
-Post `@coderabbitai resolve` ONLY once CodeRabbit itself is satisfied with every fix. CR signals
-that by EDITING its own root inline comment to append `Confirmed as addressed by @<login>` (an
-edit, not a reply), so check it mechanically first (literal helper path from Step 0; the
-`pr_number` shell variable is set per Step 0):
+Post `@coderabbitai resolve` ONLY once CodeRabbit itself is satisfied with every thread. A CR
+root is satisfied when (a) CR EDITED it to append `Confirmed as addressed by @<login>` (a verified
+FIX), or (b) CR's LATEST reply in the thread says `Review thread resolved` without `remains open`
+(an accepted REBUTTAL). A thread merely RESOLVED by CR is NOT satisfied: `@coderabbitai resolve`
+makes CR resolve every thread, including ones it just said are still open (#521). Check it
+mechanically first (literal helper path from Step 0; the `pr_number` shell variable is set per
+Step 0):
 
 ```bash
 bash HELPER_DIR/pr-unreplied-comments.sh --cr-unconfirmed "$pr_number"
 ```
 
-- **exit 0** (every CR root confirmed, or CR has no root comments): post the resolve:
+- **exit 0** (every CR root satisfied, or CR has no root comments): post the resolve:
 
   ```bash
   bash HELPER_DIR/reply-comment.sh "$pr_number" '@coderabbitai resolve'
   ```
 
-- **exit 1** (the listed threads are not confirmed): do NOT post it yet. Read each listed
-  thread. CR has either not answered yet, or replied with a residual concern, which is a NEW
-  finding: disposition it FIX / DEFER / REBUT like any other, push, and re-run the check later.
-  A line ending `FORCE-RESOLVED?(by <login>)` is a thread someone other than CR resolved while
-  CR still has not confirmed it: raise it, never paper over it.
-- **exit 2** (could not determine: a gh/jq read failure or malformed data): stop and report.
-  Never post the resolve on an unreadable state.
-
-"Satisfied" is the marker (CR verified a FIX) OR a thread CR resolved itself (CR ACCEPTED a
-rebuttal, which carries no marker). A thread CR resolved is never listed.
+- **exit 1** (the listed threads are not yet satisfied): do NOT post it yet. CR adds its marker or
+  reply roughly 15-30s AFTER your reply, so exit 1 within about a minute of the replies is
+  EXPECTED. Re-run the check in the BACKGROUND (`run_in_background: true`), bounded: up to ~5
+  checks about 30s apart, stopping at the first exit 0. A backgrounded bounded re-check is
+  allowed; a FOREGROUND sleep loop is forbidden. If it is still exit 1 after the bound, read
+  each listed thread: a residual concern is a NEW finding, so disposition it FIX / DEFER / REBUT
+  like any other and push; do NOT post the resolve. A line ending `FORCE-RESOLVED?(by <login>)`
+  is a thread someone other than CR resolved, and one ending `RESOLVED-BY-CR-BUT-UNCONFIRMED`
+  is one CR resolved without accepting it: raise either, never paper over it.
+  Exit 1 with NO listed thread lines means a bad or stale helper (for example a deployed copy
+  without the flag): treat it as exit 2.
+- **exit 2** (could not determine: a gh/jq read failure, malformed data, or a usage error): stop
+  and report. Never post the resolve on an unreadable state.
 
 CR resolve also covers review body findings -- CodeRabbit tracks its
 own outside-diff items and will mark them resolved when the underlying code
 changes appear on the next push.
 
-Report whether CR resolve was requested, or which threads are still unconfirmed.
+Report whether CR resolve was requested, or which threads are still not satisfied.
 
 ### Copilot + Greptile + Codoki threads -- GraphQL resolve
 

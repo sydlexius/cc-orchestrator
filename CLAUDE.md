@@ -301,20 +301,24 @@ Runtime (`scripts/`; canonical source is this repo):
   The retired agent-judgment rules are archived in
   `skills/orchestrate/design/ARCHIVE-codoki-mechanisms.md`.
 - `pr-unreplied-comments.sh --cr-unconfirmed <pr> [repo]` (and its advisory use in `ship-gate-preflight.sh`):
-  the mechanical form of "post `@coderabbitai resolve` only once CR is satisfied". CR signals that in TWO
-  ways and both count: after verifying a FIX it EDITS its own ROOT inline comment to append `Confirmed as
-  addressed by @<login>` (an edit, not a reply); after ACCEPTING A REBUTTAL it resolves the thread ITSELF
-  and adds NO marker. The mode lists every CR root satisfied by neither (marker absent, case-sensitive
-  ASCII, AND not resolved by coderabbitai), one line `<id> | <path>:<line> | <title> | replied:<yes|no> |
-  resolved:<yes|no>` (replied = a non-bot reply; resolved = GraphQL isResolved). EXIT 0 all satisfied (or
-  zero CR roots), 1 some unsatisfied, 2 undetermined: any gh/jq failure, malformed body, or an unsatisfied
-  root with no matching thread. A resolved-but-unsatisfied thread (resolved by someone other than CR) is
-  tagged `FORCE-RESOLVED?(by <login>)`. THE RULE WAS CORRECTED BY A LIVE SWEEP of 36 real PRs across three
-  repos: the first version treated only the marker as satisfaction, plus a "CR self-resolved but no marker
-  anywhere = wording changed" canary; both misfired on accepted rebuttals (#509, #522, canticle#1233), so the
-  canary was removed. A stub harness alone could not have found this; run a read-only mode against real PRs
+  the mechanical form of "post `@coderabbitai resolve` only once CR is satisfied". A CR ROOT is satisfied
+  iff EITHER (a) its body contains `Confirmed as addressed` (CR EDITS its own root after verifying a FIX),
+  OR (b) CR's LATEST reply in that thread (in_reply_to_id == root, coderabbitai[bot], greatest created_at)
+  contains `Review thread resolved` AND NOT `remains open` (CR's explicit acceptance of a REBUTTAL);
+  case-sensitive ASCII. GraphQL `resolvedBy` confers NOTHING, and WHY: CR-resolved was DROPPED as a
+  satisfaction signal because `@coderabbitai resolve` makes CR resolve EVERY thread, including ones it just
+  said are still open (live: PR #521, last CR reply "This finding remains open."), which made the mode report
+  all-satisfied on exactly the case it exists for. `resolvedBy` now only feeds tags. The mode lists every
+  unsatisfied root, one line `<id> | <path>:<line> | <title> | replied:<yes|no> | resolved:<yes|no>`, plus
+  ` FORCE-RESOLVED?(by <login>)` (resolved by someone other than CR) or ` RESOLVED-BY-CR-BUT-UNCONFIRMED`
+  (resolved by CR, the #521 shape). EXIT 0 all satisfied (or zero CR roots), 1 some unsatisfied, 2
+  undetermined (any gh/jq failure, malformed body, an unsatisfied root with no matching thread) or a USAGE
+  error (never 1, which means "unsatisfied"). THE PREDICATE WAS CORRECTED TWICE BY LIVE DATA: a sweep of 36
+  real PRs killed the marker-only rule and its wording canary (accepted rebuttals #509, #522, canticle#1233
+  carry no marker), then #521 killed the resolvedBy-confers-satisfaction rule. A stub harness alone could not
+  have found either; run a read-only mode against real PRs
   before trusting its predicate. A read failure never exits 0 (the "could not read" == "nothing to read" class). In
-  `ship-gate-preflight.sh` FULL mode it only appends a WARN (exit 1, naming force-resolved threads) or NOTE
+  `ship-gate-preflight.sh` FULL mode it only appends a WARN (exit 1, naming force-resolved threads, "not yet satisfied") or NOTE
   (anything else) to the PASS line, like the #301 coverage advisory: verdict and exit code are fixed first.
   `/handle-review` Step 8 gates the resolve post on it.
 - `scripts/prose-lint.sh` - the outward-draft prose-lint adapter (#219). A THIN wrapper over

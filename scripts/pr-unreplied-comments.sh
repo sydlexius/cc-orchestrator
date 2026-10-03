@@ -61,27 +61,29 @@
 #                          list still exits 0. Mutually exclusive with --count-only /
 #                          --pending-only / --coverage-only / --audit (exits 1 on a bad combo).
 #
-#   --cr-unconfirmed       CODERABBIT SATISFACTION screen. CR signals it is satisfied with a thread
-#                          in ONE OF TWO WAYS, and both count: (a) after verifying a FIX it EDITS
-#                          its own ROOT inline comment to append "Confirmed as addressed by
-#                          @<login>" (an edit, not a reply); (b) after ACCEPTING A REBUTTAL it
-#                          resolves the thread ITSELF and adds NO marker (measured across 36 live
-#                          PRs: #509/#522/canticle#1233 withdrawals carry no marker). Lists every CR
-#                          ROOT inline comment satisfied by NEITHER (marker absent, case-sensitive
-#                          ASCII match, AND not resolved by coderabbitai), one line each:
+#   --cr-unconfirmed       CODERABBIT SATISFACTION screen. Lists every CR ROOT inline comment CR is
+#                          NOT yet satisfied with. A root is SATISFIED iff EITHER (a) its body
+#                          contains "Confirmed as addressed" (CR EDITS its own root after verifying
+#                          a FIX), OR (b) CR's LATEST reply in that thread (in_reply_to_id == root,
+#                          author coderabbitai[bot], greatest created_at) contains "Review thread
+#                          resolved" AND does NOT contain "remains open" (CR's explicit acceptance
+#                          of a REBUTTAL). Matching is case-sensitive ASCII. GraphQL resolvedBy
+#                          does NOT confer satisfaction: it was DROPPED as a signal because
+#                          `@coderabbitai resolve` makes CR resolve EVERY thread, including ones it
+#                          just said are still open (live: cc-orchestrator PR #521, whose last CR
+#                          reply ends "This finding remains open."). One line per unsatisfied root:
 #                          "<comment-id> | <path>:<line> | <title ~60 chars> | replied:<yes|no> |
-#                          resolved:<yes|no>" (replied = a NON-bot reply exists in the thread;
-#                          resolved = GraphQL isResolved). A thread that is resolved but
-#                          unconfirmed and NOT resolved by coderabbitai gets a trailing
-#                          " FORCE-RESOLVED?(by <login>)". Exit 0 = every CR root satisfied
-#                          (zero CR roots included, said on stdout), 1 = at least one
-#                          unsatisfied, 2 = undetermined (ANY gh/jq failure, malformed body, or an
-#                          unsatisfied root with no GraphQL thread). A read failure NEVER exits 0.
-#                          NO MARKER-WORDING CANARY: an earlier "CR self-resolved but no marker
-#                          anywhere" alarm was REMOVED, because (b) above makes exactly that a
-#                          normal accepted rebuttal, not a reworded marker (it misfired live on
-#                          canticle#1233). If CR rewords the marker, fixed threads it has not yet
-#                          resolved will list as unsatisfied: fail toward NOT posting the resolve.
+#                          resolved:<yes|no>" (replied = a NON-bot reply exists; resolved = GraphQL
+#                          isResolved). Trailing tags (resolvedBy is used ONLY for these): an
+#                          unsatisfied, resolved root NOT resolved by CR gets
+#                          " FORCE-RESOLVED?(by <login>)"; one resolved BY CR gets
+#                          " RESOLVED-BY-CR-BUT-UNCONFIRMED" (the #521 shape). Exit 0 = every CR
+#                          root satisfied (zero CR roots included, said on stdout), 1 = at least
+#                          one unsatisfied, 2 = undetermined (ANY gh/jq failure, malformed body, an
+#                          unsatisfied root with no GraphQL thread) OR a usage error (the
+#                          mutually-exclusive check; never 1, which means "unsatisfied"). A read
+#                          failure NEVER exits 0. If CR rewords either phrase, threads list as
+#                          unsatisfied: fail toward NOT posting the resolve.
 #                          Mutually exclusive with every other mode.
 #
 # Checks four comment types:
@@ -269,13 +271,13 @@ if [ "$#" -gt 2 ]; then
 fi
 
 # --cr-unconfirmed is its own report with its own 0/1/2 contract; combining it with any other
-# mode is a usage error (exit 1, before any gh call).
+# mode is a usage error (exit 2, never 1: 1 means "unsatisfied"; before any gh call).
 if [ "$cr_unconfirmed" = true ]; then
   if [ "$count_only" = true ] || [ "$pending_only" = true ] || [ "$coverage_only" = true ] || \
      [ "$audit_mode" = true ] || [ "$itemized" = true ] || [ "$check_resolved" = true ] || \
      [ "$wait_mode" = true ] || [ "$full_mode" = true ] || [ "$latest_per_reviewer" = true ]; then
     echo "Usage: --cr-unconfirmed is mutually exclusive with every other mode flag" >&2
-    exit 1
+    exit 2
   fi
 fi
 
@@ -709,8 +711,8 @@ fetch_review_thread_nodes() {
   return 0
 }
 
-# --- CR-unconfirmed mode: which CodeRabbit roots lack the confirmation marker -----
-# READ-ONLY. Exit 0 all confirmed / 1 some unconfirmed / 2 undetermined. THE DEFECT CLASS
+# --- CR-unconfirmed mode: which CodeRabbit roots are not yet satisfied -----
+# READ-ONLY. Exit 0 all satisfied / 1 some unsatisfied / 2 undetermined. THE DEFECT CLASS
 # TO AVOID: "I could not read this" becoming "there is nothing to read" -> exit 0 -> the
 # caller posts `@coderabbitai resolve` on unverified fixes. So every read is captured and
 # its status checked, the shape of each input is asserted, and an unconfirmed root whose
@@ -737,11 +739,15 @@ if [ "$cr_unconfirmed" = true ]; then
       | gsub("\\|"; "/") | gsub("[\\r\\n\\t]+"; " ") | .[0:60];
     ($c | map(select((.in_reply_to_id == null) and iscr(.user.login // "")))) as $roots
     | ($t | map({key: ((.comments.nodes // [])[0].fullDatabaseId // "" | tostring), value: .}) | from_entries) as $tix
-      # Satisfied = the marker (CR verified a fix) OR CR resolved the thread itself (CR accepted
-      # a rebuttal, which carries no marker). Unsatisfied = neither.
-      | def crresolved($r): ($tix[($r.id | tostring)] // {}) as $th
-            | ($th.isResolved == true) and iscr($th.resolvedBy.login // "");
-      ($roots | map(select((.body | contains("Confirmed as addressed") | not) and (crresolved(.) | not)))) as $unc
+      # Satisfied = (a) the root body carries the marker (a verified fix), OR (b) the LATEST CR
+      # reply in the thread says "Review thread resolved" and NOT "remains open" (an accepted
+      # rebuttal). GraphQL resolvedBy confers NOTHING: `@coderabbitai resolve` makes CR resolve
+      # EVERY thread, including ones it just said are still open (PR #521).
+      | def lastcr($r): [$c[] | select((.in_reply_to_id == $r.id) and iscr(.user.login // ""))]
+            | sort_by(.created_at // "") | last // null;
+      def accepted($r): (lastcr($r)) as $l
+            | ($l != null) and (($l.body // "") | (contains("Review thread resolved") and (contains("remains open") | not)));
+      ($roots | map(select((.body | contains("Confirmed as addressed") | not) and (accepted(.) | not)))) as $unc
       | if ($unc | any(($tix[(.id | tostring)]) == null)) then {error: "unsatisfied CR root without a matching review thread"}
         else {roots: ($roots | length),
           lines: ($unc | map(
@@ -750,7 +756,8 @@ if [ "$cr_unconfirmed" = true ]; then
             | ($c | any(.[]; (.in_reply_to_id == $r.id) and (((.user // {}) | isbot(.)) | not))) as $rep
             | ($th.resolvedBy.login // "unknown") as $by
             | "\($r.id) | \($r.path // "?"):\($r.line // $r.original_line // "?") | \(title($r.body)) | replied:\(if $rep then "yes" else "no" end) | resolved:\(if $th.isResolved == true then "yes" else "no" end)"
-              + (if ($th.isResolved == true) and ((iscr($by)) | not) then " FORCE-RESOLVED?(by \($by))" else "" end)))} end
+              + (if ($th.isResolved == true) and ((iscr($by)) | not) then " FORCE-RESOLVED?(by \($by))"
+                 elif ($th.isResolved == true) then " RESOLVED-BY-CR-BUT-UNCONFIRMED" else "" end)))} end
     ') || { echo "cr-unconfirmed: could not evaluate comment/thread data" >&2; exit 2; }
   cu_err=$(echo "$cu_result" | jq -r '.error // empty' 2>/dev/null) || { echo "cr-unconfirmed: unreadable evaluation result" >&2; exit 2; }
   if [ -n "$cu_err" ]; then echo "cr-unconfirmed: $cu_err" >&2; exit 2; fi
@@ -763,7 +770,7 @@ if [ "$cr_unconfirmed" = true ]; then
   fi
   if [ -n "$cu_lines" ]; then printf '%s\n' "$cu_lines"; fi
   if [ -z "$cu_lines" ]; then
-    echo "PR #$pr_number: all $cu_roots CodeRabbit root comment(s) satisfied (confirmed fix or CR-resolved)."
+    echo "PR #$pr_number: all $cu_roots CodeRabbit root comment(s) satisfied (confirmed fix or CR-accepted rebuttal)."
     exit 0
   fi
   exit 1

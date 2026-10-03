@@ -1850,7 +1850,7 @@ def main():
           rc_p == 0 and out_p.strip() == "0")
 
 
-    print("== --cr-unconfirmed: CodeRabbit confirmation marker mode ==")
+    print("== --cr-unconfirmed: CodeRabbit satisfaction mode ==")
     CONF = "Confirmed as addressed"
 
     def crc(cid, title, confirmed, path="a.sh", line=10, login="coderabbitai[bot]", reply_to=None, utype=None):
@@ -1912,23 +1912,61 @@ def main():
     rc, out, err = cu([crc(1, "A", False)], [])
     check("cr-unconfirmed: unconfirmed root with no matching thread -> exit 2", rc == 2)
 
-    # Live GraphQL reports resolvedBy.login WITH the [bot] suffix (verified on PR #530); the bare
-    # spelling is kept on thread 2 so the matcher's acceptance of both stays covered.
-    # An ACCEPTED REBUTTAL: CR resolves the thread itself and adds NO marker (live: #509, #522,
-    # canticle#1233). That is SATISFIED, not unconfirmed, and never a "marker reworded" alarm.
-    rc, out, err = cu([crc(1, "A", False), crc(2, "B", False)], [thr(1, True, "coderabbitai[bot]"), thr(2, True, "coderabbitai")])
-    check("cr-unconfirmed: CR-resolved roots with no marker anywhere are satisfied -> exit 0", rc == 0)
-    check("cr-unconfirmed: an accepted rebuttal raises no marker-wording alarm",
-          "WARN" not in err and "marker wording" not in err and " | replied:" not in out)
-    rc, out, err = cu([crc(1, "A", False)], [thr(1, True, "coderabbitai[bot]")])
-    check("cr-unconfirmed: canticle#1233 shape (one CR-resolved rebuttal, no marker) -> exit 0",
+    def crr(cid, root, text, at, login="coderabbitai[bot]"):
+        return {"id": cid, "user": {"login": login}, "in_reply_to_id": root, "path": "a.sh",
+                "line": 10, "original_line": 10, "body": text, "created_at": at}
+
+    ACCEPT = "Understood, thanks for the context.\n\n✅ Review thread resolved"
+    OPEN = "Thanks, but this does not address it. This finding remains open."
+
+    # resolvedBy confers NOTHING (live: `@coderabbitai resolve` makes CR resolve EVERY thread, PR #521).
+    # #521 shape: CR-resolved, no marker, CR's last reply says "remains open" -> UNSATISFIED, exit 1.
+    rc, out, err = cu([crc(1, "A", False), crr(21, 1, OPEN, "2026-10-02T04:15:14Z")],
+                      [thr(1, True, "coderabbitai[bot]")])
+    check("cr-unconfirmed: #521 shape (CR-resolved, last reply 'remains open') -> exit 1", rc == 1)
+    check("cr-unconfirmed: #521 shape is listed with the RESOLVED-BY-CR-BUT-UNCONFIRMED tag",
+          out.startswith("1 | ") and out.rstrip().endswith("resolved:yes RESOLVED-BY-CR-BUT-UNCONFIRMED")
+          and "FORCE-RESOLVED" not in out)
+    # CR-resolved with NO reply and NO marker: resolvedBy alone never satisfies.
+    rc, out, err = cu([crc(1, "A", False)], [thr(1, True, "coderabbitai[bot]"), ])
+    check("cr-unconfirmed: CR-resolved with no reply and no marker -> exit 1", rc == 1)
+    rc, out, err = cu([crc(1, "A", False)], [thr(1, True, "coderabbitai")])
+    check("cr-unconfirmed: bare coderabbitai resolver, no reply, no marker -> exit 1", rc == 1)
+    # FINDING 3: reopened/unresolved thread whose resolvedBy is still CR is never satisfied.
+    rc, out, err = cu([crc(1, "A", False)], [thr(1, False, "coderabbitai[bot]")])
+    check("cr-unconfirmed: isResolved:false + resolvedBy CR -> exit 1",
+          rc == 1 and "resolved:no" in out and "RESOLVED-BY-CR" not in out and "FORCE-RESOLVED" not in out)
+    # Accepted rebuttal: CR's latest reply carries "Review thread resolved" (live: #509, #522, canticle#1233).
+    rc, out, err = cu([crc(1, "A", False), crr(21, 1, ACCEPT, "2026-10-02T04:15:14Z")],
+                      [thr(1, True, "coderabbitai[bot]")])
+    check("cr-unconfirmed: rebuttal accepted ('Review thread resolved' last) -> exit 0",
           rc == 0 and "all 1 CodeRabbit root comment(s) satisfied" in out)
-    rc, out, err = cu([crc(1, "A", False), crc(2, "B", True)], [thr(1, True, "coderabbitai[bot]"), thr(2, True, "coderabbitai[bot]")])
-    check("cr-unconfirmed: a CR-resolved unmarked root beside a marked one -> both satisfied, exit 0",
-          rc == 0 and " | replied:" not in out)
-    rc, out, err = cu([crc(1, "A", False), crc(2, "B", False)], [thr(1, True, "coderabbitai[bot]"), thr(2, False)])
-    check("cr-unconfirmed: CR-resolved + an open unmarked root -> only the open one listed, exit 1",
+    # Satisfaction comes from the reply, not the resolution state.
+    rc, out, err = cu([crc(1, "A", False), crr(21, 1, ACCEPT, "2026-10-02T04:15:14Z")], [thr(1, False)])
+    check("cr-unconfirmed: accepted rebuttal on an unresolved thread -> exit 0", rc == 0)
+    # Only the LATEST CR reply counts, by created_at, regardless of array order.
+    rc, out, err = cu([crc(1, "A", False), crr(22, 1, OPEN, "2026-10-02T05:00:00Z"),
+                       crr(21, 1, ACCEPT, "2026-10-02T04:00:00Z")], [thr(1, True, "coderabbitai[bot]")])
+    check("cr-unconfirmed: older accept then newer 'remains open' -> exit 1", rc == 1)
+    rc, out, err = cu([crc(1, "A", False), crr(22, 1, OPEN, "2026-10-02T04:00:00Z"),
+                       crr(21, 1, ACCEPT, "2026-10-02T05:00:00Z")], [thr(1, True, "coderabbitai[bot]")])
+    check("cr-unconfirmed: older 'remains open' then newer accept -> exit 0", rc == 0)
+    # A reply by someone else never satisfies, even carrying the phrase.
+    rc, out, err = cu([crc(1, "A", False), crr(21, 1, ACCEPT, "2026-10-02T04:15:14Z", login="sydlexius")],
+                      [thr(1, True, "coderabbitai[bot]")])
+    check("cr-unconfirmed: non-CR reply quoting the phrase does not satisfy -> exit 1", rc == 1)
+    # Case-sensitive ASCII match.
+    rc, out, err = cu([crc(1, "A", False), crr(21, 1, "review thread resolved", "2026-10-02T04:15:14Z")], [thr(1, True, "coderabbitai[bot]")])
+    check("cr-unconfirmed: lowercase 'review thread resolved' does not satisfy -> exit 1", rc == 1)
+    # A reply on one root never satisfies a different root.
+    rc, out, err = cu([crc(1, "A", False), crc(2, "B", False), crr(21, 1, ACCEPT, "2026-10-02T04:15:14Z")],
+                      [thr(1, True, "coderabbitai[bot]"), thr(2, True, "coderabbitai[bot]")])
+    check("cr-unconfirmed: accept on root 1 leaves root 2 listed -> exit 1",
           rc == 1 and len(out.splitlines()) == 1 and out.splitlines()[0].startswith("2 |"))
+    # Marker still satisfies beside an accepted rebuttal.
+    rc, out, err = cu([crc(1, "A", False), crc(2, "B", True), crr(21, 1, ACCEPT, "2026-10-02T04:15:14Z")],
+                      [thr(1, True, "coderabbitai[bot]"), thr(2, True, "coderabbitai[bot]")])
+    check("cr-unconfirmed: marker root beside an accepted rebuttal -> exit 0", rc == 0 and " | replied:" not in out)
 
     rc, out, err = cu([crc(1, "A", False)], [thr(1, True, "sydlexius")])
     check("cr-unconfirmed: resolved by a human + unconfirmed -> FORCE-RESOLVED? tell",
@@ -1953,7 +1991,7 @@ def main():
     rc, out, err = cu([nl], [thr(1, False)])
     check("cr-unconfirmed: null line falls back to original_line", "a.sh:99" in out)
     rc, out, err = run(["--cr-unconfirmed", "--audit"])
-    check("cr-unconfirmed + --audit -> exit 1 (usage)", rc == 1)
+    check("cr-unconfirmed + --audit -> exit 2 (usage; never 1 = unsatisfied)", rc == 2)
 
     print()
     if FAILS:

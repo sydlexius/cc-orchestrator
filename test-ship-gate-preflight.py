@@ -1052,7 +1052,7 @@ def main():
     check("crconf: all confirmed -> plain PASS, no CR WARN/NOTE",
           rc0 == 0 and "RESULT: PASS" in out0 and "CodeRabbit" not in out0 and "CR confirmation" not in out0)
     check("crconf: unconfirmed -> WARN with the count on the PASS line",
-          "WARN: 2 CodeRabbit thread(s) not confirmed as addressed" in out1 and "RESULT: PASS" in out1)
+          "WARN: 2 CodeRabbit thread(s) not yet satisfied" in out1 and "RESULT: PASS" in out1)
     check("crconf: undetermined (helper exit 2) -> NOTE on the PASS line",
           "NOTE: CR confirmation state unreadable" in out2 and "RESULT: PASS" in out2)
     check("crconf: helper crash (exit 7) -> NOTE, still PASS",
