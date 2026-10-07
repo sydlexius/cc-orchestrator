@@ -235,6 +235,7 @@ def schedule(entries, free, budget, busy):
             if cls(e) == 0:                                  # priority past waiting gates
                 passed += [w for w in order
                            if cls(w) > 0 and w.worktree not in claimed
+                           and w.worktree != e.worktree     # e is about to claim it: w waits on the worktree
                            and min(w.cost, budget) > free - c]
             start.append((e, passed)); free -= c; claimed.add(e.worktree)
         else:
@@ -255,9 +256,14 @@ in the same critical section from the holder records whose flock is HELD (runnin
 are taken ONCE, together, all or nothing, and nothing is ever acquired while holding either, so there is no hold-and-wait and no
 deadlock. Releases happen at any time and only ever raise `free` or shrink `busy`.
 
-Each evaluator acts only for what it owns: a ticket's process starts only itself. An entry that is ahead and fits is still charged
-against `free` when someone else evaluates, which is the reservation: its owner starts it on its next poll (a ticket polls every 1 s
-with jitter). Two rules on what an evaluator may touch:
+Each evaluator acts only for what it owns: a ticket's process starts only itself. `commit` is therefore called ONLY for the
+evaluator's own entry, in the SAME `admit.lock` critical section as the `schedule()` call that returned it, and it takes real slot
+flocks there: that is why it cannot fail, and why no reservation is ever written to disk. Entries in `start` that belong to other
+processes are NOT started and nothing is held for them; they only reduce `free` inside this one calculation, so the evaluator cannot
+take budget the order gives to someone ahead. Every later pass recomputes from the live locks and tickets, so if the state changed
+before an owner polled (a class-0 arrival, a new holder in its worktree) that owner simply gets the new answer. The budget and the
+exclusion rest on held flocks alone, never on another pass's result (a ticket polls every 1 s with jitter). Two rules on what an
+evaluator may touch:
 
 - an evaluator schedules, rewrites and unlinks only records of ITS OWN pool protocol (section 4);
 - a ticket of the evaluator's own protocol whose flock is free belongs to a dead process and is unlinked (with its sidecar) by the
@@ -413,7 +419,11 @@ job_timeout_s = 5400           # one RUN is killed after this: with the pool ON,
 
 Unit B adds its own keys to this file (call timeouts, tool paths); unit A's reader ignores keys it does not define (ASSUMED; the
 alternative, refusing unknown keys, would make a unit B config break a unit A runner). `protocol` and `budget` are the only required
-keys; every other key, when absent, takes the value shown above. A runner that finds a budget configured but no `gate_pool.py`
+keys; every other key, when absent, takes the value shown above. VALIDATION, one rule for every key this unit defines: `protocol`,
+`budget`, `backfill_bypass_limit`, `small_check_cap`, `wait_timeout_s` and `job_timeout_s` must each be a POSITIVE INTEGER when
+present (`bool` refused, zero refused, a string or float refused), and so must a `[[pool.command]]` `timeout_s`. A bad value exits 2
+naming the key, exactly like a bad `budget`: `backfill_bypass_limit = 0` would protect every waiter at once and `job_timeout_s = 0`
+would kill every run. All of it is validated in A1's config reader, including the keys A2 and A3 first use. A runner that finds a budget configured but no `gate_pool.py`
 beside it exits 2 (`gate-runner: NOT RUN - pool configured but gate_pool.py is missing`): it must never fall back to running
 unpooled.
 
@@ -451,7 +461,11 @@ Two rules, and no larger table.
   until they exit. A ticket already WAITING never re-reads the config: it keeps waiting against the slot files and the other live
   tickets, starts when its cost fits, or exits 75 at `wait_timeout_s`. It never converts to an unpooled run. Unpooled newcomers hold
   no slot and no worktree claim, so it cannot see them. Removing the file is the supported way to turn the pool off in a hurry; it
-  never kills anything.
+  never kills anything. LIMIT, stated plainly: from the removal until the last pooled holder exits, a newcomer is neither budgeted
+  NOR excluded, so it can run in a worktree where a pooled gate or mutation check is still running. That is today's behavior
+  (nothing excludes anything with the pool off) and the receipt's clean-before, clean-after and unchanged-tree checks are the
+  backstop. Keeping claims alive through the drain was rejected: it needs newcomers to keep reading a pool the user just switched
+  off. To turn the pool off WITHOUT that window, wait until `waiters/` is empty, then remove the file.
 - CHANGED (`budget` raised or lowered, `K`, the cap, a timeout): the file is read at each process start. A process that is already
   running or waiting keeps the values it read, so the pool may be briefly over a lowered figure or under a raised one while older
   processes exit. That costs load or fairness, never correctness: slot flocks, not the config, are what bound the units actually
@@ -520,6 +534,13 @@ protocol, and may never change: `admit.lock`, the `seq` file, the slot files, th
   and ignores foreign tickets with a higher seq. Wait-for edges then only point at lower sequence numbers, so two protocols cannot
   deadlock on each other, and the budget is never exceeded because real slot flocks are still required. This is conservative on
   purpose (a mixed pool degrades toward one-at-a-time) and lasts until the older processes exit.
+- A COPY THAT PREDATES THE POOL knows no protocol, no `GATEQ_HOME` and no `config.toml`: it runs an ordinary gate UNPOOLED and
+  nothing in its output says so. No protocol number can catch code that never reads one. So ACTIVATION HAS A PRECONDITION: the
+  budget is written only after `orchestrate-setup.py doctor` reports every copy it can see as pool-capable. With a budget
+  configured, doctor WARNs naming each `gate-runner.py` on the deployed leg and in the plugin cache that lacks a `gate_pool.py`
+  beside it or does not import it (a text check; read-only). LIMIT, stated plainly: doctor cannot see a cc-orchestrator WORKTREE
+  whose branch predates A1 (the repo leg wins there). Such a gate is unbudgeted and unexcluded until the branch is refreshed, which
+  is the same exposure as a raw heavy command (section 7).
 - THE LIMIT, stated plainly: a number catches an honest version change, not an edit that keeps the number. A comment beside
   `POOL_PROTOCOL` says to bump it when ordering or layout semantics change; nothing enforces that. (A harness pin on a hash of the
   policy source was considered and CUT: it is test churn on every refactor, for an honest-actor limit.) A same-number edit can start
@@ -573,8 +594,22 @@ The cost of non-inheritable slot descriptors is that a SIGKILLed gate leaves its
 The fix, ADOPTED as its own PR under unit A: a DEATH-PIPE WATCHDOG. The gate process starts one tiny `python3 -c` child in its own
 session whose stdin is a pipe; it sends `+<pgid>` when a step group starts and `-<pgid>` when it empties; on EOF (the gate process
 is gone, SIGKILL included) the watchdog SIGKILLs the groups still listed. RUN (E3): after SIGKILL of the parent, a registered `sleep
-& sleep` group was gone within one second. It never touches a pgid the runner already pruned, which is what makes it safe against
-pid reuse. The watchdog is started with `Popen` and `close_fds=True` like every other child, so it holds no lock. It covers the
+& sleep` group was gone within one second.
+
+- LAUNCH IS HELD UNTIL REGISTERED. `Popen` creates the group before the runner can name it, so a runner killed in between would
+  leave an unregistered step running. Every watched step therefore starts HELD: its shell first reads one byte from a start pipe.
+  The runner writes `+<pgid>` to the watchdog and only then writes the start byte. A step whose start pipe reaches EOF (the runner
+  died first) exits without running anything. The `+<pgid>` is already in the watchdog's pipe when the byte is sent, so the
+  watchdog reads it before it can see EOF; no acknowledgement round trip is needed (REASONED, not run; a harness case in A4 kills
+  the runner between `Popen` and the start byte).
+- PRUNE ORDER. A pgid cannot be reused while its leader is an unreaped child or any member is alive. The runner sweeps the group,
+  then writes `-<pgid>`, as the FIRST thing after reaping the leader. The watchdog never signals a pruned pgid. RESIDUAL, stated
+  plainly: a runner SIGKILLed in the instants between that reap and that write leaves a listed pgid whose number is free; harm
+  needs the kernel to hand that exact number to a new group before the watchdog reads EOF (milliseconds). The earlier text called
+  this "safe against pid reuse"; it is narrow, not closed. Learning of the exit without reaping (`os.waitid` with `WNOWAIT`) would
+  close it but is not on macOS before Python 3.13 (PRIOR, from the Python docs; not run), so it is not required.
+
+The watchdog is started with `Popen` and `close_fds=True` like every other child, so it holds no lock. It covers the
 parallel step path, the pooled serial step path and `--pool-run`; the pool-off serial path has no group and stays untouched. The
 watchdog lives in `gate-runner.py`, not `gate_pool.py`: A4's harness runs pool-off, where the module is never imported.
 
@@ -657,6 +692,10 @@ Run as `python3 <leg>/gate-runner.py --pool-run <name>`:
   deployed or plugin-cache copy would therefore answer a request for a 2-unit mutation check with an unpooled full gate and exit
   0. So the charter rule and every caller treat "no `POOL-RUN:` line" as NOT RUN and report it; a pass is only ever `POOL-RUN:
      <name> ran exit=0`.
+- THE LINE DETECTS A STALE RUNNER ONLY AFTER ITS FULL GATE HAS RUN, so callers also check BEFORE: a leg is used for `--pool-run`
+  only if its `gate-runner.py` contains the flag (`grep -q -- '--pool-run' <the literal leg path>`, beside the usual `[ -f ]`
+  test). A leg that fails is skipped like a missing file, and with no capable leg the caller reports NOT RUN and starts nothing.
+  The doctor WARN of section 4 names the same stale copies.
 - An optional `timeout_s` per command kills the group and reports `ran exit=124`. Absent, with the pool ON the bound is
   `job_timeout_s`; with the pool OFF there is no run timeout (as for a hand-run gate today).
 - POOL OFF: `--pool-run <name>` still resolves the name and runs the command, with no ticket and no wait. So a charter can say
@@ -672,7 +711,7 @@ the queue):
 
 > A heavy check (a race or sanitizer run, a mutation run, a fuzz or accessibility suite, a container build: anything that runs the
 > toolchain for more than a few seconds or rewrites files in place) is run ONLY through a name declared in the repo's `.gates.toml`
-> (`gate-runner.py --pool-run <name>`), in the background. It ran only if the output ends with `POOL-RUN: <name> ran exit=<n>`; no
+> (`gate-runner.py --pool-run <name>`), in the background, from a runner copy that contains `--pool-run`. It ran only if the output ends with `POOL-RUN: <name> ran exit=<n>`; no
 > such line means it did NOT run, whatever the exit code. If the check you need has no declared name, report that to the lead
 > instead of running it raw; declaring one is a reviewed edit to trusted config.
 
@@ -703,6 +742,19 @@ these hold:
    pool protocol is the caller's;
 2. the holder's recorded WORKTREE KEY equals the caller's own key (the same string comparison the exclusion uses);
 3. the holder's recorded held COST is at or above the nested run's cost (`min(cost, budget)`).
+
+ONE NESTED RUN PER HOLDER AT A TIME. Condition 3 alone lets two children of a cost-4 holder each start a cost-4 nested run, 8 units
+under 4 slots. So a nested run that passes all three conditions then takes an exclusive `flock` on `<holder ticket>.nest` (a
+sidecar nobody else locks) for its whole run. A second nested run under the same holder WAITS on that lock, holding nothing, and
+exits 75 at `wait_timeout_s`. The run that holds it sets `GATEQ_NEST=<that path>` for its own children; a child whose `GATEQ_NEST`
+names the held `.nest` of its own holder is that run's descendant and proceeds without taking it (otherwise it would wait on its
+own ancestor). The kernel frees the lock when its holder dies.
+
+WHAT THIS BOUNDS, AND WHAT IT DOES NOT. Real load under one holder is at most its own steps plus ONE nested run no heavier than
+itself. A gate whose parallel steps keep running beside a nested named command therefore uses up to `cost + nested cost` while
+holding `cost`. That is not charged: charging it would mean acquiring while holding, the one hold-and-wait this design forbids. A
+repo that nests declares a `weight` that covers it, the same trust `weight` already rests on. The hook inside a holder's push is
+not this case: the holder is blocked in the push while the hook's gate runs, so the two never overlap.
 
 Otherwise:
 
@@ -802,6 +854,9 @@ control until then is the charter rule in section 5.
 | A hand-run gate HUNG in a step | Slots and worktree held | The runner kills it at `job_timeout_s` (exit 1, `KILLED`, a fail receipt); a named command at its `timeout_s` or `job_timeout_s` (`ran exit=124`) |
 | No slot or worktree within `wait_timeout_s` | Nothing ran | Exit 75, `NOT RUN`; a stale receipt at the `--receipt` path is unlinked (#497). Callers read 75 as not run (section 6) |
 | Old runner given `--pool-run <name>` | It ignores the flag and runs the FULL gate, unpooled | No `POOL-RUN:` line is printed, which every caller reads as NOT RUN (section 5); update the plugin and run `configure --apply` |
+| A gate-runner copy that PREDATES the pool runs an ordinary gate | It runs unpooled: unbudgeted and unexcluded, with no signal in its output | Doctor WARNs on a stale deployed or plugin copy when a budget is configured; configure the budget only after it is clean. A worktree on a pre-A1 branch is not visible to doctor (section 4) |
+| Two nested runs under one holder at once | The second waits on the holder's `.nest` lock, holding nothing | Starts when the first ends; exit 75 after `wait_timeout_s` (section 5) |
+| The runner is SIGKILLed between `Popen` and registration | The step is still held on its start pipe, reads EOF and exits without running | None needed (section 4) |
 | A gate-runner copy with another POOL PROTOCOL | Against the config: exit 2, directory untouched. Against older live records: it waits behind lower-seq foreign tickets and never schedules, rewrites or unlinks them | Clears when the older processes exit (section 4) |
 | A foreign-protocol ticket whose lock is FREE | A dead process's ticket, never touched by any evaluator. It holds no slot and no claim | `orchestrate-setup.py doctor` WARNs naming the file; the user deletes it (section 4). A foreign ticket whose lock is HELD is live and counts as held |
 | Budget file removed or its `budget` key removed | Holders finish; new processes run as with the pool off; a ticket already waiting starts when its cost fits or exits 75 | Restore the file to turn the pool back on (section 3) |
@@ -881,10 +936,10 @@ to split on if so.
 
 | PR | Scope | Tier | Test plan |
 |---|---|---|---|
-| A1 | `gate_pool.py` with `POOL_PROTOCOL`; the pure three-class `schedule()` and the per-worktree exclusion; slots; tickets plus `.sched` sidecars; gate-runner acquires as a hand-run gate; `weight`; `config.toml` (`protocol`, `budget`, `backfill_bypass_limit`, `small_check_cap`, `wait_timeout_s`, `job_timeout_s`); exit 75; the exact `GATEQ_HOLDER` exemption; the OFF proof; the `test-gate-runner.py` pin; doctor WARNs (root mode, malformed config, a foreign-protocol ticket with a free lock); `gates.toml.md`; retire the "takes no lock" note in `orchestrate-steer.sh` | CR-required | `test-gate-pool.py`: the OFF proof (golden output for Form A, serial and parallel Form B and the fallback chain; the runner copied alone with no pool module; nothing created under `GATEQ_HOME`); two cost-4 fit in 10 and a third waits; cost above budget runs alone; no `weight` and no `jobs` runs alone; SIGKILLed holder frees slots and worktree and a waiter proceeds; arrival order within a class; `schedule()` table-tested as a pure function over all three classes, replaying BOTH worked tables of section 2 and the "when the class matters" example; a protected gate holds later gates and class-0 checks but a protected first push does not hold a fix round; same-worktree entries never start together and an entry waiting on its worktree accrues no pass; timeout exits 75 and unlinks a stale receipt; malformed config exits 2; the nested exemption table of section 5, row by row; a bypass written by another process leaves the ticket's lock HELD; a foreign-protocol record is never unlinked, a foreign ticket with a free lock yields the doctor WARN, and a config mismatch exits 2; no `os.fork` in the module; a pass makes no `git` call under the lock; budget file removed mid-wait (the waiter still starts when its cost fits; a process started afterwards takes no ticket); `.gates.toml` edited during a wait (the definition run is the one read after the grant); a runner with a budget configured and no `gate_pool.py` beside it exits 2. Mutations: drop the `min(cost, budget)` clamp; drop either HOLD line; count a cost-0 start as a pass; stop counting a class-0 start as a pass; drop the `claimed` check; make slots inheritable; read a missing `budget` as unlimited; drop the worktree-key comparison from the nested check; drop the cost comparison from it; write the bypass into the ticket with `os.replace`; unlink a foreign-protocol ticket whose lock is free; honor `GATEQ_HOLDER` from a snapshot |
+| A1 | `gate_pool.py` with `POOL_PROTOCOL`; the pure three-class `schedule()` and the per-worktree exclusion; slots; tickets plus `.sched` sidecars; gate-runner acquires as a hand-run gate; `weight`; `config.toml` (`protocol`, `budget`, `backfill_bypass_limit`, `small_check_cap`, `wait_timeout_s`, `job_timeout_s`); exit 75; the exact `GATEQ_HOLDER` exemption; the OFF proof; the `test-gate-runner.py` pin; doctor WARNs (root mode, malformed config, a foreign-protocol ticket with a free lock); `gates.toml.md`; retire the "takes no lock" note in `orchestrate-steer.sh` | CR-required | `test-gate-pool.py`: the OFF proof (golden output for Form A, serial and parallel Form B and the fallback chain; the runner copied alone with no pool module; nothing created under `GATEQ_HOME`); two cost-4 fit in 10 and a third waits; cost above budget runs alone; no `weight` and no `jobs` runs alone; SIGKILLed holder frees slots and worktree and a waiter proceeds; arrival order within a class; `schedule()` table-tested as a pure function over all three classes, replaying BOTH worked tables of section 2 and the "when the class matters" example; a protected gate holds later gates and class-0 checks but a protected first push does not hold a fix round; same-worktree entries never start together and an entry waiting on its worktree accrues no pass; timeout exits 75 and unlinks a stale receipt; malformed config exits 2; the nested exemption table of section 5, row by row; a bypass written by another process leaves the ticket's lock HELD; a foreign-protocol record is never unlinked, a foreign ticket with a free lock yields the doctor WARN, and a config mismatch exits 2; no `os.fork` in the module; a pass makes no `git` call under the lock; budget file removed mid-wait (the waiter still starts when its cost fits; a process started afterwards takes no ticket); `.gates.toml` edited during a wait (the definition run is the one read after the grant); a runner with a budget configured and no `gate_pool.py` beside it exits 2; every config key refuses zero, a bool and a string with exit 2; a class-0 start records no pass against a gate waiting in its own worktree; two nested runs under one holder run one after the other and a `GATEQ_NEST` descendant does not wait on its ancestor; doctor WARNs on a pre-pool deployed or plugin copy when a budget is configured. Mutations: drop the `.nest` lock; drop the same-worktree filter from the class-0 pass list; drop the `min(cost, budget)` clamp; drop either HOLD line; count a cost-0 start as a pass; stop counting a class-0 start as a pass; drop the `claimed` check; make slots inheritable; read a missing `budget` as unlimited; drop the worktree-key comparison from the nested check; drop the cost comparison from it; write the bypass into the ticket with `os.replace`; unlink a foreign-protocol ticket whose lock is free; honor `GATEQ_HOLDER` from a snapshot |
 | A2 | The pooled serial step path (own process group, forwarded interrupts, `/dev/null` stdin); the hand-run `job_timeout_s`; the pool-on command and charter prose of section 6 (every file in that table) | CR-required (the prose rides along) | Extends `test-gate-pool.py`: a pooled serial step gets a forwarded interrupt (SIGINT, SIGTERM, SIGHUP, SIGQUIT) and the same exit status and final lines as pool-off, a hand-run gate is killed at `job_timeout_s` with `KILLED` and a fail receipt, SIGTSTP is not forwarded, and pool-off is byte-identical. `test-command-positional-args.py` and the helper-exec-path rules still pass for the four command files. Mutations: do not forward SIGQUIT; start the serial step in the runner's own group; skip the sweep on an exit path; give the step the terminal as stdin |
-| A3 | Named heavy commands: `[[pool.command]]`, `--pool-run <name>`, the `POOL-RUN:` line, pool-off pass-through; the declared-name rule (with "no `POOL-RUN:` line means not run") in the implementer, adversarial-review and adversarial-prep charters and SKILL.md line 236; `gates.toml.md` | CR-required (the prose rides along) | `test-gate-pool-run.py`: unknown, duplicated or malformed name exits 2; any extra argument exits 2 and reaches no shell; missing `weight` exits 2; class is 0 at the cap and 2 one above it, and no flag or variable changes that; `--receipt`/`--skip`/`--jobs` beside it exit 2; the command's exit code passes through and the `POOL-RUN:` line separates a command's own 75 from NOT RUN; pool off runs directly with no ticket; a check and a gate in one worktree exclude each other in both directions; `--pool-run` inside a gate step runs under `GATEQ_HOLDER` when its weight is at or below the gate's and exits 75 at once when above. Mutations: forward argv to the command; take the class from an environment variable; skip the worktree claim for named commands; treat a missing `weight` as 1; omit the `POOL-RUN:` line |
-| A4 | The orphan watchdog (death-pipe sweeper) in the parallel step path, the pooled serial step path and `--pool-run` (the pool-off serial path has no group and stays untouched) | CR-required | Extends `test-gate-runner.py`: SIGKILL the runner, assert a registered group is gone within a few seconds and a pruned pgid is never signalled; the watchdog child holds no lock descriptor. Mutations: never send `-pgid`, skip the EOF sweep |
+| A3 | Named heavy commands: `[[pool.command]]`, `--pool-run <name>`, the `POOL-RUN:` line, pool-off pass-through; the declared-name rule (with "no `POOL-RUN:` line means not run") in the implementer, adversarial-review and adversarial-prep charters and SKILL.md line 236; `gates.toml.md` | CR-required (the prose rides along) | `test-gate-pool-run.py`: unknown, duplicated or malformed name exits 2; any extra argument exits 2 and reaches no shell; missing `weight` exits 2; class is 0 at the cap and 2 one above it, and no flag or variable changes that; `--receipt`/`--skip`/`--jobs` beside it exit 2; the command's exit code passes through and the `POOL-RUN:` line separates a command's own 75 from NOT RUN; pool off runs directly with no ticket; a check and a gate in one worktree exclude each other in both directions; `--pool-run` inside a gate step runs under `GATEQ_HOLDER` when its weight is at or below the gate's and exits 75 at once when above; a leg whose runner lacks the flag is skipped by the caller's pre-check. Mutations: forward argv to the command; take the class from an environment variable; skip the worktree claim for named commands; treat a missing `weight` as 1; omit the `POOL-RUN:` line |
+| A4 | The orphan watchdog (death-pipe sweeper) in the parallel step path, the pooled serial step path and `--pool-run` (the pool-off serial path has no group and stays untouched) | CR-required | Extends `test-gate-runner.py`: SIGKILL the runner, assert a registered group is gone within a few seconds and a pruned pgid is never signalled; the watchdog child holds no lock descriptor; a runner killed between `Popen` and the start byte leaves no step running. Mutations: never send `-pgid`, skip the EOF sweep, send the start byte before `+pgid` |
 
 Dependencies: A2 and A3 each need A1 and are independent of each other. A4 needs A2 (it hooks the pooled serial path) and covers
 `--pool-run`, so it is ordered after A3 as well. A2's timeout does NOT rely on the watchdog: the runner enforces it in-process while
@@ -966,7 +1021,10 @@ labeled as in `DESIGN-gate-queue.md` so the two documents cite the same experime
 | F5 | A serial-style step `sh -c "sleep & sleep; wait"` started with `Popen(process_group=0)` (own group, same session); SIGINT forwarded to the group, then SIGTERM | After SIGINT the shell ended (`-2`) and its foreground child was gone; the BACKGROUND child survived SIGINT and was gone after the SIGTERM sweep |
 
 `exp/fix1/replay.py` transcribes the `schedule()` pseudocode of section 2 one to one and replays both worked tables and the "when
-the class matters" example; every row matched (`exp/fix1/replay.out`), and a round 2 reviewer's replay agreed.
+the class matters" example; every row matched (`exp/fix1/replay.out`), and a round 2 reviewer's replay agreed. One filter was added
+to the pseudocode AFTER that replay (PR #543 review: a class-0 start no longer counts a pass against an entry in its own worktree).
+It only removes same-worktree entries, and neither table nor the example has two entries in one worktree, so the replay still
+stands; it was not re-run.
 
 Reasoned, not run: the serial path's exact exit status on an interrupt, pool on against pool off (a harness case in A2, since no
 gate was run here); the behavior of a step stopped by SIGTTOU (section 4); an owner creating and flocking its ticket inside one
