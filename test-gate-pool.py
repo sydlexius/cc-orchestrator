@@ -6,8 +6,10 @@ skills/orchestrate/design/DESIGN-gate-pool.md ("the doc").
 TWO HALVES. The POLICY cases cover `cls()` and the three-class `schedule()` of the doc's
 section 2 as a pure function. The DISK cases cover the pool of sections 1 and 4: slots,
 tickets, `.sched` sidecars and the scheduling pass under admit.lock, and the nested-run
-exemption of section 5 (the three conditions, the `.nest` chain). The gate-runner wiring
-arrives with its own slice and extends this file.
+exemption of section 5 (the three conditions, the `.nest` chain). The RUNNER cases spawn the
+real scripts/gate-runner.py in `git init`ed temp repos, each with its own tiny `.gates.toml`:
+first the proof that a machine with no budget configured behaves exactly as before the pool
+existed (output equal to goldens recorded from the pre-pool runner).
 
 DISK CASES NEED NO THREAD AND NO SLEEP. flock belongs to the open file description, so a
 second open of a locked file in the SAME process conflicts (doc section 4, RUN E1c). A case
@@ -24,10 +26,14 @@ returned start (the way unit B's dispatcher will), so it also proves the bound o
 when one evaluator commits a whole batch.
 
 ISOLATION. No test may touch the real pool at ~/.claude/gate-queue. The module has no default
-home, so that is structural; two belts on top of it:
+home, so that is structural for the library cases; the belts on top of it:
   1. GATEQ_HOME is pinned to a fresh empty temp directory and GATEQ_HOLDER / GATEQ_NEST are
      removed, before anything else runs, and the directory must still be empty at the end;
-  2. a case asserts the module source names neither `.claude` nor `expanduser`.
+  2. a case asserts the module source names neither `.claude` nor `expanduser`;
+  3. every runner is spawned through `runner_env(home)`, whose pool root is a REQUIRED argument
+     and whose HOME is a temp directory, so even a dropped GATEQ_HOME resolves `~` to scratch;
+  4. the real pool directory (under the passwd-database home, whatever HOME says) is listed
+     at the start and at the end, and the two must be equal.
 
 MUTATION SELF-TEST (the test-ci-gates-lockstep.py pattern). An assertion that cannot fail is
 decorative, so the harness ends by copying scripts/gate_pool.py into a temp directory, breaking
@@ -41,8 +47,11 @@ import ast
 import atexit
 import contextlib
 import fcntl
+import itertools
 import json
 import os
+import pwd
+import re
 import shutil
 import signal
 import subprocess
@@ -61,11 +70,26 @@ for _var in [v for v in os.environ if v.startswith("GIT_")]:
 _PINNED_HOME = tempfile.mkdtemp(prefix="gate-pool-test-")
 os.environ["GATEQ_HOME"] = _PINNED_HOME
 atexit.register(shutil.rmtree, _PINNED_HOME, True)   # every exit path, early returns included
+# The HOME every spawned runner gets: with GATEQ_HOME dropped, `~/.claude/gate-queue` lands here.
+_FAKE_HOME = tempfile.mkdtemp(prefix="gate-pool-test-home-")
+atexit.register(shutil.rmtree, _FAKE_HOME, True)
+_REAL_POOL = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".claude", "gate-queue")
+
+
+def _real_pool_listing():
+    try:
+        return sorted(os.listdir(_REAL_POOL))
+    except OSError:
+        return None                        # absent (or unreadable): must still be so at the end
+
+
+_REAL_POOL_BEFORE = _real_pool_listing()
 
 # GATE_POOL_SCRIPTS points the harness at a COPY of the module; only the mutation self-test
 # at the end of this file sets it.
 SCRIPTS = os.environ.get("GATE_POOL_SCRIPTS") or os.path.join(HERE, "scripts")
 MODULE = os.path.join(SCRIPTS, "gate_pool.py")
+RUNNER = os.path.join(SCRIPTS, "gate-runner.py")
 sys.dont_write_bytecode = True
 sys.path.insert(0, SCRIPTS)
 import gate_pool as gp  # noqa: E402
@@ -973,6 +997,143 @@ def case_worktree_key():
              "git RECORDED for this worktree", under_hook, recorded)
 
 
+# --- the runner, end to end ---------------------------------------------------------------------
+_GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+_SERIAL = itertools.count()                # a fresh name for every temp repo of one case
+
+
+def runner_env(home, extra=None):
+    """The environment of EVERY spawned runner. `home` (the pool root) is required; HOME is a
+    temp directory; an inherited holder is dropped unless the case hands one over in `extra`."""
+    env = {k: v for k, v in os.environ.items() if k not in ("GATEQ_HOLDER", "GATEQ_NEST")}
+    env.update(_GIT_ENV, GATEQ_HOME=home, HOME=_FAKE_HOME)
+    env.update(extra or {})
+    return env
+
+
+def run_runner(root, home, *args, runner=None, env=None):
+    """Run the runner to its end in `root` -> (exit code, stdout, stderr)."""
+    r = subprocess.run([sys.executable, "-B", runner or RUNNER, *args], cwd=root,
+                       env=runner_env(home, env), capture_output=True, text=True, timeout=300)
+    return r.returncode, r.stdout, r.stderr
+
+
+def put(path, text):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
+
+
+def make_repo(tmp, name, gates=None):
+    """A `git init`ed temp repo, with `gates` as its .gates.toml (None: no such file)."""
+    root = os.path.join(tmp, name)
+    subprocess.run(["git", "init", "-q", root], check=True, capture_output=True,
+                   env={**os.environ, **_GIT_ENV})
+    if gates is not None:
+        put(os.path.join(root, ".gates.toml"), gates)
+    return root
+
+
+def e2e(fn):
+    """Run a runner case with its own scratch directory (resolved, as git reports paths) and
+    its own EMPTY pool home inside it."""
+    def case():
+        with tempfile.TemporaryDirectory(prefix="gate-pool-e2e-") as tmp:
+            tmp = os.path.realpath(tmp)
+            home = os.path.join(tmp, "gq"); os.mkdir(home, 0o700)
+            fn(tmp, home)
+    return case
+
+
+# The four gate forms. A soft failure and a skip ride in the Form B fixtures so the goldens pin
+# more than the happy line.
+_STEPS = """
+[[prep_pr.steps]]
+name = "one"
+run = "echo one-ran"
+[[prep_pr.steps]]
+name = "soft"
+run = "echo soft-ran; echo soft-err >&2; exit 3"
+required = false
+[[prep_pr.steps]]
+name = "absent"
+run = "echo never"
+skip_if_absent = "gate-pool-no-such-tool"
+[[prep_pr.steps]]
+name = "two"
+run = "echo two-ran"
+"""
+FORMS = {
+    "form-a": '[prep_pr]\ngate = "echo form-a-ran"\n',
+    "form-b-serial": "[prep_pr]\n" + _STEPS,
+    "form-b-parallel": "[prep_pr]\njobs = 2\n" + _STEPS,
+    "fallback": None,
+}
+# RECORDED FROM THE PRE-POOL RUNNER (main at eaf6900) and committed before gate-runner.py was
+# touched: (exit code, stdout, stderr), durations normalized to N.Ns, the repo root to <ROOT>.
+_B_TAIL = ("[FAIL] soft (exit 3, N.Ns)\n[WARN] soft: soft failure (required=false), continuing.\n"
+           "[SKIP] absent: gate-pool-no-such-tool not on PATH\ntwo-ran\n[PASS] two (exit 0, N.Ns)\n"
+           "gate-runner: all required steps passed (1 soft failure(s) warned, not blocking).\n")
+GOLDEN = {
+    "form-a": (0, "gate-runner: using <ROOT>/.gates.toml\n"
+                  "gate-runner: .gates.toml Form A (delegate) -> 'echo form-a-ran'\n"
+                  "form-a-ran\n[PASS] gate (exit 0, N.Ns)\n", ""),
+    # A serial step writes straight to the runner's stderr; a parallel step's is captured into
+    # its block. The goldens pin that difference too.
+    "form-b-serial": (0, "gate-runner: using <ROOT>/.gates.toml\n"
+                         "gate-runner: .gates.toml Form B (enumerate) -> 4 step(s)\n"
+                         "one-ran\n[PASS] one (exit 0, N.Ns)\nsoft-ran\n" + _B_TAIL, "soft-err\n"),
+    "form-b-parallel": (0, "gate-runner: using <ROOT>/.gates.toml\n"
+                           "gate-runner: .gates.toml Form B (enumerate) -> 4 step(s), jobs=2\n"
+                           "one-ran\n[PASS] one (exit 0, N.Ns)\nsoft-ran\nsoft-err\n" + _B_TAIL, ""),
+    "fallback": (0, "gate-runner: no .gates.toml found; entering fail-open fallback chain.\n"
+                    "gate-runner: fallback layer 2 (CLAUDE.md ## Gates) -> 1 command(s).\n"
+                    "fallback-ran\n[PASS] echo fallback-ran (exit 0, N.Ns)\n"
+                    "gate-runner: all CLAUDE.md gate commands passed.\n", ""),
+}
+
+
+def form_repo(tmp, form, name=None, gates=None):
+    root = make_repo(tmp, name or form, FORMS[form] if gates is None else gates)
+    if FORMS[form] is None:                # the fallback chain: layer 2, CLAUDE.md's Gates block
+        put(os.path.join(root, "CLAUDE.md"), "# x\n\n## Gates\n\n```sh\necho fallback-ran\n```\n")
+    return root
+
+
+def normalized(root, rc, out, err):
+    def norm(text):
+        return re.sub(r"\b[0-9]+\.[0-9]s", "N.Ns", text.replace(root, "<ROOT>"))
+    return rc, norm(out), norm(err)
+
+
+def golden_runs(label, tmp, home, runner=None):
+    """Every form against the pool root `home`: output and exit code must EQUAL the golden, and
+    the run must leave the pool root exactly as it found it."""
+    before = sorted(os.listdir(home))
+    for form in FORMS:
+        root = form_repo(tmp, form, f"{form}-{next(_SERIAL)}")
+        same(f"{label}: {form} output and exit code equal the pre-pool golden",
+             normalized(root, *run_runner(root, home, runner=runner)), GOLDEN.get(form))
+    same(f"{label}: nothing was created under the pool root", sorted(os.listdir(home)), before)
+
+
+@e2e
+def case_off_golden(tmp, home):
+    golden_runs("off golden: no config.toml", tmp, home)
+
+
+@e2e
+def case_off_runner_alone(tmp, home):
+    # The no-import proof: gate-runner.py copied ALONE, with no gate_pool.py beside it.
+    alone = os.path.join(tmp, "alone"); os.mkdir(alone)
+    runner = shutil.copy(RUNNER, alone)
+    golden_runs("off runner alone: no config.toml", tmp, home, runner)
+    put(os.path.join(home, "config.toml"), "[pool]\nprotocol = 1\n")
+    golden_runs("off runner alone: a [pool] table with no budget", tmp, home, runner)
+    same("off runner alone: the runner's directory holds the runner and nothing else",
+         os.listdir(alone), ["gate-runner.py"])
+
+
 CASES = [
     ("cls", case_cls), ("order", case_order), ("clamp", case_clamp),
     ("table1", case_table1), ("table2", case_table2), ("class-matters", case_class_matters),
@@ -988,6 +1149,7 @@ CASES = [
     ("nested-serial", case_nested_serial), ("nested-chain", case_nested_chain),
     ("unreadable-ticket", case_unreadable_ticket), ("strays", case_strays),
     ("git-isolation", case_git_isolation),
+    ("off-golden", case_off_golden), ("off-runner-alone", case_off_runner_alone),
 ]
 
 # --- mutation self-test: each assertion must be able to FAIL ---------------------------------
@@ -1205,10 +1367,16 @@ def mutation_selftest():
     with open(MODULE, encoding="utf-8") as f:
         src = f.read()
     known = {name for name, _ in CASES}
+
+    def copy_to(d, mutated=None):
+        """A scripts directory for a re-run: the module (as `mutated`, when given) and the
+        runner that imports it. COPIES, in a temp directory: no tracked file is written."""
+        os.mkdir(d)
+        put(os.path.join(d, "gate_pool.py"), src if mutated is None else mutated)
+        shutil.copy(RUNNER, d)
+        return d
     with tempfile.TemporaryDirectory(prefix="gate-pool-mut-") as tmp:
-        clean = os.path.join(tmp, "clean"); os.mkdir(clean)
-        with open(os.path.join(clean, "gate_pool.py"), "w", encoding="utf-8") as f:
-            f.write(src)
+        clean = copy_to(os.path.join(tmp, "clean"))
         rc, out = _rerun(clean)
         check("mutation self-test: the UNMUTATED copy passes", rc == 0)
         if rc != 0:
@@ -1219,9 +1387,7 @@ def mutation_selftest():
                 check(f"mutation self-test: '{label}' is stale "
                       f"({src.count(old)} occurrences of its text, case '{case}')", False)
                 continue
-            d = os.path.join(tmp, f"m{i:02d}"); os.mkdir(d)
-            with open(os.path.join(d, "gate_pool.py"), "w", encoding="utf-8") as f:
-                f.write(src.replace(old, new))
+            d = copy_to(os.path.join(tmp, f"m{i:02d}"), src.replace(old, new))
             rc, out = _rerun(d, "--only", case)
             killed = rc != 0 and f"[FAIL] {want}\n" in out
             check(f"mutation: {label} -> killed by '{case}'", killed)
@@ -1256,6 +1422,10 @@ def main():
 
     print("isolation:")
     same("isolation: the pinned GATEQ_HOME is still empty", os.listdir(_PINNED_HOME), [])
+    same("isolation: no spawned runner created anything under its (temp) HOME",
+         os.listdir(_FAKE_HOME), [])
+    same("isolation: the real pool directory is exactly as it was at the start",
+         _real_pool_listing(), _REAL_POOL_BEFORE)
 
     print()
     if FAILS:
