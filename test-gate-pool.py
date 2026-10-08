@@ -1523,8 +1523,12 @@ def case_e2e_three_gates(tmp, home):
 def case_e2e_over_budget(tmp, home):
     put(os.path.join(home, "config.toml"), CONFIG)
     run, started, fifo = gated(tmp, "big")
-    p = spawn(make_repo(tmp, "big", one_step(run, "weight = 12")), home)
+    repo = make_repo(tmp, "big", one_step(run, "weight = 12"))
+    deep = os.path.join(repo, "deep", "er"); os.makedirs(deep)
+    p = spawn(deep, home)                  # started two directories below the worktree root
     wait_for("the weight-12 gate to start", lambda: os.path.exists(started), p)
+    same("over budget: a gate started from a SUBDIRECTORY is keyed by its worktree ROOT",
+         [t.get("worktree") for t in tickets(home)], [repo])
     small = gp.Pool(home, cfg()).enter("gate", "gate", 1, "/wt/small")
     same("over budget: a weight above the budget runs, holding the WHOLE budget: nothing fits "
          "beside it",
@@ -2059,6 +2063,10 @@ RUNNER_MUTATIONS = [
      "        with pool._admit(): key = gate_pool.worktree_key(root)", "e2e-git-outside-lock",
      "git outside the lock: the runner resolves its worktree key and takes its receipt "
      "snapshot through git, and NO git call runs while admit.lock is held"),
+    ("the worktree key taken from the current directory, not the worktree root",
+     "        key = gate_pool.worktree_key(root)",
+     "        key = gate_pool.worktree_key(os.getcwd())", "e2e-over-budget",
+     "over budget: a gate started from a SUBDIRECTORY is keyed by its worktree ROOT"),
     ("the receipt snapshot taken before the grant",
      "    state, pool = _pool_config()\n",
      "    state, pool = _pool_config()\n"
