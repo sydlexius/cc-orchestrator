@@ -688,8 +688,10 @@ configured they are untouched.
    ahead)`, or `gate-runner: waiting for this worktree (held by <kind> pid <n>)`.
 3. The receipt snapshot (`_snapshot`) is taken AFTER the grant, immediately before the first step, so a wait never widens the window
    the receipt attests, and the per-worktree exclusion guarantees no pooled check is rewriting the tree at that moment. After the
-   grant the runner re-reads `.gates.toml` and runs THAT definition (today's order: snapshot, then parse). The held cost stays the
-   ticket's; a `weight` or `jobs` edited during the wait is mis-costed for that one run (load, never a verdict).
+   grant the runner re-reads `.gates.toml` and runs THAT definition (today's order: snapshot, then parse). The definition is
+   costed AGAIN at that read, and the bytes costed are the ones run: one that now costs MORE than the ticket holds (a `weight` or
+   `jobs` raised during the wait, a branch switch) is NOT RUN, exit 75, `gate-runner: NOT RUN - .gates.toml changed during the wait
+   (cost 2 -> 8); run it again`, so a run is never wider than its slots. One that costs less runs under the larger hold.
 4. After `wait_timeout_s` it gives up: exit 75 (`EX_TEMPFAIL`), `gate-runner: NOT RUN - no gate slot within 3600s`. 75 is none of 0
    (pass), 1 (gate failed), 2 (config) or 130 (interrupted), so a caller can never read "did not run" as "failed" or as "passed".
    With `--receipt`, an older receipt at the path is unlinked, as for every other run that produced none (#497).

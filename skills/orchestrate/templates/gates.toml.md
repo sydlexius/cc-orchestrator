@@ -246,7 +246,11 @@ above the budget is clamped to it. One thing runs per worktree at a time.
 While it waits the runner prints `gate-runner: waiting for 4 of 10 gate slots
 (2 free, 3 ahead)` (or `... waiting for this worktree (held by <kind> pid
 <n>)`) once, then every 30 seconds. The receipt snapshot and the `.gates.toml`
-read happen AFTER the wait, so a wait never widens what a receipt attests.
+read happen AFTER the wait, so a wait never widens what a receipt attests. The
+definition is costed again at that read: if it now costs more than the run holds
+(a `jobs` or `weight` raised during the wait, a branch switch), the run exits 75
+with `NOT RUN - .gates.toml changed during the wait (cost 2 -> 8); run it again`
+instead of running wider than its slots.
 
 **Exit 75 means NOT RUN.** A wait that outlasts `wait_timeout_s` prints
 `gate-runner: NOT RUN - no gate slot within <N>s` and exits 75: no step ran. It

@@ -1394,7 +1394,7 @@ def main(argv=None):
         if receipt_path:                   # no step ran: nothing may read as this run's (#497)
             _remove_stale(receipt_path)
         return 2
-    holder = raw = None
+    holder = raw = grew = None
     if state == "on":
         # Cost first, outside every lock. A config this run would reject anyway takes no
         # ticket: it falls through and _run_gates rejects the bytes that were judged.
@@ -1405,12 +1405,23 @@ def main(argv=None):
                 if receipt_path:
                     _remove_stale(receipt_path)
                 return code
-            raw = None                     # granted: re-read .gates.toml and run THAT definition
+            # Granted. The definition may have changed during the wait (an edit, a branch
+            # switch), so it is costed AGAIN and the bytes costed here are the ones that run.
+            # One that now costs more than this run holds is NOT RUN: never wider than its slots.
+            recost, raw = _pool_cost(root, jobs, pool["budget"])
+            if recost is not None and recost > cost:
+                grew = (cost, recost)
             # Children get the holder from THIS run's own state, never an inherited value.
             os.environ.update(holder.child_env())
             if not os.environ["GATEQ_NEST"]:
                 del os.environ["GATEQ_NEST"]
     try:
+        if grew:
+            _pool_say("gate-runner: NOT RUN - .gates.toml changed during the wait "
+                      f"(cost {grew[0]} -> {grew[1]}); run it again")
+            if receipt_path:
+                _remove_stale(receipt_path)
+            return 75
         # The snapshot is taken AFTER the grant, so a wait never widens what a receipt attests.
         pre = _snapshot(root, receipt_path) if receipt_path else None
         rc, records = _run_gates(root, memoize_dir, jobs, skip, shard, raw=raw)

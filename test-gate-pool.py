@@ -1694,6 +1694,21 @@ def case_e2e_gates_edited(tmp, home):
     same("gates edited: a .gates.toml edited during the wait is re-read after the grant, and "
          "THAT definition runs",
          (p.wait(timeout=60), os.path.exists(def1), os.path.exists(def2)), (0, False, True))
+    # The same edit RAISING the cost: the run holds 2 units and the new definition needs 8.
+    def3, def4 = os.path.join(tmp, "def3"), os.path.join(tmp, "def4")
+    wide = make_repo(tmp, "w", one_step(f"echo x > '{def3}'", "jobs = 2"))
+    holder, receipt = hold(home, "/wt/elsewhere"), os.path.join(tmp, "old-receipt.json")
+    put(receipt, '{"result": "pass"}\n')
+    p = spawn(wide, home, "--receipt", receipt)
+    wait_for("the wait line", lambda: "waiting for 2 of 10" in read(p.err), p)
+    put(os.path.join(wide, ".gates.toml"), one_step(f"echo x > '{def4}'", "jobs = 8"))
+    drop(holder)
+    same("gates edited: a definition that costs MORE after the wait than the run holds is NOT "
+         "RUN, exit 75: no step, no stale receipt, and its slots are given back",
+         (p.wait(timeout=60), os.path.exists(def3), os.path.exists(def4), os.path.exists(receipt),
+          read(p.err).splitlines()[-1], listing(home, suffix=".ticket")),
+         (75, False, False, False, "gate-runner: NOT RUN - .gates.toml changed during the wait "
+                                   "(cost 2 -> 8); run it again", []))
 
 
 @e2e
@@ -2144,9 +2159,15 @@ RUNNER_MUTATIONS = [
      "receipt: the snapshot is taken AFTER the grant: the receipt binds the commit made during "
      "the wait, and passes"),
     ("the definition costed before the wait run after the grant",
-     "            raw = None                     # granted", "            pass  #", "e2e-gates-edited",
+     "            recost, raw = _pool_cost(root, jobs, pool[\"budget\"])",
+     "            recost, _ = _pool_cost(root, jobs, pool[\"budget\"])", "e2e-gates-edited",
      "gates edited: a .gates.toml edited during the wait is re-read after the grant, and THAT "
      "definition runs"),
+    ("a definition that grew during the wait run under the smaller hold",
+     "            if recost is not None and recost > cost:", "            if False:",
+     "e2e-gates-edited",
+     "gates edited: a definition that costs MORE after the wait than the run holds is NOT RUN, "
+     "exit 75: no step, no stale receipt, and its slots are given back"),
     ("an inherited GATEQ_HOLDER passed through to the steps",
      "            os.environ.update(holder.child_env())",
      '            os.environ.setdefault("GATEQ_NEST", "")', "e2e-holder-env",
@@ -2186,8 +2207,9 @@ RUNNER_MUTATIONS = [
      "rejected while costing: main() hands the bytes it costed to the run: the invalid config "
      "is rejected even though the file on disk is valid"),
     ("the slots given back before the gate ran (released at the grant)",
-     "            raw = None                     # granted",
-     "            holder.release(); raw = None   #", "e2e-over-budget",
+     "            recost, raw = _pool_cost(root, jobs, pool[\"budget\"])",
+     "            holder.release(); recost, raw = _pool_cost(root, jobs, pool[\"budget\"])",
+     "e2e-over-budget",
      "over budget: a weight above the budget runs, holding the WHOLE budget: nothing fits "
      "beside it"),
 ]
