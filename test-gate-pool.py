@@ -1468,6 +1468,54 @@ def case_e2e_refusals(tmp, home):
     same("refusals: an unknown TABLE beside [pool] is ignored: the gate runs, pooled, silently",
          (run_runner(root, home)[::2], os.path.exists(marker), "waiters" in os.listdir(home),
           listing(home)), ((0, ""), True, True, []))
+    os.unlink(marker)                      # the pooled run above left its marker and its dirs
+    for n in os.listdir(home):
+        if n != "config.toml":
+            (shutil.rmtree if os.path.isdir(os.path.join(home, n)) else os.unlink)(
+                os.path.join(home, n))
+    same("refusals: a top-level budget (outside [pool]) exits 2 saying where it belongs",
+         refused_by("budget = 10\nprotocol = 1\n"),
+         not_run(f"{path}: top-level `budget` belongs under [pool]"))
+
+    def refused_at(h):
+        put(receipt, '{"result": "pass"}\n')
+        rc, out, err = run_runner(root, h, "--receipt", receipt)
+        return rc, err, os.path.exists(marker), os.path.exists(receipt)
+    os.unlink(path); gone = os.path.join(tmp, "nowhere"); dangling = os.path.join(tmp, "dangling")
+    os.symlink(gone, path); os.symlink(gone, dangling)
+    same("refusals: a dangling config.toml or a dangling pool home exits 2, never 'off': no "
+         "step, no stale receipt",
+         (refused_at(home), refused_at(dangling)),
+         ((2, f"gate-runner: NOT RUN - {path}: is a dangling symlink\n", False, False),
+          (2, f"gate-runner: NOT RUN - {dangling}: is a dangling symlink\n", False, False)))
+    os.unlink(path); os.unlink(dangling)
+    put(path, CONFIG); put(os.path.join(home, "waiters"), "x")
+    rc, err, ran, kept = refused_at(home)
+    os.unlink(os.path.join(home, "waiters"))
+    same("refusals: a pool home whose waiters is a regular file exits 2, never unpooled",
+         (rc, err.startswith("gate-runner: NOT RUN - pool error: "), ran, kept),
+         (2, True, False, False))
+    broken = os.path.join(tmp, "broken"); os.mkdir(broken)
+    put(os.path.join(broken, "gate_pool.py"), "def (\n")
+    rc, err, ran, kept, _ = refused_by(CONFIG, shutil.copy(RUNNER, broken))
+    same("refusals: a gate_pool.py with a syntax error exits 2 in one line, never a traceback",
+         (rc, err.startswith("gate-runner: NOT RUN - pool error: SyntaxError: "),
+          err.count("\n"), ran, kept), (2, True, 1, False, False))
+    linked = os.path.join(tmp, "linked"); os.mkdir(linked)
+    os.symlink(RUNNER, os.path.join(linked, "gate-runner.py"))
+    put(path, CONFIG)
+    rc, out, err = run_runner(root, home, runner=os.path.join(linked, "gate-runner.py"))
+    same("refusals: a runner reached through a symlink finds gate_pool.py beside the real file",
+         (rc, "is missing" in err, os.path.exists(marker)), (0, False, True))
+    if os.geteuid() != 0:                  # uid 0 reads through any mode
+        os.unlink(marker); put(path, CONFIG + "wait_timeout_s = 1\n")
+        holder = hold(home, "/wt/elsewhere"); gates = os.path.join(root, ".gates.toml")
+        os.chmod(gates, 0)
+        rc, out, err = run_runner(root, home)
+        os.chmod(gates, 0o600); drop(holder)
+        same("refusals: a .gates.toml that cannot be read still takes a ticket at the whole "
+             "budget (waits, exits 75), never an unpooled run",
+             (rc, "waiting for 10 of 10" in err, os.path.exists(marker)), (75, True, False))
 
 
 @e2e
@@ -1487,6 +1535,19 @@ def case_e2e_rejected_costing(tmp, home):
              "no ticket",
              (on[0], on == normalized(root, *run_runner(root, off, *args)), "-ran" in on[1],
               os.listdir(home)), (2, True, False, ["config.toml"]))
+    fwd = os.path.join(tmp, "fwd-ran")
+    good, here, sink = make_repo(tmp, "fwd", one_step(f"echo x > '{fwd}'")), os.getcwd(), io.StringIO()
+    mod = load_runner(); mod._pool_cost = lambda root, jobs, budget: (None, b"[prep_pr\n")
+    os.chdir(good)
+    try:
+        with pool_home_env(home), contextlib.redirect_stderr(sink), \
+                contextlib.redirect_stdout(sink):
+            rc = mod.main([])
+    finally:
+        os.chdir(here)
+    same("rejected while costing: main() hands the bytes it costed to the run: the invalid "
+         "config is rejected even though the file on disk is valid",
+         (rc, os.path.exists(fwd)), (2, False))
 
 
 @e2e
@@ -1606,7 +1667,7 @@ def case_e2e_budget_removed(tmp, home):
                               home)
     same("budget removed: a gate started AFTER the removal runs at once, unpooled, and takes "
          "no ticket", (rc, err, os.path.exists(fresh), listing(home)), (0, "", True, before))
-    same("budget removed: the gate already waiting keeps waiting, it never converts",
+    same("budget removed: the gate already waiting is still waiting shortly after the unlink",
          (w.poll(), os.path.exists(waited)), (None, False))
     drop(holder)
     same("budget removed: and it starts when its cost fits",
@@ -1768,7 +1829,8 @@ print("done", flush=True)
 @e2e
 def case_contention(tmp, home):
     # REAL processes, because every in-process case is single-threaded and so cannot tell a
-    # taken admit.lock from an absent one. Six race enter() and poll() on a budget of 2, two per
+    # taken admit.lock from an absent one. Proven: with admit.lock not taken, concurrent
+    # processes corrupt staging and seq allocation and this harness fails. Six race enter() and poll() on a budget of 2, two per
     # worktree. Each, while it HOLDS, proves the pool's promise with locks of its OWN, outside
     # the pool: its worktree's check lock (nobody else runs in this worktree) and one of two
     # unit locks (at most `budget` run at once). Both are taken after the grant and dropped
@@ -1792,8 +1854,7 @@ def case_contention(tmp, home):
            sorted({ln[1] for ln in lines if len(ln) == 2}), seqs == list(range(1, len(seqs) + 1)),
            len(seqs), listing(home))
     same("contention: six processes racing enter() and poll() on a budget of 2: every one "
-         "finishes every round, never over budget, never two in one worktree, and no seq is "
-         "handed out twice", got, ([0] * 6, 6, 6, ["ok"], True, 6 * rounds, []))
+         "finishes every round, no seq is handed out twice, and the pool's directory is left empty", got, ([0] * 6, 6, 6, ["ok"], True, 6 * rounds, []))
     if got[0] != [0] * 6:
         print("         " + " | ".join(err.strip().splitlines()[-1] for _, err in outs
                                         if err.strip()))
@@ -2027,7 +2088,7 @@ MUTATIONS += [
      "            fcntl.flock(fd, fcntl.LOCK_EX)\n            yield", "            yield",
      "contention",
      "contention: six processes racing enter() and poll() on a budget of 2: every one finishes "
-     "every round, never over budget, never two in one worktree, and no seq is handed out twice"),
+     "every round, no seq is handed out twice, and the pool's directory is left empty"),
     ("lock descriptors inherited by a child started by exec",
      "return os.open(path, flags, 0o600)",
      "fd = os.open(path, flags, 0o600); os.set_inheritable(fd, True); return fd", "inherit",
@@ -2089,6 +2150,28 @@ RUNNER_MUTATIONS = [
      "                return code", "                return code", "e2e-timeout",
      "timeout: no step ran, the waiter's ticket is gone, and no older receipt is left to read "
      "as this run's"),
+    ("a dangling symlink read as 'no config' (pool off)",
+     "            if os.path.islink(p):", "            if False:", "e2e-refusals",
+     "refusals: a dangling config.toml or a dangling pool home exits 2, never 'off': no step, "
+     "no stale receipt"),
+    ("a broken gate_pool.py escapes as a traceback (no catch-all arm)",
+     "    except Exception as e:                 # a broken gate_pool.py",
+     "    except ZeroDivisionError as e:         # a broken gate_pool.py", "e2e-refusals",
+     "refusals: a gate_pool.py with a syntax error exits 2 in one line, never a traceback"),
+    ("an unusable pool directory lets the gate run (the OSError arm returns 0)",
+     '            _pool_say(f"gate-runner: NOT RUN - pool error: {e}")\n            return None, 2',
+     '            _pool_say(f"gate-runner: NOT RUN - pool error: {e}")\n            return None, 0',
+     "e2e-refusals",
+     "refusals: a pool home whose waiters is a regular file exits 2, never unpooled"),
+    ("a top-level budget ignored",
+     '        if key in data:                    # outside [pool]',
+     '        if False:                          # outside [pool]', "e2e-refusals",
+     "refusals: a top-level budget (outside [pool]) exits 2 saying where it belongs"),
+    ("main() drops the costed bytes instead of forwarding them",
+     "_run_gates(root, memoize_dir, jobs, skip, shard, raw=raw)",
+     "_run_gates(root, memoize_dir, jobs, skip, shard)", "e2e-rejected-costing",
+     "rejected while costing: main() hands the bytes it costed to the run: the invalid config "
+     "is rejected even though the file on disk is valid"),
     ("the slots given back before the gate ran (released at the grant)",
      "            raw = None                     # granted",
      "            holder.release(); raw = None   #", "e2e-over-budget",
@@ -2096,6 +2179,13 @@ RUNNER_MUTATIONS = [
      "beside it"),
 ]
 if os.geteuid() != 0:                      # chmod does not bite for root, so that case skips
+    RUNNER_MUTATIONS.append(
+        ("an unreadable .gates.toml takes no ticket (runs unpooled)",
+         "        # Unreadable right now: judged again after the grant, pooled at the whole budget.\n"
+         "        return budget, None",
+         "        return None, None", "e2e-refusals",
+         "refusals: a .gates.toml that cannot be read still takes a ticket at the whole budget "
+         "(waits, exits 75), never an unpooled run"))
     MUTATIONS.append(
         ("any failure to open a ticket read as 'missing'",
          'except FileNotFoundError:\n        return None, ""',

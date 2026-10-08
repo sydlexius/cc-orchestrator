@@ -252,7 +252,10 @@ read happen AFTER the wait, so a wait never widens what a receipt attests.
 `gate-runner: NOT RUN - no gate slot within <N>s` and exits 75: no step ran. It
 is neither a pass (0) nor a failed gate (1) nor a config error (2), and with
 `--receipt` any older receipt at the path is removed so nothing reads as this
-run's verdict. An interrupt while waiting exits 130 the same way.
+run's verdict. A SIGINT while waiting exits 130 the same way; other signals take
+their default action and may leave an older receipt in place. A usage error in
+`--skip` or `--shard` is reported only after the slot is granted, so it can wait
+and can exit 75.
 
 A gate started BY a pooled gate in the same worktree (the pre-push hook under a
 gate step that uploads, a gate run from a step) runs under its holder's slots

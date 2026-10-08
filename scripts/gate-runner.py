@@ -45,8 +45,8 @@ effective `jobs`, else the whole budget) and waits for them; a wait that gives
 up is exit 75, NOT RUN, which is neither a pass nor a failed gate.
 
 Exit codes: 0 = all gates passed / skipped / fell open; 75 = NOT RUN (pool on,
-no slot in time); other non-zero = a required gate failed (1) or a config
-error (2).
+no slot in time); 130 = SIGINT while waiting for a slot (NOT RUN); other
+non-zero = a required gate failed (1) or a config error (2).
 
 Run: python3 gate-runner.py   (from anywhere inside the repo)
 """
@@ -1256,9 +1256,15 @@ def _pool_config():
         with open(path, "rb") as f:
             data = tomllib.load(f)
     except FileNotFoundError:
+        for p in (path, _pool_home()):     # a dangling symlink is no "missing": it is a config
+            if os.path.islink(p):          # that cannot be read, so never read as OFF
+                return "error", f"{p}: is a dangling symlink"
         return "off", None
     except (OSError, ValueError) as e:     # ValueError: a TOML or a UTF-8 decode error
         return "error", f"{path}: {e}"
+    for key in ("budget", "protocol"):
+        if key in data:                    # outside [pool]: would read as no budget at all
+            return "error", f"{path}: top-level `{key}` belongs under [pool]"
     if "pool" not in data:
         return "off", None
     pool = data["pool"]
@@ -1319,7 +1325,10 @@ def _pool_cost(root, jobs_raw, budget):
 
 def _pool_say(line):
     """A pool line: stderr, no `WARN:` prefix (a wait is not a warning)."""
-    print(line, file=sys.stderr, flush=True)
+    try:
+        print(line, file=sys.stderr, flush=True)
+    except OSError:                        # a closed stderr must not change the exit code
+        pass
 
 
 def _pool_enter(cfg, root, cost):
@@ -1328,29 +1337,38 @@ def _pool_enter(cfg, root, cost):
     code cannot use, 75 for a wait that gave up (NOT RUN), 130 for an interrupted wait.
     A run started BY a holder in this worktree goes under that holder's slots instead
     (gate_pool decides, from GATEQ_HOLDER). The module is imported only here."""
-    if not os.path.isfile(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                       "gate_pool.py")):
+    here = os.path.dirname(os.path.abspath(__file__))
+    real = os.path.dirname(os.path.realpath(__file__))
+    where = next((d for d in (here, real)
+                  if os.path.isfile(os.path.join(d, "gate_pool.py"))), None)
+    if where is None:
         # Never fall back to running unpooled: the user configured a bound.
         _pool_say("gate-runner: NOT RUN - pool configured but gate_pool.py is missing")
         return None, 2
-    import gate_pool
     try:
-        # Pool() refuses another pool protocol and a root that is not the user's own 0700
-        # directory BEFORE it touches anything there.
-        pool = gate_pool.Pool(_pool_home(), cfg)
-        # The worktree key runs git, so it is resolved HERE, before admit.lock is ever
-        # taken, from the worktree ROOT (a subdirectory would get a different key).
-        key = gate_pool.worktree_key(root)
-        return pool.acquire("gate", "gate", cost, key, environ=os.environ,
-                            say=_pool_say), None
-    except gate_pool.NotRun as e:
-        _pool_say(e.message)
-        return None, e.code
-    except KeyboardInterrupt:              # the ticket was given up by acquire()
-        _pool_say("gate-runner: NOT RUN - interrupted while waiting for a gate slot")
-        return None, 130
-    except OSError as e:                   # a pool directory this run cannot use: never unpooled
-        _pool_say(f"gate-runner: NOT RUN - pool error: {e}")
+        if where not in sys.path:          # a runner reached through a symlink
+            sys.path.insert(0, where)
+        import gate_pool
+        try:
+            # Pool() refuses another pool protocol and a root that is not the user's own 0700
+            # directory BEFORE it touches anything there.
+            pool = gate_pool.Pool(_pool_home(), cfg)
+            # The worktree key runs git, so it is resolved HERE, before admit.lock is ever
+            # taken, from the worktree ROOT (a subdirectory would get a different key).
+            key = gate_pool.worktree_key(root)
+            return pool.acquire("gate", "gate", cost, key, environ=os.environ,
+                                say=_pool_say), None
+        except gate_pool.NotRun as e:
+            _pool_say(e.message)
+            return None, e.code
+        except KeyboardInterrupt:          # the ticket was given up by acquire()
+            _pool_say("gate-runner: NOT RUN - interrupted while waiting for a gate slot")
+            return None, 130
+        except OSError as e:               # a pool directory this run cannot use: never unpooled
+            _pool_say(f"gate-runner: NOT RUN - pool error: {e}")
+            return None, 2
+    except Exception as e:                 # a broken gate_pool.py: never a traceback, never unpooled
+        _pool_say(f"gate-runner: NOT RUN - pool error: {type(e).__name__}: {e}")
         return None, 2
 
 
@@ -1400,7 +1418,10 @@ def main(argv=None):
             _write_receipt(receipt_path, root, rc, records, pre)
     finally:
         if holder is not None:
-            holder.release()
+            try:
+                holder.release()
+            except OSError as e:           # the kernel drops the locks at exit anyway
+                _pool_say(f"gate-runner: note: could not release the gate slots: {e}")
     return rc
 
 
