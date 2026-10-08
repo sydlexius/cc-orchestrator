@@ -325,6 +325,28 @@ def _prune_lingering(lingering):
         lingering.discard(pgid)
 
 
+def _reap(p, block=False):
+    """Reap direct child `p` WITHOUT Popen's `_waitpid_lock`; True once it is
+    gone. Cleanup runs with INT/TERM/HUP ignored, so it must not depend on that
+    lock (#546): if an exception ever leaked it, poll() answers None forever
+    and wait() never returns. One thread owns every child, so nothing else can
+    be waiting on this pid. Setting `returncode` as Popen would keeps its later
+    poll(), wait() and __del__ returning at once, never touching the lock."""
+    if p.returncode is not None:
+        return True
+    try:
+        pid, status = os.waitpid(p.pid, 0 if block else os.WNOHANG)
+    except ChildProcessError:
+        # Already reaped (a poll() cut short after its waitpid) or SIGCHLD is
+        # ignored: the status is lost. 0 is Popen's own value for this case.
+        p.returncode = 0
+        return True
+    if pid != p.pid:
+        return False
+    p.returncode = os.waitstatus_to_exitcode(status)
+    return True
+
+
 def _terminate_groups(running, lingering=(), grace=KILL_GRACE_S):
     """SIGTERM every in-flight step's process group AND every finished step's
     still-populated group (`lingering`: a `sleep 30 &` left behind by a step
@@ -337,13 +359,14 @@ def _terminate_groups(running, lingering=(), grace=KILL_GRACE_S):
         _killpg(g, signal.SIGTERM)
     deadline = time.monotonic() + grace
     while time.monotonic() < deadline and (
-            any(p.poll() is None for p in procs)
+            any(not _reap(p) for p in procs)
             or any(_group_alive(g) for g in lingering)):
         time.sleep(POLL_S)
     for g in groups:
         _killpg(g, signal.SIGKILL)
     for p in procs:
-        p.wait()
+        while not _reap(p, block=True):
+            pass
 
 
 def _print_block(e):

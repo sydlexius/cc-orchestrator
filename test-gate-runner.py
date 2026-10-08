@@ -1779,6 +1779,72 @@ def test_parallel_inherited_ignored_sigint():
     check("#546: inherited-ignored SIGINT: still ignored after the run", still)
 
 
+# Runs in its OWN process: if cleanup did depend on Popen's lock it would block
+# forever, and only a parent with a timeout can turn that into a failed check.
+# Each case starts a real `sleep 60` in its own group, breaks Popen's view of it,
+# and calls _terminate_groups. `lock-held` gets a 30 s grace it must not need
+# (the grace leg); `lock-held-deaf` ignores SIGTERM and gets a 0.3 s grace, so
+# only the SIGKILL leg's final blocking reap can collect it.
+_REAP_DRIVER = """\
+import importlib.util, json, os, signal, subprocess, sys, time
+spec = importlib.util.spec_from_file_location("gate_runner_reap", sys.argv[1])
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+case = sys.argv[2]
+run = "exec sleep 60" if case != "lock-held-deaf" else "trap '' TERM; echo; exec sleep 60"
+p = subprocess.Popen(["/bin/sh", "-c", run], start_new_session=True,
+                     stdout=subprocess.PIPE)
+print(p.pid, flush=True)
+if case == "lock-held-deaf":
+    p.stdout.readline()              # the trap is installed before any signal
+if case == "already-reaped":         # reaped behind Popen's back: status lost
+    os.kill(p.pid, signal.SIGKILL); os.waitpid(p.pid, 0); seam = True
+else:                                # the #546 leak: held by nobody, forever
+    seam = p._waitpid_lock.acquire(False)
+print("seam" if seam else "no-seam", flush=True)
+t0 = time.monotonic()
+mod._terminate_groups({0: {"proc": p}}, grace=0.3 if case == "lock-held-deaf" else 30)
+took = time.monotonic() - t0
+try:
+    os.waitpid(p.pid, os.WNOHANG); reaped = False
+except ChildProcessError:
+    reaped = True
+print(json.dumps({"took": took, "returncode": p.returncode, "reaped": reaped}),
+      flush=True)
+"""
+
+
+def test_terminate_groups_ignores_popen_lock():
+    """Cleanup reaps without Popen's `_waitpid_lock`: with that lock held (what
+    an exception raised inside poll() leaves behind, from any source) it still
+    kills and reaps the child at once and leaves Popen's returncode set, on the
+    SIGTERM leg and on the SIGKILL leg; and a child already reaped behind
+    Popen's back does not fail or hang it."""
+    want = {"lock-held": -signal.SIGTERM, "lock-held-deaf": -signal.SIGKILL}
+    for case in ("lock-held", "lock-held-deaf", "already-reaped"):
+        proc = subprocess.Popen([sys.executable, "-c", _REAP_DRIVER, RUNNER, case],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            out, err = proc.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill(); out, err = proc.communicate()
+        lines = out.splitlines()
+        try:
+            r = json.loads(lines[2]) if len(lines) > 2 else {}
+        except ValueError:
+            r = {}
+        check(f"#546: cleanup, {case}: the case was set up (driver ran, seam taken)",
+              lines[1:2] == ["seam"])
+        check(f"#546: cleanup, {case}: returns well inside the grace, no hang "
+              f"({r.get('took', -1):.2f}s)", proc.returncode == 0 and 0 <= r.get("took", -1) < 15)
+        check(f"#546: cleanup, {case}: the child is reaped and Popen knows it",
+              r.get("reaped") is True and r.get("returncode") is not None)
+        if case in want:
+            check(f"#546: cleanup, {case}: returncode is the real status "
+                  f"({want[case]})", r.get("returncode") == want[case])
+        if lines and lines[0].isdigit():   # never leak the sleeper if cleanup broke
+            _cleanup_pids(int(lines[0]))
+
+
 # --- Part D: opt-in `--skip <name>` (CI leaves lint to its own pinned steps) --
 
 def test_skip_named_steps_serial_and_parallel():
@@ -1904,6 +1970,7 @@ def main():
         test_parallel_interrupt_in_launch_window,
         test_parallel_interrupt_during_output,
         test_parallel_inherited_ignored_sigint,
+        test_terminate_groups_ignores_popen_lock,
         test_skip_named_steps_serial_and_parallel, test_skip_absent_is_byte_identical,
         test_skip_refuses_doubt,
     ]:
