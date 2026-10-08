@@ -37,13 +37,13 @@ the churn is open question 2, outside the first delivery.
 
 ## Decisions this unit is bound by
 
-1. `gate-runner.py` may open a PR for a queued job; opening one is opt-in PER JOB (the `pr` object). Its default stays "write the
-   receipt".
-2. A job is DATA: a worktree, a branch, a body file, labels. Never a command line.
-13. `/prep-pr` KEEPS its inline Step 2 gate; the queued tail reuses its receipt.
-14. THE RUNNER MAKES NO COMMIT. A first push that is definitively behind its base is refused `stale-base`; the lead refreshes in its
-    own session.
-15. Commits need not be squashed before a push.
+- Decision 1: `gate-runner.py` may open a PR for a queued job; opening one is opt-in PER JOB (the `pr` object). Its default stays
+  "write the receipt".
+- Decision 2: a job is DATA: a worktree, a branch, a body file, labels. Never a command line.
+- Decision 13: `/prep-pr` KEEPS its inline Step 2 gate; the queued tail reuses its receipt.
+- Decision 14: THE RUNNER MAKES NO COMMIT. A first push that is definitively behind its base is refused `stale-base`; the lead
+  refreshes in its own session.
+- Decision 15: commits need not be squashed before a push.
 
 (14 and 15 are the two later decisions; the earlier draft numbered them 13 and 14 and the inline-gate decision 12, one off from the
 pool document.)
@@ -76,7 +76,11 @@ it EQUALS `head_sha`, because the runner never adds a commit), `behind_base` (no
 
 Validation, at `add` and again in the worker:
 
-- `base`: `git check-ref-format --branch`, not dash-led, not `refs/*`.
+- `base`: `git check-ref-format refs/heads/<base>` must succeed (exit status only), and the value is not dash-led, not `HEAD` and
+  not `refs/*`. This is the check `base-freshness.sh` makes (READ: its line 62), so the two cannot disagree. NOT the `--branch`
+  form: git documents that form as EXPANDING the previous-checkout shorthand `@{-N}`, so it can accept a value that is not a
+  branch name, which `base-freshness.sh` then rejects with exit 2 and `safe-push.sh` reads as unknown and proceeds on (READ:
+  its `*)` arm). The stored value is the validated string itself; nothing is expanded or normalized.
 - `pr.body`: the caller passes `--body-file <path>`. The helper reads it (cap 65536 characters, valid UTF-8, no NUL), COPIES it to
   `payload/<job>.r<rev>/body.md` and records the sha256. A later edit or a deleted temp file cannot change the job.
 - `pr.title`: `--title-file <path>` is the ONLY form. The floor greps command LINES, and a title that quotes a trigger phrase would
@@ -100,10 +104,10 @@ NOTHING IN THE WORKTREE: what it pushes is exactly the commit that was enqueued.
 | 0 | (recovered jobs only) | The `.pushing` marker is present: read origin FIRST (section 6) | section 6 |
 | 1 | `preflight` | queue section 4 | `refused` |
 | 2 | `classify` | ONE fresh read of the branch's PRs in ALL states (section 3). Decides fix round or first push BEFORE anything is pushed, and resolves `base`: the open PR's base, else the job's `base`, else the default branch | `error` `gh-unreadable` after 3 tries (2 s, 5 s, 10 s); `refused` `ambiguous-pr`, `pr-merged`, `pr-closed`, `pr-head-unknown`, `no-pr-details`, `shallow-clone`, `base-mismatch` |
-| 3 | `freshness` | ONLY when no PR exists, or the open PR shows no review activity (or the activity is unreadable). `base-freshness.sh <base> refs/heads/<branch>`, the same read-only call `safe-push.sh` makes. Exit 1 (definitively BEHIND): STOP before any gate step. Exit 0 (fresh or unknown) proceeds | `refused` `stale-base`, `gate=not-run`, the behind count in the log |
+| 3 | `freshness` | ONLY when no PR exists, or the open PR shows no review activity (or the activity is unreadable). `base-freshness.sh <base> refs/heads/<branch>`, the same read-only call `safe-push.sh` makes. Exit 1 (definitively BEHIND): STOP before any gate step. Exit 0 (fresh or unknown) proceeds. Any other exit (2: the helper rejected its arguments) is doubt and STOPS | `refused` `stale-base`, `gate=not-run`, the behind count in the log; `error` `freshness-error`, nothing sent |
 | 4 | `gate` | queue section 4: reuse a binding receipt, else run in-process under slots, else bounce | `failed` |
 | 5 | `receipt` | queue section 4 | `failed` |
-| 6 | `push` | A cost-0 worker re-tests the pre-push hook condition and BOUNCES if a hook is now present. Then the marker is written, then `safe-push.sh` runs (section 5), bounded by `push_timeout_s` | section 5 |
+| 6 | `push` | The worker re-tests the pre-push hook condition: a cost-0 worker BOUNCES if a hook is now present, and the answer picks the call's bound (section 5). Then the marker is written, then `safe-push.sh` runs under that bound | section 5 |
 | 7 | `pr` | Section 7: a fix round creates nothing and verifies the PR head; a first push lists again, then creates | `error`, always with `pushed=yes` |
 | 8 | `finalize` | queue section 4 | - |
 
@@ -201,7 +205,19 @@ line: `nested-over-holder` means the worker's held cost is below the gate's (run
 second identical result goes to the maintainer. Queue section 2's cost rule (a job in a hook-installed repo holds
 the gate weight, and a bounce pins it) is what keeps the exemption true on the ordinary path.
 
-- `--base <base>` is always passed. It is a FACT (the PR's own base, or the declared base of a new branch).
+- `--base <base>` is always passed, for the default branch too. It is a FACT (the PR's own base, or the declared base of a new
+  branch), and naming it spares `safe-push.sh` its fallback to a cached `origin/HEAD` that may be unset (freshness then reads
+  unknown and the push proceeds; READ its freshness leg). The TYPED contracts differ on purpose and are not changed: `/prep-pr`
+  Step 7 and the pr-shipper OMIT `--base` for the default base, because the floor's destination matcher reads a bare `main` or
+  `master` word anywhere in a `safe-push.sh` COMMAND LINE as a push to it (READ `scripts/orchestrate-guard.sh`, `has_main_dest`:
+  a whole-word match over the clause, whatever flag precedes it). That deny is real and does not reach this call: the worker's
+  argv is a list handed to `Popen` by a detached process, never a Bash tool call, so no PreToolUse hook sees it (section 9).
+  The consequence is for people and harnesses: this argv is never pasted onto an agent's command line (section 11's fixtures).
+- THE BOUND on the call is `push_timeout_s` when no pre-push hook can run (the cost rule's test, queue section 2, made by EVERY
+  worker immediately before the marker) and `job_timeout_s + push_timeout_s` when one can. The hook's gate carries the pool's
+  `job_timeout_s` (5400 by default, against 900), so with `push_timeout_s` alone the worker's bound would end a healthy gate and
+  report `pushed=unknown`. `push_timeout_s` thus always means the push itself, and no config can put it below the gate. A hook
+  that appears after the test gets the short bound and, if its gate outlasts it, `error` `push-timeout`.
 - `--stale-ok` is passed IFF step 2's read showed an open PR WITH review activity. There is ONE read, at step 2; nothing is re-read
   at push time (the earlier text said both). Unreadable activity = flag absent = `safe-push.sh` refuses a behind branch.
 - A first push refused `stale-base` here (the base moved after step 3) ends `refused` `stale-base`. There is no retry.
@@ -216,7 +232,7 @@ Its ONE stdout line decides (READ, `scripts/safe-push.sh`: the EXIT trap prints 
 | `FAILED` (the push ran; origin was read and does not hold the SHA) | `failed` `push-failed` | `no` |
 | `ERROR` (an abort before the push ran) | `error` `safe-push-error` | `no` |
 | `USAGE` (a defect in the closed template) | `error` `safe-push-usage` | `no` |
-| `UNVERIFIED` (exit 3), no line at all, or the call was ended at `push_timeout_s` | `error` (`push-unverified`, `push-timeout`), the tail STOPS: no PR is opened on an unknown | `unknown` |
+| `UNVERIFIED` (exit 3), no line at all, or the call was ended at its bound | `error` (`push-unverified`, `push-timeout`), the tail STOPS: no PR is opened on an unknown | `unknown` |
 
 ---
 
@@ -304,9 +320,9 @@ The control environment (queue section 4) removes what a SESSION could inject. I
   detached, NOT RUN. A setup that relies ONLY on a token variable fails the push over HTTPS, or gets a pushed branch and `error` at
   `pr` over SSH.
 - (c) A pre-push hook fired by the runner's push runs under the CONTROL environment; one whose gate needs directories outside
-  `tool_dirs` fails loudly (`failed`, nothing pushed) until the user adds them. `push_timeout_s` must exceed that gate's length:
-  the hook's gate carries the pool's `job_timeout_s` (5400 by default), which is longer than the default `push_timeout_s` (900),
-  so the worker's bound on the push is the one that fires first.
+  `tool_dirs` fails loudly (`failed`, nothing pushed) until the user adds them. Its gate may outlast `push_timeout_s` (the pool's
+  `job_timeout_s` is 5400 by default, against 900), so with a hook present the worker bounds the push by their SUM (section 5);
+  the price is that a push stuck in a hook-installed repo holds its slots and worktree that much longer.
 - (d) PROXY AND CA VARIABLES ARE NOT CARRIED (`HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`, `GIT_SSL_CAINFO` and the
   like). A machine that reaches GitHub only through a proxy set in the environment cannot use the queue in v1.
 
@@ -355,7 +371,7 @@ PR, stack linking, the merge, cleanup. The runner never commits, comments, edits
 
 | Failure | Resulting state | Recovery |
 |---|---|---|
-| The push hangs (a prompting key agent, a stuck hook, a dead network) | Slots and worktree held | The WORKER kills the push's group at `push_timeout_s`: `error` `push-timeout`, `pushed=unknown`. Re-enqueueing is safe; with a hook installed, raise `push_timeout_s` first |
+| The push hangs (a prompting key agent, a stuck hook, a dead network) | Slots and worktree held | The WORKER kills the push's group at the call's bound (section 5): `error` `push-timeout`, `pushed=unknown`. Re-enqueueing is safe |
 | Worker SIGKILLed mid-push | Its watchdog kills the push at once and keeps the worktree claimed (its `.sweep`, and the hook gate's own) until every group is gone. The marker exists | Recovery re-queues; the job is not eligible until the claims free; the next worker reads origin FIRST (section 6) |
 | A pre-push hook's gate prints `gate-runner: NOT RUN` (exit 75 `nested-over-holder`, or a pool config error) | The push fails; nothing sent | `failed` `push-failed`, `pushed=no`; the line is in the log. Not a failed gate, and not transient: correct the cause the line names, re-enqueue ONCE (section 5) |
 | Killed after the push, before PR create | Origin holds the SHA; no PR | Origin first: straight to `pr`, which lists and creates |
@@ -379,7 +395,7 @@ PR, stack linking, the merge, cleanup. The runner never commits, comments, edits
 ## 11. Decomposition: unit C (#541) as two PRs
 
 - C1, THE PUSH LEG: `--tail push`, `base`, the all-states same-repository PR read and its table, freshness before the gate, the
-  cost-0 hook re-test, the marker and origin-first recovery, the closed-template `safe-push.sh` call under `push_timeout_s`, the
+  cost-0 hook re-test, the marker and origin-first recovery, the closed-template `safe-push.sh` call under its bound, the
   verdict table, the `pushed` rule in every writer, the fix-round half of the `pr` step, the argv registry.
 - C2, THE PR-CREATE LEG: the `pr` object, the title and body copies, list-first `gh pr create`, crash-resume.
 
@@ -396,7 +412,7 @@ DEPENDENCIES. C1 needs B3 (the worker) and is ordered after B4 (both edit `gate_
         missing worktree; nothing is sent on any refusal.
   - [ ] No job field and no code path can add a word to the `safe-push.sh` call beyond `--base <name>` and a derived `--stale-ok`;
         `safe-push.sh` is unchanged; every one of its six verdicts maps to a stated result; the call is ended by the worker at
-        `push_timeout_s` with its whole process group.
+        its bound (`push_timeout_s`, plus `job_timeout_s` when a pre-push hook can run) with its whole process group.
   - [ ] The runner makes no commit. A first-push branch definitively behind at slot grant is refused `stale-base` BEFORE any gate
         step, with nothing sent; unknown freshness does not block; a reviewed PR is pushed with `--stale-ok`; what is pushed is
         exactly the enqueued commit. (The stale-base re-gate is NOT ended by this unit.)
@@ -410,7 +426,7 @@ DEPENDENCIES. C1 needs B3 (the worker) and is ordered after B4 (both edit `gate_
 
 | PR | Test plan |
 |---|---|
-| C1 | A harness against a local bare `origin` built by FETCH (the guard greps sandbox commands too; trigger text stays inside fixtures): protected-branch refusal including an unreadable live default; no extra word can reach `safe-push.sh` and `--base` is two words; `--stale-ok` only with review activity; a behind first push is refused with no gate step started; unknown freshness proceeds; every row of section 3's table and all five cases for both job kinds; a fork PR with the same branch name is ignored; a read at the limit is unreadable; each of the six verdicts, with a stub printing it; a stand-in push that never returns is ended at `push_timeout_s` with its group and yields no `pr` step; the worker killed after the marker with origin holding the pin, then with the base moved, then with the receipt deleted, then with the PR merged and the branch gone (each ends `pushed=yes`); killed with origin not holding it and then refused (`unknown`); origin unreadable at recovery (`error`, `unknown`); `cancel` and the 3-attempt cap on a marked job say `unknown`; a replace in place keeps the marker; a hook's gate inside the push takes no ticket, holds the worker's `.nest` and its own `.sweep`, and one heavier than the worker's held cost exits 75 at once and yields `failed` `push-failed` with the NOT RUN line in the log; an origin-first first push on a reused branch name (case b or d) does not end `pr-merged-during-job`; a fix-round PR whose head differs is `pr-head-mismatch`; the registry holds no history-writing verb. Mutations: forward one extra argv word; write `--base=<name>`; pass `--stale-ok` on an unreadable read; read open PRs only; count cross-repository PRs; treat a missing PR head as unrelated; drop the reachable-from-base condition; run the gate before the freshness check; write the marker AFTER starting the push; skip the origin-first read; report `no` for a marked job; read a failed `ls-remote` as "absent"; drop `push_timeout_s`; add `git merge` to the registry. Then LIVE UAT over SSH and HTTPS |
+| C1 | A harness against a local bare `origin` built by FETCH (the guard greps sandbox commands too; trigger text stays inside fixtures): protected-branch refusal including an unreadable live default; no extra word can reach `safe-push.sh`, `--base` is two words and is passed for the default base too; a `base` of `@{-1}` (with a previous checkout in the fixture), `HEAD`, a `refs/` name or a refspec is refused at `add` and again by the worker; a `base-freshness.sh` stub exiting 2 ends `error` `freshness-error` with no gate step and no push; `--stale-ok` only with review activity; a behind first push is refused with no gate step started; unknown freshness proceeds; every row of section 3's table and all five cases for both job kinds; a fork PR with the same branch name is ignored; a read at the limit is unreadable; each of the six verdicts, with a stub printing it; a stand-in push that never returns is ended at `push_timeout_s` with its group and yields no `pr` step; with a pre-push hook present, a stand-in hook gate that outlasts `push_timeout_s` is NOT ended and the push completes, and one that outlasts `job_timeout_s + push_timeout_s` is ended `push-timeout`; the worker killed after the marker with origin holding the pin, then with the base moved, then with the receipt deleted, then with the PR merged and the branch gone (each ends `pushed=yes`); killed with origin not holding it and then refused (`unknown`); origin unreadable at recovery (`error`, `unknown`); `cancel` and the 3-attempt cap on a marked job say `unknown`; a replace in place keeps the marker; a hook's gate inside the push takes no ticket, holds the worker's `.nest` and its own `.sweep`, and one heavier than the worker's held cost exits 75 at once and yields `failed` `push-failed` with the NOT RUN line in the log; an origin-first first push on a reused branch name (case b or d) does not end `pr-merged-during-job`; a fix-round PR whose head differs is `pr-head-mismatch`; the registry holds no history-writing verb. Mutations: forward one extra argv word; write `--base=<name>`; pass `--stale-ok` on an unreadable read; read open PRs only; count cross-repository PRs; treat a missing PR head as unrelated; drop the reachable-from-base condition; run the gate before the freshness check; write the marker AFTER starting the push; skip the origin-first read; report `no` for a marked job; read a failed `ls-remote` as "absent"; drop `push_timeout_s`; bound a hook-present push by `push_timeout_s` alone; validate `base` with `check-ref-format --branch`; proceed on a `base-freshness.sh` exit 2; add `git merge` to the registry. Then LIVE UAT over SSH and HTTPS |
 | C2 | Stubbed `gh`: title and body copied and hash-checked; a deleted source file changes nothing; argv is `--flag=value` only; list-first finds an existing PR and creates nothing; a PR that merged during the job creates nothing; a missing label fails after the push as `pr-create-failed`; the worker killed before and after the create never yields a second PR. Mutations: create before listing; read the body from the caller's path; drop the hash check; drop the head-equals-pushed check. Then LIVE UAT |
 
 ---

@@ -12,10 +12,10 @@ Depends on: the pool document merged, and pool PRs A1, A2, A3 and A4 (section 10
 
 Scope: one new module (`scripts/gate_queue.py`), one enqueue helper (`scripts/gate-enqueue.py`, the ONLY writer of queue entries),
 two internal `gate-runner.py` flags, two schemas in `scripts/orchestrate_schemas.py`, a small extension of `scripts/gate_pool.py`
-(section 2), ONE read-only check in `scripts/cleanup-worktree.sh` and the matching prose in `commands/post-merge-cleanup.md`. NO
-deterministic-floor change. No allow-list entry is harvested or written by any tool; ONE entry (the helper) is printed for the
-maintainer to grant by hand (section 8). Stdlib Python 3.11+, no new bash file. Unit B sends NOTHING outward: its jobs stop after the
-receipt check. The runner makes NO commit.
+(section 2), ONE read-only check in `scripts/cleanup-worktree.sh` and the matching prose in `commands/post-merge-cleanup.md`, and
+ONE advisory rule in `scripts/orchestrate-steer.sh` (section 8). NO deterministic-floor change. No allow-list entry is harvested
+or written by any tool; ONE entry (the helper) is printed for the maintainer to grant by hand (section 8). Stdlib Python 3.11+, no
+new bash file. Unit B sends NOTHING outward: its jobs stop after the receipt check. The runner makes NO commit.
 
 Evidence labels: RUN = executed on this machine in an earlier round or by a reviewer (Darwin 27.0.0 and 27.0.1, Python 3.14.8;
 appendix), READ = read from the current source, REASONED = argued and not executed, PRIOR = a report with no persisted data. NOTHING
@@ -39,16 +39,17 @@ nothing gives a fix round precedence over a first push. The push-side problems a
 
 Numbered as in the epic and the pool document (3, 4, 6, 9, 11, 12 and 13 are specified there).
 
-1. `gate-runner.py` may open a PR for a queued job. With no job it is unchanged: run the gate, write the receipt, nothing outward.
-2. A job is declared DATA (worktree, branch, PR details). Never a command line.
-5. A failed job loses its position (a re-enqueue goes to the back of its class).
-6. Fix rounds outrank first pushes; FIFO within each class (the pool's `schedule()`).
-7. One job per branch, replaced in place while queued. If that branch's job is running, the new one waits behind it and is dropped
-   when the branch head has not moved.
-8. Self-starting runner: whoever enqueues tries the runner lock; the winner starts a detached runner that drains the queue and exits
-   when it is empty. No cron, no designated lead.
-9. A stale lock must not be able to break the queue: kernel `flock` only.
-10. Result delivery is the designer's call: a result file.
+- Decision 1: `gate-runner.py` may open a PR for a queued job. With no job it is unchanged: run the gate, write the receipt,
+  nothing outward.
+- Decision 2: a job is declared DATA (worktree, branch, PR details). Never a command line.
+- Decision 5: a failed job loses its position (a re-enqueue goes to the back of its class).
+- Decision 6: fix rounds outrank first pushes; FIFO within each class (the pool's `schedule()`).
+- Decision 7: one job per branch, replaced in place while queued. If that branch's job is running, the new one waits behind it
+  and is dropped when the branch head has not moved.
+- Decision 8: self-starting runner: whoever enqueues tries the runner lock; the winner starts a detached runner that drains the
+  queue and exits when it is empty. No cron, no designated lead.
+- Decision 9: a stale lock must not be able to break the queue: kernel `flock` only.
+- Decision 10: result delivery is the designer's call: a result file.
 
 ## Shape in one page
 
@@ -205,7 +206,7 @@ Unit A's code reads `waiters/` only. From B2, every evaluator (a hand-run gate, 
 5. honors `GATEQ_HOLDER` and `GATEQ_NEST` for a file directly inside `running/` as well as `waiters/`. The pool's rule already
    says so (pool section 5: `GATEQ_NEST` in the SAME directory as the holder's record); B2 implements the `running/` half. A
    worker's nest lock is `running/<job>.ticket.nest`; without this a level-2 run under a worker would take the holder's own `.nest`
-   and wait on its ancestor until `push_timeout_s`. A `.nest` still HELD when its job leaves `running/` is left in place (the
+   and wait on its ancestor until the push's bound. A `.nest` still HELD when its job leaves `running/` is left in place (the
    pool's rule) and unlinked by the dispatcher on a later pass, once free;
 6. allocates a seq from the maximum visible in `queued/` and `running/` as well as `waiters/` (section 1).
 
@@ -257,7 +258,7 @@ key: an unknown key inside `[pool]` exits 2 for every gate, and unit A's reader 
 ```toml
 [queue]                        # every key optional
 enabled = true                 # the queue's OWN switch; absent = off, whatever the pool does
-push_timeout_s = 900           # unit C: the worker's bound on one safe-push.sh call; with a pre-push hook it must exceed the gate's length (push section 8)
+push_timeout_s = 900           # unit C: the worker's bound on one safe-push.sh call; a pre-push hook adds job_timeout_s to it (push section 5)
 call_timeout_s = 30            # every other git and gh call the runner itself makes
 tool_dirs = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]   # the default; the runner's whole PATH
 ```
@@ -412,9 +413,9 @@ one persisted bit keep the REPORT truthful in that case, they do not stop the or
 |---|---|---|
 | any `git` or `gh` call (and unit C's `base-freshness.sh`) | `call_timeout_s` | an UNREADABLE result for that call: silence on doubt in the dispatcher, the step's `error` in a worker |
 | the gate | the pool's `job_timeout_s`, in-process, exactly as a hand-run gate (pool section 4, "The hand-run timeout") | `failed` `job-timeout`, with a fail receipt |
-| `safe-push.sh` (unit C) | `push_timeout_s` | `error` `push-timeout`, `pushed=unknown` |
+| `safe-push.sh` (unit C) | `push_timeout_s`; `job_timeout_s + push_timeout_s` when a pre-push hook can run (push section 5) | `error` `push-timeout`, `pushed=unknown` |
 
-WHAT BOUNDS A JOB: `job_timeout_s`, plus `push_timeout_s`, plus a handful of `call_timeout_s`, all enforced by the worker with no
+WHAT BOUNDS A JOB: `job_timeout_s`, plus the push's bound, plus a handful of `call_timeout_s`, all enforced by the worker with no
 other process alive. Nothing outside bounds the WORKER PROCESS itself; a worker older than that sum is a bug, and `status` marks it
 `overdue`. A worker handles SIGTERM by sweeping its registered groups and writing its own result (`error` `terminated`); that is how
 an operator ends a running job (`kill <pid>`, the pid `status` shows). THE HANDLER ONLY RAISES in the main flow: it is deferred
@@ -473,7 +474,7 @@ drain():
 
 | # | Step | What happens | On failure |
 |---|---|---|---|
-| 1 | `preflight` | Re-validate the entry. The worktree exists, holds `branch`, is clean, not mid-rebase or merge; `refs/heads/<branch>` equals `head_sha`. If `after` is set and that job's `head_sha` equals this one's: `superseded` | `refused` `no-worktree`, `dirty-worktree`, `head-moved`, `protected-branch`, `mid-rebase`; `superseded` `dropped-unchanged` |
+| 1 | `preflight` | Re-validate the entry. The worktree exists, holds `branch`, is clean, not mid-rebase or merge; `refs/heads/<branch>` equals `head_sha`. If `after` is set, that job's result says `done`, and its `head_sha` equals this one's: `superseded` (section 5; any other predecessor state, or no readable result, drops nothing) | `refused` `no-worktree`, `dirty-worktree`, `head-moved`, `protected-branch`, `mid-rebase`; `superseded` `dropped-unchanged` |
 | 2 | `gate` | A passing receipt binds `HEAD^{tree}` and the tree is clean: REUSE it. Else, holding slots: run the gate IN-PROCESS through the pool's pooled step path with the step environment, `GATEQ_HOLDER` set, and `_write_receipt` to `<git-dir>/prep-pr-receipt.json`. Else (admitted at cost 0): BOUNCE | `failed` `gate-failed` or `job-timeout` (the fail receipt is on disk) |
 | 3 | `receipt` | Full `gate-receipt/v1` validation, `producer == gate-runner`, `result == pass`, `tree_sha == HEAD^{tree}` | `failed` `receipt-invalid`, `receipt-stale` |
 | 4 | `finalize` | Write the result atomically; then, under `admit.lock`, move the job's files to `done/` and delete `.pushing`; exit (which frees the slots and the ticket) | - |
@@ -557,8 +558,9 @@ A queued line held back by a held `.sweep` in its worktree gains `blocked=sweep 
 A running line gains `overdue` (older than the job's bounds), `dead` (ticket lock free, awaiting recovery) or `foreign-protocol`.
 `status --worktree <path> --quiet` prints nothing and answers by exit code: 0 = no record claims the worktree, 10 = claimed, 2 =
 could not determine. "Claimed" means a record whose flock is HELD (a running job's ticket, a pool ticket, or a `.sweep` file) names
-it, or, with the queue ON, a queued job does. With the queue off a queued job claims nothing. The read uses only the directory and the locks, so a
-malformed config cannot make it undeterminable. 10 is used because a crashed Python exits 1 (RUN R5).
+it, or a QUEUED job does, with the queue on OR off: a queued job is durable work that resumes when the queue is turned back on, and
+`cancel` works either way. The read uses only the directory and the locks, never the config, so a malformed config cannot make it
+undeterminable. 10 is used because a crashed Python exits 1 (RUN R5).
 
 `cancel <job>` withdraws a job that no process owns. It acts by itself, under `admit.lock`, with or without a dispatcher.
 
@@ -596,8 +598,9 @@ RUN-DIRECTORY CAPTURE, and only when the worktree directory exists:
 | it exits 10 | REFUSES (`exit 1`, nothing touched), naming the record; the message says to wait or to `cancel` a queued job |
 | it exits anything else (2, a crash's 1, 127: READ `/usr/bin/python3` here is 3.9) | REFUSES (`exit 1`, nothing touched) as UNDETERMINED, printing the code |
 
-- With the queue off, `status` reports only records whose lock is HELD, so the script refuses only when a process is working in
-  that worktree right now. No path refuses forever: a queued job is cancellable and a running one ends at its own timeouts.
+- The answer does not depend on the queue's switch: a queued job claims its worktree while the queue is off too, or a cleanup
+  made then would leave a job that can only end `no-worktree` once the queue is back. No path refuses forever: a queued job is
+  cancellable (with the queue off as well) and a running one ends at its own timeouts.
 - THE OVERRIDE IS THE MAINTAINER'S. The refusal message does not print it; `commands/post-merge-cleanup.md` says an agent reports
   the refusal and sets the variable only on the maintainer's explicit word in that session.
 - READ (`commands/post-merge-cleanup.md`, Step 3, about lines 104 to 114): that command also removes a worktree INLINE with a bare
@@ -618,8 +621,19 @@ push-side rules (the closed `safe-push.sh` template, the argv registry, what the
   (RUN R1) and also bypasses the budget, because no dispatcher counted it.
 - THE OS-LEVEL POWER IS THE SAME AS AN INLINE PUSH, BUT THE PERMISSION SYSTEM AND THE FLOOR DO NOT SEE IT: once unit C exists, a
   forged entry needs no push or PR grant. A teammate that holds no `safe-push.sh` and no `gh pr create` grant, but any file-writing
-  Bash call, can cause a push and a PR this way. What bounds it is what a hand-edited entry can cause (below and unit C) and a
-  charter rule (`DESIGN-gate-queue-wiring.md`); nothing mechanical in the first delivery.
+  Bash call, can cause a push and a PR this way. What bounds it is what a hand-edited entry can cause (below and unit C), a
+  charter rule (`DESIGN-gate-queue-wiring.md`) and one nudge (next bullet). No deny.
+- THE ENQUEUE NUDGE (PR B4, ADVISORY). `orchestrate-steer.sh` gains one rule: `gate-enqueue.py` at command position (the clause
+  split of its rules 2, 3 and 6) with the verb `add`, `cancel` or `stop`, in a call whose hook payload carries a non-empty
+  `agent_type`, prints a `STEER:` line naming the charter rule. Per the #426 measurement (cited, not re-run; B4's UAT repeats it
+  on the deployed Claude Code) the lead's main thread carries no `agent_type`, and a subagent, a fork and a teammate in either
+  mode each carry one. Exit 0 on every path; an absent or unreadable field is silent. It says the rule at the point of use; it
+  is NOT enforcement.
+- ACCEPTED LIMIT, decided here and not deferred: a teammate that ignores the charter and the nudge, or forges an entry, can
+  queue a push. A deny needs the caller's identity, which only a PreToolUse hook sees, so it is a FLOOR change; and it would
+  cover the helper's command line only, while the forged entry (any file write by the same uid) stays open. Against the
+  floor's own threat model (an honest actor on the obvious path) it adds nothing to the nudge; against anyone else it is one
+  file write from useless. The outcome stays bounded by what a hand-edited entry can cause (below and unit C).
 - No `Edit(...)` rule for the directory is in the required list and none must ever be added; that keeps the OBVIOUS path (the file
   tools) closed, and nothing more is claimed for it.
 
@@ -673,8 +687,9 @@ Round 3 found the former B2 too large for one review, so the dispatcher and the 
   the doctor WARN for a visible `gate_pool.py` whose `POOL_PROTOCOL` differs from the configured one. Tested against a STUB worker.
 - B3, THE WORKER: `--queue-worker`, its hand-off, non-inheritable descriptors, the step environment, the in-process gate and receipt
   check (`tail = "gate"`), its `.sweep` claim, the bounce, finalize, SIGTERM.
-- B4, OPERABILITY: `stop`, the `hung`, `overdue` and `dead` reports, the `cleanup-worktree.sh` check and the
-  `commands/post-merge-cleanup.md` edit. A script FUNCTION change, in this unit on purpose: it is needed once a job can run.
+- B4, OPERABILITY: `stop`, the `hung`, `overdue` and `dead` reports, the `cleanup-worktree.sh` check, the
+  `commands/post-merge-cleanup.md` edit, and the enqueue nudge in `orchestrate-steer.sh` (ADVISORY tier, earned by checking the
+  post-diff file). A script FUNCTION change, in this unit on purpose: it is needed once a job can run.
 
 DEPENDENCIES. B1 needs A1. B2 needs B1 and A4 (its calls register with the watchdog; A4 itself needs A2 and A3). B3 needs B2 and A2
 (the pooled step path and the in-process `job_timeout_s`). B4 needs B3. Tier: CR-required (script function). Agent hints: `[mode:
@@ -703,20 +718,21 @@ Acceptance criteria:
       owns and never touches a held one; `stop` ends the dispatcher and starts nothing.
 - [ ] `cleanup-worktree.sh` and the inline `/post-merge-cleanup` path proceed when the helper or the queue root is absent or the
       override is set, refuse (nothing touched) on exit 10, and refuse as undetermined on any other non-zero exit.
+- [ ] An `add`, `cancel` or `stop` typed by anything but the lead's main thread draws a `STEER:` line and is never blocked.
 - [ ] A malformed, mis-owned or hand-edited entry is refused before anything runs; every assertion is mutation-proven.
 
 TEST PLANS. Every script PR follows the pool document's rules (pool section 9, "PR-level slicing"): stdlib, `ruff`, a new `test-*.py`
 harness as a named `.gates.toml` step and in both lint lists, `HELPER_NAMES` with the #284 lockstep, every assertion MUTATION-PROVEN
 on a copy, every harness pins `GATEQ_HOME` to a fresh temp directory, removes `GATEQ_HOLDER` from the child environment and never
-runs the real gate. NO new bash, with ONE exception:
-B4 edits `scripts/cleanup-worktree.sh`.
+runs the real gate. NO new bash file:
+B4 edits two existing ones, `scripts/cleanup-worktree.sh` and `scripts/orchestrate-steer.sh`.
 
 | PR | Test plan |
 |---|---|
-| B1 | `test-gate-enqueue.py`, `git` stubbed: atomic publish; replace in place keeps the name and the bypass count and drops the ticket; every field validator; `env_passthrough` refuses each denied pattern; no credential-named variable is snapshotted; ownership checks; `cancel` of a queued entry, of a held running record (refused) and of a free one (withdrawn); `status --worktree --quiet` returns 0, 10 and 2, and with the queue off a queued job does not claim, while a held `.sweep` does; an unknown `[queue]` key in `config.toml` exits 2, and `.gates.toml` `[pool] env_passthrough` is not read. Mutations: read `env_passthrough` from `[pool]`; accept a mismatched stem; let `GIT_SSH_COMMAND` into the snapshot; publish before the payload is fsynced; let `cancel` touch a held record; return 1 for "claimed" |
+| B1 | `test-gate-enqueue.py`, `git` stubbed: atomic publish; replace in place keeps the name and the bypass count and drops the ticket; every field validator; `env_passthrough` refuses each denied pattern; no credential-named variable is snapshotted; ownership checks; `cancel` of a queued entry, of a held running record (refused) and of a free one (withdrawn); `status --worktree --quiet` returns 0, 10 and 2, a queued job claims with the queue on AND off (and with no readable config), and so does a held `.sweep`; an unknown `[queue]` key in `config.toml` exits 2, and `.gates.toml` `[pool] env_passthrough` is not read. Mutations: read `env_passthrough` from `[pool]`; accept a mismatched stem; let `GIT_SSH_COMMAND` into the snapshot; publish before the payload is fsynced; let `cancel` touch a held record; return 1 for "claimed"; read the config to decide whether a queued job claims |
 | B2 | `test-gate-queue.py`, `gh` and `git` stubbed, a stub worker: a hand-run ticket does not start in a worktree whose job ticket is held; it counts queued jobs only while `runner.alive` is held and the beat is fresh; it never unlinks a job record; an A-era protocol exits 2; class derivation and its unreadable and timed-out paths; a cross-repository PR does not make a fix round; enqueue-versus-exit interleavings driven deterministically; a probe of `runner.alive` during an `add` strands nothing; the ticket is HELD before the worker process exists; a hand-typed `--drain-queue` exits 2 and leaves `runner.lock` free; the discarded environment; no `git` call under `admit.lock`; a bounded call's grandchild is gone after expiry; the dispatcher SIGKILLed mid-call leaves no call running; a call killed between `Popen` and the start byte runs nothing; dead-worker requeue keeps the name and the marker, and the 3-attempt cap holds; budget file removed with a worker alive; a call whose descendant starts its own session and keeps stdout returns at the leader's exit (K2); the queue is off without `[queue] enabled`; a batch of jobs committed in one pass never passes an entry beyond K; the doctor WARN. Mutations: recompute a job's `passed` list at commit; capture a call's output through a pipe; enqueue takes the lock BEFORE writing; skip the re-scan after release; treat a `gh` read failure as "no PR"; count a cross-repository PR; drop rule 1 of the pool extension; honor queued jobs with a stale beat; flock the ticket after the worker starts; send the start byte before `+pgid`; kill only the direct child; drop the timeout from one call; register a worker with the dispatcher's watchdog |
-| B3 | Extends `test-gate-queue.py`: WITH A WORKER ALIVE, SIGKILL of the dispatcher leaves the worker running to its own result; a stuck gate step is ended by the worker at `job_timeout_s` with no dispatcher alive; SIGKILL of the worker leaves no step and no call running and frees its ticket even with a `close_fds=False` child alive; SIGTERM yields `error` `terminated` and is deferred while `admit.lock` is held (K1); a level-2 run under a worker does not wait on its ancestor; a hand-typed `--queue-worker` exits 2; cost-0 reuse, the bounce and its pinned cost; `after` with an unmoved head is `superseded`; the worker's `.sweep` is in `waiters/` and locked by its watchdog before its first call; with a step group that ignores the first kill, SIGKILL of the worker leaves the requeued job and a same-worktree hand-run gate waiting until the watchdog is done, and the same with a nested run's watchdog. Mutations: start a call before the `.sweep` is locked; put the worker's `.sweep` where `busy` does not read; start the worker with a bare fork; pass `runner.lock` in the worker's `pass_fds`; `LOCK_UN` a handed descriptor; drop the `set_inheritable` call; have the worker close its ticket descriptor early; skip the environment discard; let a bounce keep cost 0 |
-| B4 | `stop` with a worker alive leaves the worker running and `runner.lock` free; `stop` never touches `runner.lock`; the three status flags. `test-cleanup-worktree.py` gains: helper absent, root absent, override set (each proceeds); exit 0; exit 10 (refuses, nothing touched); exits 1, 2 and 127 (undetermined); the check runs after the cwd guard and before the run-directory capture. Mutations: let `stop` start a dispatcher; let `cleanup-worktree.sh` proceed on exit 2; refuse when the helper is absent; read exit 1 as "claimed"; print the override in the refusal |
+| B3 | Extends `test-gate-queue.py`: WITH A WORKER ALIVE, SIGKILL of the dispatcher leaves the worker running to its own result; a stuck gate step is ended by the worker at `job_timeout_s` with no dispatcher alive; SIGKILL of the worker leaves no step and no call running and frees its ticket even with a `close_fds=False` child alive; SIGTERM yields `error` `terminated` and is deferred while `admit.lock` is held (K1); a level-2 run under a worker does not wait on its ancestor; a hand-typed `--queue-worker` exits 2; cost-0 reuse, the bounce and its pinned cost; `after` with an unmoved head is `superseded` only when the predecessor ended `done` (a failed, cancelled or result-less one drops nothing); the worker's `.sweep` is in `waiters/` and locked by its watchdog before its first call; with a step group that ignores the first kill, SIGKILL of the worker leaves the requeued job and a same-worktree hand-run gate waiting until the watchdog is done, and the same with a nested run's watchdog. Mutations: start a call before the `.sweep` is locked; put the worker's `.sweep` where `busy` does not read; start the worker with a bare fork; pass `runner.lock` in the worker's `pass_fds`; `LOCK_UN` a handed descriptor; drop the `set_inheritable` call; have the worker close its ticket descriptor early; skip the environment discard; let a bounce keep cost 0; drop the predecessor-`done` test from `superseded` |
+| B4 | `stop` with a worker alive leaves the worker running and `runner.lock` free; `stop` never touches `runner.lock`; the three status flags. `test-cleanup-worktree.py` gains: helper absent, root absent, override set (each proceeds); exit 0; exit 10 (refuses, nothing touched), including a real helper run against a QUEUED job with the queue turned off, which proceeds once the job is cancelled; exits 1, 2 and 127 (undetermined); the check runs after the cwd guard and before the run-directory capture. Mutations: let `stop` start a dispatcher; let `cleanup-worktree.sh` proceed on exit 2; refuse when the helper is absent; read exit 1 as "claimed"; print the override in the refusal. `test-orchestrate-steer.py` gains: `add`, `cancel` and `stop` with an `agent_type` each warn; the same three with none, and `status`, `enabled` and `wait` with one, are silent; a quoted or commented mention is silent; every case exits 0 with empty stdout. Mutations: warn with no `agent_type`; warn on `status`; exit non-zero on a match |
 
 ---
 

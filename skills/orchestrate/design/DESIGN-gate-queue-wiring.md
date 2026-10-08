@@ -43,19 +43,34 @@ never "fix the failing gate") is the pool's and lands with PR A2 (pool section 6
 | 6 | Squashing becomes OPTIONAL and the default flips to KEEP the commits (decision 15; section 2) |
 | 7 + 8 | REORDERED on the queue path: Step 8a and 8b (issue refs, labels, the template-aware body, the advisory prose-lint, and the "create the PR?" offer, now asked BEFORE the push as open / draft / no PR) run first, then ONE enqueue block, then a background wait. The "no PR" answer takes today's inline Step 7 push instead of the queue (push section 3) |
 
-The enqueue block (leg selection as in "Helper exec paths"; the deployed leg first, like the elmer commands, because the grant names
-that path):
+EVERY queue call is one block of the "Helper exec paths" shape: the `enabled` probe, the enqueue and the wait alike. Each is its
+own Bash call (a fresh shell), so each selects its leg again, by the SAME tests in the SAME order, and so all three run the same
+copy. TWO legs only, the two paths the grant names: the deployed one first (like the elmer commands), then the plugin one. There
+is NO repo-local leg: the grant does not cover one, and a helper run from a cc-orchestrator worktree would be that branch's
+unreviewed code writing entries for every repo's jobs (the reason `RUNNER` is always the deployed copy, queue section 4). The
+enqueue block:
 
 ```bash
-python3 ~/.claude/scripts/gate-enqueue.py add --worktree "$PWD" --tail push [--base "$base"] \
-  --title-file "$title_file" --body-file "$body_file" [--label "$label"]... [--milestone "$ms"] [--draft]
+if [ -f ~/.claude/scripts/gate-enqueue.py ]; then leg=stable
+elif [ -f '${CLAUDE_PLUGIN_ROOT}/scripts/gate-enqueue.py' ]; then leg=plugin
+else leg=none; fi
+eq_rc=2
+[ "$leg" = stable ] && { python3 ~/.claude/scripts/gate-enqueue.py add --worktree "$PWD" --tail push [--base "$base"] \
+  --title-file "$title_file" --body-file "$body_file" [--label "$label"]... [--milestone "$ms"] [--draft]; eq_rc=$?; }
+[ "$leg" = plugin ] && { python3 '${CLAUDE_PLUGIN_ROOT}/scripts/gate-enqueue.py' add --worktree "$PWD" --tail push [--base "$base"] \
+  --title-file "$title_file" --body-file "$body_file" [--label "$label"]... [--milestone "$ms"] [--draft]; eq_rc=$?; }
+[ "$leg" = none ]   && echo "gate-enqueue.py not found (deployed or plugin)" >&2
+echo "eq_rc=$eq_rc leg=$leg"
 ```
 
-`--base` is passed only when the PR's base is not the repository default. The block prints `GATE-ENQUEUE: ENQUEUED|REPLACED id=<job>
-position=<n> runner=...` and exits 0, 1 (REFUSED, nothing written) or 2 (setup). Then, as a BACKGROUND task:
+The `enabled` probe is the same block with `enabled` as the only argument; `leg=none` there means the queue is off and the
+command takes the inline path. `--base` is passed only when the PR's base is not the repository default. The block prints
+`GATE-ENQUEUE: ENQUEUED|REPLACED id=<job> position=<n> runner=...` and exits 0, 1 (REFUSED, nothing written) or 2 (setup, and
+`leg=none`). Then, as a BACKGROUND task, the same selection around:
 
 ```bash
-python3 ~/.claude/scripts/gate-enqueue.py wait "$job_id" --timeout 1800
+[ "$leg" = stable ] && { python3 ~/.claude/scripts/gate-enqueue.py wait "$job_id" --timeout 1800; w_rc=$?; }
+[ "$leg" = plugin ] && { python3 '${CLAUDE_PLUGIN_ROOT}/scripts/gate-enqueue.py' wait "$job_id" --timeout 1800; w_rc=$?; }
 ```
 
 The timeout matters: without it a hung dispatcher, or a job whose class cannot be read (`gh` down), never returns and the
@@ -118,9 +133,13 @@ adds ONE paragraph to `commands/stack-prs.md` and one default to `/prep-pr`:
 
 - `commands/stack-prs.md` says that a slice's PR may have been opened through the queue (a PR-number slice), and that nothing about
   the link, the preflight or the draft default changes when the queue is on.
-- In `/prep-pr`'s reordered offer (open / draft / no PR), the RECOMMENDED answer is `draft` when `--base` is not the repository
-  default branch, that is, when the PR is an upper slice of a stack: it matches what link would have created, and only the bottom
-  PR of a stack is reviewed by CodeRabbit. For a PR on the default branch the recommendation stays `open`, as today.
+- In `/prep-pr`'s reordered offer (open / draft / no PR), the RECOMMENDED answer is `draft` only when the PR is CONFIRMED an upper
+  slice of a stack: its base is not the repository default AND one read, `gh pr list --repo=<repo> --head=<base> --state=open
+  --json=number,isCrossRepository`, shows exactly one same-repository OPEN PR whose head branch is that base. That matches what
+  link would have created, and only the bottom PR of a stack is reviewed by CodeRabbit. A non-default base alone proves nothing:
+  READ (`commands/prep-pr.md`, Step 7) it is also a backport or release base, and the pr-shipper brief says a non-default
+  `--base` is not a stack. So a backport, a release base, an unreadable read and a PR on the default branch all keep the
+  recommendation `open`, as today. It is a recommendation; the lead answers.
 
 ## 5. `# prep-pr-ok` and a push made by a detached process
 
@@ -136,9 +155,13 @@ instruction-level but gains the `head_sha` pin: what is pushed is EXACTLY the co
   > A push or a PR is requested only by the LEAD, through `gate-enqueue.py add`. A teammate never runs `add`, `cancel` or `stop`
   > and never writes a file under `~/.claude/gate-queue/`; `gate-enqueue.py status` is fine.
 
-  THIS IS A CHARTER RULE AND NOTHING MORE (queue section 8): a queue entry needs no push or PR grant, so the permission system does
-  not stand behind it. The earlier draft's "the same charter-level wall as `safe-push.sh`" is withdrawn: that wall has a grant
-  behind it, and this one does not. Closing it mechanically is unit E's subject.
+  THIS IS A CHARTER RULE, BACKED BY A NUDGE AND NOT BY A DENY (queue section 8): a queue entry needs no push or PR grant, so the
+  permission system does not stand behind it. The earlier draft's "the same charter-level wall as `safe-push.sh`" is withdrawn:
+  that wall has a grant behind it, and this one does not. What the first delivery adds is PR B4's advisory steer rule, which
+  says the charter rule to any caller but the lead's main thread at the moment it types `add`, `cancel` or `stop`. What it does
+  NOT add is a refusal, and that is an ACCEPTED LIMIT with its reason in queue section 8, not work deferred to unit E: a deny
+  would be a floor change that leaves the forged entry open, and the outcome is bounded by what a hand-edited entry can cause
+  (push section 9). Unit E, if it is ever taken up, revisits this; nothing in units B to D waits on it.
 - `pr-shipper-brief.md` is NOT CHANGED BY THIS UNIT (ASSUMED): the shipper's stacked pushes stay inline, through the deployed
   `safe-push.sh`; a hook's gate there is already pooled by unit A, and pool PR A2 has already given its step 1 push the pool-on
   prose (pool section 6).
@@ -166,9 +189,15 @@ instruction-level but gains the `head_sha` pin: what is pushed is EXACTLY the co
         refusal is answered by a refresh in the lead's own session and a re-enqueue, and the prose says this costs a second gate;
         a `push-failed` whose log carries `gate-runner: NOT RUN` is answered by correcting the cause its NOT RUN line names and re-enqueueing once, never by "fixing" the gate.
   - [ ] No `# prep-pr-ok` token appears on an enqueue line; the new grant is printed for the maintainer, not harvested; the three
-        charters carry the enqueue rule and say it is not backed by a grant.
+        charters carry the enqueue rule and say it is backed by an advisory nudge, not by a grant or a deny.
+  - [ ] Every queue call (`enabled`, `add`, `wait`) selects its leg by the same two tests in the same order, with a literal
+        helper path in each leg and no repo-local leg.
+  - [ ] `/prep-pr` recommends `draft` only for a base that is the head of an open same-repository PR; a backport base, an
+        unreadable read and the default base recommend `open`.
 - Test plan: `test-command-positional-args.py`, `test-prep-pr-freshness.py` and the helper-exec-path rules still pass; a dry run of
-  both commands with the queue off (identical to today) and on, each with commits kept and with commits squashed.
+  both commands with the queue off (identical to today) and on, each with commits kept and with commits squashed; the three
+  queue blocks read side by side for one leg order, and one run with only the plugin copy present (all three take the plugin
+  leg); the offer run on a default base, a release base with no PR on it (both `open`) and an upper stack slice (`draft`).
 
 ---
 
