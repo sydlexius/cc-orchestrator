@@ -28,6 +28,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -1549,6 +1550,7 @@ class _FakeProc:
     """Stands in for Popen: poll() returns None `holds` times, then `code`."""
     def __init__(self, code, holds=0):
         self.pid, self.code, self.holds = 999999, code, holds
+        self.returncode = None
 
     def poll(self):
         if self.holds:
@@ -1642,6 +1644,139 @@ def test_parallel_head_checked_once():
     check("#501: blocked head: skip predicate ran once",
           rc == 0 and len(skips) == 1)
     check("#501: blocked head: memo lookup ran once per step", len(trees) == 3)
+
+
+# --- #546: an interrupt must never raise from inside Popen.poll() ------------
+
+class _LockProc(_FakeProc):
+    """A fake Popen whose poll() has the shape of Popen._internal_poll: a
+    non-blocking acquire of a non-reentrant lock, then a `try` whose `finally`
+    releases it. The FIRST poll signals this process between the two, which is
+    exactly where an exception raised from a signal handler leaks the lock (the
+    real hang: cleanup's wait() then blocks on it forever). First poll returns
+    `first`, every later one `then`."""
+    def __init__(self, sig, first=None, then=-15):
+        super().__init__(then)
+        self.sig, self.first, self.polls = sig, first, 0
+        self.lock = threading.Lock()
+
+    def _boundary(self):
+        """A Python-level call: a pending handler runs here at the latest."""
+
+    def poll(self):
+        if not self.lock.acquire(False):
+            return None
+        self.polls += 1
+        if self.polls == 1:
+            signal.raise_signal(self.sig); self._boundary()
+        try:
+            return self.first if self.polls == 1 else self.code
+        finally:
+            self.lock.release()
+
+
+def _with_outer_handlers(fn):
+    """Run fn() from the state a real runner starts in, made safe for the
+    harness: SIGINT on Python's own raising handler, TERM/HUP on a recording
+    one (their default would kill the harness if the runner installed nothing).
+    Returns (fn result, signals the OUTER handler saw, {sig: restored?})."""
+    seen = []
+
+    def outer(signum, frame):
+        seen.append(signum)
+    want = {signal.SIGINT: signal.default_int_handler,
+            signal.SIGTERM: outer, signal.SIGHUP: outer}
+    old = {s: signal.signal(s, h) for s, h in want.items()}
+    try:
+        res = fn()
+        restored = {s: signal.getsignal(s) is h for s, h in want.items()}
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
+    return res, seen, restored
+
+
+def test_parallel_interrupt_never_raises_in_poll():
+    """THE #546 regression: SIGINT, SIGTERM or SIGHUP landing inside poll(),
+    after its lock is taken and before its `try`, still ends the run as an
+    interrupt, and the lock is NOT left held."""
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        p = _LockProc(sig)
+        (rc, recs, out), seen, restored = _with_outer_handlers(
+            lambda: _inproc_parallel([{"name": "s", "run": "x"}], lambda *a, **k: p))
+        check(f"#546: {sig.name} inside poll(): the signal fired there, once",
+              p.polls >= 1 and seen == [])
+        check(f"#546: {sig.name} inside poll(): poll's lock is not leaked",
+              not p.lock.locked())
+        check(f"#546: {sig.name} inside poll(): still an interrupt (rc 130, step "
+              "cancelled)", rc == 130 and "gate-runner: interrupted" in out
+              and recs == [{"name": "s", "result": "fail", "cancelled": True}])
+        check(f"#546: {sig.name} inside poll(): previous handlers restored",
+              all(restored.values()))
+
+
+def test_parallel_interrupt_in_last_iteration():
+    """A signal recorded during the iteration that finishes the run is still an
+    interrupt: the loop's exit must not drop it and report success."""
+    p = _LockProc(signal.SIGTERM, first=0)
+    (rc, _, out), _, _ = _with_outer_handlers(
+        lambda: _inproc_parallel([{"name": "s", "run": "x"}], lambda *a, **k: p))
+    check("#546: signal in the final iteration -> rc 130, not a pass",
+          rc == 130 and "gate-runner: interrupted" in out and "all steps passed" not in out)
+
+
+def test_parallel_interrupt_in_launch_window():
+    """A signal that arrives while the launch window has it blocked is acted on
+    as soon as the step is registered: nothing further launches."""
+    launched = []
+
+    def popen(*a, **k):
+        launched.append(a[0])
+        signal.raise_signal(signal.SIGHUP)   # blocked here: pending until restore
+        return _FakeProc(0, holds=50)
+    (rc, recs, _), _, _ = _with_outer_handlers(
+        lambda: _inproc_parallel([{"name": "a", "run": "x"}, {"name": "b", "run": "y"}],
+                                 popen))
+    check("#546: signal in the launch window: the launched step is cancelled",
+          rc == 130 and recs == [{"name": "a", "result": "fail", "cancelled": True}])
+    check("#546: signal in the launch window: no further step launches",
+          launched == ["x"])
+
+
+def test_parallel_interrupt_during_output():
+    """Printing a finished block can block on a stalled stdout for as long as
+    the reader likes, so a signal THERE raises at once instead of waiting for
+    the write to return."""
+    after = []
+
+    def flush(fn):
+        def wrapped(plan, printed):
+            if not after:
+                signal.raise_signal(signal.SIGTERM)
+                after.append("returned")   # reached only if the signal did not raise
+            return fn(plan, printed)
+        return wrapped
+    (rc, _, _), _, _ = _with_outer_handlers(
+        lambda: _inproc_parallel([{"name": "s", "run": "x"}],
+                                 lambda *a, **k: _FakeProc(0, holds=50),
+                                 patch={"_flush_ready": flush}))
+    check("#546: signal during output raises there (rc 130)",
+          rc == 130 and after == [])
+
+
+def test_parallel_inherited_ignored_sigint():
+    """SIGINT inherited as SIG_IGN (a non-interactive shell's `&` job) stays
+    ignored: the run completes, and it is still ignored afterwards."""
+    old = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        p = _LockProc(signal.SIGINT, then=0)
+        rc, recs, _ = _inproc_parallel([{"name": "s", "run": "x"}], lambda *a, **k: p)
+        still = signal.getsignal(signal.SIGINT) == signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGINT, old)
+    check("#546: inherited-ignored SIGINT: the run completes (rc 0, step passes)",
+          rc == 0 and recs == [{"name": "s", "result": "pass"}] and p.polls >= 2)
+    check("#546: inherited-ignored SIGINT: still ignored after the run", still)
 
 
 # --- Part D: opt-in `--skip <name>` (CI leaves lint to its own pinned steps) --
@@ -1764,6 +1899,11 @@ def main():
         test_parallel_receipt, test_parallel_double_interrupt_term_ignoring,
         test_parallel_soft_skip_memo, test_parallel_launch_error_and_tiebreak,
         test_parallel_launch_signal_mask, test_parallel_head_checked_once,
+        test_parallel_interrupt_never_raises_in_poll,
+        test_parallel_interrupt_in_last_iteration,
+        test_parallel_interrupt_in_launch_window,
+        test_parallel_interrupt_during_output,
+        test_parallel_inherited_ignored_sigint,
         test_skip_named_steps_serial_and_parallel, test_skip_absent_is_byte_identical,
         test_skip_refuses_doubt,
     ]:

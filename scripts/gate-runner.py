@@ -368,10 +368,6 @@ def _flush_ready(plan, printed):
     return printed
 
 
-def _sigterm_to_interrupt(signum, frame):
-    raise KeyboardInterrupt
-
-
 def run_form_b_parallel(steps, root, memoize_dir, jobs, cli_skip=None):
     """Parallel Form B. Same return contract as run_form_b: (exit_code, records
     in declaration order). Every step is validated BEFORE anything launches."""
@@ -406,16 +402,46 @@ def run_form_b_parallel(steps, root, memoize_dir, jobs, cli_skip=None):
     nxt = printed = 0
     hard = None
     rc = 0
+    # INT/TERM/HUP handlers only RECORD the signal (#546); the loop raises
+    # KeyboardInterrupt itself, at the top of an iteration. A handler that
+    # raises lands on ANY bytecode boundary, including inside Popen.poll()
+    # between its `_waitpid_lock.acquire(False)` and the `try` that releases
+    # it: the lock then stays held by nobody and cleanup's reap blocks on it
+    # forever, with all three signals already ignored. Python's default SIGINT
+    # handler raises the same way, so SIGINT is replaced too.
     # SIGHUP joins SIGTERM: the groups run in their own sessions, so a hangup
     # never reaches them and an unhandled one would orphan every group.
-    old_term = signal.signal(signal.SIGTERM, _sigterm_to_interrupt)
-    old_hup = signal.signal(signal.SIGHUP, _sigterm_to_interrupt)
+    got = []            # signals recorded so far
+    in_output = [False]
+
+    def _note(signum, frame):
+        got.append(signum)
+        # THE ONE PLACE A HANDLER STILL RAISES: while the loop prints finished
+        # blocks. A write to a stalled stdout blocks for as long as the reader
+        # likes and is retried after a handler returns, so recording alone
+        # would leave the runner unstoppable there. No Popen call is in flight
+        # in that window. At most once: a second signal must never raise out
+        # of the cleanup below.
+        if in_output[0]:
+            in_output[0] = False
+            raise KeyboardInterrupt
+    # SIGINT inherited as SIG_IGN (a non-interactive shell's `&` job) stays
+    # ignored, as Python itself leaves it.
+    old = {s: signal.signal(s, _note) for s in _LAUNCH_SIGS
+           if not (s == signal.SIGINT
+                   and signal.getsignal(s) == signal.SIG_IGN)}
     try:
         while True:
+            if got:
+                raise KeyboardInterrupt
             # Dispatch in declaration order. Skip predicates and memo lookups
             # run here in the parent ONCE per step (`checked`), when it first
             # reaches the head: a head blocked on capacity never re-runs them.
             while hard is None and nxt < len(plan):
+                # A signal that was pending across the launch window below was
+                # recorded when the mask was restored: stop launching.
+                if got:
+                    raise KeyboardInterrupt
                 e = plan[nxt]
                 if not e["checked"]:
                     e["checked"] = True
@@ -441,9 +467,10 @@ def run_form_b_parallel(steps, root, memoize_dir, jobs, cli_skip=None):
                 e["out"] = os.path.join(capdir, f"{nxt}.out")
                 e["start"] = time.perf_counter()
                 # Block INT/TERM/HUP from Popen until the step is registered in
-                # `running`: a signal in between would otherwise raise before
-                # cleanup can see the new group, orphaning it. A pending signal
-                # is delivered when the mask is restored, after registration.
+                # `running`: a signal in between would otherwise be acted on
+                # before cleanup can see the new group, orphaning it. A pending
+                # signal is delivered (recorded) when the mask is restored,
+                # after registration, and raised at the top of this loop.
                 # The child inherits the blocked mask through fork/exec, so
                 # preexec_fn restores the caller's mask there, else the step
                 # could never receive the SIGTERM leg of cleanup.
@@ -500,7 +527,11 @@ def run_form_b_parallel(steps, root, memoize_dir, jobs, cli_skip=None):
                                      "(required=false), continuing.")
             if hard is not None:
                 break
-            printed = _flush_ready(plan, printed)
+            in_output[0] = True
+            try:
+                printed = _flush_ready(plan, printed)
+            finally:
+                in_output[0] = False
             if nxt >= len(plan) and not running:
                 break
             time.sleep(POLL_S)
@@ -510,8 +541,11 @@ def run_form_b_parallel(steps, root, memoize_dir, jobs, cli_skip=None):
         # Ignore further INT/TERM/HUP while cleaning up: a second Ctrl-C inside
         # the kill grace would otherwise abort it, orphaning the groups and
         # leaking capdir. Restored after the rmtree.
-        masked = {s: signal.signal(s, signal.SIG_IGN)
-                  for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+        masked = {s: signal.signal(s, signal.SIG_IGN) for s in _LAUNCH_SIGS}
+        # A signal recorded after the loop's last check (in the iteration that
+        # finished or failed the run) is still an interrupt, never a pass.
+        if got:
+            rc = 130
         # Sweep on EVERY exit path, all-pass included: a finished step's stray
         # background job is never wanted and must not outlive the run.
         _prune_lingering(lingering)
@@ -527,9 +561,8 @@ def run_form_b_parallel(steps, root, memoize_dir, jobs, cli_skip=None):
         if rc == 0:
             printed = _flush_ready(plan, printed)
         shutil.rmtree(capdir, ignore_errors=True)
-        signal.signal(signal.SIGINT, masked[signal.SIGINT])
-        signal.signal(signal.SIGTERM, old_term)
-        signal.signal(signal.SIGHUP, old_hup)
+        for s in _LAUNCH_SIGS:   # a SIGINT left ignored above goes back to that
+            signal.signal(s, old.get(s, masked[s]))
 
     records = []
     for e in plan:
