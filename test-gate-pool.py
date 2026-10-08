@@ -53,6 +53,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # --- isolation pins: before the module under test is imported, before any case -------------
 for _var in ("GATEQ_HOLDER", "GATEQ_NEST"):
     os.environ.pop(_var, None)
+# A git hook exports GIT_DIR (and friends); every git this harness starts, the fixture's included,
+# would then write into the REAL repository. No GIT_ variable survives into a case.
+for _var in [v for v in os.environ if v.startswith("GIT_")]:
+    os.environ.pop(_var, None)
 _PINNED_HOME = tempfile.mkdtemp(prefix="gate-pool-test-")
 os.environ["GATEQ_HOME"] = _PINNED_HOME
 atexit.register(shutil.rmtree, _PINNED_HOME, True)   # every exit path, early returns included
@@ -630,6 +634,8 @@ def case_acquire(home):
 
     def sleep(s):
         slept.append(s); now[0] += s
+        if len(slept) > 500:               # a timeout that stopped firing fails, never hangs
+            raise AssertionError("acquire() kept waiting past its timeout")
     kw = dict(environ={}, say=said.append, clock=lambda: now[0], sleep=sleep)
     h = pool.acquire("gate", "gate", 4, "/wt/a", **kw)
     same("acquire: a free pool grants on the first poll, with no line and no sleep",
@@ -740,11 +746,10 @@ def case_nested_rows(home):
     waiting = pool.enter("gate", "gate", 4, "/wt/X")
     plant(home, "0000000007-dead.ticket", running)
     alien = plant(home, "0000000008-alien.ticket", {**running, "pool_protocol": 999}, hold=True)
-    plant(home, "0000000009-out.ticket", running, hold=True, sub="")
     rows = {"unset": "", "a missing file": h.path + "x.ticket",
             "an unlocked ticket": os.path.join(home, "waiters", "0000000007-dead.ticket"),
             "another protocol": os.path.join(home, "waiters", "0000000008-alien.ticket"),
-            "outside waiters/": os.path.join(home, "0000000009-out.ticket"),
+            "outside waiters/": os.path.join(home, os.path.basename(h.path)),
             "a ticket still waiting": waiting.path}
     same("nested rows: condition 1 fails -> no exemption, and no line",
          ({k: pool.nested(4, "/wt/X", {"GATEQ_HOLDER": v}, said.append) for k, v in rows.items()},
@@ -826,9 +831,11 @@ def case_nested_chain(home):
     c1.leave()
     same("nested chain: the second child starts when the first ends", c2.poll(), True)
     c2.leave()
-    other = plant(home, "0000000042-other.ticket.nest", "", hold=True)
+    # The foreign name is as long as the holder's, so only the prefix comparison rejects it.
+    foreign = "9" + os.path.basename(h.path)[1:] + ".nest"
+    other = plant(home, foreign, "", hold=True)
     bad = {"unlocked": h.path + ".nest.nest", "missing": h.path + ".nest.nest.nest",
-           "not this holder's": os.path.join(home, "waiters", "0000000042-other.ticket.nest")}
+           "not this holder's": os.path.join(home, "waiters", foreign)}
     tries = {k: pool.nested(4, "/wt/X", {**env, "GATEQ_NEST": v}, print) for k, v in bad.items()}
     same("nested chain: a GATEQ_NEST that is unlocked, missing or not this holder's is ignored: "
          "the run waits on its holder's own child lock", {k: t.poll() for k, t in tries.items()},
@@ -837,6 +844,66 @@ def case_nested_chain(home):
     same("nested chain: and takes that lock once it is free",
          (tries["unlocked"].poll(), tries["unlocked"].holder.nest), (True, h.path + ".nest"))
     tries["unlocked"].leave(); os.close(other); h.leave()
+
+
+def poll_or_err(w):
+    try:
+        return w.poll()
+    except Exception as e:
+        return f"raised {type(e).__name__}"
+
+
+def case_unreadable_ticket():
+    if os.geteuid() == 0:
+        print("  [ok] unreadable ticket: skipped, uid 0 ignores file modes")
+        return
+    with tempfile.TemporaryDirectory(prefix="gate-pool-home-") as tmp:
+        home = os.path.join(tmp, "gq")
+        pool = gp.Pool(home, cfg())
+        fd = plant(home, "0000000001-held.ticket", "", hold=True)
+        path = os.path.join(home, "waiters", "0000000001-held.ticket")
+        os.chmod(path, 0)                  # held, yet it cannot be opened: unknown content
+        w = pool.enter("gate", "gate", 1, "/wt/w")
+        same("unreadable ticket: a flocked ticket that cannot be opened is a live unknown one, "
+             "never absent: a higher seq does not start", poll_or_err(w), False)
+        check("unreadable ticket: and it is not unlinked", os.path.exists(path))
+        os.chmod(path, 0o600); os.close(fd); w.leave()
+
+
+def case_strays():
+    def fresh(tmp, name):
+        pool = gp.Pool(os.path.join(tmp, name), cfg(budget=2))
+        return pool, pool.enter("gate", "gate", 2, "/wt/a")
+    with tempfile.TemporaryDirectory(prefix="gate-pool-home-") as tmp:
+        pool, a = fresh(tmp, "dir")
+        os.mkdir(os.path.join(pool.waiters, "0000000000-dir.ticket"))
+        same("strays: a directory named *.ticket in waiters/ changes nothing",
+             poll_or_err(a), True)
+        a.leave()
+        pool, a = fresh(tmp, "tmpdir")
+        os.mkdir(os.path.join(pool.tmp, "stray"))
+        same("strays: a directory in tmp/ does not stop the sweep", poll_or_err(a), True)
+        a.leave()
+        pool, a = fresh(tmp, "link")
+        link = os.path.join(pool.waiters, "0000000000-link.ticket")
+        os.symlink(a.path, link)
+        same("strays: a symlink to a live ticket is not a second entry, so the ticket starts",
+             poll_or_err(a), True)
+        check("strays: and the symlink is left alone", os.path.islink(link))
+        a.leave()
+
+
+def case_git_isolation():
+    check("git isolation: no GIT_ variable is in the environment at case time",
+          [v for v in os.environ if v.startswith("GIT_")] == [])
+    # The hook shape for real: GIT_DIR exported to a re-run of the fixture case. Unscrubbed, its
+    # git init writes into that directory (or the case fails); scrubbed, the directory stays empty.
+    with tempfile.TemporaryDirectory(prefix="gate-pool-gitdir-") as tmp:
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "--only", "worktree-key"],
+                           capture_output=True, text=True,
+                           env={**os.environ, "GIT_DIR": tmp, "GATE_POOL_SCRIPTS": SCRIPTS})
+        same("git isolation: with GIT_DIR exported the fixture case still passes and the "
+             "directory GIT_DIR names stays empty", (r.returncode, os.listdir(tmp)), (0, []))
 
 
 def case_worktree_key():
@@ -879,6 +946,8 @@ CASES = [
     ("no-git-under-lock", case_no_git_under_lock), ("worktree-key", case_worktree_key),
     ("acquire", case_acquire), ("foreign", case_foreign), ("nested-rows", case_nested_rows),
     ("nested-serial", case_nested_serial), ("nested-chain", case_nested_chain),
+    ("unreadable-ticket", case_unreadable_ticket), ("strays", case_strays),
+    ("git-isolation", case_git_isolation),
 ]
 
 # --- mutation self-test: each assertion must be able to FAIL ---------------------------------
@@ -1051,7 +1120,27 @@ MUTATIONS = [
      "            return line[9:]", "            return real", "worktree-key",
      "worktree key: a path that resolves to a registered worktree gets the string git "
      "RECORDED"),
+    ("a GATEQ_NEST honored without the holder's name as its prefix",
+     "if nname.startswith(hname) and tail and", "if tail and", "nested-chain",
+     "nested chain: a GATEQ_NEST that is unlocked, missing or not this holder's is ignored: "
+     "the run waits on its holder's own child lock"),
+    ("a non-regular file in waiters/ read as a ticket",
+     'if not name.endswith(".ticket") or not _is_file(path):', 'if not name.endswith(".ticket"):',
+     "strays", "strays: a directory named *.ticket in waiters/ changes nothing"),
+    ("a symlink in waiters/ followed as a ticket",
+     'if not name.endswith(".ticket") or not _is_file(path):', 'if not name.endswith(".ticket"):',
+     "strays", "strays: a symlink to a live ticket is not a second entry, so the ticket starts"),
+    ("the tmp/ sweep raising on a stray entry",
+     "except OSError:  # a stray entry in tmp/", "except FileNotFoundError:", "strays",
+     "strays: a directory in tmp/ does not stop the sweep"),
 ]
+if os.geteuid() != 0:                      # chmod does not bite for root, so that case skips
+    MUTATIONS.append(
+        ("any failure to open a ticket read as 'missing'",
+         'except FileNotFoundError:\n        return None, ""',
+         'except OSError:\n        return None, ""', "unreadable-ticket",
+         "unreadable ticket: a flocked ticket that cannot be opened is a live unknown one, "
+         "never absent: a higher seq does not start"))
 
 
 def _rerun(scripts_dir, *args):

@@ -161,17 +161,30 @@ def _try_lock(fd):
 
 def _probe(path):
     """Try-lock an EXISTING file and read it -> (held, text); held is None when it is missing.
-    The trial lock is dropped by closing (rule 2). Called only under admit.lock, where owners
-    create and lock their files, so a probe can never beat a new owner to its own file."""
+    A file that exists but cannot be opened is a HELD record of unknown content (held True,
+    empty text), the way a foreign or unreadable ticket is treated: doubt never reads as
+    "absent". The trial lock is dropped by closing (rule 2). Called only under admit.lock, where
+    owners create and lock their files, so a probe can never beat a new owner to its own file."""
     try:
         fd = os.open(path, os.O_RDONLY)
-    except OSError:
+    except FileNotFoundError:
         return None, ""
+    except OSError:
+        return True, ""
     try:
         held = not _try_lock(fd)
         return held, os.read(fd, 65536).decode("utf-8", "replace")
     finally:
         os.close(fd)
+
+
+def _is_file(path):
+    """True for a REGULAR file, judged by lstat so a symlink is never followed (and so never
+    counted as a second copy of the ticket it points at)."""
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
 
 
 def _rm(path):
@@ -224,7 +237,9 @@ def worktree_key(root):
     the `git worktree list --porcelain` record that `root` resolves to. Resolution only PICKS
     the record; the string git recorded is what is stored and compared. A directory that is no
     registered worktree is keyed by its own resolved path, so two different directories never
-    exclude each other. Runs git, so it is called BEFORE admit.lock is taken, never under it."""
+    exclude each other. `root` is the worktree ROOT: a subdirectory of a worktree resolves to
+    no record and so gets a DIFFERENT key (its own resolved path), not its worktree's. Runs
+    git, so it is called BEFORE admit.lock is taken, never under it."""
     real = os.path.realpath(root)
     try:
         out = subprocess.run(["git", "-C", root, "worktree", "list", "--porcelain"],
@@ -421,12 +436,15 @@ class Pool:
         HIGHER seq does not start. Wait-for edges then only point at lower numbers, so two
         protocols cannot deadlock on each other (doc section 4)."""
         for name in os.listdir(self.tmp):  # staging never outlives one admit.lock section
-            _rm(os.path.join(self.tmp, name))
+            try:
+                _rm(os.path.join(self.tmp, name))
+            except OSError:  # a stray entry in tmp/
+                pass           # (a directory): never worth stopping a scheduling pass
         entries, busy, blocked = [], {}, False
         for name in sorted(os.listdir(self.waiters)):
-            if not name.endswith(".ticket"):
-                continue
             path = os.path.join(self.waiters, name)
+            if not name.endswith(".ticket") or not _is_file(path):
+                continue                   # a stray directory or symlink is no ticket
             held, text = _probe(path)
             rec, n = _load(text), _seq_of(name)
             ours = _ours(rec) and n is not None
@@ -444,6 +462,8 @@ class Pool:
                 busy[rec["worktree"]] = f"{rec['kind']} pid {rec.get('pid')}"
         for name in os.listdir(self.waiters):   # a sidecar or child lock whose ticket is gone
             path = os.path.join(self.waiters, name)
+            if not _is_file(path):
+                continue
             if name.endswith(".sched") and not os.path.exists(path[:-6] + ".ticket") \
                     and _read_sched(path) is not None:
                 _rm(path)
