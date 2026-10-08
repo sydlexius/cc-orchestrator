@@ -5,7 +5,8 @@ skills/orchestrate/design/DESIGN-gate-pool.md ("the doc").
 
 TWO HALVES. The POLICY cases cover `cls()` and the three-class `schedule()` of the doc's
 section 2 as a pure function. The DISK cases cover the pool of sections 1 and 4: slots,
-tickets, `.sched` sidecars and the scheduling pass under admit.lock. The gate-runner wiring
+tickets, `.sched` sidecars and the scheduling pass under admit.lock, and the nested-run
+exemption of section 5 (the three conditions, the `.nest` chain). The gate-runner wiring
 arrives with its own slice and extends this file.
 
 DISK CASES NEED NO THREAD AND NO SLEEP. flock belongs to the open file description, so a
@@ -629,7 +630,7 @@ def case_acquire(home):
 
     def sleep(s):
         slept.append(s); now[0] += s
-    kw = dict(say=said.append, clock=lambda: now[0], sleep=sleep)
+    kw = dict(environ={}, say=said.append, clock=lambda: now[0], sleep=sleep)
     h = pool.acquire("gate", "gate", 4, "/wt/a", **kw)
     same("acquire: a free pool grants on the first poll, with no line and no sleep",
          (len(h.fds), said, slept), (5, [], []))
@@ -655,7 +656,7 @@ def case_acquire(home):
     def interrupt(s):
         raise KeyboardInterrupt
     try:
-        pool.acquire("gate", "gate", 4, "/wt/c", say=said.append, sleep=interrupt); got = None
+        pool.acquire("gate", "gate", 4, "/wt/c", **{**kw, "sleep": interrupt}); got = None
     except KeyboardInterrupt:
         got = listing(home)
     same("acquire: an interrupt while waiting passes through and leaves no ticket behind",
@@ -663,10 +664,10 @@ def case_acquire(home):
     h2.release()
 
 
-def plant(home, name, content, hold=False):
+def plant(home, name, content, hold=False, sub="waiters"):
     """Put a file in waiters/ that this pool did not write; with `hold`, flock it the way a
     live owner would and return the descriptor."""
-    path = os.path.join(home, "waiters", name)
+    path = os.path.join(home, sub, name)
     with open(path, "w", encoding="utf-8") as f:
         f.write(content if isinstance(content, str) else json.dumps(content))
     if hold:
@@ -716,6 +717,128 @@ def case_foreign(home):
     check("foreign: and the directory it names is not touched", not os.path.exists(other))
 
 
+# --- nested runs (doc section 5) ---------------------------------------------------------------
+def holder_in(pool, worktree, cost=4):
+    """A running ticket holder, and the environment it gives the children it starts."""
+    h = pool.enter("gate", "gate", cost, worktree); h.poll()
+    return h, h.holder.child_env()
+
+
+def no_wait(s):
+    """The sleep of an acquire() that must be granted on its first poll: a wait is a failure
+    here, never a hang."""
+    raise AssertionError("acquire() had to wait")
+
+
+@with_home
+def case_nested_rows(home):
+    pool, said = gp.Pool(home, cfg()), []
+    h, env = holder_in(pool, "/wt/X")
+    same("nested rows: a ticket holder names its OWN ticket for its children, and blanks "
+         "GATEQ_NEST", env, {"GATEQ_HOLDER": h.path, "GATEQ_NEST": ""})
+    running = on_disk(h)
+    waiting = pool.enter("gate", "gate", 4, "/wt/X")
+    plant(home, "0000000007-dead.ticket", running)
+    alien = plant(home, "0000000008-alien.ticket", {**running, "pool_protocol": 999}, hold=True)
+    plant(home, "0000000009-out.ticket", running, hold=True, sub="")
+    rows = {"unset": "", "a missing file": h.path + "x.ticket",
+            "an unlocked ticket": os.path.join(home, "waiters", "0000000007-dead.ticket"),
+            "another protocol": os.path.join(home, "waiters", "0000000008-alien.ticket"),
+            "outside waiters/": os.path.join(home, "0000000009-out.ticket"),
+            "a ticket still waiting": waiting.path}
+    same("nested rows: condition 1 fails -> no exemption, and no line",
+         ({k: pool.nested(4, "/wt/X", {"GATEQ_HOLDER": v}, said.append) for k, v in rows.items()},
+          said), (dict.fromkeys(rows), []))
+    same("nested rows: condition 2 fails (another worktree) -> a ticket, and ONE line naming "
+         "the leak", (pool.nested(4, "/wt/Y", env, said.append), said),
+         (None, ["gate-runner: ignoring GATEQ_HOLDER, its holder is in another worktree "
+                 "(/wt/X); taking a ticket"]))
+    same("nested rows: condition 3 fails (heavier than its holder) -> NOT RUN, exit 75, at once",
+         refused(lambda: pool.nested(5, "/wt/X", env, said.append)),
+         (75, "nested-over-holder",
+          "gate-runner: NOT RUN reason=nested-over-holder holder=4 needs=5"))
+    os.close(alien)                        # or every ticket below would wait behind it
+    tickets = listing(home, suffix=".ticket")
+    n = pool.acquire("named", "small", 4, "/wt/X", environ=env, say=said.append, sleep=no_wait)
+    same("nested rows: all three hold -> it runs with no ticket and no slot of its own",
+         (listing(home, suffix=".ticket"), len(n.fds), os.get_inheritable(n.fds[0])),
+         (tickets, 1, False))
+    same("nested rows: what it holds is its holder's child lock, which it names for ITS children",
+         (n.nest, n.child_env()), (h.path + ".nest", {"GATEQ_NEST": h.path + ".nest"}))
+    n.release()
+    t = pool.acquire("gate", "gate", 1, "/wt/Y", environ=env, say=said.append, sleep=no_wait)
+    same("nested rows: a run handed a holder from another worktree takes its own ticket and "
+         "names THAT one for its children",
+         (t.nest, t.child_env()["GATEQ_HOLDER"] == t.path != h.path, len(said)), (None, True, 2))
+    t.release(); waiting.leave(); h.leave()
+
+
+@with_home
+def case_nested_serial(home):
+    pool = gp.Pool(home, cfg())
+    h, env = holder_in(pool, "/wt/X")
+    n1, n2, n3 = (pool.nested(4, "/wt/X", env, print) for _ in range(3))
+    same("nested serial: two nested runs under one holder do not run together",
+         (n1.poll(), n2.poll()), (True, False))
+    n1.leave()
+    same("nested serial: the second starts when the first ends", (n2.poll(), n3.poll()),
+         (True, False))
+    die(h)                                 # the holder is SIGKILLed under a running nested run
+    same("nested serial: a nested WAIT whose holder died is exempt no longer",
+         (n3.poll(), n3.lost), (False, True))
+    w = pool.enter("gate", "gate", 1, "/wt/other"); w.poll()
+    same("nested serial: the pass that unlinks a dead holder's ticket leaves its HELD child lock",
+         (os.path.exists(h.path), os.path.exists(h.path + ".nest")), (False, True))
+    n2.leave(); w.leave()
+    w = pool.enter("gate", "gate", 1, "/wt/other"); w.poll(); w.leave()
+    check("nested serial: a later pass unlinks the child lock once it is free",
+          not os.path.exists(h.path + ".nest"))
+    # The same through acquire(): the wait turns into an ordinary ticket.
+    h2, env2 = holder_in(pool, "/wt/Z")
+    first = pool.nested(2, "/wt/Z", env2, print); first.poll()
+
+    naps = []
+
+    def holder_dies(s):
+        naps.append(s)
+        if len(naps) == 1:
+            die(h2)
+        elif len(naps) > 3:
+            raise AssertionError("acquire() kept waiting under a dead holder")
+    got = pool.acquire("named", "small", 2, "/wt/Z", environ=env2, say=lambda line: None,
+                       sleep=holder_dies)
+    same("nested serial: acquire() takes a ticket when the holder it waited under dies",
+         (got.nest, listing(home, suffix=".ticket")), (None, [os.path.basename(got.path)]))
+    got.release(); first.leave()
+
+
+@with_home
+def case_nested_chain(home):
+    pool = gp.Pool(home, cfg())
+    h, env = holder_in(pool, "/wt/X")
+    n1 = pool.nested(4, "/wt/X", env, print); n1.poll()
+    env1 = {**env, **n1.holder.child_env()}
+    c1, c2 = (pool.nested(4, "/wt/X", env1, print) for _ in range(2))
+    same("nested chain: a run one level deeper does not wait on its ancestor, it locks one "
+         "level below", (c1.poll(), c1.holder.nest), (True, h.path + ".nest.nest"))
+    same("nested chain: FAN-OUT, two children of one nested run do not run together",
+         c2.poll(), False)
+    c1.leave()
+    same("nested chain: the second child starts when the first ends", c2.poll(), True)
+    c2.leave()
+    other = plant(home, "0000000042-other.ticket.nest", "", hold=True)
+    bad = {"unlocked": h.path + ".nest.nest", "missing": h.path + ".nest.nest.nest",
+           "not this holder's": os.path.join(home, "waiters", "0000000042-other.ticket.nest")}
+    tries = {k: pool.nested(4, "/wt/X", {**env, "GATEQ_NEST": v}, print) for k, v in bad.items()}
+    same("nested chain: a GATEQ_NEST that is unlocked, missing or not this holder's is ignored: "
+         "the run waits on its holder's own child lock", {k: t.poll() for k, t in tries.items()},
+         dict.fromkeys(bad, False))
+    n1.leave()
+    same("nested chain: and takes that lock once it is free",
+         (tries["unlocked"].poll(), tries["unlocked"].holder.nest), (True, h.path + ".nest"))
+    tries["unlocked"].leave(); os.close(other); h.leave()
+
+
 def case_worktree_key():
     # A linked worktree that was MOVED, with a symlink left at the path git recorded: the one
     # shape where the recorded string and the resolved path differ on every platform.
@@ -754,7 +877,8 @@ CASES = [
     ("disk-worktree", case_disk_worktree), ("sidecar", case_sidecar), ("sigkill", case_sigkill),
     ("inherit", case_inherit), ("budget-change", case_budget_change), ("root", case_root),
     ("no-git-under-lock", case_no_git_under_lock), ("worktree-key", case_worktree_key),
-    ("acquire", case_acquire), ("foreign", case_foreign),
+    ("acquire", case_acquire), ("foreign", case_foreign), ("nested-rows", case_nested_rows),
+    ("nested-serial", case_nested_serial), ("nested-chain", case_nested_chain),
 ]
 
 # --- mutation self-test: each assertion must be able to FAIL ---------------------------------
@@ -880,6 +1004,39 @@ MUTATIONS = [
     ("the wait line repeated on every poll",
      "if noted is None or now - noted >= WAIT_NOTE_S:", "if True:", "acquire",
      "acquire: one wait line at the first failed poll, then one every 30 s"),
+    # --- nested runs. The first four are named by the doc's A1 test plan. ---
+    ("the .nest lock dropped",
+     "if not _try_lock(fd):", "if False:", "nested-serial",
+     "nested serial: two nested runs under one holder do not run together"),
+    ("a run with a valid GATEQ_NEST skips locking",
+     'return "ok", os.path.join(self.waiters, parent + ".nest")',
+     'return "ok", os.path.join(self.waiters, parent + ".nest" + ('
+     'os.urandom(4).hex() if parent != hname else ""))', "nested-chain",
+     "nested chain: FAN-OUT, two children of one nested run do not run together"),
+    ("the worktree-key comparison dropped from the nested check",
+     'if rec["worktree"] != worktree:', "if False:", "nested-rows",
+     "nested rows: condition 2 fails (another worktree) -> a ticket, and ONE line naming "
+     "the leak"),
+    ("the cost comparison dropped from the nested check",
+     "if have < need:", "if False:", "nested-rows",
+     "nested rows: condition 3 fails (heavier than its holder) -> NOT RUN, exit 75, at once"),
+    ("condition 1 no longer needs the holder's lock HELD",
+     "if not held or not _ours(rec)", "if not _ours(rec)", "nested-rows",
+     "nested rows: condition 1 fails -> no exemption, and no line"),
+    ("a GATEQ_NEST honored without its lock HELD",
+     " \\\n                and _probe(os.path.join(self.waiters, nname))[0]:", ":", "nested-chain",
+     "nested chain: a GATEQ_NEST that is unlocked, missing or not this holder's is ignored: "
+     "the run waits on its holder's own child lock"),
+    ("a HELD child lock unlinked with its dead holder's ticket",
+     " \\\n                    and _probe(path)[0] is False:", ":", "nested-serial",
+     "nested serial: the pass that unlinks a dead holder's ticket leaves its HELD child lock"),
+    ("a nested wait keeps its exemption after its holder died",
+     "self.lost = True", "pass", "nested-serial",
+     "nested serial: a nested WAIT whose holder died is exempt no longer"),
+    ("a ticket holder passes an inherited GATEQ_HOLDER through",
+     'return {"GATEQ_HOLDER": self.path, "GATEQ_NEST": ""}', 'return {"GATEQ_NEST": ""}',
+     "nested-rows",
+     "nested rows: a ticket holder names its OWN ticket for its children, and blanks GATEQ_NEST"),
     ("seq allocated from the seq file alone",
      "seq = 1 + max([0, last] + [n for n in map(_seq_of, os.listdir(self.waiters))\n"
      "                                       if n is not None])", "seq = 1 + last", "disk-order",

@@ -6,10 +6,12 @@ several worktrees gate at once without oversubscribing the machine: every gate, 
 and named heavy command takes `cost` units of one machine budget, and what does not fit waits.
 
 TWO LAYERS. The POLICY is `cls()` and `schedule()`, the doc's section 2 pseudocode as a pure
-function. The POOL ON DISK (`Pool`, `Waiter`, `Holder`) is sections 1 and 4: one kernel flock
-per budget unit under slots/, one flocked ticket per waiting or running process under
-waiters/, and ONE short lock, admit.lock, around every scheduling pass and every change to
-waiters/. No lock here can go stale: the kernel drops each one when its process dies.
+function. The POOL ON DISK (`Pool`, `Waiter`, `Nested`, `Holder`) is sections 1, 4 and 5:
+one kernel flock per budget unit under slots/, one flocked ticket per waiting or running
+process under waiters/, and ONE short lock, admit.lock, around every scheduling pass and every
+change to waiters/. A run started BY a holder (a hook under its upload, a named command
+inside a gate step) goes under that holder's slots instead of waiting on them, on three exact
+conditions. No lock here can go stale: the kernel drops each one when its process dies.
 
 THE HOME IS ALWAYS PASSED IN. This module resolves no home directory and reads no config
 file; its caller hands it the pool root and an already validated config. Nothing imports it
@@ -316,18 +318,22 @@ class Pool:
                 raise
         return w
 
-    def acquire(self, kind, name, cost, worktree, *, say, clock=time.monotonic,
+    def acquire(self, kind, name, cost, worktree, *, environ, say, clock=time.monotonic,
                 sleep=time.sleep):
-        """Take a ticket and poll until it is granted -> Holder. Raises NotRun(75) when no
+        """Run under the holder `environ` names if the exact exemption holds (`nested`), else
+        take a ticket; poll until granted -> Holder. Raises NotRun(75) when no
         slot or no worktree came within wait_timeout_s: the caller did NOT run, which is
         neither a pass nor a failed gate. On any way out but a grant (the timeout, an
         interrupt) the ticket is given up, so nothing is left waiting. `say` gets one wait line
         at the first failed poll and one every WAIT_NOTE_S; a grant on the first poll says
         nothing. The sleep only paces the polls: every decision is made under admit.lock."""
-        w = self.enter(kind, name, cost, worktree)
+        w = self.nested(cost, worktree, environ, say) or self.enter(kind, name, cost, worktree)
         deadline, noted = clock() + self.wait_timeout_s, None
         try:
             while not w.poll():
+                if w.lost:                 # its holder went away mid-wait: wait like anyone
+                    w = self.enter(kind, name, cost, worktree)
+                    continue
                 now = clock()
                 if now >= deadline:
                     raise NotRun(EX_TEMPFAIL, "wait-timeout", "gate-runner: NOT RUN - no gate "
@@ -340,6 +346,54 @@ class Pool:
             w.leave()
             raise
         return w.holder
+
+    def _nest_lock(self, cost, worktree, environ):
+        """The exact GATEQ_HOLDER exemption (doc section 5), under admit.lock. ->
+        ("ticket", None): condition 1 fails, the variable buys nothing;
+        ("leak", the holder's worktree): condition 2 fails, an unrelated gate;
+        ("over", (held, needs)): condition 3 fails, heavier than its holder;
+        ("ok", the child lock this run must hold for its whole run)."""
+        hdir, hname = os.path.split(environ.get("GATEQ_HOLDER") or "")
+        here = os.path.realpath(self.waiters)
+        # 1. a file directly inside THIS pool's waiters/, flock HELD, this protocol, running
+        if not hname.endswith(".ticket") or os.path.realpath(hdir) != here:
+            return "ticket", None
+        held, text = _probe(os.path.join(self.waiters, hname))
+        rec = _load(text)
+        if not held or not _ours(rec) or rec["state"] != "running":
+            return "ticket", None
+        if rec["worktree"] != worktree:    # 2. the same worktree key
+            return "leak", rec["worktree"]
+        have, need = min(rec["cost"], self.budget), min(cost, self.budget)
+        if have < need:                    # 3. the holder holds at least what this run costs
+            return "over", (have, need)
+        # A CHAIN, never a tree: lock ONE level below the lock the parent holds. GATEQ_NEST is
+        # honored only as <holder ticket>.nest[.nest ...] beside the holder's record, HELD.
+        parent = hname
+        ndir, nname = os.path.split(environ.get("GATEQ_NEST") or "")
+        tail = nname[len(hname):]
+        if nname.startswith(hname) and tail and not tail.replace(".nest", "") \
+                and os.path.realpath(ndir) == here \
+                and _probe(os.path.join(self.waiters, nname))[0]:
+            parent = nname
+        return "ok", os.path.join(self.waiters, parent + ".nest")
+
+    def nested(self, cost, worktree, environ, say):
+        """-> a Nested to poll when this run may go under the holder GATEQ_HOLDER names, None
+        when it must take a ticket like anyone. A run heavier than its holder is NotRun(75)
+        AT ONCE: it cannot wait (its own parent holds the worktree) and it must not run (the
+        difference would be unbudgeted)."""
+        with self._admit():
+            verdict, detail = self._nest_lock(cost, worktree, environ)
+        if verdict == "ok":
+            return Nested(self, cost, worktree, environ)
+        if verdict == "over":
+            raise NotRun(EX_TEMPFAIL, "nested-over-holder", "gate-runner: NOT RUN "
+                         f"reason=nested-over-holder holder={detail[0]} needs={detail[1]}")
+        if verdict == "leak":
+            say("gate-runner: ignoring GATEQ_HOLDER, its holder is in another worktree "
+                f"({detail}); taking a ticket")
+        return None
 
     def _free_slots(self):
         """Try-lock every slot below THIS process's budget; the descriptors that locked are
@@ -388,10 +442,16 @@ class Pool:
                                      bypass=_read_sched(_sched_of(path)) or 0, path=path))
             else:
                 busy[rec["worktree"]] = f"{rec['kind']} pid {rec.get('pid')}"
-        for name in os.listdir(self.waiters):   # a sidecar whose ticket is gone
+        for name in os.listdir(self.waiters):   # a sidecar or child lock whose ticket is gone
             path = os.path.join(self.waiters, name)
             if name.endswith(".sched") and not os.path.exists(path[:-6] + ".ticket") \
                     and _read_sched(path) is not None:
+                _rm(path)
+            # A child lock still HELD belongs to a nested run that outlived its holder for a
+            # moment: left in place, and unlinked by a later pass once it is free (rule 3).
+            elif name.endswith(".nest") and ".ticket." in name and not os.path.exists(
+                    os.path.join(self.waiters, name[:name.index(".ticket.") + 7])) \
+                    and _probe(path)[0] is False:
                 _rm(path)
         return entries, busy, blocked
 
@@ -399,6 +459,7 @@ class Pool:
 class Waiter:
     """A ticket and its owner's side of the wait. `poll()` is ONE scheduling pass; everything
     that waits is a loop around it. `holder` is set once the pass granted this ticket."""
+    lost = False                           # only a Nested wait can lose what it waits under
 
     def __init__(self, pool, path, fd, seq, kind, name, cost, worktree):
         self.pool, self.path, self.fd, self.seq = pool, path, fd, seq
@@ -467,21 +528,73 @@ class Waiter:
             self.fd = None
 
 
-class Holder:
-    """A granted ticket: the ticket's lock plus `min(cost, budget)` slot locks, all taken in
-    one critical section and held for the whole run. `fds` is every descriptor it holds."""
+class Nested:
+    """A nested run's side of the wait, with a Waiter's surface. It takes NO ticket and no
+    slot: it runs under its holder's. What it waits for is its parent's child lock, so two
+    nested runs under one parent run one after the other (condition 3 alone would let two
+    children of a cost-4 holder run 8 units under 4 slots). It holds nothing while it waits."""
 
-    def __init__(self, pool, path, cost, worktree, fds):
+    def __init__(self, pool, cost, worktree, environ):
+        self.pool, self.cost, self.worktree, self.environ = pool, cost, worktree, dict(environ)
+        self.holder, self.lost = None, False
+
+    def poll(self):
+        """One try under admit.lock, where every child lock is created, opened and locked. The
+        three conditions are RE-CHECKED each time: a holder that died during the wait exempts
+        nobody, and `lost` tells the caller to take a ticket instead."""
+        if self.holder is not None:
+            return True
+        with self.pool._admit():
+            verdict, lock = self.pool._nest_lock(self.cost, self.worktree, self.environ)
+            if verdict != "ok":
+                self.lost = True
+                return False
+            fd = _open_lock(lock)
+            if not _try_lock(fd):
+                os.close(fd)
+                return False
+            self.holder = Holder(self.pool, self.environ["GATEQ_HOLDER"], self.cost,
+                                 self.worktree, [fd], nest=lock)
+        return True
+
+    def status(self):
+        return "gate-runner: waiting for another nested run under this holder to finish"
+
+    def leave(self):
+        if self.holder is not None:
+            self.holder.release()
+
+
+class Holder:
+    """What a run holds for its whole run. A granted ticket: the ticket's lock plus
+    `min(cost, budget)` slot locks, taken in one critical section. A nested run (`nest` set):
+    only its parent's child lock, and `path` is the holder it runs under. `fds` is every
+    descriptor it holds."""
+
+    def __init__(self, pool, path, cost, worktree, fds, nest=None):
         self.pool, self.path, self.cost, self.worktree, self.fds = pool, path, cost, worktree, fds
+        self.nest = nest
+
+    def child_env(self):
+        """The variables this run sets on the children it starts, from its OWN state and never
+        from what it inherited. A ticket holder names itself and blanks GATEQ_NEST (empty reads
+        as unset), so a value leaked from another holder dies here. A nested run keeps the
+        GATEQ_HOLDER it runs under and names the lock it holds, which its children lock one
+        level below."""
+        if self.nest:
+            return {"GATEQ_NEST": self.nest}
+        return {"GATEQ_HOLDER": self.path, "GATEQ_NEST": ""}
 
     def release(self):
-        """Unlink the ticket and its sidecar under admit.lock, then drop every lock by closing
-        its descriptor. Skipped by a process that dies: the kernel frees the locks at once and
-        the next evaluator unlinks the ticket."""
+        """A ticket holder unlinks its ticket and sidecar under admit.lock; then every lock is
+        dropped by closing its descriptor. A nested run only closes: a child lock is never
+        unlinked by its user (a sibling may be about to lock it). Skipped by a process that
+        dies: the kernel frees the locks at once and the next evaluator unlinks the ticket."""
         if self.fds:
-            with self.pool._admit():
-                _rm(self.path)
-                _rm(_sched_of(self.path))
+            if not self.nest:
+                with self.pool._admit():
+                    _rm(self.path)
+                    _rm(_sched_of(self.path))
             for fd in self.fds:
                 os.close(fd)
             self.fds = []
