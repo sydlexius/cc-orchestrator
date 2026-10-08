@@ -59,6 +59,9 @@ def schedule(entries, free, budget, busy, *, k, cap):
     Returns [(entry, passed)] to start now, in order; `passed` lists the entries that start
     leaves waiting, whose bypass count the caller's commit raises by one.
 
+    Caller guarantees a unique `seq` per entry, `cost >= 0`, `budget >= 1` and
+    `0 <= free <= budget`.
+
     Pure: reads nothing but its arguments and changes none of them. A one-to-one transcription
     of the doc's section 2 pseudocode, with K and CAP as keyword arguments. Called only under
     admit.lock."""

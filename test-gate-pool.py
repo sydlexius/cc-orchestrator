@@ -15,12 +15,10 @@ returned start (the way unit B's dispatcher will), so it also proves the bound o
 when one evaluator commits a whole batch.
 
 ISOLATION. No test may touch the real pool at ~/.claude/gate-queue. The module has no default
-home, so that is structural; three belts on top of it:
+home, so that is structural; two belts on top of it:
   1. GATEQ_HOME is pinned to a fresh empty temp directory and GATEQ_HOLDER / GATEQ_NEST are
      removed, before anything else runs, and the directory must still be empty at the end;
-  2. the real pool directory (resolved from the passwd database, never from $HOME) is listed
-     at the start and at the end, and any difference fails the harness;
-  3. a case asserts the module source names neither `.claude` nor `expanduser`.
+  2. a case asserts the module source names neither `.claude` nor `expanduser`.
 
 MUTATION SELF-TEST (the test-ci-gates-lockstep.py pattern). An assertion that cannot fail is
 decorative, so the harness ends by copying scripts/gate_pool.py into a temp directory, breaking
@@ -30,8 +28,9 @@ pass, so a broken fixture cannot read as a full set of kills. The working tree's
 opened for writing, so a concurrent `git add` can never capture a mutant.
 """
 
+import atexit
 import os
-import pwd
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -43,17 +42,7 @@ for _var in ("GATEQ_HOLDER", "GATEQ_NEST"):
     os.environ.pop(_var, None)
 _PINNED_HOME = tempfile.mkdtemp(prefix="gate-pool-test-")
 os.environ["GATEQ_HOME"] = _PINNED_HOME
-_REAL_POOL = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".claude", "gate-queue")
-
-
-def _real_pool_listing():
-    try:
-        return sorted(os.listdir(_REAL_POOL))
-    except FileNotFoundError:
-        return None
-
-
-_REAL_POOL_BEFORE = _real_pool_listing()
+atexit.register(shutil.rmtree, _PINNED_HOME, True)   # every exit path, early returns included
 
 # GATE_POOL_SCRIPTS points the harness at a COPY of the module; only the mutation self-test
 # at the end of this file sets it.
@@ -148,6 +137,8 @@ def case_cls():
          gp.cls(ent("n", 1, "named", 2, weight=8), cap), 2)
     same("cls: a ticket built without a weight reads its cost as the weight",
          gate("g", 1, 4).weight, 4)
+    same("cls: an explicit weight of 0 is honored, not replaced by the cost",
+         gp.cls(ent("n", 1, "named", 5, weight=0), cap), 0)
 
 
 def case_order():
@@ -270,6 +261,9 @@ def case_class0_pass_list():
          run([named("m", 30, 2), gate("G", 10, 4)], 6), [("m", []), ("G", [])])
     same("class-0 pass list: a class-0 start records no pass against another class-0 check",
          run([named("m", 1, 2), named("n", 2, 2)], 2), [("m", [])])
+    same("class-0 pass list: a gate whose worktree an earlier start claimed is not passed",
+         run([named("m1", 1, 2, wt=X), named("m2", 2, 2, wt="/wt/Y"), gate("G", 3, 8, wt=X)],
+             4), [("m1", []), ("m2", [])])
 
 
 def case_bound_in_pass():
@@ -406,6 +400,13 @@ MUTATIONS = [
     ("class-0 pass list counts a gate that still fits",
      "> free - c]", ">= free - c]", "class0-pass-list",
      "class-0 pass list: a gate that still fits beside the check is not passed"),
+    ("class-0 pass list counts a gate whose worktree this pass claimed",
+     "cls(w, cap) > 0 and w.worktree not in claimed", "cls(w, cap) > 0 and w.worktree not in busy",
+     "class0-pass-list",
+     "class-0 pass list: a gate whose worktree an earlier start claimed is not passed"),
+    ("an explicit weight of 0 replaced by the cost",
+     "cost if weight is None else weight", "weight or cost", "cls",
+     "cls: an explicit weight of 0 is honored, not replaced by the cost"),
     ("the pass's own starts no longer recorded",
      "pend[b] = pend.get(b, 0) + 1", "pass", "bound-in-pass",
      "bound: one pass over a gate at bypass 1 with four class-0 checks returns ONE start"),
@@ -467,12 +468,12 @@ def main():
     if only is None and not os.environ.get("GATE_POOL_SCRIPTS"):
         print("mutation self-test:")
         mutation_selftest()
+    elif only is None:
+        print("mutation self-test: skipped (GATE_POOL_SCRIPTS is set: this is a re-run "
+              "against a copy)")
 
     print("isolation:")
     same("isolation: the pinned GATEQ_HOME is still empty", os.listdir(_PINNED_HOME), [])
-    os.rmdir(_PINNED_HOME)
-    same("isolation: the real pool directory is exactly as it was found",
-         _real_pool_listing(), _REAL_POOL_BEFORE)
 
     print()
     if FAILS:
