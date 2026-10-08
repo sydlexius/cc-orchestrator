@@ -195,7 +195,10 @@ worker's nest lock `running/<job>.ticket.nest` for its run, and has its own watc
 (queue section 2). When the exemption fails on cost it prints `gate-runner: NOT RUN` and exits 75 at once
 (`nested-over-holder`); a pool config or protocol error exits 2. Either fails the push with nothing sent: `safe-push.sh` prints
 `FAILED`, the job ends `failed` `push-failed`, and the line is in `log_path`. That is a gate that DID NOT RUN, never a failed
-gate (pool section 6): the lead re-enqueues and fixes nothing. Queue section 2's cost rule (a job in a hook-installed repo holds
+gate (pool section 6), so the gate's steps are not what to fix; it is also never transient inside a queued push. Read the NOT RUN
+line: `nested-over-holder` means the worker's held cost is below the gate's (run `stop` after a `budget` change, or correct
+`weight`); exit 2 names a config or protocol error (on a branch that predates B2, merge main). Correct that, re-enqueue ONCE; a
+second identical result goes to the maintainer. Queue section 2's cost rule (a job in a hook-installed repo holds
 the gate weight, and a bounce pins it) is what keeps the exemption true on the ordinary path.
 
 - `--base <base>` is always passed. It is a FACT (the PR's own base, or the declared base of a new branch).
@@ -352,9 +355,9 @@ PR, stack linking, the merge, cleanup. The runner never commits, comments, edits
 
 | Failure | Resulting state | Recovery |
 |---|---|---|
-| The push hangs (a prompting key agent, a stuck hook, a dead network) | Slots and worktree held | The WORKER kills the push's group at `push_timeout_s`: `error` `push-timeout`, `pushed=unknown`. Re-enqueueing is safe |
+| The push hangs (a prompting key agent, a stuck hook, a dead network) | Slots and worktree held | The WORKER kills the push's group at `push_timeout_s`: `error` `push-timeout`, `pushed=unknown`. Re-enqueueing is safe; with a hook installed, raise `push_timeout_s` first |
 | Worker SIGKILLed mid-push | Its watchdog kills the push at once and keeps the worktree claimed (its `.sweep`, and the hook gate's own) until every group is gone. The marker exists | Recovery re-queues; the job is not eligible until the claims free; the next worker reads origin FIRST (section 6) |
-| A pre-push hook's gate prints `gate-runner: NOT RUN` (exit 75 `nested-over-holder`, or a pool config error) | The push fails; nothing sent | `failed` `push-failed`, `pushed=no`; the line is in the log. Not a failed gate: re-enqueue, never fix (section 5) |
+| A pre-push hook's gate prints `gate-runner: NOT RUN` (exit 75 `nested-over-holder`, or a pool config error) | The push fails; nothing sent | `failed` `push-failed`, `pushed=no`; the line is in the log. Not a failed gate, and not transient: correct the cause the line names, re-enqueue ONCE (section 5) |
 | Killed after the push, before PR create | Origin holds the SHA; no PR | Origin first: straight to `pr`, which lists and creates |
 | Killed after PR create, before the result | The PR exists | Origin first: straight to `pr`, which finds ONE open PR with the pushed head and records it |
 | Killed after the push; the base then moved, or the receipt is gone | Origin holds the SHA | Origin first skips freshness and the gate: `done`, never `refused stale-base` |

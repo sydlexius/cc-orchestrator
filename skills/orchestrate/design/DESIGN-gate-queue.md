@@ -84,8 +84,8 @@ Root: the pool's `GATEQ_HOME`. The queue adds these; `config.toml`, `admit.lock`
                                       dispatcher before the worker exists and handed to it: a FREE lock means a dead worker
   running/<job>.ticket.nest*          the nest locks of nested runs under the worker (the pool's `.nest` chain); finalize, bounce
                                       and recovery unlink them by prefix, only after trying each lock
-  waiters/<job>.sweep                 the worker's SWEEP CLAIM, flocked by its watchdog (section 2). In the POOL's directory, by the
-                                      pool's rule and name; so is a nested run's `waiters/<job>.<its pid>.sweep`
+  waiters/<job>.<pid>.sweep           the worker's SWEEP CLAIM (its own pid), flocked by its watchdog (section 2). In the POOL's
+                                      directory, by the pool's rule and name; so is a nested run's, in the same shape
   done/<job>.json, results/<job>.json the terminal entry; gate-job-result/v1 (THE delivery channel)
   payload/<job>.r<rev>/               env.json (the step environment snapshot); unit C adds title.txt and body.md
   logs/<job>.log, logs/runner.log     one job's transcript; the dispatcher's log, append-only
@@ -156,8 +156,8 @@ runner always runs from the deployed leg and must not validate against "validato
 
 The earlier draft kept queue fields in a job's `.sched` and declared the foreign-waiter rule cut. Both are withdrawn: a pool
 evaluator rewriting such a sidecar would have dropped the queue's fields, and the pool keeps the rule. The pool document needs a few
-wording edits that say "unit B extends this"; they are listed in the section "Edits this unit needs in the pool document" below
-and change no unit A behavior.
+wording edits that say "unit B extends this"; they are listed in the section "Edits this unit needs in the pool document"
+(`DESIGN-gate-queue-pool-edits.md`) and change no unit A behavior.
 
 ### A job has a ticket
 
@@ -174,9 +174,12 @@ A job is represented to the pool by a TICKET with the pool's own fields, so the 
   fields (`pool_protocol`, `worktree`, `cost`) and its flock is held by the worker. `GATEQ_HOLDER` for a worker's children is its
   path, and the pool's nest lock is `<that path>.nest`. Nothing else is a holder record.
 - THE SWEEP CLAIM is the pool's, unchanged, and stays in `waiters/` (pool section 4). A worker is a runner with a watchdog, so it
-  holds one: `waiters/<job>.sweep` (`{pool_protocol, worktree}`; the job's name is its ticket name), flocked by the worker's
+  holds one: `waiters/<job>.<worker pid>.sweep` (`{pool_protocol, worktree}`; the job's name is its ticket name, and the pid keeps
+  one attempt's file from ever being the one a later attempt creates), flocked by the worker's
   WATCHDOG. The dispatcher made the commit before the worker existed, so the WORKER creates it, in the `admit.lock` section that
-  writes its pid into its ticket (kept until a try-lock on the file fails), BEFORE its first step and its first external call; its
+  writes its pid into its ticket (kept until a try-lock on the file fails; the wait also ends when the watchdog child has
+  exited: the worker then unlinks its own still-free `.sweep`, releases `admit.lock` and exits non-zero having started nothing,
+  and recovery re-queues it, `attempts + 1`), BEFORE its first step and its first external call; its
   held ticket covers the gap. A run nested under a worker (a hook's gate inside its push, a `--pool-run` inside a step) creates its
   own by the pool's rule, `waiters/<job>.<its pid>.sweep`. Nothing is added to `running/` and no evaluator changes: `busy` already
   counts EVERY held `.sweep` in `waiters/`, and any evaluator unlinks a free one. So after a worker is SIGKILLed nothing starts in
@@ -253,8 +256,8 @@ key: an unknown key inside `[pool]` exits 2 for every gate, and unit A's reader 
 
 ```toml
 [queue]                        # every key optional
-enabled = true                 # the queue's OWN switch; absent = off, whatever the pool does (section 3)
-push_timeout_s = 900           # unit C: the worker's bound on one safe-push.sh call
+enabled = true                 # the queue's OWN switch; absent = off, whatever the pool does
+push_timeout_s = 900           # unit C: the worker's bound on one safe-push.sh call; with a pre-push hook it must exceed the gate's length (push section 8)
 call_timeout_s = 30            # every other git and gh call the runner itself makes
 tool_dirs = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]   # the default; the runner's whole PATH
 ```
@@ -264,12 +267,19 @@ tool_dirs = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]   # the 
 - A non-integer or non-positive timeout (`bool` refused), an `enabled` that is not a boolean, a `tool_dirs` that is not a list of
   absolute paths, or an UNKNOWN KEY inside `[queue]` makes `add` exit 2 naming the key and the dispatcher admit nothing: a typo
   never silently changes a bound (the pool's unknown-key rule, applied to the queue's table by the queue's reader, never by a gate).
+  An invalid `[queue]` is the queue OFF for every reader, by the same path as an unreadable budget file (next bullet), with the key
+  named: `enabled` exits 1 and prints it, `wait` exits 2 `queue-config key=<k>` for a queued job, `status` prints `queue=invalid
+  key=<k>`, the dispatcher admits nothing and exits once no worker is alive. Queued entries stay and resume in order when the file
+  is fixed.
 - ON OR OFF. On exactly when the pool is on at `protocol = 2`, the code speaks it, AND `[queue] enabled` is true (absent = off).
   So the protocol edit the pool demands after B2 keeps the pool working without turning the queue on. `gate-enqueue.py enabled`
   exits 0 or 1 and prints why. The pool's activation rule comes first (pool sections 4 and 9): a budget is written only after A1
   to A4 are released and deployed and doctor reports every visible copy pool-capable (`gate_pool.py` beside the runner, the
   import, and the `POOL_WATCHDOG = 1` line); `enabled = true` only after B1 to B4 are released and deployed likewise. VALUES ARE
-  READ ONCE (the pool's rule): the dispatcher and each worker keep the values read at start; only on-or-off is re-read each pass.
+  READ ONCE (the pool's rule): the dispatcher and each worker keep the values read at start; only on-or-off (which includes the
+  validity of `[queue]`) is re-read each pass, and the dispatcher admits nothing while `waiters/` holds a protocol-1 ticket (a ticket already waiting at
+  the flag day never re-reads the config and would start beside a job). A changed `budget`, K or cap
+  therefore reaches the dispatcher only at its next start: run `stop` after editing them.
 - THE BUDGET FILE REMOVED or unreadable: off from the next poll. `add` exits 2; `wait` keeps waiting for a RUNNING job and exits 2
   `queue-off` for a queued one; the dispatcher admits nothing and exits once no worker is alive; workers finish (they keep the values
   they started with); queued entries stay, `status` and `cancel` keep working, and restoring the file resumes them in order.
@@ -296,7 +306,7 @@ the queue (no bare fork, close and never `LOCK_UN`, a flocked file is never repl
 |---|---|---|
 | `runner.lock`, `runner.alive` | the dispatcher and nothing else | its whole life |
 | `admit.lock` (the pool's) | anyone | milliseconds: directory work, one `Popen`, and a worker's wait for its watchdog to lock its `.sweep`; never a `git` or `gh` call, never a gate |
-| `waiters/<job>.sweep` (the pool's) | the worker's WATCHDOG, by its own open | from the worker's start until every group it registered is gone |
+| `waiters/<job>.<pid>.sweep` (the pool's) | the worker's WATCHDOG, by its own open | from the worker's start until every group it registered is gone |
 | `slots/NNN.lock` (the pool's), `running/<job>.ticket` | the job's worker (taken by the dispatcher, handed over) | the job |
 
 Order: `runner.lock`, then `admit.lock`, then slot and ticket files with `LOCK_NB` only. Nothing blocks on a slot or a ticket, and a
@@ -334,7 +344,7 @@ THE STEP ENVIRONMENT is what a job's GATE STEPS run with. At enqueue the helper 
 `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TMPDIR`, `XDG_*`, `SSH_AUTH_SOCK`, `GNUPGHOME`, `GH_HOST`, `GH_CONFIG_DIR`, the
 common toolchain roots (`NVM_DIR`, `GOPATH`, `GOROOT`, `GOFLAGS`, `CARGO_HOME`, `RUSTUP_HOME`, `VIRTUAL_ENV`, `PYENV_ROOT`), and any
 name the repo lists in `.gates.toml` `[queue] env_passthrough` (read only by `gate-enqueue.py`). NOT under `[pool]`: in both files
-that table is the pool's, and `gate-runner.py` ignores a `.gates.toml` table it does not define (READ: `[steer]`, `[merge_pr]`).
+that table is the pool's, and `gate-runner.py` ignores a `.gates.toml` table it does not define (READ: this repo's file has `[prep_pr]` and `[merge_pr]`; `[steer]` is a consumer opt-in).
 
 - `env_passthrough` is BOUNDED: a name matching `GIT_*`, `GATEQ_*`, `DYLD_*`, `LD_*`, `PYTHON*`, `BASH_ENV`, `ENV`, `IFS` or `PATH` is
   refused at enqueue and stripped again at load. `.gates.toml` is agent-editable; without the bound, `GIT_CONFIG_COUNT` would carry
@@ -353,6 +363,7 @@ PATH                 tool_dirs joined with ":"          HOME, USER, LOGNAME   fr
 LANG, LC_ALL         C.UTF-8                            TMPDIR                <GATEQ_HOME>/ctl-tmp
 GATEQ_HOME           the validated root                 GIT_TERMINAL_PROMPT   0
 GIT_SSH_COMMAND      "ssh -o BatchMode=yes" (constant)  GH_PROMPT_DISABLED    1
+GIT_OPTIONAL_LOCKS   0                                  (so the dispatcher's `git status` never takes `index.lock`)
 ```
 
 plus four VALUES from the job's snapshot, each validated as data and used only for that job's calls: `SSH_AUTH_SOCK` (a socket owned
@@ -421,7 +432,7 @@ drain():
     take runner.alive; write runner.beat
     loop:
         beat()                                         # also before and after every external call
-        on = the pool config is readable, has a budget, and is at this protocol
+        on = the pool config is readable, has a budget, is at this protocol, AND [queue] is valid with enabled = true
         recover()                                      # section 5: running/ entries whose ticket lock is FREE
         if on:
             for at most ONE job without a ticket: derive open_pr and cost   # one gh read and local reads, OUTSIDE admit.lock
@@ -447,7 +458,7 @@ drain():
   dispatcher closes the descriptors (freeing them) and renames the files back under the same `admit.lock`.
 - A WORKER verifies its record (the ticket descriptor is open on `running/<job_id>.ticket` and held; every slot descriptor is a held
   slot), sets them non-inheritable, discards the environment, builds the control one, starts its watchdog, then in ONE `admit.lock`
-  section writes its pid into its ticket and creates its `.sweep` (section 2), re-validates the entry, then runs the tail. It holds no `runner.lock`, `runner.alive` or `admit.lock`.
+  section writes its pid into its ticket and creates its `.sweep` (section 2), then, outside the lock, re-validates the entry and runs the tail. It holds no `runner.lock`, `runner.alive` or `admit.lock`.
 - WHEN THE DISPATCHER DIES, workers do not (RUN F1b: `runner.lock` and `admit.lock` were free at once; the worker kept its locks).
   They lose NOTHING: every bound is their own, and each finalizes its own job. The next dispatcher sees them as held tickets.
 - THE HEARTBEAT. `runner.alive` HELD says a dispatcher exists, not that it is working. It touches `runner.beat` each pass and around
@@ -540,6 +551,8 @@ GATE-POOL: budget=10 free=2 protocol=2 runner=alive pid=4411 beat=1s queued=3 ru
 running 0000000041-...  cls=1 cost=4 pid=4502 age=312s            branch=fix/x  worktree=/w/a
 queued  0000000045-...  cls=2 cost=4 bypass=1 attempts=0           branch=feat/y worktree=/w/c
 ```
+
+A queued line held back by a held `.sweep` in its worktree gains `blocked=sweep pid=<n>`.
 
 A running line gains `overdue` (older than the job's bounds), `dead` (ticket lock free, awaiting recovery) or `foreign-protocol`.
 `status --worktree <path> --quiet` prints nothing and answers by exit code: 0 = no record claims the worktree, 10 = claimed, 2 =
@@ -652,10 +665,10 @@ Pool failures are in the pool document; push and PR failures are in `DESIGN-gate
 Round 3 found the former B2 too large for one review, so the dispatcher and the worker are SEPARATE PRs unconditionally.
 
 - B1, DATA ONLY: both schemas and the registry extension; deploy `orchestrate_schemas.py`; `gate-enqueue.py` with `add` (`--tail
-  gate`), `enabled`, `status` (with `--worktree --quiet`) and `cancel`. No runner exists, so `add` prints `runner=none`. `gates.toml.md` documents `.gates.toml` `[queue] env_passthrough`.
+  gate`), `enabled` (and the `[queue]` table's reader), `status` (with `--worktree --quiet`) and `cancel`. No runner exists, so `add` prints `runner=none`. `gates.toml.md` documents `.gates.toml` `[queue] env_passthrough`.
 - B2, THE DISPATCHER AND THE POOL EXTENSION: the `gate_pool.py` job-ticket reader and `POOL_PROTOCOL = 2`; `--drain-queue`, the
   `runner.lock` hand-off, the discarded environment, the bounded-call helper with watchdog registration, class and cost, admission
-  through `schedule()`, the heartbeat, recovery, `wait`, the `[queue]` table and its `enabled` switch, `GATEQ_HOLDER` and `GATEQ_NEST`
+  through `schedule()`, the heartbeat, recovery, `wait`, `GATEQ_HOLDER` and `GATEQ_NEST`
   honored for `running/`, and
   the doctor WARN for a visible `gate_pool.py` whose `POOL_PROTOCOL` differs from the configured one. Tested against a STUB worker.
 - B3, THE WORKER: `--queue-worker`, its hand-off, non-inheritable descriptors, the step environment, the in-process gate and receipt
@@ -709,46 +722,7 @@ B4 edits `scripts/cleanup-worktree.sh`.
 
 ## Edits this unit needs in the pool document
 
-Re-checked against the MERGED `DESIGN-gate-pool.md` (main at 7d0d087, PR #543), passages quoted by text; one follow-up PR. None
-changes unit A behavior. (The former item 1, `GATEQ_NEST` for `running/`, is SATISFIED by the merged chain rule.)
-
-1. Section 2, `commit()`: "record e.worktree and e.cost in e's own holder record (its ticket, or its running journal)" -> "...
-   (its ticket)". The note under the pseudocode: "Where its comments say "job" or "running journal" they mean unit B's queued jobs;
-   in unit A the only entries are tickets and the holder record is the ticket." -> "Where its comments say "job" they mean unit B's
-   jobs, whose holder record is also a ticket (`running/<job>.ticket`); in unit A the only entries are tickets." Section 5, nested
-   runs: "`GATEQ_HOLDER=<path of its own ticket or running entry>`" -> "`GATEQ_HOLDER=<path of its own ticket>`". No journal exists.
-2. Section 4, pool protocol, after "`gate_pool.py` therefore defines `POOL_PROTOCOL = 1`, and it is written into every ticket, every
-   `.sched` sidecar and (by the user) `config.toml`." ADD: "Unit B's PR B2 moves it to 2: evaluators then also read job tickets in
-   `queued/` and `running/`, and a protocol-1 copy exits 2 against a protocol-2 config. Deploying B2 needs the user's edit of
-   `protocol` in `config.toml`; a branch that predates B2 exits 2 until it merges main."
-3. Section 4, "A COPY THAT PREDATES THE POOL", after "doctor WARNs naming each `gate-runner.py` on the deployed leg and in the plugin
-   cache that fails any part, and says which." ADD: "From unit B's PR B2 doctor also WARNs on a visible `gate_pool.py` whose
-   `POOL_PROTOCOL` differs from the configured `protocol`; pool-capable itself never tests the number."
-4. Section 4, "THE WORKTREE STAYS CLAIMED UNTIL THE SWEEP IS DONE", after "sends the path to its watchdog over the pipe." ADD:
-   "`<ticket name>` is the stem `<seq>-<id>`, as for `.sched`. Every `.sweep` lives in `waiters/`, whatever directory its holder's
-   record is in, so `busy` reads them from one place. A unit B worker is committed by the dispatcher before it exists, so it
-   creates `waiters/<job>.sweep` itself, in the `admit.lock` section that writes its pid, before its first step or external call;
-   its ticket lock, held since the commit, covers the gap." And under "EVERY RUNNER WITH A WATCHDOG HOLDS A CLAIM", ADD: "Unit
-   B's dispatcher is the exception: its watchdog covers only its own read calls and it holds no worktree, so it creates none."
-5. Section 4, end of the watchdog: "It covers the parallel step path, the pooled serial step path and `--pool-run`" -> "... and
-   `--pool-run`, and from unit B the process group of every external call a worker or the dispatcher makes".
-6. Section 9, dependencies: "The watchdog is a prerequisite for unit B, whose dispatcher SIGKILLs a stuck worker and relies on the
-   watchdog to sweep that worker's step groups; that is why A4 must land before unit B, and it is the only dependency of the queue
-   on this unit's later PRs." -> "The watchdog is a prerequisite for unit B, whose dispatcher and workers each run their own (the
-   dispatcher never signals a worker) and whose workers hold a `.sweep` claim; A4 must land before B2. The queue also needs A2 (B3:
-   the pooled step path and `job_timeout_s`) and A3 (D1: the SKILL.md machine-resource bullet)."
-7. Section 1, entry name: "every seq visible in `waiters/`" -> "every seq visible in `waiters/` (from unit B also `queued/` and
-   `running/`)". Section 3, under the `[[pool.command]]` table, ADD: "`[[pool.command]]` is all this unit reads under `.gates.toml`
-   `[pool]`. Unit B's repo key (`env_passthrough`) lives in `.gates.toml` `[queue]`, as its machine keys live in `config.toml`
-   `[queue]`."
-8. Pointers, now that the queue design is three documents. Header: "`DESIGN-gate-queue.md` (units B to D: the job queue, the
-   dispatcher, the push and PR tail; in progress)" -> "`DESIGN-gate-queue.md` (unit B: the job queue, dispatcher and workers),
-   `DESIGN-gate-queue-push.md` (unit C: the push and PR tail), `DESIGN-gate-queue-wiring.md` (unit D, and the deferred unit E)".
-   "What this document does not cover": "These are in `DESIGN-gate-queue.md` (in progress)." -> "These are in those three
-   documents."; "It is described in `DESIGN-gate-queue.md`." -> "... in `DESIGN-gate-queue-wiring.md`, section 8." Section 5:
-   "the deferred enforcement phase's subject (`DESIGN-gate-queue.md`)" -> "(`DESIGN-gate-queue-wiring.md`, section 8)". Defaults:
-   "runner-made refresh merges, belongs to the queue" -> "... belongs to `DESIGN-gate-queue-push.md`". Open questions: "belongs to
-   `DESIGN-gate-queue.md`" -> "belongs to `DESIGN-gate-queue-push.md` (questions 1, 2) and `DESIGN-gate-queue-wiring.md` (3, 4)".
+Moved verbatim, with the review-5 additions, to `DESIGN-gate-queue-pool-edits.md` (one follow-up PR against the pool document).
 
 ---
 

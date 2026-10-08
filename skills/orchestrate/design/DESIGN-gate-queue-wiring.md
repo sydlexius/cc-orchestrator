@@ -68,7 +68,7 @@ reported status is the wrapper's). A wait is a watch: never foreground.
 | Exit | State | The session does |
 |---|---|---|
 | 0 | `done` | report the line; for a first push, the PR URL from the result |
-| 1 | `failed` | read `log_path`; fix; re-enqueue (back of the class). EXCEPT a `push-failed` whose log shows a hook line `gate-runner: NOT RUN`: that gate did not run (pool section 6, push section 5); re-enqueue and fix nothing |
+| 1 | `failed` | read `log_path`; fix; re-enqueue (back of the class). EXCEPT a `push-failed` whose log shows a hook line `gate-runner: NOT RUN`: that gate did not run (pool section 6, push section 5), so its steps are not what to fix, and it is never transient: correct the cause the NOT RUN line names (push section 5), re-enqueue ONCE; a second identical result goes to the maintainer |
 | 3 | `refused` | act on `reason` (commit, refresh a `stale-base` branch, ...) and re-enqueue. `pushed` says whether an EARLIER attempt may have sent something; `no` means nothing was sent |
 | 4 | `superseded` | nothing to do for this submission |
 | 5 | `error` | read `pushed` and `pr_number` in the result and reconcile from origin before anything else; re-enqueueing is safe |
@@ -164,7 +164,7 @@ instruction-level but gains the `head_sha` pin: what is pushed is EXACTLY the co
   - [ ] The session waits in the background and reads the verdict line and result file, never a notification's exit code; replies
         cite `pushed_sha` only after `DONE`; an `error` is reconciled from `pushed` before anything is retried; a `stale-base`
         refusal is answered by a refresh in the lead's own session and a re-enqueue, and the prose says this costs a second gate;
-        a `push-failed` whose log carries `gate-runner: NOT RUN` is re-enqueued, never "fixed".
+        a `push-failed` whose log carries `gate-runner: NOT RUN` is answered by correcting the cause its NOT RUN line names and re-enqueueing once, never by "fixing" the gate.
   - [ ] No `# prep-pr-ok` token appears on an enqueue line; the new grant is printed for the maintainer, not harvested; the three
         charters carry the enqueue rule and say it is not backed by a grant.
 - Test plan: `test-command-positional-args.py`, `test-prep-pr-freshness.py` and the helper-exec-path rules still pass; a dry run of
