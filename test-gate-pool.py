@@ -3,11 +3,19 @@
 Hand-rolled, stdlib-only, no pytest. Design of record:
 skills/orchestrate/design/DESIGN-gate-pool.md ("the doc").
 
-THIS SLICE COVERS THE PURE POLICY ONLY: `cls()` and the three-class `schedule()` of the doc's
-section 2. Nothing here opens a lock or writes a pool file; the on-disk pool, the nested-run
-exemption and the gate-runner wiring arrive with their own slices and extend this file.
+TWO HALVES. The POLICY cases cover `cls()` and the three-class `schedule()` of the doc's
+section 2 as a pure function. The DISK cases cover the pool of sections 1 and 4: slots,
+tickets, `.sched` sidecars and the scheduling pass under admit.lock. The gate-runner wiring
+arrives with its own slice and extends this file.
 
-TABLE-DRIVEN. Every case builds synthetic entries, calls `schedule()` once, and compares the
+DISK CASES NEED NO THREAD AND NO SLEEP. flock belongs to the open file description, so a
+second open of a locked file in the SAME process conflicts (doc section 4, RUN E1c). A case
+therefore plays several processes by holding several waiters in one temp home and calling
+`poll()` on them in a fixed order. A DEAD owner is played by closing its descriptors (what
+the kernel does), and once for real by SIGKILLing a helper child after reading the line it
+prints when it holds; `wait()` returns only after the kernel has closed its descriptors.
+
+POLICY CASES ARE TABLE-DRIVEN. Each builds synthetic entries, calls `schedule()` once, and compares the
 WHOLE answer: which entries start, in which order, and which entries each start passes. The
 two worked tables and the "when the class matters" example of section 2 are REPLAYED row by
 row, asserting the start set AND the bypass counts after each row. A replay commits every
@@ -28,9 +36,13 @@ pass, so a broken fixture cannot read as a full set of kills. The working tree's
 opened for writing, so a concurrent `git add` can never capture a mutant.
 """
 
+import ast
 import atexit
+import fcntl
+import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -322,6 +334,311 @@ def case_static():
     check("static: the module never expands a home directory", "expanduser" not in src)
     check("static: the module under test is the one in the selected scripts directory",
           os.path.realpath(gp.__file__) == os.path.realpath(MODULE))
+    # An AST walk, so the comments that explain the rule do not trip it (doc section 4, rule 1).
+    bad = []
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, (ast.Attribute, ast.Name)):
+            ident = node.attr if isinstance(node, ast.Attribute) else node.id
+            if ident in ("fork", "forkpty"):
+                bad.append(ident)
+        elif isinstance(node, ast.keyword) and (node.arg == "pass_fds" or (
+                node.arg == "close_fds" and getattr(node.value, "value", None) is False)):
+            bad.append(node.arg)
+    same("static: no bare fork, no pass_fds and no close_fds=False in the module", bad, [])
+
+
+# --- the pool on disk -------------------------------------------------------------------------
+def cfg(budget=10, **kw):
+    return {"protocol": gp.POOL_PROTOCOL, "budget": budget, **kw}
+
+
+def with_home(fn):
+    """Run a case against its OWN pool home, a directory that does not exist yet."""
+    def case():
+        with tempfile.TemporaryDirectory(prefix="gate-pool-home-") as tmp:
+            fn(os.path.join(tmp, "gq"))
+    return case
+
+
+def lock_free(path):
+    """What any other process would see: a FRESH open of `path`, try-locked."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def die(w):
+    """Play a dead owner: every descriptor closed, nothing unlinked, no release() run."""
+    for fd in (w.holder.fds if w.holder else [w.fd]):
+        os.close(fd)
+
+
+def listing(home, sub="waiters", suffix=""):
+    return sorted(n for n in os.listdir(os.path.join(home, sub)) if n.endswith(suffix))
+
+
+def on_disk(w):
+    with open(w.path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def sched(w):
+    return w.path[:-len(".ticket")] + ".sched"
+
+
+@with_home
+def case_disk_budget(home):
+    # Each waiter gets its own Pool object, as each process would.
+    a, b, c = (gp.Pool(home, cfg()).enter("gate", "gate", 4, "/wt/" + n) for n in "abc")
+    same("disk budget: a new ticket is on disk in state waiting, with the fields of section 1",
+         on_disk(c), {"pid": os.getpid(), "pool_protocol": 1, "kind": "gate", "name": "gate",
+                      "cost": 4, "worktree": "/wt/c", "state": "waiting"})
+    check("disk budget: a waiting ticket is flocked from the moment it exists",
+          not lock_free(c.path))
+    same("disk budget: two cost-4 gates fit in a budget of 10", (a.poll(), b.poll()), (True, True))
+    same("disk budget: a third cost-4 gate waits", c.poll(), False)
+    same("disk budget: the wait line names the cost, the budget and what is free",
+         c.status(), "gate-runner: waiting for 4 of 10 gate slots (2 free, 0 ahead)")
+    same("disk budget: a holder's ticket says running", on_disk(a)["state"], "running")
+    same("disk budget: a holder holds its ticket plus one slot per cost unit",
+         len(a.holder.fds), 5)
+    same("disk budget: a failed poll keeps no slot (2 of 10 are still free to a newcomer)",
+         sum(lock_free(os.path.join(home, "slots", n)) for n in listing(home, "slots")), 2)
+    modes = {os.path.relpath(os.path.join(d, n), home): os.stat(os.path.join(d, n)).st_mode & 0o777
+             for d, subs, files in os.walk(home) for n in subs + files}
+    same("disk budget: every pool directory is 0700 and every file 0600",
+         {k: oct(v) for k, v in modes.items()
+          if v != (0o700 if k in ("waiters", "slots", "tmp") else 0o600)}, {})
+    same("disk budget: the root itself is 0700", os.stat(home).st_mode & 0o777, 0o700)
+    a.holder.release()
+    same("disk budget: a release frees the slots and the waiter starts", c.poll(), True)
+    b.holder.release(); c.leave()
+    same("disk budget: after every release waiters/ and tmp/ are empty",
+         (listing(home), listing(home, "tmp")), ([], []))
+    same("disk budget: the budget is one slot file per cost unit",
+         listing(home, "slots"), [f"{i:03d}.lock" for i in range(10)])
+
+
+@with_home
+def case_disk_order(home):
+    pool = gp.Pool(home, cfg(budget=1))
+    a, b = pool.enter("gate", "gate", 1, "/wt/a"), pool.enter("gate", "gate", 1, "/wt/b")
+    os.unlink(os.path.join(home, "seq"))
+    c = pool.enter("gate", "gate", 1, "/wt/c")
+    same("disk order: seq follows enter() order and survives a deleted seq file",
+         (a.seq, b.seq, c.seq), (1, 2, 3))
+    same("disk order: a ticket's name leads with its 10-digit seq",
+         os.path.basename(c.path)[:11], "0000000003-")
+    same("disk order: a later arrival does not start ahead of an earlier one",
+         (c.poll(), b.poll()), (False, False))
+    same("disk order: the wait line counts the entries ahead",
+         c.status(), "gate-runner: waiting for 1 of 1 gate slots (1 free, 2 ahead)")
+    same("disk order: the earliest starts", a.poll(), True)
+    a.holder.release()
+    same("disk order: then the next in arrival order, not the last", (c.poll(), b.poll()),
+         (False, True))
+    b.holder.release(); c.leave()
+    d = pool.enter("gate", "gate", 1, "/wt/d")
+    same("disk order: a seq is never reused once its ticket is gone (the seq file)", d.seq, 4)
+    with open(os.path.join(home, "seq"), "w", encoding="utf-8") as f:
+        f.write("not a number\n")
+    e = pool.enter("gate", "gate", 1, "/wt/e")
+    same("disk order: a corrupt seq file is rebuilt from the visible maximum", e.seq, 5)
+    d.leave(); e.leave()
+    same("disk order: leave() unlinks a waiting ticket", listing(home), [])
+
+
+@with_home
+def case_disk_worktree(home):
+    pool = gp.Pool(home, cfg())
+    a = pool.enter("gate", "gate", 4, "/wt/X")
+    b = pool.enter("gate", "gate", 4, "/wt/X")       # same worktree; its cost fits beside a
+    g = pool.enter("gate", "gate", 8, "/wt/X")       # same worktree, and too big to fit as well
+    c = pool.enter("gate", "gate", 2, "/wt/Y")
+    same("disk worktree: the first entry in a worktree starts", a.poll(), True)
+    same("disk worktree: a second entry in the SAME worktree does not start", b.poll(), False)
+    same("disk worktree: its wait line names who holds the worktree", b.status(),
+         f"gate-runner: waiting for this worktree (held by gate pid {os.getpid()})")
+    same("disk worktree: an entry in another worktree starts past both", c.poll(), True)
+    check("disk worktree: an entry waiting on its worktree accrues no pass (no sidecar appears)",
+          not os.path.exists(sched(b)) and not os.path.exists(sched(g)))
+    a.holder.release(); c.holder.release()
+    same("disk worktree: the next one starts once the worktree's holder is gone, and only one",
+         (g.poll(), b.poll(), g.poll()), (False, True, False))
+    b.leave(); g.leave()
+
+
+@with_home
+def case_sidecar(home):
+    pool = gp.Pool(home, cfg())
+    x = pool.enter("gate", "gate", 4, "/wt/x"); x.poll()
+    b = pool.enter("gate", "gate", 8, "/wt/b")       # 8 > the 6 free: blocked on budget
+    inode = os.fstat(b.fd).st_ino
+    c = pool.enter("gate", "gate", 2, "/wt/c")
+    same("sidecar: a later entry backfills past the blocked one", (b.poll(), c.poll()),
+         (False, True))
+    check("sidecar: a bypass written by another evaluator leaves the ticket's lock HELD",
+          not lock_free(b.path))
+    same("sidecar: the passed ticket is still the inode its owner opened",
+         os.stat(b.path).st_ino, inode)
+    with open(sched(b), encoding="utf-8") as f:
+        same("sidecar: the pass is recorded in the passed ticket's .sched sidecar",
+             json.load(f), {"pool_protocol": 1, "bypass": 1})
+    same("sidecar: the passed ticket's own content is untouched", on_disk(b)["state"], "waiting")
+    d = pool.enter("gate", "gate", 2, "/wt/d")
+    e = pool.enter("gate", "gate", 2, "/wt/e")
+    same("sidecar: a second pass is read back and counted", d.poll(), True)
+    same("sidecar: at K passes the entry is protected, and a later one that fits is held",
+         e.poll(), False)
+    die(b)                                            # b's process is gone; nothing cleaned up
+    same("sidecar: a dead waiter protects nobody: the held entry starts", e.poll(), True)
+    same("sidecar: the dead ticket and its sidecar were unlinked by that pass",
+         (os.path.exists(b.path), os.path.exists(sched(b))), (False, False))
+    with open(os.path.join(home, "tmp", "left-behind"), "w", encoding="utf-8"):
+        pass
+    for w in (x, c, d, e):
+        w.leave()
+    f = pool.enter("gate", "gate", 1, "/wt/f"); f.poll(); f.leave()
+    same("sidecar: a pass clears staging left in tmp/ by a process that died mid-write",
+         listing(home, "tmp"), [])
+
+
+HOLD_CHILD = """
+import sys
+sys.path.insert(0, sys.argv[1])
+import gate_pool as gp
+w = gp.Pool(sys.argv[2], {"protocol": gp.POOL_PROTOCOL, "budget": 10}).enter(
+    "gate", "gate", 10, sys.argv[3])
+assert w.poll()
+print("held", flush=True)
+sys.stdin.read()
+"""
+
+
+@with_home
+def case_sigkill(home):
+    pool = gp.Pool(home, cfg())
+    child = subprocess.Popen([sys.executable, "-B", "-c", HOLD_CHILD, SCRIPTS, home, "/wt/W"],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        same("sigkill: the helper child holds the whole budget", child.stdout.readline(), "held\n")
+        dead = listing(home, suffix=".ticket")
+        w = pool.enter("gate", "gate", 4, "/wt/W")
+        same("sigkill: a waiter in the holder's worktree does not start", w.poll(), False)
+        same("sigkill: its wait line names the live holder", w.status(),
+             f"gate-runner: waiting for this worktree (held by gate pid {child.pid})")
+        other = pool.enter("gate", "gate", 1, "/wt/other")
+        same("sigkill: nor does one elsewhere, with every slot held", other.poll(), False)
+        same("sigkill: no slot is free while the holder lives", other.status(),
+             "gate-runner: waiting for 1 of 10 gate slots (0 free, 1 ahead)")
+        child.send_signal(signal.SIGKILL)
+        child.wait()                       # the kernel closed its descriptors before this returns
+        same("sigkill: a SIGKILLed holder frees its slots and its worktree at once",
+             (w.poll(), other.poll()), (True, True))
+        check("sigkill: the dead holder's ticket was unlinked by the next pass",
+              len(dead) == 1 and dead[0] not in listing(home))
+        w.leave(); other.leave()
+    finally:
+        child.kill(); child.wait()
+        child.stdin.close(); child.stdout.close()
+
+
+@with_home
+def case_inherit(home):
+    w = gp.Pool(home, cfg()).enter("gate", "gate", 3, "/wt/a")
+    check("inherit: a waiting ticket's descriptor is non-inheritable",
+          not os.get_inheritable(w.fd))
+    w.poll()
+    same("inherit: no descriptor a holder holds (ticket and slots) is inheritable",
+         [os.get_inheritable(fd) for fd in w.holder.fds], [False] * 4)
+    w.leave()
+
+
+@with_home
+def case_budget_change(home):
+    a = gp.Pool(home, cfg(budget=2)).enter("gate", "gate", 1, "/wt/a"); a.poll()
+    same("budget change: a budget of 2 makes two slot files",
+         listing(home, "slots"), ["000.lock", "001.lock"])
+    b = gp.Pool(home, cfg(budget=4)).enter("gate", "gate", 3, "/wt/b")
+    same("budget change: the first evaluator with a RAISED budget creates the new slots",
+         (b.poll(), listing(home, "slots")),
+         (True, ["000.lock", "001.lock", "002.lock", "003.lock"]))
+    b.leave()
+    c = gp.Pool(home, cfg(budget=1)).enter("gate", "gate", 1, "/wt/c")
+    same("budget change: an evaluator with a LOWERED budget never probes above its own figure",
+         (c.poll(), c.status()),
+         (False, "gate-runner: waiting for 1 of 1 gate slots (0 free, 0 ahead)"))
+    big = gp.Pool(home, cfg(budget=1)).enter("gate", "gate", 12, "/wt/big")
+    a.leave(); c.leave()
+    same("budget change: a cost above the budget holds the whole budget and no more",
+         (big.poll(), len(big.holder.fds)), (True, 2))
+    big.leave()
+
+
+@with_home
+def case_root(home):
+    os.mkdir(home, 0o755); os.chmod(home, 0o755)
+    try:
+        gp.Pool(home, cfg()); err = None
+    except gp.NotRun as e:
+        err = e
+    same("root: a pool root open to group or other is refused with exit 2",
+         (err.code, err.message) if err else None,
+         (2, f"gate-runner: NOT RUN - pool root {home} must be owned by you with mode 0700"))
+    same("root: a refused root is left untouched", os.listdir(home), [])
+
+
+class _NoSubprocess:
+    def __getattr__(self, name):
+        raise AssertionError(f"subprocess.{name} used under admit.lock")
+
+
+@with_home
+def case_no_git_under_lock(home):
+    real, gp.subprocess = gp.subprocess, _NoSubprocess()
+    try:
+        pool = gp.Pool(home, cfg(budget=1))
+        a, b = pool.enter("gate", "gate", 1, "/wt/a"), pool.enter("gate", "gate", 1, "/wt/b")
+        a.poll(); b.poll(); a.leave(); b.poll(); b.leave()
+        ok = True
+    except AssertionError as e:
+        ok = False; print(f"         {e}")
+    finally:
+        gp.subprocess = real
+    check("no git under the lock: enter, poll, commit and release start no process", ok)
+
+
+def case_worktree_key():
+    # A linked worktree that was MOVED, with a symlink left at the path git recorded: the one
+    # shape where the recorded string and the resolved path differ on every platform.
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    with tempfile.TemporaryDirectory(prefix="gate-pool-wt-") as tmp:
+        repo, wt, moved, plain = (os.path.join(tmp, n) for n in ("repo", "wt", "moved", "plain"))
+
+        def git(*args):
+            return subprocess.run(["git", "-C", repo, *args], check=True, capture_output=True,
+                                  text=True, env=env).stdout
+        os.mkdir(repo); os.mkdir(plain)
+        git("init", "-q")
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q",
+            "--allow-empty", "-m", "init")
+        git("worktree", "add", "-q", "--detach", wt)
+        os.rename(wt, moved); os.symlink(moved, wt)
+        recorded = [ln[len("worktree "):] for ln in git("worktree", "list", "--porcelain")
+                    .splitlines() if ln.startswith("worktree ") and ln.endswith("/wt")]
+        check("worktree key: the fixture's recorded string differs from the resolved path",
+              len(recorded) == 1 and recorded[0] != os.path.realpath(moved))
+        same("worktree key: a path that resolves to a registered worktree gets the string git "
+             "RECORDED", [gp.worktree_key(moved)], recorded)
+        same("worktree key: every spelling of one worktree gets the same key",
+             [gp.worktree_key(wt)], recorded)
+        same("worktree key: a directory that is no worktree is keyed by its own resolved path",
+             gp.worktree_key(plain), os.path.realpath(plain))
 
 
 CASES = [
@@ -330,6 +647,10 @@ CASES = [
     ("protected", case_protected), ("worktree", case_worktree),
     ("class0-pass-list", case_class0_pass_list), ("bound-in-pass", case_bound_in_pass),
     ("cost-zero", case_cost_zero), ("pure", case_pure), ("static", case_static),
+    ("disk-budget", case_disk_budget), ("disk-order", case_disk_order),
+    ("disk-worktree", case_disk_worktree), ("sidecar", case_sidecar), ("sigkill", case_sigkill),
+    ("inherit", case_inherit), ("budget-change", case_budget_change), ("root", case_root),
+    ("no-git-under-lock", case_no_git_under_lock), ("worktree-key", case_worktree_key),
 ]
 
 # --- mutation self-test: each assertion must be able to FAIL ---------------------------------
@@ -413,6 +734,44 @@ MUTATIONS = [
     ("the c == 0 branch dropped",
      "if c == 0:", "if False:", "cost-zero",
      "cost 0: a zero-cost entry is not held by a protected entry ahead of it"),
+    # --- the pool on disk. The first two are named by the doc's A1 test plan. ---
+    ("slot and ticket descriptors made inheritable",
+     "return os.open(path, flags, 0o600)",
+     "fd = os.open(path, flags, 0o600); os.set_inheritable(fd, True); return fd", "inherit",
+     "inherit: no descriptor a holder holds (ticket and slots) is inheritable"),
+    ("the bypass written into the ticket with os.replace",
+     "p._put(_sched_of(b.path), json.dumps(", "p._put(b.path, json.dumps(", "sidecar",
+     "sidecar: a bypass written by another evaluator leaves the ticket's lock HELD"),
+    ("a bare fork in the module",
+     "import time\n", "import time\n_fork = os.fork\n", "static",
+     "static: no bare fork, no pass_fds and no close_fds=False in the module"),
+    ("the worktree key resolved inside admit.lock",
+     "entries, busy = p._scan()", "entries, busy = p._scan(); worktree_key(p.home)",
+     "no-git-under-lock",
+     "no git under the lock: enter, poll, commit and release start no process"),
+    ("a failed poll keeps the slots it probed",
+     "for fd in got[keep:]:", "for fd in got[len(got):]:", "disk-budget",
+     "disk budget: a failed poll keeps no slot (2 of 10 are still free to a newcomer)"),
+    ("the worktree of a running ticket not counted as busy",
+     "busy[rec[\"worktree\"]] = f\"{rec['kind']} pid {rec.get('pid')}\"", "pass", "disk-worktree",
+     "disk worktree: a second entry in the SAME worktree does not start"),
+    ("a dead ticket left in place",
+     "if not held:\n                _rm(path)", "if False:\n                _rm(path)", "sidecar",
+     "sidecar: a dead waiter protects nobody: the held entry starts"),
+    ("seq allocated from the seq file alone",
+     "seq = 1 + max([0, last] + [n for n in map(_seq_of, os.listdir(self.waiters))\n"
+     "                                       if n is not None])", "seq = 1 + last", "disk-order",
+     "disk order: seq follows enter() order and survives a deleted seq file"),
+    ("seq allocated from the visible tickets alone",
+     "seq = 1 + max([0, last] +", "seq = 1 + max([0] +", "disk-order",
+     "disk order: a seq is never reused once its ticket is gone (the seq file)"),
+    ("the pool root's mode not checked",
+     "or stat.S_IMODE(st.st_mode) & 0o077:", "and False:", "root",
+     "root: a pool root open to group or other is refused with exit 2"),
+    ("the recorded worktree string replaced by the resolved path",
+     "            return line[9:]", "            return real", "worktree-key",
+     "worktree key: a path that resolves to a registered worktree gets the string git "
+     "RECORDED"),
 ]
 
 
@@ -463,7 +822,10 @@ def main():
         return 2
     for name, fn in selected:
         print(f"{name}:")
-        fn()
+        try:
+            fn()
+        except Exception as e:             # a crash is a FAIL line, never a lost verdict
+            check(f"{name}: the case ran to its end (raised {type(e).__name__}: {e})", False)
     # Skipped inside a re-run against a copy, so the self-test never recurses.
     if only is None and not os.environ.get("GATE_POOL_SCRIPTS"):
         print("mutation self-test:")
