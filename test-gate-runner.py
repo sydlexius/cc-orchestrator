@@ -1743,6 +1743,30 @@ def test_parallel_interrupt_in_launch_window():
           launched == ["x"])
 
 
+def test_parallel_interrupt_before_launch():
+    """A signal recorded while the parent runs a step's skip predicate (or its
+    memo lookup) stops that step from launching at all: a step with side
+    effects must not start after the stop request."""
+    launched = []
+
+    def popen(*a, **k):
+        launched.append(a[0])
+        return _FakeProc(0, holds=50)
+
+    def noisy(orig):
+        def skip_reason(*a, **k):
+            signal.raise_signal(signal.SIGTERM)   # recorded, not raised
+            return orig(*a, **k)
+        return skip_reason
+    (rc, recs, _), _, _ = _with_outer_handlers(
+        lambda: _inproc_parallel([{"name": "a", "run": "x"}], popen,
+                                 patch={"_skip_reason": noisy}))
+    check("#546: signal during a skip predicate: still an interrupt (rc 130)",
+          rc == 130)
+    check("#546: signal during a skip predicate: the step never launches",
+          launched == [] and recs == [])
+
+
 def test_parallel_interrupt_during_output():
     """Printing a finished block can block on a stalled stdout for as long as
     the reader likes, so a signal THERE raises at once instead of waiting for
@@ -1968,6 +1992,7 @@ def main():
         test_parallel_interrupt_never_raises_in_poll,
         test_parallel_interrupt_in_last_iteration,
         test_parallel_interrupt_in_launch_window,
+        test_parallel_interrupt_before_launch,
         test_parallel_interrupt_during_output,
         test_parallel_inherited_ignored_sigint,
         test_terminate_groups_ignores_popen_lock,

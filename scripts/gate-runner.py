@@ -444,7 +444,10 @@ def run_form_b_parallel(steps, root, memoize_dir, jobs, cli_skip=None):
         # likes and is retried after a handler returns, so recording alone
         # would leave the runner unstoppable there. No Popen call is in flight
         # in that window. At most once: a second signal must never raise out
-        # of the cleanup below.
+        # of the cleanup below. This covers the in-loop flush ONLY: the flush
+        # inside the cleanup and the final log line run with these signals
+        # ignored or restored, so a stalled stdout can still hold the runner
+        # there (#548).
         if in_output[0]:
             in_output[0] = False
             raise KeyboardInterrupt
@@ -487,6 +490,11 @@ def run_form_b_parallel(steps, root, memoize_dir, jobs, cli_skip=None):
                                 continue
                 if not _may_launch(running, jobs, e["exclusive"]):
                     break
+                # The skip predicate and the memo lookup above can take a while
+                # (they shell out): a signal recorded during them must stop
+                # THIS step from starting, not kill it one iteration later.
+                if got:
+                    raise KeyboardInterrupt
                 e["out"] = os.path.join(capdir, f"{nxt}.out")
                 e["start"] = time.perf_counter()
                 # Block INT/TERM/HUP from Popen until the step is registered in
@@ -550,8 +558,8 @@ def run_form_b_parallel(steps, root, memoize_dir, jobs, cli_skip=None):
                                      "(required=false), continuing.")
             if hard is not None:
                 break
-            in_output[0] = True
             try:
+                in_output[0] = True   # inside the try: no window leaves it set
                 printed = _flush_ready(plan, printed)
             finally:
                 in_output[0] = False
