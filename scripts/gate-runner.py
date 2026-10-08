@@ -1257,7 +1257,7 @@ def _pool_config():
             data = tomllib.load(f)
     except FileNotFoundError:
         for p in (path, _pool_home()):     # a dangling symlink is no "missing": it is a config
-            if os.path.islink(p):          # that cannot be read, so never read as OFF
+            if os.path.islink(p) and not os.path.exists(p):   # unreadable: never read as OFF
                 return "error", f"{p}: is a dangling symlink"
         return "off", None
     except (OSError, ValueError) as e:     # ValueError: a TOML or a UTF-8 decode error

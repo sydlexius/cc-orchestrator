@@ -1489,6 +1489,13 @@ def case_e2e_refusals(tmp, home):
          ((2, f"gate-runner: NOT RUN - {path}: is a dangling symlink\n", False, False),
           (2, f"gate-runner: NOT RUN - {dangling}: is a dangling symlink\n", False, False)))
     os.unlink(path); os.unlink(dangling)
+    empty, valid = os.path.join(tmp, "empty"), os.path.join(tmp, "valid")
+    os.mkdir(empty, 0o700); os.symlink(empty, valid)
+    same("refusals: a pool home that is a symlink to a real directory with no config is OFF: "
+         "the gate runs unpooled and nothing is created there",
+         (run_runner(root, valid)[::2], os.path.exists(marker), os.listdir(empty)),
+         ((0, ""), True, []))
+    os.unlink(marker)
     put(path, CONFIG); put(os.path.join(home, "waiters"), "x")
     rc, err, ran, kept = refused_at(home)
     os.unlink(os.path.join(home, "waiters"))
@@ -2151,9 +2158,15 @@ RUNNER_MUTATIONS = [
      "timeout: no step ran, the waiter's ticket is gone, and no older receipt is left to read "
      "as this run's"),
     ("a dangling symlink read as 'no config' (pool off)",
-     "            if os.path.islink(p):", "            if False:", "e2e-refusals",
+     "            if os.path.islink(p) and not os.path.exists(p):", "            if False:",
+     "e2e-refusals",
      "refusals: a dangling config.toml or a dangling pool home exits 2, never 'off': no step, "
      "no stale receipt"),
+    ("a symlinked pool home refused as dangling although its target exists",
+     "            if os.path.islink(p) and not os.path.exists(p):",
+     "            if os.path.islink(p):", "e2e-refusals",
+     "refusals: a pool home that is a symlink to a real directory with no config is OFF: "
+     "the gate runs unpooled and nothing is created there"),
     ("a broken gate_pool.py escapes as a traceback (no catch-all arm)",
      "    except Exception as e:                 # a broken gate_pool.py",
      "    except ZeroDivisionError as e:         # a broken gate_pool.py", "e2e-refusals",
