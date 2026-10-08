@@ -2037,6 +2037,9 @@ def test_shard_malformed_and_refusals():
             ("fallback chain", None),
             ("duplicate step name",
              _steps_cfg([("a", "true", ""), ("a", f"touch {marker}", "")])),
+            # A non-string name cannot be hashed: a config error, never a traceback.
+            ("non-string step name",
+             f'[prep_pr]\n[[prep_pr.steps]]\nname = 123\nrun = "touch {marker}"\n'),
         ]
         for label, c in cases:
             with tempfile.TemporaryDirectory() as root:

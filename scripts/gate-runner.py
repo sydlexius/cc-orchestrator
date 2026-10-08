@@ -198,6 +198,12 @@ def run_prep_pr(prep, root, memoize_dir=None, cli_jobs=None, cli_skip=None,
         # a shard, so the duplicate would hide. Unnamed steps count by their
         # derived `step-<index>` name, which can collide with an explicit one.
         flag = "--skip" if cli_skip else "--shard"
+        if cli_shard and any(isinstance(s, dict) and s.get("name")
+                             and not isinstance(s["name"], str)
+                             for s in prep["steps"]):
+            # The shard is a hash of the name: a non-string one cannot be hashed.
+            warn("`--shard` needs every step `name` to be a string")
+            return 2, _synth_records(2)
         all_names = [(s.get("name") or f"step-{i}") for i, s in enumerate(prep["steps"])
                      if isinstance(s, dict)]
         dupes = sorted({n for n in all_names if all_names.count(n) > 1})

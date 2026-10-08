@@ -665,8 +665,8 @@ Runtime (`scripts/`; canonical source is this repo):
   both legs, `test-orchestrate-setup` on macOS), and no CI-run step `required = false` or
   carrying `skip_if_absent`/`skip_if`. The FS leg still requires every `test-*.py` to be a
   `.gates.toml` step. shellcheck/ruff keep their dedicated Linux CI steps (digest-pinned image,
-  Linux-only ruff), so their lists stay hand-maintained and keep all three checks. A 13-case
-  MUTATION SELF-TEST (29 cases) proves each check fails when its invariant breaks. gate-runner's
+  Linux-only ruff), so their lists stay hand-maintained and keep all three checks. A 29-case
+  MUTATION SELF-TEST proves each check fails when its invariant breaks. gate-runner's
   `--skip <name>` (repeatable, default off) exits 2 on a name matching no step, on Form A /
   the fallback chain, and beside `--receipt` (a receipt must attest the whole gate); `--shard K/N`
   is refused the same three ways and on a malformed value or a duplicated step name.
