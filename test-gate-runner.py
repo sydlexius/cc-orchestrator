@@ -34,6 +34,17 @@ import time
 RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                       "scripts", "gate-runner.py")
 
+# GATE POOL ISOLATION (#539, DESIGN-gate-pool.md section 3 "OFF means off"). Every runner this
+# harness spawns copies or inherits os.environ, and the in-process cases load the module here,
+# so ONE pin covers them all: the pool root is a fresh EMPTY temp directory (no config.toml, so
+# the pool is OFF and no fixture gate can take a ticket from the machine's live pool), and no
+# holder is inherited from an outer gate. main() asserts the directory is STILL empty at the
+# end: over this whole suite the runner created nothing under its pool root.
+_GATEQ_HOME = tempfile.mkdtemp(prefix="gate-runner-test-gateq-")
+os.environ["GATEQ_HOME"] = _GATEQ_HOME
+for _var in ("GATEQ_HOLDER", "GATEQ_NEST"):
+    os.environ.pop(_var, None)
+
 # Import the shared schema validator the same way gate-runner does, to assert the
 # receipt actually conforms (not just that we spelled the fields the same way).
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
@@ -2161,6 +2172,11 @@ def main():
     ]:
         print(f"- {fn.__name__}")
         fn()
+    print("- gate pool isolation")
+    check("#539: the pinned GATEQ_HOME is still empty (pool off: nothing was created there)",
+          os.listdir(_GATEQ_HOME) == [])
+    if not os.listdir(_GATEQ_HOME):
+        os.rmdir(_GATEQ_HOME)
     print()
     if FAILS:
         print(f"FAIL ({len(FAILS)} check(s) failed):")

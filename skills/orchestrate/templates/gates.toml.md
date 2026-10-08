@@ -204,6 +204,69 @@ changes the gate exit code.
   model), costs a full extra checkout per run, and breaks gates that read
   untracked config or caches from the live worktree.
 
+### Machine-wide gate pool (`weight`, #539)
+
+OFF by default, and OFF means off: with no budget configured the runner's output
+and exit codes are exactly what they were before the pool existed. Design of
+record: `../design/DESIGN-gate-pool.md`.
+
+The pool keeps several worktrees gating at once from oversubscribing the machine.
+It is turned on by the USER, per machine, never by a repo and never by a tool:
+
+```toml
+# ~/.claude/gate-queue/config.toml   (root override: GATEQ_HOME)
+[pool]
+protocol = 1                 # REQUIRED with a budget: the pool protocol this directory speaks
+budget = 10                  # cost units. Absent (or no file, or no [pool] table) = OFF
+backfill_bypass_limit = 2    # optional: how often a waiting gate may be passed (default 2)
+small_check_cap = 2          # optional: named commands at or below this weight go first (default 2)
+wait_timeout_s = 3600        # optional: a gate gives up WAITING after this (default 3600)
+job_timeout_s = 5400         # optional: validated now, enforced by a later release
+```
+
+Each of the six keys must be a positive integer when present. Any other key
+inside `[pool]`, a bad value, a `budget` with no `protocol`, or a file that does
+not parse exits 2 for EVERY gate: a typo must never silently disable the bound
+it configures. Tables other than `[pool]` are ignored.
+
+With a budget configured, every `gate-runner.py` run (a hand-run gate, the
+pre-push hook) first takes its COST in budget units and waits until they are
+free. A repo declares the cost in `.gates.toml`:
+
+| Key      | Type | Default | Meaning |
+|----------|------|---------|---------|
+| `weight` | int  | (none)  | `[prep_pr] weight = N`: the machine cost units this gate occupies. A positive integer; anything else exits 2 (with the pool on or off), like `jobs`. It changes how many gates run at once, never how this one runs. |
+
+The cost is `weight`; else, for Form B, the `jobs` the run will actually use
+(`--jobs` wins); else the WHOLE budget, so a Form A gate, the fallback chain and
+a Form B table that declares neither RUN ALONE. An undeclared cost is assumed
+heavy; a repo opts into running beside others by declaring one number. A cost
+above the budget is clamped to it. One thing runs per worktree at a time.
+
+While it waits the runner prints `gate-runner: waiting for 4 of 10 gate slots
+(2 free, 3 ahead)` (or `... waiting for this worktree (held by <kind> pid
+<n>)`) once, then every 30 seconds. The receipt snapshot and the `.gates.toml`
+read happen AFTER the wait, so a wait never widens what a receipt attests. The
+definition is costed again at that read: if it now costs more than the run holds
+(a `jobs` or `weight` raised during the wait, a branch switch), the run exits 75
+with `NOT RUN - .gates.toml changed during the wait (cost 2 -> 8); run it again`
+instead of running wider than its slots.
+
+**Exit 75 means NOT RUN.** A wait that outlasts `wait_timeout_s` prints
+`gate-runner: NOT RUN - no gate slot within <N>s` and exits 75: no step ran. It
+is neither a pass (0) nor a failed gate (1) nor a config error (2), and with
+`--receipt` any older receipt at the path is removed so nothing reads as this
+run's verdict. A SIGINT while waiting exits 130 the same way; other signals take
+their default action and may leave an older receipt in place. A usage error in
+`--skip` or `--shard` is reported only after the slot is granted, so it can wait
+and can exit 75.
+
+A gate started BY a pooled gate in the same worktree (the pre-push hook under a
+gate step that uploads, a gate run from a step) runs under its holder's slots
+instead of waiting on them, one such nested run at a time; one that would cost
+more than its holder exits 75 at once. The runner sets `GATEQ_HOLDER` (and
+`GATEQ_NEST`) for its steps for that purpose; a step never sets them itself.
+
 ---
 
 ## `[merge_pr]` section

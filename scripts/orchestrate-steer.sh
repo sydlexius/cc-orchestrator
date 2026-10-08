@@ -312,7 +312,7 @@ is_canonical_path() {
   for cand in "$p" "$resolved"; do
     case "$cand" in
       */scripts/reply-comment.sh|*/scripts/resolve-threads.sh|*/scripts/cleanup-worktree.sh|\
-      */scripts/patch-coverage.sh|*/scripts/safe-push.sh|*/scripts/gate-runner.py|\
+      */scripts/patch-coverage.sh|*/scripts/safe-push.sh|*/scripts/gate-runner.py|*/scripts/gate_pool.py|\
       */scripts/pre-push-hook.sh|*/scripts/prefs-coverage.py|*/scripts/issue-watch.sh|\
       */scripts/ship-gate-preflight.sh|*/scripts/orchestrate-context-meter.sh|\
       */scripts/orchestrate-setup.py|*/scripts/orchestrate-authorize-merge.sh|\
@@ -911,8 +911,11 @@ _command_rule() {
 # up from the payload cwd (fork-free `[ -e ]` tests) to the nearest dir holding `.git` and read
 # its `.gates.toml` with ONE python3 tomllib fork (the grammar gate-runner.py itself requires, so a
 # hand-rolled TOML subset cannot silently drop a valid declaration). Nothing is cached.
-# NOT DONE: concurrent-gate lock detection. gate-runner.py takes no lock, and the lock a consumer's
-# own gate takes has no declared location, so there is nothing cheap and deterministic to test.
+# NOT DONE: concurrent-gate lock detection, and no longer wanted here. With a machine budget
+# configured gate-runner.py itself takes machine-wide slot locks and waits for them
+# (DESIGN-gate-pool.md), so two gates at once need no nudge; with none it takes no lock. The lock
+# a consumer's own gate takes still has no declared location, so there is nothing cheap and
+# deterministic to test.
 _x7_prefilter() {
   local c="$1"
   [[ $c == *=* ]] || return 1

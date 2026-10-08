@@ -6,8 +6,10 @@ skills/orchestrate/design/DESIGN-gate-pool.md ("the doc").
 TWO HALVES. The POLICY cases cover `cls()` and the three-class `schedule()` of the doc's
 section 2 as a pure function. The DISK cases cover the pool of sections 1 and 4: slots,
 tickets, `.sched` sidecars and the scheduling pass under admit.lock, and the nested-run
-exemption of section 5 (the three conditions, the `.nest` chain). The gate-runner wiring
-arrives with its own slice and extends this file.
+exemption of section 5 (the three conditions, the `.nest` chain). The RUNNER cases spawn the
+real scripts/gate-runner.py in `git init`ed temp repos, each with its own tiny `.gates.toml`:
+first the proof that a machine with no budget configured behaves exactly as before the pool
+existed (output equal to goldens recorded from the pre-pool runner).
 
 DISK CASES NEED NO THREAD AND NO SLEEP. flock belongs to the open file description, so a
 second open of a locked file in the SAME process conflicts (doc section 4, RUN E1c). A case
@@ -24,16 +26,21 @@ returned start (the way unit B's dispatcher will), so it also proves the bound o
 when one evaluator commits a whole batch.
 
 ISOLATION. No test may touch the real pool at ~/.claude/gate-queue. The module has no default
-home, so that is structural; two belts on top of it:
+home, so that is structural for the library cases; the belts on top of it:
   1. GATEQ_HOME is pinned to a fresh empty temp directory and GATEQ_HOLDER / GATEQ_NEST are
      removed, before anything else runs, and the directory must still be empty at the end;
-  2. a case asserts the module source names neither `.claude` nor `expanduser`.
+  2. a case asserts the module source names neither `.claude` nor `expanduser`;
+  3. every runner is spawned through `runner_env(home)`, whose pool root is a REQUIRED argument
+     and whose HOME is a temp directory, so even a dropped GATEQ_HOME resolves `~` to scratch;
+  4. the real pool directory (under the passwd-database home, whatever HOME says) is listed
+     at the start and at the end, and the two must be equal.
 
 MUTATION SELF-TEST (the test-ci-gates-lockstep.py pattern). An assertion that cannot fail is
-decorative, so the harness ends by copying scripts/gate_pool.py into a temp directory, breaking
-ONE thing in the copy, and re-running itself against that copy with `--only <case>`. The run
+decorative, so the harness ends by copying scripts/gate_pool.py and scripts/gate-runner.py into
+a temp directory, breaking ONE thing in one copy, and re-running itself against that directory
+with `--only <case>`. The run
 must exit non-zero AND print the named check's FAIL line. An unmutated copy runs first and must
-pass, so a broken fixture cannot read as a full set of kills. The working tree's file is never
+pass, so a broken fixture cannot read as a full set of kills. No working-tree file is ever
 opened for writing, so a concurrent `git add` can never capture a mutant.
 """
 
@@ -41,13 +48,19 @@ import ast
 import atexit
 import contextlib
 import fcntl
+import importlib.util
+import io
+import itertools
 import json
 import os
+import pwd
+import re
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -61,11 +74,26 @@ for _var in [v for v in os.environ if v.startswith("GIT_")]:
 _PINNED_HOME = tempfile.mkdtemp(prefix="gate-pool-test-")
 os.environ["GATEQ_HOME"] = _PINNED_HOME
 atexit.register(shutil.rmtree, _PINNED_HOME, True)   # every exit path, early returns included
+# The HOME every spawned runner gets: with GATEQ_HOME dropped, `~/.claude/gate-queue` lands here.
+_FAKE_HOME = tempfile.mkdtemp(prefix="gate-pool-test-home-")
+atexit.register(shutil.rmtree, _FAKE_HOME, True)
+_REAL_POOL = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".claude", "gate-queue")
+
+
+def _real_pool_listing():
+    try:
+        return sorted(os.listdir(_REAL_POOL))
+    except OSError:
+        return None                        # absent (or unreadable): must still be so at the end
+
+
+_REAL_POOL_BEFORE = _real_pool_listing()
 
 # GATE_POOL_SCRIPTS points the harness at a COPY of the module; only the mutation self-test
 # at the end of this file sets it.
 SCRIPTS = os.environ.get("GATE_POOL_SCRIPTS") or os.path.join(HERE, "scripts")
 MODULE = os.path.join(SCRIPTS, "gate_pool.py")
+RUNNER = os.path.join(SCRIPTS, "gate-runner.py")
 sys.dont_write_bytecode = True
 sys.path.insert(0, SCRIPTS)
 import gate_pool as gp  # noqa: E402
@@ -543,8 +571,9 @@ HOLD_CHILD = """
 import sys
 sys.path.insert(0, sys.argv[1])
 import gate_pool as gp
-w = gp.Pool(sys.argv[2], {"protocol": gp.POOL_PROTOCOL, "budget": 10}).enter(
-    "gate", "gate", 10, sys.argv[3])
+cost, budget = (int(a) for a in (sys.argv[4:6] or (10, 10)))
+w = gp.Pool(sys.argv[2], {"protocol": gp.POOL_PROTOCOL, "budget": budget}).enter(
+    "gate", "gate", cost, sys.argv[3])
 assert w.poll()
 print("held", flush=True)
 sys.stdin.read()
@@ -579,6 +608,19 @@ def case_sigkill(home):
         child.stdin.close(); child.stdout.close()
 
 
+FD_PROBE = """
+import os, sys
+found = []
+for fd in map(int, sys.argv[1:]):
+    try:
+        os.fstat(fd)
+        found.append(fd)
+    except OSError:
+        pass
+print(found)
+"""
+
+
 @with_home
 def case_inherit(home):
     w = gp.Pool(home, cfg()).enter("gate", "gate", 3, "/wt/a")
@@ -587,6 +629,18 @@ def case_inherit(home):
     w.poll()
     same("inherit: no descriptor a holder holds (ticket and slots) is inheritable",
          [os.get_inheritable(fd) for fd in w.holder.fds], [False] * 4)
+    # The flag is the mechanism; this is the outcome. A REAL child, started by exec and asked
+    # to keep every descriptor it can (close_fds=False), reports which of the holder's
+    # descriptor numbers are open in it. The pipe end is the control: it IS inheritable, so a
+    # probe that could see nothing would fail here.
+    r, wr = os.pipe(); os.set_inheritable(r, True)
+    try:
+        seen = subprocess.run([sys.executable, "-B", "-c", FD_PROBE, *map(str, w.holder.fds + [r])],
+                              close_fds=False, capture_output=True, text=True).stdout
+    finally:
+        os.close(r); os.close(wr)
+    same("inherit: a child a holder starts by exec holds NONE of the holder's lock descriptors",
+         seen, f"[{r}]\n")
     w.leave()
 
 
@@ -973,6 +1027,861 @@ def case_worktree_key():
              "git RECORDED for this worktree", under_hook, recorded)
 
 
+# --- the runner, end to end ---------------------------------------------------------------------
+_GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+_SERIAL = itertools.count()                # a fresh name for every temp repo of one case
+
+
+def runner_env(home, extra=None):
+    """The environment of EVERY spawned runner. `home` (the pool root) is required; HOME is a
+    temp directory; an inherited holder is dropped unless the case hands one over in `extra`."""
+    env = {k: v for k, v in os.environ.items() if k not in ("GATEQ_HOLDER", "GATEQ_NEST")}
+    env.update(_GIT_ENV, GATEQ_HOME=home, HOME=_FAKE_HOME)
+    env.update(extra or {})
+    return env
+
+
+def run_runner(root, home, *args, runner=None, env=None):
+    """Run the runner to its end in `root` -> (exit code, stdout, stderr)."""
+    r = subprocess.run([sys.executable, "-B", runner or RUNNER, *args], cwd=root,
+                       env=runner_env(home, env), capture_output=True, text=True, timeout=300)
+    return r.returncode, r.stdout, r.stderr
+
+
+def put(path, text):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
+
+
+def make_repo(tmp, name, gates=None):
+    """A `git init`ed temp repo, with `gates` as its .gates.toml (None: no such file)."""
+    root = os.path.join(tmp, name)
+    subprocess.run(["git", "init", "-q", root], check=True, capture_output=True,
+                   env={**os.environ, **_GIT_ENV})
+    if gates is not None:
+        put(os.path.join(root, ".gates.toml"), gates)
+    return root
+
+
+def e2e(fn):
+    """Run a runner case with its own scratch directory (resolved, as git reports paths) and
+    its own EMPTY pool home inside it."""
+    def case():
+        with tempfile.TemporaryDirectory(prefix="gate-pool-e2e-") as tmp:
+            tmp = os.path.realpath(tmp)
+            home = os.path.join(tmp, "gq"); os.mkdir(home, 0o700)
+            try:
+                fn(tmp, home)
+            finally:
+                reap_all()                 # nothing a case started outlives it
+    return case
+
+
+# The four gate forms. A soft failure and a skip ride in the Form B fixtures so the goldens pin
+# more than the happy line.
+_STEPS = """
+[[prep_pr.steps]]
+name = "one"
+run = "echo one-ran"
+[[prep_pr.steps]]
+name = "soft"
+run = "echo soft-ran; echo soft-err >&2; exit 3"
+required = false
+[[prep_pr.steps]]
+name = "absent"
+run = "echo never"
+skip_if_absent = "gate-pool-no-such-tool"
+[[prep_pr.steps]]
+name = "two"
+run = "echo two-ran"
+"""
+FORMS = {
+    "form-a": '[prep_pr]\ngate = "echo form-a-ran"\n',
+    "form-b-serial": "[prep_pr]\n" + _STEPS,
+    "form-b-parallel": "[prep_pr]\njobs = 2\n" + _STEPS,
+    "fallback": None,
+}
+# RECORDED FROM THE PRE-POOL RUNNER (main at eaf6900) and committed before gate-runner.py was
+# touched: (exit code, stdout, stderr), durations normalized to N.Ns, the repo root to <ROOT>.
+_B_TAIL = ("[FAIL] soft (exit 3, N.Ns)\n[WARN] soft: soft failure (required=false), continuing.\n"
+           "[SKIP] absent: gate-pool-no-such-tool not on PATH\ntwo-ran\n[PASS] two (exit 0, N.Ns)\n"
+           "gate-runner: all required steps passed (1 soft failure(s) warned, not blocking).\n")
+GOLDEN = {
+    "form-a": (0, "gate-runner: using <ROOT>/.gates.toml\n"
+                  "gate-runner: .gates.toml Form A (delegate) -> 'echo form-a-ran'\n"
+                  "form-a-ran\n[PASS] gate (exit 0, N.Ns)\n", ""),
+    # A serial step writes straight to the runner's stderr; a parallel step's is captured into
+    # its block. The goldens pin that difference too.
+    "form-b-serial": (0, "gate-runner: using <ROOT>/.gates.toml\n"
+                         "gate-runner: .gates.toml Form B (enumerate) -> 4 step(s)\n"
+                         "one-ran\n[PASS] one (exit 0, N.Ns)\nsoft-ran\n" + _B_TAIL, "soft-err\n"),
+    "form-b-parallel": (0, "gate-runner: using <ROOT>/.gates.toml\n"
+                           "gate-runner: .gates.toml Form B (enumerate) -> 4 step(s), jobs=2\n"
+                           "one-ran\n[PASS] one (exit 0, N.Ns)\nsoft-ran\nsoft-err\n" + _B_TAIL, ""),
+    "fallback": (0, "gate-runner: no .gates.toml found; entering fail-open fallback chain.\n"
+                    "gate-runner: fallback layer 2 (CLAUDE.md ## Gates) -> 1 command(s).\n"
+                    "fallback-ran\n[PASS] echo fallback-ran (exit 0, N.Ns)\n"
+                    "gate-runner: all CLAUDE.md gate commands passed.\n", ""),
+}
+
+
+def form_repo(tmp, form, name=None, gates=None):
+    root = make_repo(tmp, name or form, FORMS[form] if gates is None else gates)
+    if FORMS[form] is None:                # the fallback chain: layer 2, CLAUDE.md's Gates block
+        put(os.path.join(root, "CLAUDE.md"), "# x\n\n## Gates\n\n```sh\necho fallback-ran\n```\n")
+    return root
+
+
+def normalized(root, rc, out, err):
+    def norm(text):
+        return re.sub(r"\b[0-9]+\.[0-9]s", "N.Ns", text.replace(root, "<ROOT>"))
+    return rc, norm(out), norm(err)
+
+
+def golden_runs(label, tmp, home, runner=None):
+    """Every form against the pool root `home`: output and exit code must EQUAL the golden, and
+    the run must leave the pool root exactly as it found it."""
+    before = sorted(os.listdir(home))
+    for form in FORMS:
+        root = form_repo(tmp, form, f"{form}-{next(_SERIAL)}")
+        same(f"{label}: {form} output and exit code equal the pre-pool golden",
+             normalized(root, *run_runner(root, home, runner=runner)), GOLDEN.get(form))
+    same(f"{label}: nothing was created under the pool root", sorted(os.listdir(home)), before)
+
+
+@e2e
+def case_off_golden(tmp, home):
+    golden_runs("off golden: no config.toml", tmp, home)
+
+
+@e2e
+def case_off_runner_alone(tmp, home):
+    # The no-import proof: gate-runner.py copied ALONE, with no gate_pool.py beside it.
+    alone = os.path.join(tmp, "alone"); os.mkdir(alone)
+    runner = shutil.copy(RUNNER, alone)
+    golden_runs("off runner alone: no config.toml", tmp, home, runner)
+    put(os.path.join(home, "config.toml"), "[pool]\nprotocol = 1\n")
+    golden_runs("off runner alone: a [pool] table with no budget", tmp, home, runner)
+    same("off runner alone: the runner's directory holds the runner and nothing else",
+         os.listdir(alone), ["gate-runner.py"])
+
+
+# --- the runner with a budget configured --------------------------------------------------------
+# NO SLEEP IS A SYNCHRONIZATION. A case waits for FACTS with a bounded deadline (`wait_for`): a
+# step's started file, a wait line on stderr, a process exit. A step that must stay running
+# blocks on a FIFO until the case opens it. "The third gate waits" is a STATE assertion (its
+# ticket says waiting, its step never started) made while the holders are provably blocked.
+# A production waiter notices a release on its next 1 s poll, so each such hand-over costs about
+# a second; no test-only seam shortens it.
+CONFIG = "[pool]\nprotocol = 1\nbudget = 10\n"
+_LIVE = []                                 # every process a case started, for its cleanup
+
+
+def load_runner():
+    """The runner as a module, for the two pure-ish functions a spawn would table-test slowly."""
+    spec = importlib.util.spec_from_file_location("_gate_runner", RUNNER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@contextlib.contextmanager
+def pool_home_env(home):
+    """GATEQ_HOME for an IN-PROCESS call of the runner's config reader; the pin comes back."""
+    os.environ["GATEQ_HOME"] = home
+    try:
+        yield
+    finally:
+        os.environ["GATEQ_HOME"] = _PINNED_HOME
+
+
+def read(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
+def wait_for(what, fact, *procs, timeout=60.0):
+    """Wait for a FACT. The short sleep only paces the checks. A deadline reached, or a watched
+    process that exited first, raises: the case fails by name instead of hanging."""
+    end = time.monotonic() + timeout
+    while not fact():
+        if any(p.poll() is not None for p in procs) and not fact():
+            raise AssertionError(f"a process exited before: {what}")
+        if time.monotonic() > end:
+            raise AssertionError(f"timed out waiting for: {what}")
+        time.sleep(0.02)
+
+
+def spawn(root, home, *args, env=None):
+    """Start a runner in its own session, its output in files (`.out`, `.err`)."""
+    base = os.path.join(os.path.dirname(home), f"run{next(_SERIAL)}")
+    with open(base + ".out", "wb") as out, open(base + ".err", "wb") as err:
+        p = subprocess.Popen(
+            [sys.executable, "-B", RUNNER, *args], cwd=root, env=runner_env(home, env),
+            stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True,
+            # A harness started with SIGINT ignored must not hand that to the interrupt case.
+            preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+    p.out, p.err = base + ".out", base + ".err"
+    _LIVE.append(p)
+    return p
+
+
+def _stop(p, sig):
+    with contextlib.suppress(OSError):
+        if hasattr(p, "err"):              # a runner: its whole session
+            os.killpg(p.pid, sig)
+        else:
+            p.kill()
+
+
+def reap_all():
+    """Every exit path of a runner case: nothing a case started outlives it."""
+    for p in _LIVE:
+        if p.poll() is None:
+            _stop(p, signal.SIGTERM)       # TERM first: a parallel runner kills its own steps
+            try:
+                p.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                _stop(p, signal.SIGKILL)
+                p.wait()
+        for stream in (p.stdin, p.stdout):
+            if stream:
+                stream.close()
+    del _LIVE[:]
+
+
+def hold(home, worktree, cost=10, budget=10):
+    """A helper child HOLDING `cost` of the budget in `worktree`; returns once it does."""
+    child = subprocess.Popen([sys.executable, "-B", "-c", HOLD_CHILD, SCRIPTS, home, worktree,
+                              str(cost), str(budget)], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, text=True)
+    _LIVE.append(child)
+    if child.stdout.readline() != "held\n":
+        raise AssertionError("the helper child did not get its slots")
+    return child
+
+
+def drop(child):
+    """The holder's process ends WITHOUT releasing: the kernel frees its locks, and wait()
+    returns only after that."""
+    child.stdin.close()
+    child.wait(timeout=60)
+
+
+def gated(tmp, tag):
+    """A step that records it started, then blocks until the case lets it go ->
+    (run string, started file, fifo)."""
+    started, fifo = os.path.join(tmp, tag + ".started"), os.path.join(tmp, tag + ".fifo")
+    os.mkfifo(fifo)
+    return f"echo x > '{started}'; cat '{fifo}' > /dev/null", started, fifo
+
+
+def let_go(fifo):
+    def opened():                          # ENXIO until the step's cat has the FIFO open
+        try:
+            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+            return True
+        except OSError:
+            return False
+    wait_for(f"a reader on {os.path.basename(fifo)}", opened)
+
+
+def one_step(run, head=""):
+    return f'[prep_pr]\n{head}\n[[prep_pr.steps]]\nname = "s"\nrun = "{run}"\n'
+
+
+def tickets(home):
+    return [_load_json(os.path.join(home, "waiters", n)) for n in listing(home, suffix=".ticket")]
+
+
+def _load_json(path):
+    try:
+        return json.loads(read(path))
+    except ValueError:
+        return {}
+
+
+def commit(root, msg):
+    env = {**os.environ, **_GIT_ENV}
+    subprocess.run(["git", "-C", root, "add", "-A"], check=True, capture_output=True, env=env)
+    subprocess.run(["git", "-C", root, "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                    "commit", "-q", "-m", msg], check=True, capture_output=True, env=env)
+    return subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], check=True,
+                          capture_output=True, text=True, env=env).stdout.strip()
+
+
+@e2e
+def case_config_table(tmp, home):
+    gr, path = load_runner(), os.path.join(home, "config.toml")
+
+    def cfg_of(body):
+        if body is not None:
+            put(path, body)
+        with pool_home_env(home):
+            return gr._pool_config()
+
+    def error(reason):
+        return "error", f"{path}: {reason}"
+    same("config: no config.toml is OFF", cfg_of(None), ("off", None))
+    same("config: a file with no [pool] table is OFF, and an unknown TABLE is ignored",
+         cfg_of("[queue]\nbudget = 3\n"), ("off", None))
+    same("config: a [pool] table with no budget is OFF, and says so for doctor",
+         cfg_of("[pool]\nprotocol = 1\nwait_timeout_s = 5\n"), ("off", "pool-table-without-budget"))
+    full = {k: n for n, k in enumerate(gr.POOL_KEYS, 1)}
+    same("config: all six keys beside another table are ON, as the validated [pool] table",
+         cfg_of("[pool]\n" + "".join(f"{k} = {v}\n" for k, v in full.items()) + "[queue]\nx = 0\n"),
+         ("on", full))
+    wrong = {}
+    for key in gr.POOL_KEYS:               # one rule for all six: a positive integer
+        for value in ("0", "-1", "true", '"3"', "1.5"):
+            body = "[pool]\n" + "".join(
+                f"{k} = {v}\n" for k, v in {"protocol": 1, "budget": 10, key: value}.items())
+            if cfg_of(body) != error(f"[pool].{key} must be a positive integer"):
+                wrong[f"{key} = {value}"] = cfg_of(body)
+    same("config: every key refuses zero, a negative, a bool, a string and a float, naming "
+         "the key", wrong, {})
+    same("config: a misspelled key (budegt) is an error naming it, never 'no budget'",
+         cfg_of("[pool]\nprotocol = 1\nbudegt = 10\n"), error("unknown key [pool].budegt"))
+    same("config: [pool] that is not a table is an error",
+         cfg_of('pool = "on"\n'), error("[pool] must be a table"))
+    same("config: a budget with no protocol is an error",
+         cfg_of("[pool]\nbudget = 10\n"), error("[pool].budget needs [pool].protocol"))
+    state, message = cfg_of("[pool\nbudget = 10\n")
+    check("config: a file that does not parse is an error naming the file",
+          state == "error" and message.startswith(path + ": "))
+    os.environ["GATEQ_HOME"] = ""
+    try:
+        same("config: an empty GATEQ_HOME reads as unset", gr._pool_home(),
+             os.path.join(os.path.expanduser("~"), ".claude", "gate-queue"))
+    finally:
+        os.environ["GATEQ_HOME"] = _PINNED_HOME
+    same("config: reading the config created nothing", os.listdir(home), ["config.toml"])
+
+
+@e2e
+def case_cost_table(tmp, home):
+    gr = load_runner()
+
+    def cost(gates, jobs=None, budget=10):
+        root = os.path.join(tmp, f"cost{next(_SERIAL)}"); os.mkdir(root)
+        if gates is not None:
+            put(os.path.join(root, ".gates.toml"), gates)
+        return gr._pool_cost(root, jobs, budget)[0]
+    b = "[prep_pr]\n{}\n" + _STEPS         # Form B with a head line
+    same("cost: weight wins over jobs and over --jobs",
+         (cost(b.format("jobs = 2\nweight = 4")), cost(b.format("weight = 4"), "8")), (4, 4))
+    same("cost: a weight above the budget is clamped to it", cost(b.format("weight = 12")), 10)
+    same("cost: with no weight, Form B costs its effective jobs (--jobs wins), clamped",
+         (cost(b.format("jobs = 4")), cost(b.format("jobs = 4"), "2"), cost(b.format(""), "1"),
+          cost(b.format("jobs = 16"))), (4, 2, 1, 10))
+    same("cost: no weight and no jobs is the WHOLE budget (bare Form B, Form A, the fallback "
+         "chain), and jobs buys Form A and the fallback chain nothing",
+         (cost(b.format("")), cost(FORMS["form-a"]), cost(None), cost(FORMS["form-a"], "3"),
+          cost('[prep_pr]\njobs = 3\ngate = "true"\n'), cost(None, "3"), cost(None, budget=7)),
+         (10, 10, 10, 10, 10, 10, 7))
+    rejected = {"--jobs 0": cost(b.format(""), "0"), "--jobs x": cost(b.format(""), "x"),
+                "unparseable": cost("[prep_pr\n"), "no [prep_pr]": cost("[other]\nx = 1\n"),
+                "gate and steps": cost('[prep_pr]\ngate = "true"\nsteps = []\n'),
+                "jobs = 0": cost(b.format("jobs = 0")), "weight = 0": cost(b.format("weight = 0")),
+                "weight = true": cost(b.format("weight = true")),
+                'weight = "4"': cost(b.format('weight = "4"'))}
+    same("cost: a config the run rejects anyway has NO cost (it takes no ticket)",
+         rejected, dict.fromkeys(rejected))
+    # The bytes judged invalid are the ones rejected, whatever the file says by then.
+    root = form_repo(tmp, "form-a", "raw")
+    with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+        rc = gr._run_gates(root, None, raw=b"[prep_pr\n")[0]
+    same("cost: the config judged while costing is the one rejected, not a later rewrite", rc, 2)
+
+
+@e2e
+def case_weight(tmp, home):                # `home` stays empty: the pool is OFF throughout
+    got = {}
+    for bad in ("0", "true", '"4"', "2.5"):
+        root = make_repo(tmp, f"w{next(_SERIAL)}", f"[prep_pr]\nweight = {bad}\n" + _STEPS)
+        rc, out, err = run_runner(root, home)
+        got[bad] = (rc, err, "one-ran" in out)
+    same("weight: with the pool OFF a weight that is no positive integer exits 2 and runs no "
+         "step", got,
+         dict.fromkeys(got, (2, "WARN: [prep_pr].weight must be a positive integer\n", False)))
+    root = form_repo(tmp, "form-b-serial", "weight-ok", "[prep_pr]\nweight = 3\n" + _STEPS)
+    same("weight: with the pool OFF a valid weight changes no output (the serial golden)",
+         normalized(root, *run_runner(root, home)), GOLDEN["form-b-serial"])
+    same("weight: and nothing was created under the pool root", os.listdir(home), [])
+
+
+@e2e
+def case_e2e_refusals(tmp, home):
+    path, marker = os.path.join(home, "config.toml"), os.path.join(tmp, "ran")
+    receipt = os.path.join(tmp, "receipt.json")
+    root = make_repo(tmp, "r", one_step(f"echo x > '{marker}'"))
+
+    def refused_by(body, runner=None):
+        """-> (exit code, stderr, a step ran, a stale receipt survived, the pool root)."""
+        put(path, body); put(receipt, '{"result": "pass"}\n')
+        rc, out, err = run_runner(root, home, "--receipt", receipt, runner=runner)
+        return rc, err, os.path.exists(marker), os.path.exists(receipt), sorted(os.listdir(home))
+
+    def not_run(line):
+        return 2, f"gate-runner: NOT RUN - {line}\n", False, False, ["config.toml"]
+    for label, body, reason in (
+            ("[pool] that is not a table", 'pool = "on"\n', "[pool] must be a table"),
+            ("a misspelled key (budegt)", "[pool]\nprotocol = 1\nbudegt = 10\n",
+             "unknown key [pool].budegt"),
+            ("a zero budget", "[pool]\nprotocol = 1\nbudget = 0\n",
+             "[pool].budget must be a positive integer"),
+            ("a bool in a key a later PR first uses", CONFIG + "job_timeout_s = true\n",
+             "[pool].job_timeout_s must be a positive integer"),
+            ("a budget with no protocol", "[pool]\nbudget = 10\n",
+             "[pool].budget needs [pool].protocol")):
+        same(f"refusals: {label} exits 2 naming it: no step, no ticket, no stale receipt",
+             refused_by(body), not_run(f"{path}: {reason}"))
+    rc, err, *rest = refused_by("[pool\n")
+    same("refusals: a config that does not parse exits 2 the same way",
+         (rc, err.startswith(f"gate-runner: NOT RUN - {path}: "), err.count("\n"), rest),
+         (2, True, 1, [False, False, ["config.toml"]]))
+    if os.geteuid() != 0:                  # uid 0 reads through any mode
+        put(path, CONFIG); os.chmod(path, 0)
+        rc, out, err = run_runner(root, home)
+        os.chmod(path, 0o600)
+        same("refusals: a config that cannot be read exits 2, never 'no budget'",
+             (rc, err.startswith(f"gate-runner: NOT RUN - {path}: "), os.path.exists(marker)),
+             (2, True, False))
+    same("refusals: a config of another pool protocol exits 2 and the directory is untouched",
+         refused_by("[pool]\nprotocol = 2\nbudget = 10\n"),
+         not_run("pool protocol 1 != configured 2; update the plugin and run configure --apply"))
+    os.chmod(home, 0o750)
+    try:
+        same("refusals: a pool root open to the group exits 2",
+             refused_by(CONFIG), not_run(f"pool root {home} must be owned by you with mode 0700"))
+    finally:
+        os.chmod(home, 0o700)
+    alone = os.path.join(tmp, "alone"); os.mkdir(alone)
+    same("refusals: a budget configured and no gate_pool.py beside the runner exits 2, never "
+         "an unpooled run", refused_by(CONFIG, shutil.copy(RUNNER, alone)),
+         not_run("pool configured but gate_pool.py is missing"))
+    put(path, "[queue]\nbudegt = 1\n" + CONFIG)
+    same("refusals: an unknown TABLE beside [pool] is ignored: the gate runs, pooled, silently",
+         (run_runner(root, home)[::2], os.path.exists(marker), "waiters" in os.listdir(home),
+          listing(home)), ((0, ""), True, True, []))
+    os.unlink(marker)                      # the pooled run above left its marker and its dirs
+    for n in os.listdir(home):
+        if n != "config.toml":
+            (shutil.rmtree if os.path.isdir(os.path.join(home, n)) else os.unlink)(
+                os.path.join(home, n))
+    same("refusals: a top-level budget (outside [pool]) exits 2 saying where it belongs",
+         refused_by("budget = 10\nprotocol = 1\n"),
+         not_run(f"{path}: top-level `budget` belongs under [pool]"))
+
+    def refused_at(h):
+        put(receipt, '{"result": "pass"}\n')
+        rc, out, err = run_runner(root, h, "--receipt", receipt)
+        return rc, err, os.path.exists(marker), os.path.exists(receipt)
+    os.unlink(path); gone = os.path.join(tmp, "nowhere"); dangling = os.path.join(tmp, "dangling")
+    os.symlink(gone, path); os.symlink(gone, dangling)
+    same("refusals: a dangling config.toml or a dangling pool home exits 2, never 'off': no "
+         "step, no stale receipt",
+         (refused_at(home), refused_at(dangling)),
+         ((2, f"gate-runner: NOT RUN - {path}: is a dangling symlink\n", False, False),
+          (2, f"gate-runner: NOT RUN - {dangling}: is a dangling symlink\n", False, False)))
+    os.unlink(path); os.unlink(dangling)
+    empty, valid = os.path.join(tmp, "empty"), os.path.join(tmp, "valid")
+    os.mkdir(empty, 0o700); os.symlink(empty, valid)
+    same("refusals: a pool home that is a symlink to a real directory with no config is OFF: "
+         "the gate runs unpooled and nothing is created there",
+         (run_runner(root, valid)[::2], os.path.exists(marker), os.listdir(empty)),
+         ((0, ""), True, []))
+    os.unlink(marker)
+    put(path, CONFIG); put(os.path.join(home, "waiters"), "x")
+    rc, err, ran, kept = refused_at(home)
+    os.unlink(os.path.join(home, "waiters"))
+    same("refusals: a pool home whose waiters is a regular file exits 2, never unpooled",
+         (rc, err.startswith("gate-runner: NOT RUN - pool error: "), ran, kept),
+         (2, True, False, False))
+    broken = os.path.join(tmp, "broken"); os.mkdir(broken)
+    put(os.path.join(broken, "gate_pool.py"), "def (\n")
+    rc, err, ran, kept, _ = refused_by(CONFIG, shutil.copy(RUNNER, broken))
+    same("refusals: a gate_pool.py with a syntax error exits 2 in one line, never a traceback",
+         (rc, err.startswith("gate-runner: NOT RUN - pool error: SyntaxError: "),
+          err.count("\n"), ran, kept), (2, True, 1, False, False))
+    linked = os.path.join(tmp, "linked"); os.mkdir(linked)
+    os.symlink(RUNNER, os.path.join(linked, "gate-runner.py"))
+    put(path, CONFIG)
+    rc, out, err = run_runner(root, home, runner=os.path.join(linked, "gate-runner.py"))
+    same("refusals: a runner reached through a symlink finds gate_pool.py beside the real file",
+         (rc, "is missing" in err, os.path.exists(marker)), (0, False, True))
+    if os.geteuid() != 0:                  # uid 0 reads through any mode
+        os.unlink(marker); put(path, CONFIG + "wait_timeout_s = 1\n")
+        holder = hold(home, "/wt/elsewhere"); gates = os.path.join(root, ".gates.toml")
+        os.chmod(gates, 0)
+        rc, out, err = run_runner(root, home)
+        os.chmod(gates, 0o600); drop(holder)
+        same("refusals: a .gates.toml that cannot be read still takes a ticket at the whole "
+             "budget (waits, exits 75), never an unpooled run",
+             (rc, "waiting for 10 of 10" in err, os.path.exists(marker)), (75, True, False))
+
+
+@e2e
+def case_e2e_rejected_costing(tmp, home):
+    put(os.path.join(home, "config.toml"), CONFIG)
+    off = os.path.join(tmp, "off"); os.mkdir(off)
+    for label, gates, args in (
+            ("a bad --jobs", FORMS["form-b-serial"], ["--jobs", "0"]),
+            ("an unparseable .gates.toml", "[prep_pr\n", []),
+            ("no [prep_pr] table", "[other]\nx = 1\n", []),
+            ("both gate and steps", '[prep_pr]\ngate = "echo no"\nsteps = []\n', []),
+            ("a bad jobs", "[prep_pr]\njobs = 0\n" + _STEPS, []),
+            ("a bad weight", "[prep_pr]\nweight = 0\n" + _STEPS, [])):
+        root = make_repo(tmp, f"rej{next(_SERIAL)}", gates)
+        on = normalized(root, *run_runner(root, home, *args))
+        same(f"rejected while costing: {label} exits 2 with the pool-off output, no step and "
+             "no ticket",
+             (on[0], on == normalized(root, *run_runner(root, off, *args)), "-ran" in on[1],
+              os.listdir(home)), (2, True, False, ["config.toml"]))
+    fwd = os.path.join(tmp, "fwd-ran")
+    good, here, sink = make_repo(tmp, "fwd", one_step(f"echo x > '{fwd}'")), os.getcwd(), io.StringIO()
+    mod = load_runner(); mod._pool_cost = lambda root, jobs, budget: (None, b"[prep_pr\n")
+    os.chdir(good)
+    try:
+        with pool_home_env(home), contextlib.redirect_stderr(sink), \
+                contextlib.redirect_stdout(sink):
+            rc = mod.main([])
+    finally:
+        os.chdir(here)
+    same("rejected while costing: main() hands the bytes it costed to the run: the invalid "
+         "config is rejected even though the file on disk is valid",
+         (rc, os.path.exists(fwd)), (2, False))
+
+
+@e2e
+def case_e2e_three_gates(tmp, home):
+    put(os.path.join(home, "config.toml"), CONFIG)
+    runs = []
+    for tag in "abc":
+        run, started, fifo = gated(tmp, tag)
+        runs.append((make_repo(tmp, tag, one_step(run, "jobs = 4")), started, fifo))
+    a, b = spawn(runs[0][0], home), spawn(runs[1][0], home)
+    wait_for("the first two gates to start", lambda: all(os.path.exists(r[1]) for r in runs[:2]),
+             a, b)
+    c = spawn(runs[2][0], home)
+    line = "gate-runner: waiting for 4 of 10 gate slots (2 free, 0 ahead)\n"
+    wait_for("the third gate's wait line", lambda: line in read(c.err), c)
+    same("three gates: two cost-4 gates run together in a budget of 10 and a third WAITS: its "
+         "ticket says so, its step has not started, and it printed the one wait line",
+         (sorted(t.get("state") for t in tickets(home)), os.path.exists(runs[2][1]), read(c.err)),
+         (["running", "running", "waiting"], False, line))
+    same("three gates: each ticket is a hand-run gate of cost 4 keyed by its own worktree",
+         sorted((t.get("kind"), t.get("cost"), t.get("worktree")) for t in tickets(home)),
+         sorted(("gate", 4, r[0]) for r in runs))
+    let_go(runs[0][2])
+    same("three gates: the first gate passes", a.wait(timeout=60), 0)
+    wait_for("the third gate to start once slots are free", lambda: os.path.exists(runs[2][1]), c)
+    let_go(runs[1][2]); let_go(runs[2][2])
+    same("three gates: all pass, the pool is left empty, and a gate granted on its first poll "
+         "printed nothing new",
+         ([p.wait(timeout=60) for p in (b, c)], listing(home), read(a.err) + read(b.err)),
+         ([0, 0], [], ""))
+
+
+@e2e
+def case_e2e_over_budget(tmp, home):
+    put(os.path.join(home, "config.toml"), CONFIG)
+    run, started, fifo = gated(tmp, "big")
+    repo = make_repo(tmp, "big", one_step(run, "weight = 12"))
+    deep = os.path.join(repo, "deep", "er"); os.makedirs(deep)
+    p = spawn(deep, home)                  # started two directories below the worktree root
+    wait_for("the weight-12 gate to start", lambda: os.path.exists(started), p)
+    same("over budget: a gate started from a SUBDIRECTORY is keyed by its worktree ROOT",
+         [t.get("worktree") for t in tickets(home)], [repo])
+    small = gp.Pool(home, cfg()).enter("gate", "gate", 1, "/wt/small")
+    same("over budget: a weight above the budget runs, holding the WHOLE budget: nothing fits "
+         "beside it",
+         (small.poll(), small.status(), [t.get("cost") for t in tickets(home)
+                                         if t.get("state") == "running"]),
+         (False, "gate-runner: waiting for 1 of 10 gate slots (0 free, 0 ahead)", [10]))
+    let_go(fifo)
+    same("over budget: and gives the whole budget back when it ends",
+         (p.wait(timeout=60), small.poll()), (0, True))
+    small.leave()
+
+
+@e2e
+def case_e2e_undeclared(tmp, home):
+    put(os.path.join(home, "config.toml"), CONFIG)
+    run, started, fifo = gated(tmp, "umbrella")
+    a = spawn(make_repo(tmp, "form-a", f'[prep_pr]\ngate = "{run}"\n'), home)
+    wait_for("the Form A gate to start", lambda: os.path.exists(started), a)
+    b = spawn(make_repo(tmp, "bare-b", one_step("echo second-ran")), home)
+    line = "gate-runner: waiting for 10 of 10 gate slots (0 free, 0 ahead)\n"
+    wait_for("the second gate's wait line", lambda: line in read(b.err), b)
+    same("undeclared cost: a Form A gate holds the whole budget, and a Form B gate declaring "
+         "neither weight nor jobs waits for all of it",
+         (read(b.err), "second-ran" in read(b.out)), (line, False))
+    let_go(fifo)
+    same("undeclared cost: the second runs alone once the first ends",
+         (a.wait(timeout=60), b.wait(timeout=60), "second-ran" in read(b.out)), (0, 0, True))
+
+
+@e2e
+def case_e2e_timeout(tmp, home):
+    put(os.path.join(home, "config.toml"), CONFIG + "wait_timeout_s = 1\n")
+    hold(home, "/wt/elsewhere")
+    marker = os.path.join(tmp, "ran")
+    receipt = put(os.path.join(tmp, "receipt.json"), '{"result": "pass"}\n')
+    root = make_repo(tmp, "t", one_step(f"echo x > '{marker}'", "jobs = 2"))
+    same("timeout: a wait that outlasts wait_timeout_s exits 75, NOT RUN",
+         run_runner(root, home, "--receipt", receipt),
+         (75, "", "gate-runner: waiting for 2 of 10 gate slots (0 free, 0 ahead)\n"
+                  "gate-runner: NOT RUN - no gate slot within 1s\n"))
+    same("timeout: no step ran, the waiter's ticket is gone, and no older receipt is left to "
+         "read as this run's",
+         (os.path.exists(marker), len(listing(home, suffix=".ticket")), os.path.exists(receipt)),
+         (False, 1, False))
+
+
+@e2e
+def case_e2e_interrupt(tmp, home):
+    put(os.path.join(home, "config.toml"), CONFIG)
+    hold(home, "/wt/elsewhere")
+    marker = os.path.join(tmp, "ran")
+    receipt = put(os.path.join(tmp, "receipt.json"), '{"result": "pass"}\n')
+    p = spawn(make_repo(tmp, "i", one_step(f"echo x > '{marker}'", "jobs = 2")), home,
+              "--receipt", receipt)
+    wait_for("the wait line", lambda: "waiting for 2 of 10" in read(p.err), p)
+    os.kill(p.pid, signal.SIGINT)
+    same("interrupt: an interrupt while WAITING exits 130 with one line; no step ran, the "
+         "ticket and the stale receipt are gone",
+         (p.wait(timeout=60), read(p.err).splitlines()[1:], os.path.exists(marker),
+          len(listing(home, suffix=".ticket")), os.path.exists(receipt)),
+         (130, ["gate-runner: NOT RUN - interrupted while waiting for a gate slot"], False, 1,
+          False))
+
+
+@e2e
+def case_e2e_budget_removed(tmp, home):
+    config = put(os.path.join(home, "config.toml"), CONFIG)
+    holder = hold(home, "/wt/elsewhere")
+    waited, fresh = os.path.join(tmp, "waited"), os.path.join(tmp, "fresh")
+    w = spawn(make_repo(tmp, "w", one_step(f"echo x > '{waited}'", "jobs = 2")), home)
+    wait_for("the wait line", lambda: "waiting for 2 of 10" in read(w.err), w)
+    os.unlink(config)
+    before = listing(home)
+    rc, out, err = run_runner(make_repo(tmp, "n", one_step(f"echo x > '{fresh}'", "jobs = 2")),
+                              home)
+    same("budget removed: a gate started AFTER the removal runs at once, unpooled, and takes "
+         "no ticket", (rc, err, os.path.exists(fresh), listing(home)), (0, "", True, before))
+    same("budget removed: the gate already waiting is still waiting shortly after the unlink",
+         (w.poll(), os.path.exists(waited)), (None, False))
+    drop(holder)
+    same("budget removed: and it starts when its cost fits",
+         (w.wait(timeout=60), os.path.exists(waited)), (0, True))
+
+
+@e2e
+def case_e2e_gates_edited(tmp, home):
+    put(os.path.join(home, "config.toml"), CONFIG)
+    holder = hold(home, "/wt/elsewhere")
+    def1, def2 = os.path.join(tmp, "def1"), os.path.join(tmp, "def2")
+    root = make_repo(tmp, "e", one_step(f"echo x > '{def1}'", "jobs = 2"))
+    p = spawn(root, home)
+    wait_for("the wait line", lambda: "waiting for 2 of 10" in read(p.err), p)
+    put(os.path.join(root, ".gates.toml"), one_step(f"echo x > '{def2}'", "jobs = 2"))
+    drop(holder)
+    same("gates edited: a .gates.toml edited during the wait is re-read after the grant, and "
+         "THAT definition runs",
+         (p.wait(timeout=60), os.path.exists(def1), os.path.exists(def2)), (0, False, True))
+    # The same edit RAISING the cost: the run holds 2 units and the new definition needs 8.
+    def3, def4 = os.path.join(tmp, "def3"), os.path.join(tmp, "def4")
+    wide = make_repo(tmp, "w", one_step(f"echo x > '{def3}'", "jobs = 2"))
+    holder, receipt = hold(home, "/wt/elsewhere"), os.path.join(tmp, "old-receipt.json")
+    put(receipt, '{"result": "pass"}\n')
+    p = spawn(wide, home, "--receipt", receipt)
+    wait_for("the wait line", lambda: "waiting for 2 of 10" in read(p.err), p)
+    put(os.path.join(wide, ".gates.toml"), one_step(f"echo x > '{def4}'", "jobs = 8"))
+    drop(holder)
+    same("gates edited: a definition that costs MORE after the wait than the run holds is NOT "
+         "RUN, exit 75: no step, no stale receipt, and its slots are given back",
+         (p.wait(timeout=60), os.path.exists(def3), os.path.exists(def4), os.path.exists(receipt),
+          read(p.err).splitlines()[-1], listing(home, suffix=".ticket")),
+         (75, False, False, False, "gate-runner: NOT RUN - .gates.toml changed during the wait "
+                                   "(cost 2 -> 8); run it again", []))
+
+
+@e2e
+def case_e2e_receipt(tmp, home):
+    put(os.path.join(home, "config.toml"), CONFIG)
+    holder = hold(home, "/wt/elsewhere")
+    root = make_repo(tmp, "r", one_step("true", "jobs = 2"))
+    first, receipt = commit(root, "before the wait"), os.path.join(tmp, "receipt.json")
+    p = spawn(root, home, "--receipt", receipt)
+    wait_for("the wait line", lambda: "waiting for 2 of 10" in read(p.err), p)
+    put(os.path.join(root, "new.txt"), "x\n")
+    second = commit(root, "during the wait")
+    drop(holder)
+    rc, rec = p.wait(timeout=60), _load_json(receipt)
+    same("receipt: the snapshot is taken AFTER the grant: the receipt binds the commit made "
+         "during the wait, and passes",
+         (rc, rec.get("commit_sha") == second != first, rec.get("result")), (0, True, "pass"))
+
+
+GIT_STUB = """
+import fcntl, os, sys
+admit, log, real, args = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+state = "ABSENT"
+try:
+    fd = os.open(admit, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        state = "FREE"
+    except BlockingIOError:
+        state = "HELD"
+    os.close(fd)
+except FileNotFoundError:
+    pass
+with open(log, "a") as f:
+    f.write(state + " " + " ".join(args) + "\\n")
+os.execv(real, ["git"] + args)
+"""
+
+
+@e2e
+def case_e2e_git_outside_lock(tmp, home):
+    # Every git the runner starts goes through a stub that first asks: is admit.lock held?
+    put(os.path.join(home, "config.toml"), CONFIG)
+    bindir, log = os.path.join(tmp, "bin"), os.path.join(tmp, "git.log")
+    os.mkdir(bindir)
+    stub = put(os.path.join(tmp, "git-stub.py"), GIT_STUB)
+    put(os.path.join(bindir, "git"),
+        f"#!/bin/sh\nexec '{sys.executable}' -B '{stub}' '{os.path.join(home, 'admit.lock')}' "
+        f"'{log}' '{shutil.which('git')}' \"$@\"\n")
+    os.chmod(os.path.join(bindir, "git"), 0o755)
+    root = make_repo(tmp, "g", one_step("true", "jobs = 2"))
+    commit(root, "init")
+    rc, out, err = run_runner(root, home, "--receipt", os.path.join(tmp, "receipt.json"),
+                              env={"PATH": bindir + os.pathsep + os.environ["PATH"]})
+    calls = read(log).splitlines()
+    same("git outside the lock: the runner resolves its worktree key and takes its receipt "
+         "snapshot through git, and NO git call runs while admit.lock is held",
+         (rc, [c for c in calls if c.startswith("HELD")],
+          any("worktree list" in c for c in calls), any(c.startswith("FREE") for c in calls)),
+         (0, [], True, True))
+
+
+HOLDER_STEP = """
+echo "${GATEQ_HOLDER-unset}|${GATEQ_NEST-unset}" >> "$1/env"
+if [ -z "$GATE_POOL_INNER" ]; then
+  GATE_POOL_INNER=1 "$2" -B "$3" > "$1/inner.out" 2>&1
+  echo $? > "$1/inner.rc"
+else
+  ls "$GATEQ_HOME/waiters" > "$1/inner.ls"
+fi
+"""
+
+
+@e2e
+def case_e2e_holder_env(tmp, home):
+    # wait_timeout_s bounds the one way this case can go wrong: an inner run that waits on the
+    # worktree its own outer gate holds.
+    put(os.path.join(home, "config.toml"), CONFIG + "wait_timeout_s = 3\n")
+    hold(home, "/wt/leak", cost=1)
+    leaked = os.path.join(home, "waiters", listing(home, suffix=".ticket")[0])
+    out_dir = os.path.join(tmp, "seen"); os.mkdir(out_dir)
+    script = put(os.path.join(tmp, "step.sh"), HOLDER_STEP)
+    root = make_repo(tmp, "h", one_step(
+        f"sh '{script}' '{out_dir}' '{sys.executable}' '{RUNNER}'", "weight = 2"))
+    rc, out, err = run_runner(root, home, env={"GATEQ_HOLDER": leaked, "GATEQ_NEST": "/leaked"})
+    seen = read(os.path.join(out_dir, "env")).splitlines()
+    own = seen[0].split("|")[0] if seen else ""
+    same("holder env: a runner handed a holder from ANOTHER worktree says so once and takes "
+         "its own ticket", (rc, err),
+         (0, "gate-runner: ignoring GATEQ_HOLDER, its holder is in another worktree (/wt/leak); "
+             "taking a ticket\n"))
+    same("holder env: a holder's step sees the runner's OWN ticket in GATEQ_HOLDER, never the "
+         "inherited one, and no GATEQ_NEST",
+         (seen[:1], os.path.dirname(own), own.endswith(".ticket"), own != leaked),
+         ([f"{own}|unset"], os.path.join(home, "waiters"), True, True))
+    inner_ls = read(os.path.join(out_dir, "inner.ls")).split()
+    same("holder env: an inner runner started by a step takes NO ticket: it runs under its "
+         "holder, one lock below, and names both for its own steps",
+         (read(os.path.join(out_dir, "inner.rc")), seen[1:],
+          sum(n.endswith(".ticket") for n in inner_ls), os.path.basename(own) + ".nest" in inner_ls),
+         ("0\n", [f"{own}|{own}.nest"], 2, True))
+
+
+CONTEND_CHILD = """
+import fcntl, os, sys, time
+sys.path.insert(0, sys.argv[1])
+import gate_pool as gp
+home, wt, checks, rounds = sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
+pool = gp.Pool(home, {"protocol": gp.POOL_PROTOCOL, "budget": 2})
+
+def lock(name):
+    fd = os.open(os.path.join(checks, name), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except BlockingIOError:
+        os.close(fd)
+
+print("ready", flush=True)
+sys.stdin.readline()
+end = time.monotonic() + 120
+for _ in range(rounds):
+    w = pool.enter("gate", "gate", 1, wt)
+    while not w.poll():
+        if time.monotonic() > end:
+            sys.exit("deadline")
+        time.sleep(0.001)                  # paces the polls; every decision is under admit.lock
+    mine = lock("worktree-" + os.path.basename(wt))
+    unit = lock("unit-0") or lock("unit-1")
+    print(w.seq, "ok" if mine and unit else "TWO-IN-ONE-WORKTREE" if unit else "OVER-BUDGET",
+          flush=True)
+    for fd in (mine, unit):
+        if fd is not None:
+            os.close(fd)
+    w.leave()
+print("done", flush=True)
+"""
+
+
+@e2e
+def case_contention(tmp, home):
+    # REAL processes, because every in-process case is single-threaded and so cannot tell a
+    # taken admit.lock from an absent one. Proven: with admit.lock not taken, concurrent
+    # processes corrupt staging and seq allocation and this harness fails. Six race enter() and poll() on a budget of 2, two per
+    # worktree. Each, while it HOLDS, proves the pool's promise with locks of its OWN, outside
+    # the pool: its worktree's check lock (nobody else runs in this worktree) and one of two
+    # unit locks (at most `budget` run at once). Both are taken after the grant and dropped
+    # before the release, so under a correct pool a try-lock can never fail; the kernel answers
+    # atomically, so there is no listing to race.
+    checks, rounds = os.path.join(tmp, "checks"), 15
+    os.mkdir(checks)
+    kids = [subprocess.Popen([sys.executable, "-B", "-c", CONTEND_CHILD, SCRIPTS, home,
+                              f"/wt/{name}", checks, str(rounds)], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for name in "abc" for _ in range(2)]
+    _LIVE.extend(kids)
+    ready = [k.stdout.readline() for k in kids]
+    for k in kids:                         # the starting gun: all six are imported and waiting
+        with contextlib.suppress(OSError):
+            k.stdin.write("go\n"); k.stdin.flush()
+    outs = [k.communicate(timeout=300) for k in kids]
+    lines = [ln.split() for out, _ in outs for ln in out.splitlines()]
+    seqs = sorted(int(ln[0]) for ln in lines if len(ln) == 2)
+    got = ([k.returncode for k in kids], ready.count("ready\n"), sum(ln == ["done"] for ln in lines),
+           sorted({ln[1] for ln in lines if len(ln) == 2}), seqs == list(range(1, len(seqs) + 1)),
+           len(seqs), listing(home))
+    same("contention: six processes racing enter() and poll() on a budget of 2: every one "
+         "finishes every round, no seq is handed out twice, and the pool's directory is left empty", got, ([0] * 6, 6, 6, ["ok"], True, 6 * rounds, []))
+    if got[0] != [0] * 6:
+        print("         " + " | ".join(err.strip().splitlines()[-1] for _, err in outs
+                                        if err.strip()))
+
+
 CASES = [
     ("cls", case_cls), ("order", case_order), ("clamp", case_clamp),
     ("table1", case_table1), ("table2", case_table2), ("class-matters", case_class_matters),
@@ -988,6 +1897,15 @@ CASES = [
     ("nested-serial", case_nested_serial), ("nested-chain", case_nested_chain),
     ("unreadable-ticket", case_unreadable_ticket), ("strays", case_strays),
     ("git-isolation", case_git_isolation),
+    ("off-golden", case_off_golden), ("off-runner-alone", case_off_runner_alone),
+    ("config-table", case_config_table), ("cost-table", case_cost_table), ("weight", case_weight),
+    ("e2e-refusals", case_e2e_refusals), ("e2e-rejected-costing", case_e2e_rejected_costing),
+    ("e2e-three-gates", case_e2e_three_gates), ("e2e-over-budget", case_e2e_over_budget),
+    ("e2e-undeclared", case_e2e_undeclared), ("e2e-timeout", case_e2e_timeout),
+    ("e2e-interrupt", case_e2e_interrupt), ("e2e-budget-removed", case_e2e_budget_removed),
+    ("e2e-gates-edited", case_e2e_gates_edited), ("e2e-receipt", case_e2e_receipt),
+    ("e2e-git-outside-lock", case_e2e_git_outside_lock), ("e2e-holder-env", case_e2e_holder_env),
+    ("contention", case_contention),
 ]
 
 # --- mutation self-test: each assertion must be able to FAIL ---------------------------------
@@ -1186,7 +2104,123 @@ MUTATIONS = [
      "except OSError:  # a stray entry in tmp/", "except FileNotFoundError:", "strays",
      "strays: a directory in tmp/ does not stop the sweep"),
 ]
+MUTATIONS += [
+    # --- owed by the review of the on-disk slices: real processes, and a real exec'd child ---
+    ("admit.lock never taken (the pass and every change to waiters/ unserialized)",
+     "            fcntl.flock(fd, fcntl.LOCK_EX)\n            yield", "            yield",
+     "contention",
+     "contention: six processes racing enter() and poll() on a budget of 2: every one finishes "
+     "every round, no seq is handed out twice, and the pool's directory is left empty"),
+    ("lock descriptors inherited by a child started by exec",
+     "return os.open(path, flags, 0o600)",
+     "fd = os.open(path, flags, 0o600); os.set_inheritable(fd, True); return fd", "inherit",
+     "inherit: a child a holder starts by exec holds NONE of the holder's lock descriptors"),
+]
+# The same table for scripts/gate-runner.py: the wiring. `old` must occur exactly once THERE.
+RUNNER_MUTATIONS = [
+    ("a [pool] table with no budget read as an unlimited budget",
+     '    if "budget" not in pool:\n        return "off", "pool-table-without-budget"',
+     '    pool.setdefault("budget", 1 << 20)', "off-runner-alone",
+     "off runner alone: a [pool] table with no budget: form-a output and exit code equal the "
+     "pre-pool golden"),
+    ("an unknown key inside [pool] ignored (a typo disables the bound)",
+     "        if key not in POOL_KEYS:", "        if False:", "e2e-refusals",
+     "refusals: a misspelled key (budegt) exits 2 naming it: no step, no ticket, no stale receipt"),
+    ("the positive-integer rule dropped from the machine keys",
+     "        if key in pool and not _valid_jobs(pool[key]):", "        if False:", "config-table",
+     "config: every key refuses zero, a negative, a bool, a string and a float, naming the key"),
+    ("the [prep_pr] weight check skipped",
+     'if "weight" in prep and not _valid_jobs(prep["weight"]):', "if False:", "weight",
+     "weight: with the pool OFF a weight that is no positive integer exits 2 and runs no step"),
+    ("an undeclared cost read as one unit, not the whole budget",
+     "        return min(jobs, budget), raw\n    return budget, raw",
+     "        return min(jobs, budget), raw\n    return 1, raw", "cost-table",
+     "cost: no weight and no jobs is the WHOLE budget (bare Form B, Form A, the fallback "
+     "chain), and jobs buys Form A and the fallback chain nothing"),
+    ("a config rejected while costing takes a ticket anyway",
+     "        if cost is not None:", "        if True:", "e2e-rejected-costing",
+     "rejected while costing: a bad weight exits 2 with the pool-off output, no step and no "
+     "ticket"),
+    ("the worktree key resolved inside admit.lock",
+     "        key = gate_pool.worktree_key(root)",
+     "        with pool._admit(): key = gate_pool.worktree_key(root)", "e2e-git-outside-lock",
+     "git outside the lock: the runner resolves its worktree key and takes its receipt "
+     "snapshot through git, and NO git call runs while admit.lock is held"),
+    ("the worktree key taken from the current directory, not the worktree root",
+     "        key = gate_pool.worktree_key(root)",
+     "        key = gate_pool.worktree_key(os.getcwd())", "e2e-over-budget",
+     "over budget: a gate started from a SUBDIRECTORY is keyed by its worktree ROOT"),
+    ("the receipt snapshot taken before the grant",
+     "    state, pool = _pool_config()\n",
+     "    state, pool = _pool_config()\n"
+     "    if receipt_path:\n"
+     "        _early = _snapshot(root, receipt_path); globals()['_snapshot'] = lambda r, p: _early\n",
+     "e2e-receipt",
+     "receipt: the snapshot is taken AFTER the grant: the receipt binds the commit made during "
+     "the wait, and passes"),
+    ("the definition costed before the wait run after the grant",
+     "            recost, raw = _pool_cost(root, jobs, pool[\"budget\"])",
+     "            recost, _ = _pool_cost(root, jobs, pool[\"budget\"])", "e2e-gates-edited",
+     "gates edited: a .gates.toml edited during the wait is re-read after the grant, and THAT "
+     "definition runs"),
+    ("a definition that grew during the wait run under the smaller hold",
+     "            if recost is not None and recost > cost:", "            if False:",
+     "e2e-gates-edited",
+     "gates edited: a definition that costs MORE after the wait than the run holds is NOT RUN, "
+     "exit 75: no step, no stale receipt, and its slots are given back"),
+    ("an inherited GATEQ_HOLDER passed through to the steps",
+     "            os.environ.update(holder.child_env())",
+     '            os.environ.setdefault("GATEQ_NEST", "")', "e2e-holder-env",
+     "holder env: a holder's step sees the runner's OWN ticket in GATEQ_HOLDER, never the "
+     "inherited one, and no GATEQ_NEST"),
+    ("a wait that gave up leaves the older receipt in place",
+     "                if receipt_path:\n                    _remove_stale(receipt_path)\n"
+     "                return code", "                return code", "e2e-timeout",
+     "timeout: no step ran, the waiter's ticket is gone, and no older receipt is left to read "
+     "as this run's"),
+    ("a dangling symlink read as 'no config' (pool off)",
+     "            if os.path.islink(p) and not os.path.exists(p):", "            if False:",
+     "e2e-refusals",
+     "refusals: a dangling config.toml or a dangling pool home exits 2, never 'off': no step, "
+     "no stale receipt"),
+    ("a symlinked pool home refused as dangling although its target exists",
+     "            if os.path.islink(p) and not os.path.exists(p):",
+     "            if os.path.islink(p):", "e2e-refusals",
+     "refusals: a pool home that is a symlink to a real directory with no config is OFF: "
+     "the gate runs unpooled and nothing is created there"),
+    ("a broken gate_pool.py escapes as a traceback (no catch-all arm)",
+     "    except Exception as e:                 # a broken gate_pool.py",
+     "    except ZeroDivisionError as e:         # a broken gate_pool.py", "e2e-refusals",
+     "refusals: a gate_pool.py with a syntax error exits 2 in one line, never a traceback"),
+    ("an unusable pool directory lets the gate run (the OSError arm returns 0)",
+     '            _pool_say(f"gate-runner: NOT RUN - pool error: {e}")\n            return None, 2',
+     '            _pool_say(f"gate-runner: NOT RUN - pool error: {e}")\n            return None, 0',
+     "e2e-refusals",
+     "refusals: a pool home whose waiters is a regular file exits 2, never unpooled"),
+    ("a top-level budget ignored",
+     '        if key in data:                    # outside [pool]',
+     '        if False:                          # outside [pool]', "e2e-refusals",
+     "refusals: a top-level budget (outside [pool]) exits 2 saying where it belongs"),
+    ("main() drops the costed bytes instead of forwarding them",
+     "_run_gates(root, memoize_dir, jobs, skip, shard, raw=raw)",
+     "_run_gates(root, memoize_dir, jobs, skip, shard)", "e2e-rejected-costing",
+     "rejected while costing: main() hands the bytes it costed to the run: the invalid config "
+     "is rejected even though the file on disk is valid"),
+    ("the slots given back before the gate ran (released at the grant)",
+     "            recost, raw = _pool_cost(root, jobs, pool[\"budget\"])",
+     "            holder.release(); recost, raw = _pool_cost(root, jobs, pool[\"budget\"])",
+     "e2e-over-budget",
+     "over budget: a weight above the budget runs, holding the WHOLE budget: nothing fits "
+     "beside it"),
+]
 if os.geteuid() != 0:                      # chmod does not bite for root, so that case skips
+    RUNNER_MUTATIONS.append(
+        ("an unreadable .gates.toml takes no ticket (runs unpooled)",
+         "        # Unreadable right now: judged again after the grant, pooled at the whole budget.\n"
+         "        return budget, None",
+         "        return None, None", "e2e-refusals",
+         "refusals: a .gates.toml that cannot be read still takes a ticket at the whole budget "
+         "(waits, exits 75), never an unpooled run"))
     MUTATIONS.append(
         ("any failure to open a ticket read as 'missing'",
          'except FileNotFoundError:\n        return None, ""',
@@ -1202,26 +2236,35 @@ def _rerun(scripts_dir, *args):
 
 
 def mutation_selftest():
-    with open(MODULE, encoding="utf-8") as f:
-        src = f.read()
     known = {name for name, _ in CASES}
+    # The module, the runner that imports it, and the schema module the runner validates a
+    # receipt with: one scripts directory, as deployed.
+    srcs = {name: read(os.path.join(SCRIPTS, name))
+            for name in ("gate_pool.py", "gate-runner.py", "orchestrate_schemas.py")}
+
+    def copy_to(d, name=None, mutated=None):
+        """A scripts directory for a re-run, with `name` replaced by `mutated` when given.
+        COPIES, in a temp directory: no tracked file is ever opened for writing."""
+        os.mkdir(d)
+        for n, text in srcs.items():
+            put(os.path.join(d, n), mutated if n == name else text)
+        return d
+    rows = [("gate_pool.py", m) for m in MUTATIONS] + [("gate-runner.py", m)
+                                                       for m in RUNNER_MUTATIONS]
     with tempfile.TemporaryDirectory(prefix="gate-pool-mut-") as tmp:
-        clean = os.path.join(tmp, "clean"); os.mkdir(clean)
-        with open(os.path.join(clean, "gate_pool.py"), "w", encoding="utf-8") as f:
-            f.write(src)
+        clean = copy_to(os.path.join(tmp, "clean"))
         rc, out = _rerun(clean)
         check("mutation self-test: the UNMUTATED copy passes", rc == 0)
         if rc != 0:
             print(out)
             return
-        for i, (label, old, new, case, want) in enumerate(MUTATIONS):
+        for i, (name, (label, old, new, case, want)) in enumerate(rows):
+            src = srcs[name]
             if src.count(old) != 1 or case not in known:
                 check(f"mutation self-test: '{label}' is stale "
                       f"({src.count(old)} occurrences of its text, case '{case}')", False)
                 continue
-            d = os.path.join(tmp, f"m{i:02d}"); os.mkdir(d)
-            with open(os.path.join(d, "gate_pool.py"), "w", encoding="utf-8") as f:
-                f.write(src.replace(old, new))
+            d = copy_to(os.path.join(tmp, f"m{i:02d}"), name, src.replace(old, new))
             rc, out = _rerun(d, "--only", case)
             killed = rc != 0 and f"[FAIL] {want}\n" in out
             check(f"mutation: {label} -> killed by '{case}'", killed)
@@ -1256,6 +2299,10 @@ def main():
 
     print("isolation:")
     same("isolation: the pinned GATEQ_HOME is still empty", os.listdir(_PINNED_HOME), [])
+    same("isolation: no spawned runner created anything under its (temp) HOME",
+         os.listdir(_FAKE_HOME), [])
+    same("isolation: the real pool directory is exactly as it was at the start",
+         _real_pool_listing(), _REAL_POOL_BEFORE)
 
     print()
     if FAILS:
