@@ -1135,15 +1135,20 @@ def _steps_cfg(steps, jobs=None):
 
 def _gone(pid, *, group):
     """True once the pid (or process group) no longer exists, waiting up to 3s
-    for the kernel/launchd to finish reaping."""
+    for the kernel/launchd to finish reaping.
+
+    EPERM counts as GONE, as in the runner's own `_group_alive` (#546). Every
+    process a step starts runs under this harness's uid, so a signal-0 probe of
+    a live one can never be refused. Measured on Darwin: a group holding only
+    zombies (killed, leader not yet reaped) answers EPERM, while a zombie leader
+    beside ONE live member answers success, so EPERM cannot hide a survivor. The
+    other source is a pid/pgid recycled to another user: the original is gone."""
     end = time.time() + 3
     while time.time() < end:
         try:
             (os.killpg if group else os.kill)(pid, 0)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             return True
-        except PermissionError:
-            return False
         time.sleep(0.05)
     return False
 
