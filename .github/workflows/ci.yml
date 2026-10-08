@@ -36,9 +36,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Both legs on every event (public repo -> free GitHub-hosted minutes). ubuntu
-        # covers the GNU `stat -c` branch; macos covers the BSD `stat -f` branch.
-        os: [ubuntu-latest, macos-latest]
+        # ubuntu covers the GNU `stat -c` branch and keeps the required check name
+        # `gates (ubuntu-latest)`. The macOS leg (BSD `stat -f`) is sharded across runners
+        # in `gates-macos-shard` below and reports its required name `gates (macos-latest)`
+        # from the `gates-macos` aggregate job (#544); do not add it back to this matrix.
+        os: [ubuntu-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -50,25 +52,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      # #463: macOS /bin/bash is 3.2, but the runner image puts a Homebrew bash 5 first on
-      # PATH, so harnesses (`bash script`, `#!/usr/bin/env bash`) never ran the scripts under
-      # the bash a stock Mac user has (#460: `mapfile` -> exit 127, CI green). GITHUB_PATH
-      # PREPENDS for every later step, and this runs after setup-python so nothing added
-      # later shadows it. `#!/bin/bash` scripts already hit 3.2. Nothing here needs bash 4.
-      - name: macOS - run bash as /bin/bash 3.2
-        if: runner.os == 'macOS'
-        run: |
-          mkdir -p "$RUNNER_TEMP/bash32"
-          ln -sf /bin/bash "$RUNNER_TEMP/bash32/bash"
-          echo "$RUNNER_TEMP/bash32" >> "$GITHUB_PATH"
-
-      # The shim must not silently stop applying (an image change, a later PATH edit).
-      - name: macOS - assert bash is 3.x
-        if: runner.os == 'macOS'
-        run: |
-          command -v bash && bash --version | head -n1
-          [ "$(bash -c 'echo "${BASH_VERSINFO[0]}"')" = 3 ] || { echo "::error::bash on PATH is not 3.x, the #463 shim stopped applying"; exit 1; }
-
+      # (The macOS bash 3.2 shim lives in `gates-macos-shard` below.)
       # ruff runs Linux-only (the `ruff (F,E741)` step is `if: runner.os == 'Linux'`),
       # so only install it there - no need to spend the macOS leg installing an unused tool.
       - name: Install ruff
@@ -124,11 +108,72 @@ jobs:
       #
       # Keep each invocation on ONE `run:` line with no continue-on-error: the lockstep
       # harness parses exactly that shape and fails if either OS leg stops running it.
-      # The macOS leg runs after the bash 3.2 shim above, so every harness sees /bin/bash 3.2.
       - name: harnesses + self-tests (gate-runner, Linux)
         if: runner.os == 'Linux'
         run: python3 scripts/gate-runner.py --jobs 4 --skip shellcheck --skip ruff
 
-      - name: harnesses + self-tests (gate-runner, macOS)
-        if: runner.os == 'macOS'
-        run: python3 scripts/gate-runner.py --jobs 4 --skip shellcheck --skip ruff --skip test-orchestrate-setup
+  # The macOS leg, split into 3 shards that each run on their own runner (#544): the single
+  # macOS step took 6m13s against a 10-minute timeout. `--shard K/N` partitions the
+  # .gates.toml step list by a stable hash of the step NAME, so the shards need no list of
+  # their own. test-ci-gates-lockstep.py proves the shards cover the leg's step list exactly
+  # once: same N everywhere, K exactly 1..N, no continue-on-error. The name is NOT a
+  # required check; `gates-macos` below reports the required context.
+  gates-macos-shard:
+    name: gates-macos-shard (${{ matrix.shard }}/3)
+    runs-on: macos-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      # #463: macOS /bin/bash is 3.2, but the runner image puts a Homebrew bash 5 first on
+      # PATH, so harnesses (`bash script`, `#!/usr/bin/env bash`) never ran the scripts under
+      # the bash a stock Mac user has (#460: `mapfile` -> exit 127, CI green). GITHUB_PATH
+      # PREPENDS for every later step, and this runs after setup-python so nothing added
+      # later shadows it. `#!/bin/bash` scripts already hit 3.2. Nothing here needs bash 4.
+      - name: macOS - run bash as /bin/bash 3.2
+        run: |
+          mkdir -p "$RUNNER_TEMP/bash32"
+          ln -sf /bin/bash "$RUNNER_TEMP/bash32/bash"
+          echo "$RUNNER_TEMP/bash32" >> "$GITHUB_PATH"
+
+      # The shim must not silently stop applying (an image change, a later PATH edit).
+      - name: macOS - assert bash is 3.x
+        run: |
+          command -v bash && bash --version | head -n1
+          [ "$(bash -c 'echo "${BASH_VERSINFO[0]}"')" = 3 ] || { echo "::error::bash on PATH is not 3.x, the #463 shim stopped applying"; exit 1; }
+
+      # The --skip set is the macOS CI_SKIP table; the --shard N matches the matrix length.
+      # Both are checked by test-ci-gates-lockstep.py. ONE `run:` line, no continue-on-error.
+      - name: harnesses + self-tests (gate-runner, macOS shard)
+        run: python3 scripts/gate-runner.py --jobs 4 --shard ${{ matrix.shard }}/3 --skip shellcheck --skip ruff --skip test-orchestrate-setup
+
+  # Reports the REQUIRED check context `gates (macos-latest)` now that the matrix no longer
+  # produces it. `always()` so it runs (and fails) even when a shard failed or was cancelled:
+  # a skipped aggregate would read as a missing check. The shard job's `result` is success only
+  # when EVERY matrix leg succeeded; failure, cancelled and skipped all fail this job.
+  gates-macos:
+    name: gates (macos-latest)
+    needs: gates-macos-shard
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require every macOS shard to have succeeded
+        env:
+          SHARD_RESULT: ${{ needs.gates-macos-shard.result }}
+        run: |
+          echo "macOS shard result: $SHARD_RESULT"
+          [ "$SHARD_RESULT" = "success" ] || { echo "::error::macOS gate shards did not all succeed ($SHARD_RESULT)"; exit 1; }
