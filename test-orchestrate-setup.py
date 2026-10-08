@@ -3,6 +3,7 @@
 (temp settings/marker/guard/templates/artifact dirs) so the real env is never touched.
 Run: python3 test-orchestrate-setup.py"""
 import atexit
+import fcntl
 import json
 import os
 import pwd
@@ -156,6 +157,12 @@ def isolated_env(base=None):
     env["ORCHESTRATE_GUARD"] = os.path.join(iso_scripts, "orchestrate-guard.sh")
     env["ORCHESTRATE_BUNDLED_SCRIPTS_DIR"] = here
     env["ORCHESTRATE_BUNDLED_GUARD"] = os.path.join(here, "orchestrate-guard.sh")
+    # The machine-wide gate pool (#539): doctor READS the pool root and the plugin registry. Pinned
+    # here (ASSIGNED, like the rest) so no case ever reads the developer's real
+    # ~/.claude/gate-queue or ~/.claude/plugins, and an exported GATEQ_HOME cannot leak in. Neither
+    # path exists unless a case creates it, which is doctor's "gate pool not configured" branch.
+    env["GATEQ_HOME"] = os.path.join(_ISO_HOME, ".claude", "gate-queue")
+    env["ORCHESTRATE_PLUGINS_DIR"] = os.path.join(_ISO_HOME, ".claude", "plugins")
     return env
 
 
@@ -3015,6 +3022,309 @@ def _run_checks():
     # which is only possible if they never ran.
     check_compound_shadow_matcher()
     check_default_deploy_path_follows_home()
+    check_gate_pool_doctor()
+
+
+def _tree(top):
+    """Every entry under `top` with inode, MODE, size and mtime, plus `top` itself (recorded as
+    "."), or None when `top` is absent: equal before and after means nothing there was created,
+    written, chmod-ed, replaced or unlinked."""
+    if not os.path.lexists(top):
+        return None
+    st = os.lstat(top)
+    out = [(".", st.st_ino, st.st_mode, st.st_size, st.st_mtime_ns)]
+    for root, dirs, files in os.walk(top):
+        for n in dirs + files:
+            st = os.lstat(os.path.join(root, n))
+            out.append((os.path.relpath(os.path.join(root, n), top), st.st_ino, st.st_mode,
+                        st.st_size, st.st_mtime_ns))
+    return sorted(out)
+
+
+def check_gate_pool_doctor():
+    """S5 (#539): doctor's read-only gate pool check. One case per WARN, the quiet "not
+    configured" line, and the all-capable PASS. EVERY case asserts doctor's exit code is the
+    healthy fixture's (a pool WARN never becomes a FAIL) and that doctor created, wrote and
+    unlinked NOTHING under the pool home. Each case gets its own pool home under a temp dir; the
+    bundled scripts dir is a temp COPY of the two real files, so "path-loading the runner leaves
+    no bytecode beside it" is asserted on a directory nothing else touches."""
+    here = os.path.dirname(os.path.abspath(SCRIPT))
+    on = "[pool]\nprotocol = 1\nbudget = 10\n"
+    with tempfile.TemporaryDirectory() as td:
+        guard = os.path.join(td, "guard.sh"); write_stub_guard(guard)
+        wired = os.path.join(td, "wired.json")
+        json.dump({"teammateMode": "tmux", "env": {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"},
+                   "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                       {"type": "command", "command": 'bash "$HOME/.claude/scripts/orchestrate-guard.sh"'}]}]}},
+                  open(wired, "w"))
+
+        def scripts(name, kind):
+            """A scripts dir holding a gate-runner copy: `capable` (the real runner and module),
+            `no-module` (the real runner alone) or `pre-pool` (a runner with no pool import)."""
+            d = os.path.join(td, name, "scripts"); os.makedirs(d)
+            if kind == "pre-pool":
+                open(os.path.join(d, "gate-runner.py"), "w").write("#!/usr/bin/env python3\n# a comment is no statement: import gate_pool\n")
+            else:
+                shutil.copy(os.path.join(here, "gate-runner.py"), d)
+            if kind == "capable":
+                shutil.copy(os.path.join(here, "gate_pool.py"), d)
+            return d
+        bundle, deployed = scripts("bundle", "capable"), scripts("deployed", "capable")
+        installed = scripts(os.path.join("cache", "orchestrate", "0.2.0"), "capable")
+        plugins = os.path.join(td, "plugins"); os.makedirs(plugins)
+        registry = os.path.join(plugins, "installed_plugins.json")
+        json.dump({"version": 2, "plugins": {
+            "orchestrate@cc-orchestrator": [{"installPath": os.path.dirname(installed)}],
+            "other@elsewhere": [{"installPath": os.path.join(td, "nope")}]}}, open(registry, "w"))
+        serial = iter(range(1000))
+
+        def home(config=None, mode=0o700):
+            h = os.path.join(td, f"gq{next(serial)}"); os.makedirs(os.path.join(h, "waiters"))
+            if config is not None:
+                open(os.path.join(h, "config.toml"), "w").write(config)
+            os.chmod(h, mode)
+            return h
+
+        def doctor(label, h, **over):
+            """Run doctor against pool home `h` -> its gate pool lines. Asserts the two things
+            every case owes: the exit code, and an untouched pool home."""
+            before = _tree(h)
+            rc, out = run(["doctor"], env_overrides={
+                "ORCHESTRATE_SETTINGS": wired, "ORCHESTRATE_GUARD": guard, "GATEQ_HOME": h,
+                "ORCHESTRATE_PLUGINS_DIR": plugins, "ORCHESTRATE_SCRIPTS_DIR": deployed,
+                "ORCHESTRATE_BUNDLED_SCRIPTS_DIR": bundle, **over})
+            check(f"gate pool: {label}: doctor's exit code is unchanged (rc={rc}, no hard fail)",
+                  rc == 0 and "doctor: ok (no hard fail)" in out)
+            check(f"gate pool: {label}: doctor created, wrote and unlinked nothing in the pool home",
+                  _tree(h) == before)
+            return [ln for ln in out.splitlines() if "gate pool" in ln]
+
+        absent = os.path.join(td, "no-such-pool")
+        lines = doctor("not configured", absent)
+        check("gate pool: no pool directory is exactly ONE quiet PASS line",
+              lines == ["[PASS] gate pool not configured (no pool directory; gates run unpooled)"])
+        check("gate pool: and the directory is still absent", not os.path.lexists(absent))
+
+        lines = doctor("all capable", home(on))
+        check("gate pool: a budget and every visible copy pool-capable is ONE PASS line",
+              lines == ["[PASS] gate pool: budget 10 configured (protocol 1); the 3 gate-runner "
+                        "copies doctor can see have the pool import and module (watchdog marker "
+                        "not checked until A4)"])
+        check("gate pool: the PASS line never claims 'pool-capable'", "pool-capable" not in lines[0])
+
+        empty_dir = os.path.join(td, "empty-deployed"); os.makedirs(empty_dir)
+        lines = doctor("one copy", home(on), ORCHESTRATE_SCRIPTS_DIR=empty_dir,
+                       ORCHESTRATE_PLUGINS_DIR=os.path.join(td, "no-plugins"))
+        check("gate pool: ONE visible copy reads 'the 1 gate-runner copy ... has'",
+              lines == ["[PASS] gate pool: budget 10 configured (protocol 1); the 1 gate-runner "
+                        "copy doctor can see has the pool import and module (watchdog marker "
+                        "not checked until A4)"])
+
+        h = home(on, mode=0o755)
+        lines = doctor("root mode", h)
+        check("gate pool: a pool root open to group or other WARNs, naming the fix",
+              len(lines) == 1 and lines[0].startswith(f"[WARN] gate pool: pool root {h} must be owned "
+              "by you with mode 0700 (it is mode 0755") and f"`chmod 700 {h}`" in lines[0])
+        lines = doctor("root mode 0750", home(on, mode=0o750))
+        check("gate pool: group bits alone (0750) WARN too",
+              len(lines) == 1 and "(it is mode 0750" in lines[0])
+
+        lines = doctor("config error", home("[pool]\nprotocol = 1\nbudegt = 10\n"))
+        check("gate pool: a config error WARNs with the runner's own message",
+              len(lines) == 1 and lines[0].startswith("[WARN] gate pool: config error")
+              and lines[0].endswith("config.toml: unknown key [pool].budegt"))
+
+        lines = doctor("no budget", home("[pool]\nprotocol = 1\n"))
+        check("gate pool: a [pool] table with no budget WARNs",
+              len(lines) == 1 and "[WARN]" in lines[0]
+              and "has a [pool] table with no `budget`, so the pool is OFF" in lines[0])
+
+        lines = doctor("parse on, text off", home('[pool]\nprotocol = 1\n"budget" = 10\n'))
+        check("gate pool: a budget the TOML parse sees and the text match does not WARNs",
+              len(lines) == 1 and "[WARN]" in lines[0]
+              and "in a form the commands' text match cannot see" in lines[0])
+        lines = doctor("parse off, text on", home("[queue]\n\tbudget\t= 3\n"))
+        check("gate pool: a `budget =` line the TOML parse does not read as [pool].budget WARNs",
+              len(lines) == 1 and "[WARN]" in lines[0]
+              and "reads as `budget =` but the TOML parse finds no [pool].budget" in lines[0])
+
+        alien = json.dumps({"pid": 1, "pool_protocol": 999, "kind": "gate", "name": "gate",
+                            "cost": 1, "worktree": "/wt/F", "state": "running"})
+        for held in (False, True):
+            h = home(on)
+            ticket = os.path.join(h, "waiters", "0000000007-dead.ticket")
+            side = ticket[:-len(".ticket")] + ".sched"
+            open(ticket, "w").write(alien)
+            open(side, "w").write('{"pool_protocol": 999, "bypass": 1}')
+            fd = os.open(ticket, os.O_RDONLY)
+            try:
+                if held:                   # a live owner: this process holds the ticket's flock
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lines = doctor("foreign ticket, lock held" if held else "dead foreign ticket", h)
+            finally:
+                os.close(fd)
+            if held:
+                check("gate pool: a foreign ticket whose lock is HELD is a live process: no WARN",
+                      len(lines) == 1 and lines[0].startswith("[PASS] gate pool: budget 10"))
+            else:
+                check("gate pool: a protocol-999 ticket with a free lock WARNs, naming it and its "
+                      "sidecar, to be deleted by hand",
+                      lines == ["[WARN] gate pool: dead ticket of another pool protocol (or "
+                                f"unreadable), lock free: {ticket} (and its sidecar {side}) - no "
+                                "gate will ever clear it; delete it by hand"])
+
+        # Copies that are not pool-capable: the deployed leg predates the pool (both parts), the
+        # installed plugin has a pool-aware runner and no module (one part), and two more cached
+        # versions predate it (ONE summary line, not a WARN each). A third cached version that IS
+        # capable is not counted.
+        old_deployed = scripts("old-deployed", "pre-pool")
+        cache = os.path.join(td, "cache2", "orchestrate")
+        half = scripts(os.path.join("cache2", "orchestrate", "0.3.0"), "no-module")
+        for v, kind in (("0.1.0", "pre-pool"), ("0.1.1", "pre-pool"), ("0.2.9", "capable")):
+            scripts(os.path.join("cache2", "orchestrate", v), kind)
+        plugins2 = os.path.join(td, "plugins2"); os.makedirs(plugins2)
+        json.dump({"version": 2, "plugins": {"orchestrate@cc-orchestrator": [
+            {"installPath": os.path.dirname(half)}]}},
+            open(os.path.join(plugins2, "installed_plugins.json"), "w"))
+        stale = {"ORCHESTRATE_SCRIPTS_DIR": old_deployed, "ORCHESTRATE_PLUGINS_DIR": plugins2}
+        lines = doctor("stale copies", home(on), **stale)
+        check("gate pool: with a budget, each copy that is not pool-capable WARNs and says which "
+              "part failed; other cached versions are ONE line",
+              len(lines) == 3 and all(ln.startswith("[WARN] gate pool: ") for ln in lines)
+              and f"the deployed copy at {old_deployed} is not pool-capable: its gate-runner.py "
+                  "has no `import gate_pool` statement" in lines[0]
+              and "; no gate_pool.py beside it" in lines[0]
+              and f"the installed plugin copy at {half} is not pool-capable: no gate_pool.py "
+                  "beside it" in lines[1] and "import gate_pool" not in lines[1]
+              and f"2 other cached plugin version(s) under {cache} are not pool-capable" in lines[2])
+        lines = doctor("stale copies, no budget", home(), **stale)
+        check("gate pool: with NO budget the same stale copies are not reported",
+              lines == [ln for ln in lines if ln.startswith("[PASS] gate pool: ")] and len(lines) == 1)
+
+        plugins3 = os.path.join(td, "plugins3"); os.makedirs(plugins3)
+        open(os.path.join(plugins3, "installed_plugins.json"), "w").write("{")
+        lines = doctor("unreadable registry", home(on), ORCHESTRATE_PLUGINS_DIR=plugins3)
+        check("gate pool: an unreadable plugin registry WARNs instead of reading as all capable",
+              len(lines) == 1 and lines[0].startswith("[WARN] gate pool: plugin copies not checked"))
+
+        broken = os.path.join(td, "broken"); os.makedirs(broken)
+        open(os.path.join(broken, "gate-runner.py"), "w").write("raise SystemExit(2)\n")
+        lines = doctor("runner will not load", home(on), ORCHESTRATE_BUNDLED_SCRIPTS_DIR=broken)
+        check("gate pool: a bundled runner that will not load (SystemExit included) is ONE WARN",
+              len(lines) == 1 and lines[0].startswith("[WARN] gate pool: could not be checked")
+              and "SystemExit" in lines[0])
+
+        # --- review-fix cases (F1-F7 and the surviving-mutation tests) ---
+        # F1: admit.lock held by another descriptor (a live or stuck evaluator): doctor finishes
+        # within its bounded wait and says the ticket check was skipped.
+        h = home(on)
+        admit_path = os.path.join(h, "admit.lock"); open(admit_path, "w").close()
+        afd = os.open(admit_path, os.O_RDONLY)
+        try:
+            fcntl.flock(afd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lines = doctor("admit.lock held", h)
+        finally:
+            os.close(afd)
+        check("gate pool: a held admit.lock is ONE WARN saying the ticket check was skipped",
+              len(lines) == 1 and lines[0].startswith("[WARN] gate pool: the dead-ticket check was "
+              "skipped because admit.lock is held") and "re-run doctor" in lines[0])
+
+        # F2: a configured protocol that differs from the bundled module's.
+        lines = doctor("protocol mismatch", home("[pool]\nprotocol = 2\nbudget = 10\n"))
+        check("gate pool: a protocol differing from the bundled one WARNs naming both numbers, "
+              "and no PASS line follows",
+              len(lines) == 1 and lines[0].startswith("[WARN] gate pool: ")
+              and "sets protocol 2 but the bundled gate_pool.py is protocol 1" in lines[0]
+              and "every gate exits 2 until they match" in lines[0])
+        # Tickets are judged against the CONFIGURED protocol: a dead protocol-1 ticket is foreign
+        # to a pool configured for protocol 2.
+        h = home("[pool]\nprotocol = 2\nbudget = 10\n")
+        one = os.path.join(h, "waiters", "0000000001-old.ticket")
+        open(one, "w").write(json.dumps({"pid": 1, "pool_protocol": 1, "kind": "gate",
+                                         "name": "gate", "cost": 1, "worktree": "/wt/F",
+                                         "state": "running"}))
+        lines = doctor("protocol 2, protocol-1 ticket", h)
+        check("gate pool: with protocol 2 configured a dead protocol-1 ticket IS listed",
+              any(f"lock free: {one}" in ln for ln in lines) and len(lines) == 2)
+
+        # F3: a NUL in an installPath, a deeply nested registry, and an unexpected exception.
+        def registry_case(label, text):
+            pl = os.path.join(td, "plugins-" + label.replace(" ", "-")); os.makedirs(pl)
+            open(os.path.join(pl, "installed_plugins.json"), "w").write(text)
+            return doctor(label, home(on), ORCHESTRATE_PLUGINS_DIR=pl)
+        lines = registry_case("NUL installPath", json.dumps({"plugins": {
+            "orchestrate@x": [{"installPath": "/a\u0000b"}]}}))
+        check("gate pool: an installPath holding a NUL is one 'plugin copies not checked' WARN",
+              len(lines) == 1 and lines[0].startswith("[WARN] gate pool: plugin copies not checked")
+              and "ValueError" in lines[0])
+        lines = registry_case("deep registry", "[" * 200000)
+        check("gate pool: a deeply nested registry is one WARN, not a traceback",
+              len(lines) == 1 and lines[0].startswith("[WARN] gate pool: plugin copies not checked")
+              and "RecursionError" in lines[0])
+        os.makedirs(os.path.join(td, "cache4", "orchestrate"))
+        lines = registry_case("odd installPath", json.dumps({"plugins": {"orchestrate@x": [
+            {"installPath": os.path.join(td, "cache4", "orchestrate", "v\ud800")}]}}))
+        check("gate pool: any unexpected exception while inspecting copies is ONE WARN",
+              len(lines) == 1 and lines[0].startswith("[WARN] gate pool: could not inspect "
+              "gate-runner copies: UnicodeEncodeError"))
+
+        # Surviving-mutation cases.
+        link = os.path.join(td, "gq-dangling"); os.symlink(os.path.join(td, "nowhere"), link)
+        lines = doctor("dangling symlink home", link)
+        check("gate pool: a dangling-symlink pool home is reported, not read as 'not configured'",
+              len(lines) >= 1 and all(ln.startswith("[WARN]") for ln in lines)
+              and any("dangling symlink" in ln for ln in lines))
+
+        lines = doctor("budget in a comment", home("[pool]\nprotocol = 1\n# budget = 10\n"))
+        check("gate pool: `budget =` inside a comment is not a budget (only the no-budget WARN)",
+              len(lines) == 1 and "has a [pool] table with no `budget`" in lines[0])
+        lines = doctor("budget mid-line", home('[queue]\nnote = "x budget = 3"\n'))
+        check("gate pool: `budget =` mid-line is not a budget",
+              lines == [f"[PASS] gate pool: {os.path.join(td, 'gq' + str(next(serial)-1))}"
+                        " exists, no budget configured (pool OFF)"])
+
+        dup_root = os.path.join(td, "cache3", "orchestrate")
+        scripts(os.path.join("cache3", "orchestrate", "0.1.0"), "pre-pool")
+        os.symlink(os.path.join(dup_root, "0.1.0"), os.path.join(dup_root, "link-0.1.0"))
+        pl = os.path.join(td, "plugins-dup"); os.makedirs(pl)
+        json.dump({"plugins": {"orchestrate@a": [{"installPath": os.path.join(dup_root, "0.1.0")}],
+                               "orchestrate@b": [{"installPath": os.path.join(dup_root, "link-0.1.0")}]}},
+                  open(os.path.join(pl, "installed_plugins.json"), "w"))
+        lines = doctor("duplicate registry entries", home(on), ORCHESTRATE_PLUGINS_DIR=pl)
+        check("gate pool: two registry entries resolving to one directory are reported ONCE",
+              len(lines) == 1 and "installed plugin copy at" in lines[0])
+
+        modir = scripts("module-dir", "no-module"); os.mkdir(os.path.join(modir, "gate_pool.py"))
+        lines = doctor("gate_pool.py is a directory", home(on), ORCHESTRATE_SCRIPTS_DIR=modir)
+        check("gate pool: gate_pool.py present as a DIRECTORY reads as a missing module",
+              len(lines) == 1 and f"the deployed copy at {modir}" in lines[0]
+              and "no gate_pool.py beside it" in lines[0])
+
+        if os.geteuid() != 0:
+            unread = scripts("unreadable", "capable")
+            os.chmod(os.path.join(unread, "gate-runner.py"), 0)
+            try:
+                lines = doctor("unreadable runner copy", home(on), ORCHESTRATE_SCRIPTS_DIR=unread)
+            finally:
+                os.chmod(os.path.join(unread, "gate-runner.py"), 0o600)
+            check("gate pool: an unreadable runner copy WARNs",
+                  len(lines) == 1 and "its gate-runner.py is unreadable" in lines[0])
+            h = home(on, mode=0)
+            try:
+                lines = doctor("unreadable pool root", h)
+            finally:
+                os.chmod(h, 0o700)
+            check("gate pool: an unreadable pool root WARNs (and never a FAIL)",
+                  len(lines) >= 1 and all(ln.startswith("[WARN]") for ln in lines)
+                  and any("config error" in ln and "Permission denied" in ln for ln in lines))
+            os.chmod(h, 0o700)
+        else:
+            print("  SKIP: unreadable runner copy / pool root cases (running as uid 0)")
+
+        check("gate pool: path-loading the bundled runner and module left no bytecode (or "
+              f"anything else) beside them ({sorted(os.listdir(bundle))})",
+              sorted(os.listdir(bundle)) == ["gate-runner.py", "gate_pool.py"]
+              and os.listdir(broken) == ["gate-runner.py"])
 
 
 def check_default_deploy_path_follows_home():
@@ -3061,6 +3371,8 @@ def main():
     # behind the traceback. HOME is also pinned in THIS process: several cases exec_module() setup.py
     # in-process, and its module-level defaults read expanduser("~") at import time.
     before = _snapshot_real_home()
+    real_pools = [os.path.join(h, ".claude", "gate-queue") for h in _real_homes()]
+    pools_before = [os.path.lexists(p) for p in real_pools]
     _ISO_HOME = tempfile.mkdtemp(prefix="orch-setup-home-")
     atexit.register(shutil.rmtree, _ISO_HOME, True)
     os.environ["HOME"] = _ISO_HOME
@@ -3072,6 +3384,9 @@ def main():
         check("HOME isolation: the real ~/.claude deploy + settings surfaces are untouched "
               f"by this harness ({len(changed)} path(s) changed under {', '.join(_real_homes())})",
               not changed)
+        # Existence only: once the pool is in use, live gates write tickets there all day.
+        check("HOME isolation: no real ~/.claude/gate-queue was created or removed by this harness",
+              [os.path.lexists(p) for p in real_pools] == pools_before)
         for p in changed[:40]:
             print(f"    REAL-HOME CHANGE: {p}: {before.get(p, 'ABSENT-AT-START')} -> "
                   f"{after.get(p, 'REMOVED')}")

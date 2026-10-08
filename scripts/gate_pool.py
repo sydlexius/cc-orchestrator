@@ -256,6 +256,66 @@ def worktree_key(root):
     return real
 
 
+# How long dead_foreign_tickets waits for admit.lock before it reports "skipped".
+ADMIT_WAIT_S = 2.0
+
+
+def dead_foreign_tickets(home, protocol):
+    """For `orchestrate-setup.py doctor`: the tickets under <home>/waiters/ that no evaluator
+    of pool protocol `protocol` will ever clear -> [(ticket path, its `.sched` path or None)].
+
+    That is a ticket that is NOT of `protocol` (another protocol, or one that cannot be read
+    as a ticket) whose flock is FREE: its process is dead, and every evaluator leaves a foreign
+    record alone, so only the user's own delete removes it (doc section 4). A ticket whose lock
+    is HELD is a live process and is never listed, whatever it says; a free ticket of
+    `protocol` is not listed either, because the next evaluator unlinks it.
+
+    READ-ONLY: creates nothing, writes nothing, unlinks nothing, and builds no Pool (a Pool
+    makes directories). Its trial locks are dropped by closing (rule 2). It probes under
+    admit.lock when that file EXISTS as a regular file and never creates it: a pool that has no
+    admit.lock has had no evaluator, so there is no owner to race. That lock is taken with a
+    non-blocking try in a bounded retry (ADMIT_WAIT_S seconds): a live evaluator holds it only
+    briefly, but a stuck one must never hang doctor. Returns None ("skipped") when it could not
+    be taken in that time; [] means none found. It never reads lockless while the lock file
+    exists and is held."""
+    waiters = os.path.join(home, "waiters")
+    try:
+        names = sorted(os.listdir(waiters))
+    except OSError:
+        return []
+    admit_path = os.path.join(home, "admit.lock")
+    admit = None
+    if _is_file(admit_path):
+        try:
+            admit = _open_lock(admit_path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            admit = None
+    try:
+        if admit is not None:
+            end = time.monotonic() + ADMIT_WAIT_S
+            while not _try_lock(admit):
+                if time.monotonic() >= end:
+                    return None
+                time.sleep(0.05)
+        dead = []
+        for name in names:
+            path = os.path.join(waiters, name)
+            if name.endswith(".ticket") and _is_file(path):
+                held, text = _probe(path)
+                rec = _load(text)
+                # Of `protocol`: for THIS code's protocol, exactly what an evaluator clears.
+                # For any other, only the frozen field can be read.
+                mine = rec.get("pool_protocol") == protocol and (
+                    protocol != POOL_PROTOCOL or (_ours(rec) and _seq_of(name) is not None))
+                if held is False and not mine:
+                    side = _sched_of(path)
+                    dead.append((path, side if _is_file(side) else None))
+        return dead
+    finally:
+        if admit is not None:
+            os.close(admit)
+
+
 class Pool:
     """One process's view of the pool rooted at `home`. `cfg` is the validated machine config:
     `protocol`, `budget`, and optionally the keys of DEFAULTS. The values are read ONCE, here:

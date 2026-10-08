@@ -164,6 +164,26 @@ HELPER_NAMES = (
 # The _helper_deploy_action results that warrant an actual deploy write (vs. None / informational).
 HELPER_DEPLOY_ACTIONS = ("deploy", "refresh", "replace-symlink", "replace-broken-symlink")
 
+# The machine-wide gate pool (#539, skills/orchestrate/design/DESIGN-gate-pool.md). doctor only
+# ever READS it (check_gate_pool): no tool writes the pool's config, and doctor creates nothing
+# there. GATEQ_HOME is the pool's OWN root override (the one gate-runner.py reads; empty reads as
+# unset), not an ORCHESTRATE_* seam. PLUGINS_DIR is where Claude Code records installed plugins;
+# env-overridable so the harness points it at a fixture (mirrors SCRIPTS_DIR).
+GATEQ_HOME = os.environ.get("GATEQ_HOME") or os.path.join(HOME, ".claude", "gate-queue")
+PLUGINS_DIR = os.environ.get("ORCHESTRATE_PLUGINS_DIR", os.path.join(HOME, ".claude", "plugins"))
+# THE CALLERS' TEXT MATCH FOR "A BUDGET IS CONFIGURED" - A CROSS-PR CONTRACT. Command blocks
+# cannot parse TOML, so they will decide "pool on" by matching a line of config.toml. Every later
+# command block MUST use this same expression (optional spaces or tabs, `budget`, optional spaces
+# or tabs, `=`, anchored at the line start), e.g. `grep -Eq '^[[:blank:]]*budget[[:blank:]]*='`.
+# doctor WARNs when this match and the TOML parse disagree in EITHER direction, so changing it
+# here without changing them (or the reverse) silently breaks that WARN.
+POOL_BUDGET_LINE_RE = re.compile(r"^[ \t]*budget[ \t]*=", re.MULTILINE)
+# The statement a pool-aware gate-runner.py carries (inside _pool_enter, so indented).
+# A CONTRACT with the real runner's exact `import gate_pool` line (indented, optionally followed
+# by a comment): any other import spelling (`from gate_pool import ...`, `import gate_pool as g`)
+# reads as "predates the pool", and a matching line inside a string literal reads as capable.
+POOL_IMPORT_RE = re.compile(r"^[ \t]*import gate_pool[ \t]*(?:#.*)?$", re.MULTILINE)
+
 # #428: the orchestrate ROLE DEFINITIONS (#427) - Claude Code subagent files whose `tools:` allowlist
 # the harness enforces. They deploy to USER scope (~/.claude/agents) rather than shipping in the
 # plugin's auto-loaded agents/ dir, for one live copy and because user scope is where Claude Code
@@ -2251,6 +2271,185 @@ def check_slack_bot_user_id():
     return _emit(PASS, f"ORCHESTRATE_SLACK_BOT_USER_ID={bot} is a well-formed Slack user id")
 
 
+def _load_bundled(name):
+    """Path-load a bundled script as a throwaway module, to reuse ONE definition instead of
+    copying it. Runs no `main()` (the module is not `__main__`), writes NO bytecode beside the
+    source, is never entered into sys.modules, and leaves sys.path as it found it (gate-runner.py
+    inserts its own directory at import). Raises whatever the load raises - SystemExit included
+    (gate-runner's Python 3.11 guard) - for the caller to turn into a WARN."""
+    import importlib.util
+    path = os.path.join(BUNDLED_SCRIPTS_DIR, name)
+    stem = re.sub(r"[^A-Za-z0-9]", "_", os.path.splitext(name)[0])
+    spec = importlib.util.spec_from_file_location(f"_orchestrate_doctor_{stem}", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {path}")
+    mod = importlib.util.module_from_spec(spec)
+    saved_path, saved_flag = list(sys.path), sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.path[:], sys.dont_write_bytecode = saved_path, saved_flag
+    return mod
+
+
+def _pool_incapable(scripts_dir):
+    """Why the gate-runner.py in `scripts_dir` is not pool-capable -> a list of the parts that
+    failed (empty: capable), or None when there is no runner there at all (nothing to run).
+    A TEXT check of the copy itself; nothing is executed."""
+    runner = os.path.join(scripts_dir, "gate-runner.py")
+    if not os.path.lexists(runner):
+        return None
+    parts = []
+    try:
+        with open(runner, encoding="utf-8", errors="replace") as f:
+            if not POOL_IMPORT_RE.search(f.read()):
+                parts.append("its gate-runner.py has no `import gate_pool` statement, so it "
+                             "predates the pool and gates UNPOOLED")
+    except OSError as e:
+        parts.append(f"its gate-runner.py is unreadable ({e.strerror})")
+    if not os.path.isfile(os.path.join(scripts_dir, "gate_pool.py")):
+        parts.append("no gate_pool.py beside it, so a pool-aware runner there exits 2")
+    return parts
+
+
+def _plugin_runner_dirs():
+    """The plugin copies doctor can see -> (installed, others, error). `installed`: the scripts/
+    dir of each `installPath` of an `orchestrate@*` entry in installed_plugins.json. `others`:
+    the scripts/ dirs of every OTHER cached version beside those (a session started before the
+    last plugin update still resolves its old one). A missing file is no plugin install (a
+    `--plugin-dir` dev setup): two empty lists. Anything else unreadable is `error`."""
+    path = os.path.join(PLUGINS_DIR, "installed_plugins.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            plugins = json.load(f)["plugins"]
+        roots = [e["installPath"] for key, entries in plugins.items()
+                 if key.startswith("orchestrate@") for e in entries]
+        if not all(isinstance(r, str) and r and "\0" not in r for r in roots):
+            raise ValueError("an installPath is not a path")
+    except FileNotFoundError:
+        return [], [], None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError) as e:
+        return [], [], f"{path}: {type(e).__name__}: {e}"
+    others = []
+    for parent in sorted({os.path.dirname(os.path.normpath(r)) for r in roots}):
+        try:
+            names = sorted(os.listdir(parent))
+        except OSError:
+            continue
+        others += [os.path.join(parent, n, "scripts") for n in names
+                   if os.path.join(parent, n) not in [os.path.normpath(r) for r in roots]]
+    return [os.path.join(os.path.normpath(r), "scripts") for r in roots], others, None
+
+
+def check_gate_pool():
+    """Doctor check for the machine-wide gate pool (#539). WARN-only - it NEVER returns FAIL - and
+    READ-ONLY: it reads the pool root, its config and waiters/, takes and drops trial locks on
+    tickets (and, when admit.lock already exists, takes that with a bounded ~2 s non-blocking
+    retry, skipping the ticket check with one WARN if it stays held), and creates or writes
+    nothing there or anywhere else. One WARN per condition (the
+    design's list, DESIGN-gate-pool.md sections 3, 4 and 8); with a budget configured and nothing
+    wrong, one PASS line. No pool directory at all is the common case and is one quiet PASS line.
+
+    The config verdict comes from the bundled gate-runner.py's own `_pool_config()`, path-loaded,
+    so doctor and the runner can never disagree about what a config means."""
+    home = GATEQ_HOME
+    if not os.path.lexists(home):
+        return _emit(PASS, "gate pool not configured (no pool directory; gates run unpooled)")
+    warned = []
+
+    def warn(msg):
+        warned.append(_emit(WARN, "gate pool: " + msg))
+    try:
+        st = os.stat(home)
+        if st.st_uid != os.geteuid() or st.st_mode & 0o077:
+            fix = (f"`chown` it to your user and `chmod 700 {home}`" if st.st_uid != os.geteuid()
+                   else f"`chmod 700 {home}`")
+            warn(f"pool root {home} must be owned by you with mode 0700 (it is mode "
+                 f"{st.st_mode & 0o7777:04o}, owner uid {st.st_uid}); with a budget configured "
+                 f"every gate exits 2 - {fix}")
+    except OSError as e:
+        warn(f"pool root {home} cannot be read ({e.strerror})")
+    try:
+        state, info = _load_bundled("gate-runner.py")._pool_config()
+        pool_mod = _load_bundled("gate_pool.py")
+        protocol = info["protocol"] if state == "on" else pool_mod.POOL_PROTOCOL
+        dead = pool_mod.dead_foreign_tickets(home, protocol)
+    except (Exception, SystemExit) as e:
+        warn(f"could not be checked: loading the bundled gate-runner.py / gate_pool.py from "
+             f"{BUNDLED_SCRIPTS_DIR} failed ({type(e).__name__}: {e})")
+        return WARN
+    config = os.path.join(home, "config.toml")
+    if state == "error":
+        warn(f"config error, every gate exits 2 until it is fixed - {info}")
+    else:
+        if state == "on" and info["protocol"] != pool_mod.POOL_PROTOCOL:
+            warn(f"{config} sets protocol {info['protocol']} but the bundled gate_pool.py is "
+                 f"protocol {pool_mod.POOL_PROTOCOL}: every gate exits 2 until they match - "
+                 "update the plugin and run `orchestrate-setup.py configure --apply`, or "
+                 "correct the config")
+        if info == "pool-table-without-budget":
+            warn(f"{config} has a [pool] table with no `budget`, so the pool is OFF - add "
+                 "`budget = N` or remove the table")
+        try:
+            with open(config, encoding="utf-8", errors="replace") as f:
+                text_on = bool(POOL_BUDGET_LINE_RE.search(f.read()))
+        except OSError:
+            text_on = False
+        if text_on and state != "on":
+            warn(f"{config} has a line that reads as `budget =` but the TOML parse finds no "
+                 "[pool].budget: the commands' text match treats the pool as ON while "
+                 "gate-runner runs it OFF - remove or move that line")
+        elif state == "on" and not text_on:
+            warn(f"{config} sets [pool].budget in a form the commands' text match cannot see: "
+                 "gate-runner runs the pool ON while the commands treat it as OFF - write it "
+                 "as a plain `budget = N` line under [pool]")
+    if dead is None:
+        warn("the dead-ticket check was skipped because admit.lock is held (a gate may be "
+             "scheduling, or one is stuck); re-run doctor")
+    for ticket, side in (dead or []):
+        warn(f"dead ticket of another pool protocol (or unreadable), lock free: {ticket}"
+             + (f" (and its sidecar {side})" if side else "")
+             + " - no gate will ever clear it; delete it by hand")
+    copies = 0
+    try:
+        if state == "on":
+            installed, others, err = _plugin_runner_dirs()
+            if err:
+                warn(f"plugin copies not checked - cannot read {err}")
+            seen = set()
+            for label, d in ([("deployed", SCRIPTS_DIR), ("bundled", BUNDLED_SCRIPTS_DIR)]
+                             + [("installed plugin", d) for d in installed]):
+                parts = None if os.path.realpath(d) in seen else _pool_incapable(d)
+                seen.add(os.path.realpath(d))
+                if parts is None:
+                    continue
+                copies += 1
+                if parts:
+                    warn(f"the {label} copy at {d} is not pool-capable: {'; '.join(parts)} - update "
+                         "the plugin and run `orchestrate-setup.py configure --apply`")
+            stale = [d for d in others if os.path.realpath(d) not in seen and _pool_incapable(d)]
+            if stale:
+                warn(f"{len(stale)} other cached plugin version(s) under "
+                     f"{os.path.dirname(os.path.dirname(stale[0]))} are not pool-capable; a session "
+                     "started before the last plugin update still resolves its old copy and gates "
+                     "UNPOOLED until it is restarted")
+    except Exception as e:
+        warn(f"could not inspect gate-runner copies: {type(e).__name__}: {e}")
+    if warned:
+        return WARN
+    if state == "on":
+        if copies == 0:
+            seen_copies = "no gate-runner copy was found to check"
+        else:
+            seen_copies = (f"the {copies} gate-runner cop{'y' if copies == 1 else 'ies'} doctor "
+                           f"can see {'has' if copies == 1 else 'have'} the pool import and "
+                           "module (watchdog marker not checked until A4)")
+        return _emit(PASS, f"gate pool: budget {info['budget']} configured (protocol "
+                           f"{info['protocol']}); {seen_copies}")
+    return _emit(PASS, f"gate pool: {home} exists, no budget configured (pool OFF)")
+
+
 def cmd_doctor(args):
     settings = _load_settings()
     repo_status, _head = check_repo_main(getattr(args, "repo", None))
@@ -2260,7 +2459,7 @@ def cmd_doctor(args):
                check_session_init_hook(settings),
                repo_status, check_allowlist(settings),
                check_merge_gate_shadows(), check_toolinput_only_hooks(),
-               check_slack_channel(), check_slack_bot_user_id()]
+               check_slack_channel(), check_slack_bot_user_id(), check_gate_pool()]
     hard_fail = any(s == FAIL for s in results)
     print()
     print("doctor: HARD-FAIL (fix the FAIL lines above before `up`)" if hard_fail else "doctor: ok (no hard fail)")
