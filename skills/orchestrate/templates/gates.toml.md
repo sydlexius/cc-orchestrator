@@ -122,6 +122,23 @@ one `--skip` would then match both), under Form A or the
 fallback chain (nothing to skip by name), and beside `--receipt` (a receipt must
 attest the whole gate, never a subset).
 
+### Sharding the step list (`--shard K/N`)
+
+`gate-runner.py --shard K/N` (OFF by default; absent = ZERO behavior change) runs
+only the Form B steps in shard K of N, so a CI workflow can spread one step list
+over N runners (this repo's macOS leg runs `--shard 1/3`, `2/3`, `3/3`). A step
+belongs to shard `1 + sha256(name) mod N`: a stable digest of the step NAME, not
+Python's per-process `hash()`, so the N shards partition the list and the
+assignment is identical across runs and machines. It combines with `--jobs`
+(each shard runs its steps in parallel) and with `--skip`: shard membership is
+computed from the FULL declared list by name alone, so adding a `--skip` never
+moves another step between shards, and `--skip` is still validated against the
+full list (a skipped step prints `[SKIP] <name>: --skip` in its own shard only).
+It exits 2 before running anything on a malformed value (anything but `K/N`
+with `1 <= K <= N`), when two steps share a name, under Form A or the fallback
+chain, and beside `--receipt`. The assignment is by name, not by cost, so
+shards can differ in step count and wall time.
+
 ### Pure-oracle memoization (`pure = true` + `--memoize-dir`)
 
 `gate-runner.py --memoize-dir <dir>` (OFF by default; absent = ZERO behavior
