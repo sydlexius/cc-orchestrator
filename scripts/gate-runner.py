@@ -36,13 +36,23 @@ deterministic floor or the advisory `# prep-pr-ok` gate. A `run`/`gate` string
 is handed to the shell (shell=True) ONLY as the documented trusted-config path,
 exactly like a Makefile recipe; nothing else is dynamically constructed.
 
-Exit codes: 0 = all gates passed / skipped / fell open; non-zero = a required
-gate failed.
+MACHINE-WIDE GATE POOL (#539, skills/orchestrate/design/DESIGN-gate-pool.md).
+OFF unless the USER wrote a `budget` into `~/.claude/gate-queue/config.toml`
+(root override: GATEQ_HOME). Off, nothing below changes and the sibling
+`gate_pool` module is never imported. On, this run first takes `cost` units of
+the machine budget as a hand-run gate (`[prep_pr] weight`, else Form B's
+effective `jobs`, else the whole budget) and waits for them; a wait that gives
+up is exit 75, NOT RUN, which is neither a pass nor a failed gate.
+
+Exit codes: 0 = all gates passed / skipped / fell open; 75 = NOT RUN (pool on,
+no slot in time); other non-zero = a required gate failed (1) or a config
+error (2).
 
 Run: python3 gate-runner.py   (from anywhere inside the repo)
 """
 import glob
 import hashlib
+import io
 import json
 import os
 import re
@@ -180,6 +190,12 @@ def run_prep_pr(prep, root, memoize_dir=None, cli_jobs=None, cli_skip=None,
         return 2, _synth_records(2)
     if "jobs" in prep and not _valid_jobs(prep["jobs"]):
         warn("[prep_pr].jobs must be a positive integer")
+        return 2, _synth_records(2)
+    # `weight` (#539) is the gate's machine cost. It is read by main() before this run takes
+    # its pool slots and changes nothing here, but a bad value is refused with the pool ON OR
+    # OFF, like `jobs`: CI configures no budget, and must still catch it.
+    if "weight" in prep and not _valid_jobs(prep["weight"]):
+        warn("[prep_pr].weight must be a positive integer")
         return 2, _synth_records(2)
     jobs = cli_jobs if cli_jobs is not None else prep.get("jobs", 1)
     if cli_skip and not has_steps:
@@ -1154,10 +1170,13 @@ def _parse_args(argv):
     return receipt_path, memoize_dir, jobs, skip, shard
 
 
-def _run_gates(root, memoize_dir, jobs=None, skip=None, shard=None):
+def _run_gates(root, memoize_dir, jobs=None, skip=None, shard=None, raw=None):
     """Resolve config and run the gates. Return (exit_code, records). `jobs` is
     the raw --jobs string or None; `skip` the raw --skip list or None; `shard`
-    the raw --shard string or None."""
+    the raw --shard string or None. `raw` (pool on only) is the bytes of a
+    `.gates.toml` that _pool_cost already judged INVALID: they are parsed
+    instead of the file, so the config that was refused a ticket is the one
+    rejected here, never a version fixed in between (which would run unpooled)."""
     if shard is not None:
         m = re.fullmatch(r"([0-9]+)/([0-9]+)", shard)
         if not m or not 1 <= int(m.group(1)) <= int(m.group(2)):
@@ -1175,7 +1194,7 @@ def _run_gates(root, memoize_dir, jobs=None, skip=None, shard=None):
             return 2, _synth_records(2)
         jobs = int(jobs)
     config_path = os.path.join(root, CONFIG_NAME)
-    if not os.path.isfile(config_path):
+    if raw is None and not os.path.isfile(config_path):
         if skip:
             warn("`--skip` applies only to Form B `steps`; the fallback chain "
                  "cannot honor it")
@@ -1189,8 +1208,11 @@ def _run_gates(root, memoize_dir, jobs=None, skip=None, shard=None):
                  "runs serially")
         return fallback_chain(root)
     try:
-        with open(config_path, "rb") as f:
-            data = tomllib.load(f)
+        if raw is None:
+            with open(config_path, "rb") as f:
+                data = tomllib.load(f)
+        else:
+            data = tomllib.load(io.BytesIO(raw))
     except (OSError, tomllib.TOMLDecodeError) as e:
         # A present-but-broken config is a real error (unlike a missing one).
         warn(f"could not parse {CONFIG_NAME}: {e}")
@@ -1201,6 +1223,135 @@ def _run_gates(root, memoize_dir, jobs=None, skip=None, shard=None):
         return 2, _synth_records(2)
     log(f"gate-runner: using {config_path}")
     return run_prep_pr(prep, root, memoize_dir, jobs, skip, shard)
+
+
+# --- Machine-wide gate pool (#539; OFF unless the user configured a budget) ---
+#
+# Design of record: skills/orchestrate/design/DESIGN-gate-pool.md. The config reader lives
+# HERE, not in gate_pool.py, because it must run with the pool off (a typo such as `budegt`
+# has to exit 2, never read as "no budget") while the module is never imported then.
+
+POOL_KEYS = ("protocol", "budget", "backfill_bypass_limit", "small_check_cap",
+             "wait_timeout_s", "job_timeout_s")
+
+
+def _pool_home():
+    """The pool root: $GATEQ_HOME (empty reads as unset), else ~/.claude/gate-queue."""
+    return os.environ.get("GATEQ_HOME") or os.path.join(
+        os.path.expanduser("~"), ".claude", "gate-queue")
+
+
+def _pool_config():
+    """The machine config -> ("off", info) | ("error", message) | ("on", cfg). Reads
+    <pool root>/config.toml. Never imports gate_pool, never writes, never creates.
+
+    OFF is exactly: no file, no `[pool]` table, or a `[pool]` table with no `budget` (info
+    then says so, for doctor). Everything else that is not a valid config is an ERROR, so a
+    typo can never silently disable the bound it configures: an unreadable or malformed file,
+    a `[pool]` that is no table, ANY key outside POOL_KEYS, a value that is not a positive
+    integer, a `budget` with no `protocol`. Tables other than `[pool]` are ignored (unit B
+    adds its keys in a table of its own). `cfg` is the validated `[pool]` table."""
+    path = os.path.join(_pool_home(), "config.toml")
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except FileNotFoundError:
+        return "off", None
+    except (OSError, ValueError) as e:     # ValueError: a TOML or a UTF-8 decode error
+        return "error", f"{path}: {e}"
+    if "pool" not in data:
+        return "off", None
+    pool = data["pool"]
+    if not isinstance(pool, dict):
+        return "error", f"{path}: [pool] must be a table"
+    for key in pool:
+        if key not in POOL_KEYS:
+            return "error", f"{path}: unknown key [pool].{key}"
+    for key in POOL_KEYS:
+        if key in pool and not _valid_jobs(pool[key]):
+            return "error", f"{path}: [pool].{key} must be a positive integer"
+    if "budget" not in pool:
+        return "off", "pool-table-without-budget"
+    if "protocol" not in pool:
+        return "error", f"{path}: [pool].budget needs [pool].protocol"
+    return "on", dict(pool)
+
+
+def _pool_cost(root, jobs_raw, budget):
+    """What this invocation costs -> (cost, raw). Parses `.gates.toml` OUTSIDE any lock.
+
+    cost: `[prep_pr] weight`, else the `jobs` Form B will actually use (`--jobs` wins), else
+    the WHOLE budget (Form A, the fallback chain, a Form B table declaring neither: an
+    undeclared cost is assumed heavy and runs alone), clamped to the budget.
+    cost None: this invocation's config is one _run_gates rejects with exit 2 before it runs
+    anything (a bad `--jobs`, an unparseable file, no `[prep_pr]` table, both `gate` and
+    `steps`, a bad `jobs`, a bad `weight`); it takes no ticket. `raw` is then the bytes that
+    were judged (None when no file was read), for _run_gates to reject THOSE."""
+    cli = None
+    if jobs_raw is not None:
+        if not re.fullmatch(r"[0-9]+", jobs_raw) or int(jobs_raw) < 1:
+            return None, None
+        cli = int(jobs_raw)
+    config_path = os.path.join(root, CONFIG_NAME)
+    if not os.path.isfile(config_path):
+        return budget, None                # the fallback chain
+    try:
+        with open(config_path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        # Unreadable right now: judged again after the grant, pooled at the whole budget.
+        return budget, None
+    try:
+        prep = tomllib.load(io.BytesIO(raw)).get("prep_pr")
+    except ValueError:
+        return None, raw
+    if not isinstance(prep, dict) or ("gate" in prep and "steps" in prep) \
+            or ("jobs" in prep and not _valid_jobs(prep["jobs"])) \
+            or ("weight" in prep and not _valid_jobs(prep["weight"])):
+        return None, raw
+    if "weight" in prep:
+        return min(prep["weight"], budget), raw
+    jobs = cli if cli is not None else prep.get("jobs")
+    if "steps" in prep and jobs is not None:
+        return min(jobs, budget), raw
+    return budget, raw
+
+
+def _pool_say(line):
+    """A pool line: stderr, no `WARN:` prefix (a wait is not a warning)."""
+    print(line, file=sys.stderr, flush=True)
+
+
+def _pool_enter(cfg, root, cost):
+    """Take `cost` units as a hand-run gate (kind `gate`, class 2), waiting for them ->
+    (holder, None), or (None, exit code) with the reason already printed: 2 for a pool this
+    code cannot use, 75 for a wait that gave up (NOT RUN), 130 for an interrupted wait.
+    A run started BY a holder in this worktree goes under that holder's slots instead
+    (gate_pool decides, from GATEQ_HOLDER). The module is imported only here."""
+    if not os.path.isfile(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "gate_pool.py")):
+        # Never fall back to running unpooled: the user configured a bound.
+        _pool_say("gate-runner: NOT RUN - pool configured but gate_pool.py is missing")
+        return None, 2
+    import gate_pool
+    try:
+        # Pool() refuses another pool protocol and a root that is not the user's own 0700
+        # directory BEFORE it touches anything there.
+        pool = gate_pool.Pool(_pool_home(), cfg)
+        # The worktree key runs git, so it is resolved HERE, before admit.lock is ever
+        # taken, from the worktree ROOT (a subdirectory would get a different key).
+        key = gate_pool.worktree_key(root)
+        return pool.acquire("gate", "gate", cost, key, environ=os.environ,
+                            say=_pool_say), None
+    except gate_pool.NotRun as e:
+        _pool_say(e.message)
+        return None, e.code
+    except KeyboardInterrupt:              # the ticket was given up by acquire()
+        _pool_say("gate-runner: NOT RUN - interrupted while waiting for a gate slot")
+        return None, 130
+    except OSError as e:                   # a pool directory this run cannot use: never unpooled
+        _pool_say(f"gate-runner: NOT RUN - pool error: {e}")
+        return None, 2
 
 
 def main(argv=None):
@@ -1219,10 +1370,37 @@ def main(argv=None):
              "attest the whole gate")
         return 2
     root = find_repo_root()
-    pre = _snapshot(root, receipt_path) if receipt_path else None
-    rc, records = _run_gates(root, memoize_dir, jobs, skip, shard)
-    if receipt_path:
-        _write_receipt(receipt_path, root, rc, records, pre)
+    state, pool = _pool_config()
+    if state == "error":
+        _pool_say(f"gate-runner: NOT RUN - {pool}")
+        if receipt_path:                   # no step ran: nothing may read as this run's (#497)
+            _remove_stale(receipt_path)
+        return 2
+    holder = raw = None
+    if state == "on":
+        # Cost first, outside every lock. A config this run would reject anyway takes no
+        # ticket: it falls through and _run_gates rejects the bytes that were judged.
+        cost, raw = _pool_cost(root, jobs, pool["budget"])
+        if cost is not None:
+            holder, code = _pool_enter(pool, root, cost)
+            if holder is None:
+                if receipt_path:
+                    _remove_stale(receipt_path)
+                return code
+            raw = None                     # granted: re-read .gates.toml and run THAT definition
+            # Children get the holder from THIS run's own state, never an inherited value.
+            os.environ.update(holder.child_env())
+            if not os.environ["GATEQ_NEST"]:
+                del os.environ["GATEQ_NEST"]
+    try:
+        # The snapshot is taken AFTER the grant, so a wait never widens what a receipt attests.
+        pre = _snapshot(root, receipt_path) if receipt_path else None
+        rc, records = _run_gates(root, memoize_dir, jobs, skip, shard, raw=raw)
+        if receipt_path:
+            _write_receipt(receipt_path, root, rc, records, pre)
+    finally:
+        if holder is not None:
+            holder.release()
     return rc
 
 

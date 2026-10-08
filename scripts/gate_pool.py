@@ -14,8 +14,8 @@ inside a gate step) goes under that holder's slots instead of waiting on them, o
 conditions. No lock here can go stale: the kernel drops each one when its process dies.
 
 THE HOME IS ALWAYS PASSED IN. This module resolves no home directory and reads no config
-file; its caller hands it the pool root and an already validated config. Nothing imports it
-yet outside its harness: the gate-runner wiring is a later PR of #539.
+file; its caller hands it the pool root and an already validated config. Its one caller is
+scripts/gate-runner.py, which imports it ONLY when the user configured a budget.
 
 THREE RULES EVERY LINE BELOW KEEPS (doc section 4):
   1. no lock descriptor is ever inherited: each comes from `_open_lock` (non-inheritable),
