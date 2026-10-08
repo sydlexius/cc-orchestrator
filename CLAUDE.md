@@ -198,6 +198,26 @@ Runtime (`scripts/`; canonical source is this repo):
   The backup is VERIFIED to exist rather than inferred from the call succeeding: `shutil.copy2`
   onto a DIRECTORY does not raise, it copies INTO it, so a bare try/except reports a backup that
   is not there and then clobbers the original.
+  GATE POOL (#539): `check_gate_pool` is WARN-ONLY (never a FAIL) and READ-ONLY: it creates and
+  writes nothing in the pool home. Its locks are trial try-locks on tickets, taken under
+  `admit.lock` when that file already exists as a regular file; `admit.lock` itself is taken with
+  a non-blocking try retried for about 2 seconds, and if it stays held the ticket check is
+  SKIPPED with one WARN (so a stuck evaluator can never hang doctor). No pool directory is one quiet PASS line. Else it
+  path-loads the BUNDLED `gate-runner.py` to reuse its `_pool_config()` (one definition of what a
+  config means; no `main()`, no bytecode written, nothing left in `sys.modules`; a load failure,
+  `SystemExit` included, is one WARN) and WARNs on: a root that is not the user's own 0700
+  directory, a config error, a `[pool]` table with no `budget`, a budget the TOML parse and the
+  callers' text match disagree on (`POOL_BUDGET_LINE_RE`, a CROSS-PR CONTRACT: every command
+  block that asks "is a budget configured" must use that same expression), each dead ticket of
+  another protocol (`gate_pool.dead_foreign_tickets`; no evaluator ever clears one, so the user
+  deletes it by hand), and, with a budget, each runner copy that is not pool-capable (the deployed
+  leg, the bundled copy, each `orchestrate@*` `installPath` in `installed_plugins.json`), saying
+  which part failed (the PASS line says the copies "have the pool import and module", not
+  "pool-capable"); a configured `protocol` differing from the bundled `POOL_PROTOCOL` is a WARN
+  (every gate exits 2); other cached plugin versions are ONE line. The `POOL_WATCHDOG` part of
+  pool-capable is NOT checked yet (the design assigns it to A4). KNOWN LIMIT: doctor does not
+  check that `slots/` and `waiters/` are usable directories, so a pool with a broken
+  subdirectory can PASS doctor while a gate exits 2.
 - `uat-autobuild.sh` - repo-agnostic UAT auto-rebuild watcher: polls a branch HEAD, runs a
   parameterized `--build-cmd` on a new commit, and swaps only that port's LISTEN-pid (lease-safe)
   to the fresh binary. Keeps the leased UAT binary current (the SKILL.md "UAT EVERGREEN" mandate).

@@ -229,6 +229,13 @@ inside `[pool]`, a bad value, a `budget` with no `protocol`, or a file that does
 not parse exits 2 for EVERY gate: a typo must never silently disable the bound
 it configures. Tables other than `[pool]` are ignored.
 
+`orchestrate-setup.py doctor` reports the pool's problems as WARNs (it never
+writes there): a root that is not your own 0700 directory, a config error, a
+`[pool]` table with no `budget`, a `budget` not written as a plain `budget = N`
+line, a dead ticket left by another pool protocol (delete it by hand), and, once
+a budget is set, any `gate-runner.py` copy that predates the pool. Run it before
+writing the budget and again after.
+
 With a budget configured, every `gate-runner.py` run (a hand-run gate, the
 pre-push hook) first takes its COST in budget units and waits until they are
 free. A repo declares the cost in `.gates.toml`:

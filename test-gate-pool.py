@@ -803,6 +803,100 @@ def case_foreign(home):
     check("foreign: and the directory it names is not touched", not os.path.exists(other))
 
 
+def tree(home):
+    """Every entry under `home` (and `home` itself, as ".") with its inode, MODE, size and
+    mtime: equal before and after means nothing was created, written, chmod-ed, replaced or
+    unlinked."""
+    st = os.lstat(home)
+    out = [(".", st.st_ino, st.st_mode, st.st_size, st.st_mtime_ns)]
+    for root, dirs, files in os.walk(home):
+        for n in dirs + files:
+            st = os.lstat(os.path.join(root, n))
+            out.append((os.path.relpath(os.path.join(root, n), home), st.st_ino, st.st_mode,
+                        st.st_size, st.st_mtime_ns))
+    return sorted(out)
+
+
+@with_home
+def case_doctor_tickets(home):
+    same("doctor tickets: a pool with no waiters/ has none", gp.dead_foreign_tickets(home, 1), [])
+    check("doctor tickets: and the pool root is not created", not os.path.exists(home))
+    os.makedirs(os.path.join(home, "waiters"))
+    alien = {"pid": 1, "pool_protocol": 999, "kind": "gate", "name": "gate", "cost": 1,
+             "worktree": "/wt/F", "state": "running"}
+    mine = dict(alien, pool_protocol=gp.POOL_PROTOCOL)
+    w = os.path.join(home, "waiters")
+    held = [plant(home, "0000000001-live.ticket", alien, hold=True),
+            plant(home, "0000000004-mine-live.ticket", mine, hold=True)]
+    plant(home, "0000000002-dead.ticket", alien)
+    plant(home, "0000000002-dead.sched", {"pool_protocol": 999, "bypass": 1})
+    plant(home, "0000000003-mine-dead.ticket", mine)
+    plant(home, "0000000005-junk.ticket", "not a ticket")
+    os.mkdir(os.path.join(w, "0000000006-dir.ticket"))
+    before = tree(home)
+    same("doctor tickets: a FREE ticket of another protocol is listed with its sidecar, a free "
+         "unreadable one without; a HELD ticket and one of our own protocol never are",
+         gp.dead_foreign_tickets(home, gp.POOL_PROTOCOL),
+         [(os.path.join(w, "0000000002-dead.ticket"), os.path.join(w, "0000000002-dead.sched")),
+          (os.path.join(w, "0000000005-junk.ticket"), None)])
+    same("doctor tickets: nothing was created, written or unlinked (no admit.lock either)",
+         tree(home), before)
+    same("doctor tickets: foreign means differing from the CONFIGURED protocol",
+         [os.path.basename(t) for t, _ in gp.dead_foreign_tickets(home, 999)],
+         ["0000000003-mine-dead.ticket", "0000000005-junk.ticket"])
+    check("doctor tickets: every trial lock was dropped, and a live owner's lock was not",
+          lock_free(os.path.join(w, "0000000002-dead.ticket"))
+          and not lock_free(os.path.join(w, "0000000001-live.ticket")))
+    plant(home, "admit.lock", "", sub="")
+    before = tree(home)
+    same("doctor tickets: with an admit.lock present the answer is the same",
+         len(gp.dead_foreign_tickets(home, gp.POOL_PROTOCOL)), 2)
+    check("doctor tickets: and admit.lock is left free and untouched",
+          lock_free(os.path.join(home, "admit.lock")) and tree(home) == before)
+    # An own-protocol ticket whose NAME is not numeric, or whose record lacks a field an
+    # evaluator acts on, is not one this code clears: it is listed when its lock is free.
+    plant(home, "notnum.ticket", mine)
+    plant(home, "0000000009-bad.ticket", dict(mine, state="done"))
+    same("doctor tickets: an own-protocol ticket with a non-numeric name or a malformed record "
+         "is listed, as documented",
+         sorted(os.path.basename(t) for t, _ in gp.dead_foreign_tickets(home, gp.POOL_PROTOCOL)),
+         ["0000000002-dead.ticket", "0000000005-junk.ticket", "0000000009-bad.ticket",
+          "notnum.ticket"])
+    # A HELD admit.lock (a live or stuck evaluator): the helper gives up after its bounded wait
+    # and returns None ("skipped"), distinct from [] ("none found"). It must not block; the
+    # alarm turns a blocking lock into a FAIL line rather than a hung harness.
+    class _Hung(Exception):
+        pass
+
+    def _on_alarm(signum, frame):
+        raise _Hung()
+    saved_wait, gp.ADMIT_WAIT_S = gp.ADMIT_WAIT_S, 0.3
+    old_handler = signal.signal(signal.SIGALRM, _on_alarm)
+    hold = os.open(os.path.join(home, "admit.lock"), os.O_RDONLY)
+    try:
+        fcntl.flock(hold, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        signal.alarm(10)
+        t0 = time.monotonic()
+        try:
+            got = gp.dead_foreign_tickets(home, gp.POOL_PROTOCOL)
+        except _Hung:
+            got = "HUNG: blocked on admit.lock"
+        finally:
+            signal.alarm(0)
+        elapsed = time.monotonic() - t0
+    finally:
+        signal.signal(signal.SIGALRM, old_handler)
+        gp.ADMIT_WAIT_S = saved_wait
+        os.close(hold)
+    same("doctor tickets: a held admit.lock is 'skipped' (None) after a bounded wait, never a "
+         "hang and never a lockless read", got, None)
+    check("doctor tickets: and it gave up within a few seconds", elapsed < 5)
+    same("doctor tickets: once admit.lock is free again the list comes back",
+         len(gp.dead_foreign_tickets(home, gp.POOL_PROTOCOL)), 4)
+    for fd in held:
+        os.close(fd)
+
+
 # --- nested runs (doc section 5) ---------------------------------------------------------------
 def holder_in(pool, worktree, cost=4):
     """A running ticket holder, and the environment it gives the children it starts."""
@@ -1893,7 +1987,8 @@ CASES = [
     ("sidecar", case_sidecar), ("sigkill", case_sigkill),
     ("inherit", case_inherit), ("budget-change", case_budget_change), ("root", case_root),
     ("no-git-under-lock", case_no_git_under_lock), ("worktree-key", case_worktree_key),
-    ("acquire", case_acquire), ("foreign", case_foreign), ("nested-rows", case_nested_rows),
+    ("acquire", case_acquire), ("foreign", case_foreign),
+    ("doctor-tickets", case_doctor_tickets), ("nested-rows", case_nested_rows),
     ("nested-serial", case_nested_serial), ("nested-chain", case_nested_chain),
     ("unreadable-ticket", case_unreadable_ticket), ("strays", case_strays),
     ("git-isolation", case_git_isolation),
@@ -2115,6 +2210,40 @@ MUTATIONS += [
      "return os.open(path, flags, 0o600)",
      "fd = os.open(path, flags, 0o600); os.set_inheritable(fd, True); return fd", "inherit",
      "inherit: a child a holder starts by exec holds NONE of the holder's lock descriptors"),
+    # --- dead_foreign_tickets(), doctor's read-only view (S5) ---
+    ("doctor's list includes a ticket whose lock is HELD",
+     "if held is False and not mine:", "if not mine:", "doctor-tickets",
+     "doctor tickets: a FREE ticket of another protocol is listed with its sidecar, a free "
+     "unreadable one without; a HELD ticket and one of our own protocol never are"),
+    ("doctor's list includes tickets of the configured protocol",
+     "if held is False and not mine:", "if held is False:", "doctor-tickets",
+     "doctor tickets: a FREE ticket of another protocol is listed with its sidecar, a free "
+     "unreadable one without; a HELD ticket and one of our own protocol never are"),
+    ("doctor's probe creates admit.lock",
+     "    if _is_file(admit_path):\n        try:\n            admit = _open_lock(admit_path, "
+     "os.O_RDONLY | os.O_NONBLOCK)",
+     "    if True:\n        try:\n            admit = _open_lock(admit_path, os.O_RDWR | os.O_CREAT)",
+     "doctor-tickets",
+     "doctor tickets: nothing was created, written or unlinked (no admit.lock either)"),
+    ("doctor's admit.lock try-lock reverted to a BLOCKING lock",
+     "while not _try_lock(admit):",
+     "fcntl.flock(admit, fcntl.LOCK_EX)\n            while False:", "doctor-tickets",
+     "doctor tickets: a held admit.lock is 'skipped' (None) after a bounded wait, never a hang "
+     "and never a lockless read"),
+    ("doctor reports a held admit.lock as 'none found' ([]) instead of skipped",
+     "return None\n                time.sleep(0.05)", "return []\n                time.sleep(0.05)",
+     "doctor-tickets",
+     "doctor tickets: a held admit.lock is 'skipped' (None) after a bounded wait, never a hang "
+     "and never a lockless read"),
+    ("doctor treats an own-protocol ticket with a bad name as its own",
+     "protocol != POOL_PROTOCOL or (_ours(rec) and _seq_of(name) is not None))",
+     "protocol != POOL_PROTOCOL or _ours(rec))", "doctor-tickets",
+     "doctor tickets: an own-protocol ticket with a non-numeric name or a malformed record "
+     "is listed, as documented"),
+    ("doctor's probe unlinks the dead ticket it names",
+     "dead.append((path, side if _is_file(side) else None))",
+     "dead.append((path, side if _is_file(side) else None)); _rm(path)", "doctor-tickets",
+     "doctor tickets: nothing was created, written or unlinked (no admit.lock either)"),
 ]
 # The same table for scripts/gate-runner.py: the wiring. `old` must occur exactly once THERE.
 RUNNER_MUTATIONS = [
@@ -2230,8 +2359,12 @@ if os.geteuid() != 0:                      # chmod does not bite for root, so th
 
 
 def _rerun(scripts_dir, *args):
-    r = subprocess.run([sys.executable, os.path.abspath(__file__), *args], capture_output=True,
-                       text=True, env={**os.environ, "GATE_POOL_SCRIPTS": scripts_dir})
+    try:
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), *args], capture_output=True,
+                           text=True, env={**os.environ, "GATE_POOL_SCRIPTS": scripts_dir},
+                           timeout=600)
+    except subprocess.TimeoutExpired:      # a mutant that hangs is a kill-less failure, not a hang
+        return 124, "TIMEOUT: the re-run was killed after 600 s"
     return r.returncode, r.stdout + r.stderr
 
 
