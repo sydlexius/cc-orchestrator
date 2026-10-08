@@ -241,9 +241,13 @@ def worktree_key(root):
     no record and so gets a DIFFERENT key (its own resolved path), not its worktree's. Runs
     git, so it is called BEFORE admit.lock is taken, never under it."""
     real = os.path.realpath(root)
+    # A caller under a git hook has GIT_DIR (and friends) exported: git would then list the
+    # worktrees of THAT repository whatever -C says, `root` would match no record, and a hook
+    # and a hand-run in one moved worktree would get two different keys.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     try:
         out = subprocess.run(["git", "-C", root, "worktree", "list", "--porcelain"],
-                             capture_output=True, text=True, check=False, timeout=60).stdout
+                             capture_output=True, text=True, check=False, timeout=60, env=env).stdout
     except (OSError, subprocess.SubprocessError):
         out = ""
     for line in out.splitlines():
@@ -598,23 +602,33 @@ class Holder:
     def child_env(self):
         """The variables this run sets on the children it starts, from its OWN state and never
         from what it inherited. A ticket holder names itself and blanks GATEQ_NEST (empty reads
-        as unset), so a value leaked from another holder dies here. A nested run keeps the
-        GATEQ_HOLDER it runs under and names the lock it holds, which its children lock one
-        level below."""
+        as unset), so a value leaked from another holder dies here. A nested run names the
+        holder it runs under (the one its own exemption was checked against, so a caller that
+        builds a child environment from this mapping alone still nests) and the lock it holds,
+        which its children lock one level below."""
         if self.nest:
-            return {"GATEQ_NEST": self.nest}
+            return {"GATEQ_HOLDER": self.path, "GATEQ_NEST": self.nest}
         return {"GATEQ_HOLDER": self.path, "GATEQ_NEST": ""}
 
     def release(self):
-        """A ticket holder unlinks its ticket and sidecar under admit.lock; then every lock is
-        dropped by closing its descriptor. A nested run only closes: a child lock is never
-        unlinked by its user (a sibling may be about to lock it). Skipped by a process that
-        dies: the kernel frees the locks at once and the next evaluator unlinks the ticket."""
-        if self.fds:
-            if not self.nest:
-                with self.pool._admit():
-                    _rm(self.path)
-                    _rm(_sched_of(self.path))
-            for fd in self.fds:
-                os.close(fd)
-            self.fds = []
+        """A ticket holder unlinks its ticket and sidecar and drops every lock (by closing its
+        descriptor) in ONE admit.lock section: a pass that no longer sees the ticket must not
+        still find its slots held, or it would start a same-worktree waiter that fits the
+        OTHER free slots while this holder has not let go. A nested run only closes: a child
+        lock is never unlinked by its user (a sibling may be about to lock it). Skipped by a
+        process that dies: the kernel frees the locks at once and the next evaluator unlinks
+        the ticket."""
+        if not self.fds:
+            return
+        if self.nest:
+            self._close()
+            return
+        with self.pool._admit():
+            _rm(self.path)
+            _rm(_sched_of(self.path))
+            self._close()                  # before admit.lock is let go, never after
+
+    def _close(self):
+        for fd in self.fds:
+            os.close(fd)
+        self.fds = []

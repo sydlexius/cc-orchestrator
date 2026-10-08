@@ -39,6 +39,7 @@ opened for writing, so a concurrent `git add` can never capture a mutant.
 
 import ast
 import atexit
+import contextlib
 import fcntl
 import json
 import os
@@ -478,6 +479,31 @@ def case_disk_worktree(home):
     b.leave(); g.leave()
 
 
+def _is_open(fd):
+    try:
+        os.fstat(fd)
+        return True
+    except OSError:
+        return False
+
+
+@with_home
+def case_release_atomic(home):
+    pool = gp.Pool(home, cfg())
+    a = pool.enter("gate", "gate", 4, "/wt/a"); a.poll()
+    fds, admit, seen = list(a.holder.fds), pool._admit, []
+
+    @contextlib.contextmanager
+    def spy():                             # what is still held the moment admit.lock is let go
+        with admit():
+            yield
+        seen.append((os.path.exists(a.path), [_is_open(fd) for fd in fds]))
+    pool._admit = spy
+    a.holder.release()
+    same("release: the ticket is gone and every lock dropped in ONE admit.lock section",
+         (len(fds), seen), (5, [(False, [False] * 5)]))
+
+
 @with_home
 def case_sidecar(home):
     pool = gp.Pool(home, cfg())
@@ -769,7 +795,8 @@ def case_nested_rows(home):
          (listing(home, suffix=".ticket"), len(n.fds), os.get_inheritable(n.fds[0])),
          (tickets, 1, False))
     same("nested rows: what it holds is its holder's child lock, which it names for ITS children",
-         (n.nest, n.child_env()), (h.path + ".nest", {"GATEQ_NEST": h.path + ".nest"}))
+         (n.nest, n.child_env()),
+         (h.path + ".nest", {"GATEQ_HOLDER": h.path, "GATEQ_NEST": h.path + ".nest"}))
     n.release()
     t = pool.acquire("gate", "gate", 1, "/wt/Y", environ=env, say=said.append, sleep=no_wait)
     same("nested rows: a run handed a holder from another worktree takes its own ticket and "
@@ -932,6 +959,18 @@ def case_worktree_key():
              [gp.worktree_key(wt)], recorded)
         same("worktree key: a directory that is no worktree is keyed by its own resolved path",
              gp.worktree_key(plain), os.path.realpath(plain))
+        # The hook shape: GIT_DIR exported, naming ANOTHER repository. The harness scrubs its
+        # own environment at import, so only setting it here proves the call site scrubs too.
+        other = os.path.join(tmp, "other"); os.mkdir(other)
+        subprocess.run(["git", "-C", other, "init", "-q"], check=True, capture_output=True,
+                       env=env)
+        os.environ["GIT_DIR"] = os.path.join(other, ".git")
+        try:
+            under_hook = [gp.worktree_key(moved)]
+        finally:
+            del os.environ["GIT_DIR"]
+        same("worktree key: with GIT_DIR naming another repository the key is still the string "
+             "git RECORDED for this worktree", under_hook, recorded)
 
 
 CASES = [
@@ -941,7 +980,8 @@ CASES = [
     ("class0-pass-list", case_class0_pass_list), ("bound-in-pass", case_bound_in_pass),
     ("cost-zero", case_cost_zero), ("pure", case_pure), ("static", case_static),
     ("disk-budget", case_disk_budget), ("disk-order", case_disk_order),
-    ("disk-worktree", case_disk_worktree), ("sidecar", case_sidecar), ("sigkill", case_sigkill),
+    ("disk-worktree", case_disk_worktree), ("release-atomic", case_release_atomic),
+    ("sidecar", case_sidecar), ("sigkill", case_sigkill),
     ("inherit", case_inherit), ("budget-change", case_budget_change), ("root", case_root),
     ("no-git-under-lock", case_no_git_under_lock), ("worktree-key", case_worktree_key),
     ("acquire", case_acquire), ("foreign", case_foreign), ("nested-rows", case_nested_rows),
@@ -1106,6 +1146,18 @@ MUTATIONS = [
      'return {"GATEQ_HOLDER": self.path, "GATEQ_NEST": ""}', 'return {"GATEQ_NEST": ""}',
      "nested-rows",
      "nested rows: a ticket holder names its OWN ticket for its children, and blanks GATEQ_NEST"),
+    ("a nested run passes no GATEQ_HOLDER to its children",
+     'return {"GATEQ_HOLDER": self.path, "GATEQ_NEST": self.nest}',
+     'return {"GATEQ_NEST": self.nest}', "nested-rows",
+     "nested rows: what it holds is its holder's child lock, which it names for ITS children"),
+    ("a released holder's locks dropped after admit.lock is let go",
+     "            self._close()                  # before admit.lock is let go, never after",
+     "        self._close()", "release-atomic",
+     "release: the ticket is gone and every lock dropped in ONE admit.lock section"),
+    ("worktree_key runs git with the caller's GIT_ variables",
+     "timeout=60, env=env).stdout", "timeout=60).stdout", "worktree-key",
+     "worktree key: with GIT_DIR naming another repository the key is still the string git "
+     "RECORDED for this worktree"),
     ("seq allocated from the seq file alone",
      "seq = 1 + max([0, last] + [n for n in map(_seq_of, os.listdir(self.waiters))\n"
      "                                       if n is not None])", "seq = 1 + last", "disk-order",
