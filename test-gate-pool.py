@@ -613,6 +613,109 @@ def case_no_git_under_lock(home):
     check("no git under the lock: enter, poll, commit and release start no process", ok)
 
 
+def refused(fn):
+    """The NotRun `fn` raises, as (code, reason, message); None when it raises none."""
+    try:
+        fn()
+    except gp.NotRun as e:
+        return e.code, e.reason, e.message
+    return None
+
+
+@with_home
+def case_acquire(home):
+    pool = gp.Pool(home, cfg(budget=4, wait_timeout_s=70))
+    said, slept, now = [], [], [0.0]
+
+    def sleep(s):
+        slept.append(s); now[0] += s
+    kw = dict(say=said.append, clock=lambda: now[0], sleep=sleep)
+    h = pool.acquire("gate", "gate", 4, "/wt/a", **kw)
+    same("acquire: a free pool grants on the first poll, with no line and no sleep",
+         (len(h.fds), said, slept), (5, [], []))
+    same("acquire: a wait that outlasts wait_timeout_s is NOT RUN, exit 75",
+         refused(lambda: pool.acquire("gate", "gate", 2, "/wt/b", **kw)),
+         (75, "wait-timeout", "gate-runner: NOT RUN - no gate slot within 70s"))
+    same("acquire: one wait line at the first failed poll, then one every 30 s",
+         said, ["gate-runner: waiting for 2 of 4 gate slots (0 free, 0 ahead)"] * 3)
+    check("acquire: every sleep is the 1 s poll with its jitter, and they add up to the timeout",
+          all(0.8 <= s <= 1.2 for s in slept) and 70 <= sum(slept) < 71.2)
+    same("acquire: a waiter that gave up leaves no ticket behind",
+         listing(home), [os.path.basename(h.path)])
+    mark = len(slept)
+
+    def release_on_third(s):               # the fake clock still runs, so this cannot hang
+        sleep(s)
+        if len(slept) == mark + 3:
+            h.release()
+    h2 = pool.acquire("gate", "gate", 2, "/wt/b", **{**kw, "sleep": release_on_third})
+    same("acquire: a release during the wait is taken at the next poll",
+         (len(h2.fds), len(slept) - mark), (3, 3))
+
+    def interrupt(s):
+        raise KeyboardInterrupt
+    try:
+        pool.acquire("gate", "gate", 4, "/wt/c", say=said.append, sleep=interrupt); got = None
+    except KeyboardInterrupt:
+        got = listing(home)
+    same("acquire: an interrupt while waiting passes through and leaves no ticket behind",
+         got, [os.path.basename(h2.path)])
+    h2.release()
+
+
+def plant(home, name, content, hold=False):
+    """Put a file in waiters/ that this pool did not write; with `hold`, flock it the way a
+    live owner would and return the descriptor."""
+    path = os.path.join(home, "waiters", name)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content if isinstance(content, str) else json.dumps(content))
+    if hold:
+        fd = os.open(path, os.O_RDONLY)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+
+
+@with_home
+def case_foreign(home):
+    pool = gp.Pool(home, cfg())
+    low = pool.enter("gate", "gate", 1, "/wt/low")           # seq 1
+    in_f = pool.enter("gate", "gate", 1, "/wt/F")            # seq 2, the live foreign one's worktree
+    alien = {"pid": 1, "pool_protocol": 999, "kind": "gate", "name": "gate", "cost": 1,
+             "worktree": "/wt/F", "state": "running"}
+    live = plant(home, "0000000003-live.ticket", alien, hold=True)
+    plant(home, "0000000004-dead.ticket", alien)
+    plant(home, "0000000004-dead.sched", {"pool_protocol": 999, "bypass": 1})
+    plant(home, "0000000005-junk.ticket", "not a ticket")    # unreadable counts as foreign
+    planted = ["0000000003-live.ticket", "0000000004-dead.sched", "0000000004-dead.ticket",
+               "0000000005-junk.ticket"]
+    high = pool.enter("gate", "gate", 1, "/wt/high")
+    same("foreign: seq allocation counts the foreign tickets it can see", high.seq, 6)
+    same("foreign: a waiter does not start behind a LIVE foreign ticket with a lower seq",
+         [high.poll() for _ in range(10)], [False] * 10)
+    same("foreign: its wait line says so", high.status(),
+         "gate-runner: waiting behind a ticket of another pool protocol")
+    same("foreign: a live foreign ticket's worktree is busy", (in_f.poll(), in_f.status()),
+         (False, "gate-runner: waiting for this worktree (held by another pool protocol)"))
+    same("foreign: a live foreign ticket with a HIGHER seq blocks nobody", low.poll(), True)
+    same("foreign: no foreign or unreadable record was unlinked in all those passes",
+         [n for n in listing(home) if n in planted], planted)
+    with open(os.path.join(home, "waiters", planted[2]), encoding="utf-8") as f:
+        same("foreign: nor rewritten", json.load(f), alien)
+    os.close(live)                                           # the foreign process is gone
+    same("foreign: with its lock free it blocks nobody and holds no worktree",
+         (high.poll(), in_f.poll()), (True, True))
+    same("foreign: and it is STILL never unlinked (doctor names it, the user deletes it)",
+         [n for n in listing(home) if n in planted], planted)
+    for w in (low, in_f, high):
+        w.leave()
+    other = home + "-other"
+    same("foreign: a config of another pool protocol is refused with exit 2",
+         refused(lambda: gp.Pool(other, {"protocol": 2, "budget": 10})),
+         (2, "pool-protocol", "gate-runner: NOT RUN - pool protocol 1 != configured 2; "
+                              "update the plugin and run configure --apply"))
+    check("foreign: and the directory it names is not touched", not os.path.exists(other))
+
+
 def case_worktree_key():
     # A linked worktree that was MOVED, with a symlink left at the path git recorded: the one
     # shape where the recorded string and the resolved path differ on every platform.
@@ -651,6 +754,7 @@ CASES = [
     ("disk-worktree", case_disk_worktree), ("sidecar", case_sidecar), ("sigkill", case_sigkill),
     ("inherit", case_inherit), ("budget-change", case_budget_change), ("root", case_root),
     ("no-git-under-lock", case_no_git_under_lock), ("worktree-key", case_worktree_key),
+    ("acquire", case_acquire), ("foreign", case_foreign),
 ]
 
 # --- mutation self-test: each assertion must be able to FAIL ---------------------------------
@@ -746,7 +850,7 @@ MUTATIONS = [
      "import time\n", "import time\n_fork = os.fork\n", "static",
      "static: no bare fork, no pass_fds and no close_fds=False in the module"),
     ("the worktree key resolved inside admit.lock",
-     "entries, busy = p._scan()", "entries, busy = p._scan(); worktree_key(p.home)",
+     "= p._scan(self.seq)", "= p._scan(self.seq); worktree_key(p.home)",
      "no-git-under-lock",
      "no git under the lock: enter, poll, commit and release start no process"),
     ("a failed poll keeps the slots it probed",
@@ -756,8 +860,26 @@ MUTATIONS = [
      "busy[rec[\"worktree\"]] = f\"{rec['kind']} pid {rec.get('pid')}\"", "pass", "disk-worktree",
      "disk worktree: a second entry in the SAME worktree does not start"),
     ("a dead ticket left in place",
-     "if not held:\n                _rm(path)", "if False:\n                _rm(path)", "sidecar",
-     "sidecar: a dead waiter protects nobody: the held entry starts"),
+     "if ours:", "if False:", "sidecar",
+     "sidecar: the dead ticket and its sidecar were unlinked by that pass"),
+    ("a foreign-protocol ticket whose lock is free unlinked",
+     "if ours:", "if True:", "foreign",
+     "foreign: no foreign or unreadable record was unlinked in all those passes"),
+    ("a live foreign ticket with a lower seq no longer blocks",
+     "blocked = blocked or n is None or n < seq", "pass", "foreign",
+     "foreign: a waiter does not start behind a LIVE foreign ticket with a lower seq"),
+    ("a live foreign ticket with ANY seq blocks",
+     "blocked = blocked or n is None or n < seq", "blocked = True", "foreign",
+     "foreign: a live foreign ticket with a HIGHER seq blocks nobody"),
+    ("a live foreign ticket's worktree not counted as busy",
+     'busy.setdefault(rec["worktree"], "another pool protocol")', "pass", "foreign",
+     "foreign: a live foreign ticket's worktree is busy"),
+    ("a waiter that gave up keeps its ticket",
+     "            w.leave()\n            raise", "            raise", "acquire",
+     "acquire: a waiter that gave up leaves no ticket behind"),
+    ("the wait line repeated on every poll",
+     "if noted is None or now - noted >= WAIT_NOTE_S:", "if True:", "acquire",
+     "acquire: one wait line at the first failed poll, then one every 30 s"),
     ("seq allocated from the seq file alone",
      "seq = 1 + max([0, last] + [n for n in map(_seq_of, os.listdir(self.waiters))\n"
      "                                       if n is not None])", "seq = 1 + last", "disk-order",

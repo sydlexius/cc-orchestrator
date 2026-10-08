@@ -31,6 +31,7 @@ import contextlib
 import fcntl
 import json
 import os
+import random
 import stat
 import subprocess
 import time
@@ -129,6 +130,8 @@ def schedule(entries, free, budget, busy, *, k, cap):
 EX_TEMPFAIL = 75                           # NOT RUN: none of 0 (pass), 1 (failed), 2 (config)
 # The optional machine keys and the values the doc gives them when absent (section 3).
 DEFAULTS = {"backfill_bypass_limit": 2, "small_check_cap": 2, "wait_timeout_s": 3600}
+POLL_S = 1.0                               # one pass per second, jittered 0.8x to 1.2x
+WAIT_NOTE_S = 30.0                         # a wait line at the first failed poll, then this often
 
 
 class NotRun(Exception):
@@ -234,10 +237,18 @@ def worktree_key(root):
 
 class Pool:
     """One process's view of the pool rooted at `home`. `cfg` is the validated machine config:
-    `budget`, and optionally the keys of DEFAULTS. The values are read ONCE, here: a process
-    that is waiting or running keeps the figures it started with (doc section 3)."""
+    `protocol`, `budget`, and optionally the keys of DEFAULTS. The values are read ONCE, here:
+    a process that is waiting or running keeps the figures it started with (doc section 3).
+
+    A config of ANOTHER pool protocol is refused before anything in the directory is touched:
+    a protocol bump needs the user's own edit of the config, so a branch cannot move the
+    machine to its protocol by being run (doc section 4)."""
 
     def __init__(self, home, cfg):
+        if cfg.get("protocol") != POOL_PROTOCOL:
+            raise NotRun(2, "pool-protocol",
+                         f"gate-runner: NOT RUN - pool protocol {POOL_PROTOCOL} != configured "
+                         f"{cfg.get('protocol')}; update the plugin and run configure --apply")
         self.home, self.budget = home, cfg["budget"]
         self.k, self.cap, self.wait_timeout_s = (cfg.get(key, DEFAULTS[key]) for key in DEFAULTS)
         self.waiters, self.slots, self.tmp = (os.path.join(home, d)
@@ -305,6 +316,31 @@ class Pool:
                 raise
         return w
 
+    def acquire(self, kind, name, cost, worktree, *, say, clock=time.monotonic,
+                sleep=time.sleep):
+        """Take a ticket and poll until it is granted -> Holder. Raises NotRun(75) when no
+        slot or no worktree came within wait_timeout_s: the caller did NOT run, which is
+        neither a pass nor a failed gate. On any way out but a grant (the timeout, an
+        interrupt) the ticket is given up, so nothing is left waiting. `say` gets one wait line
+        at the first failed poll and one every WAIT_NOTE_S; a grant on the first poll says
+        nothing. The sleep only paces the polls: every decision is made under admit.lock."""
+        w = self.enter(kind, name, cost, worktree)
+        deadline, noted = clock() + self.wait_timeout_s, None
+        try:
+            while not w.poll():
+                now = clock()
+                if now >= deadline:
+                    raise NotRun(EX_TEMPFAIL, "wait-timeout", "gate-runner: NOT RUN - no gate "
+                                 f"slot within {self.wait_timeout_s}s")
+                if noted is None or now - noted >= WAIT_NOTE_S:
+                    say(w.status())
+                    noted = now
+                sleep(POLL_S * random.uniform(0.8, 1.2))
+        except BaseException:
+            w.leave()
+            raise
+        return w.holder
+
     def _free_slots(self):
         """Try-lock every slot below THIS process's budget; the descriptors that locked are
         the free units. Creates a missing slot file, which is how a raised budget appears. The
@@ -318,23 +354,35 @@ class Pool:
                 os.close(fd)
         return got
 
-    def _scan(self):
-        """Read waiters/ under admit.lock -> (entries, busy). entries: the live waiting tickets
-        of this protocol. busy: {worktree key: who holds it} for the live running ones. A ticket
-        of this protocol whose lock is FREE belongs to a dead process and is unlinked here."""
+    def _scan(self, seq):
+        """Read waiters/ under admit.lock, for the ticket numbered `seq` -> (entries, busy,
+        blocked). entries: the live waiting tickets of this protocol. busy: {worktree key: who
+        holds it}. blocked: a LIVE foreign ticket with a lower seq exists.
+
+        A ticket of this protocol whose lock is FREE belongs to a dead process and is unlinked.
+        A FOREIGN ticket (another protocol, or unreadable) is never scheduled, rewritten or
+        unlinked, not even with its lock free: clearing a dead one is doctor's WARN and the
+        user's delete. While its lock is HELD it is a live process, so its worktree counts as
+        busy (its slots are held anyway: free is counted by try-lock) and a waiter with a
+        HIGHER seq does not start. Wait-for edges then only point at lower numbers, so two
+        protocols cannot deadlock on each other (doc section 4)."""
         for name in os.listdir(self.tmp):  # staging never outlives one admit.lock section
             _rm(os.path.join(self.tmp, name))
-        entries, busy = [], {}
+        entries, busy, blocked = [], {}, False
         for name in sorted(os.listdir(self.waiters)):
             if not name.endswith(".ticket"):
                 continue
             path = os.path.join(self.waiters, name)
             held, text = _probe(path)
             rec, n = _load(text), _seq_of(name)
-            if not (_ours(rec) and n is not None):
-                continue
+            ours = _ours(rec) and n is not None
             if not held:
-                _rm(path)
+                if ours:
+                    _rm(path)
+            elif not ours:
+                if isinstance(rec.get("worktree"), str):
+                    busy.setdefault(rec["worktree"], "another pool protocol")
+                blocked = blocked or n is None or n < seq
             elif rec["state"] == "waiting":
                 entries.append(Entry(n, rec["kind"], rec["cost"], rec["worktree"],
                                      bypass=_read_sched(_sched_of(path)) or 0, path=path))
@@ -345,7 +393,7 @@ class Pool:
             if name.endswith(".sched") and not os.path.exists(path[:-6] + ".ticket") \
                     and _read_sched(path) is not None:
                 _rm(path)
-        return entries, busy
+        return entries, busy, blocked
 
 
 class Waiter:
@@ -375,18 +423,20 @@ class Waiter:
             return True
         p, c = self.pool, min(self.cost, self.pool.budget)
         with p._admit():
-            entries, busy = p._scan()
+            entries, busy, blocked = p._scan(self.seq)
             got, keep = p._free_slots(), 0
             try:
                 me = next((e for e in entries if e.path == self.path), None)
                 start = schedule(entries, len(got), p.budget, set(busy), k=p.k, cap=p.cap)
                 passed = next((ps for e, ps in start if e is me), None)
-                if passed is None:
+                if passed is None or blocked:
                     ahead = 0 if me is None else sum(
                         (cls(e, p.cap), e.seq) < (cls(me, p.cap), me.seq) for e in entries)
                     self._why = (
                         f"gate-runner: waiting for this worktree (held by {busy[self.worktree]})"
                         if self.worktree in busy else
+                        "gate-runner: waiting behind a ticket of another pool protocol"
+                        if blocked and passed is not None else
                         f"gate-runner: waiting for {c} of {p.budget} gate slots "
                         f"({len(got)} free, {ahead} ahead)")
                     return False
