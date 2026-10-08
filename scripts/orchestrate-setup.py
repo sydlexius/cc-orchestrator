@@ -153,6 +153,13 @@ HELPER_NAMES = (
     #    instead of editing a canonical file mid-run. Same argument as the gh-* wrappers above:
     #    the remedy has to exist wherever the nudge is read.
     "orchestrate-status.sh", "orchestrate-feedback.sh",
+    # gate_pool.py (#539) is the module the DEPLOYED gate-runner.py imports from its own
+    # directory once the user configures a machine budget. A runner with a budget and no
+    # module beside it exits 2 ("pool configured but gate_pool.py is missing") rather than
+    # run unpooled, so omitting it here is the #216 shape again: every gate at the stable
+    # path (the pre-push hook's included) would stop the day the budget is written, while
+    # every test in this repo, where the sibling is always found, keeps passing.
+    "gate_pool.py",
 )
 # The _helper_deploy_action results that warrant an actual deploy write (vs. None / informational).
 HELPER_DEPLOY_ACTIONS = ("deploy", "refresh", "replace-symlink", "replace-broken-symlink")

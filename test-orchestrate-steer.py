@@ -1186,8 +1186,10 @@ def main():
     # unattended) and orchestrate-feedback.sh (named by steer rule 1 as the canonical way to log
     # feedback). Bumping this number is DELIBERATE, not bookkeeping: pinning it is what makes a
     # helper added to the deploy set impossible to add without also making it canonical below.
+    # 30 = those 29 + gate_pool.py (#539), the module the deployed gate-runner.py imports from
+    # its own directory once a machine budget is configured.
     check("#284 lockstep: HELPER_NAMES imported (exact count -- a truncated parse must not pass)",
-          len(helper_names) == 29)
+          len(helper_names) == 30)
     for h in helper_names:
         p = os.path.join(repo, "scripts", h)
         rc, err = run_steer({"file_path": p}, channel="stdin", tool_name="Edit", marker_active=True)

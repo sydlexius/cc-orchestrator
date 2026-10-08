@@ -118,8 +118,9 @@ Runtime (`scripts/`; canonical source is this repo):
   the key at all (a non-opted-in repo never forks). Accepted false positives: `export -n VAR=1; <gate>`
   and `export VAR=1 | <gate>` (the var never reaches the gate). An export/unset inside `bash -c`,
   `$(...)`, backticks or a shell-fed heredoc is SCOPED to that frame (it cannot reach the outer
-  shell); `eval` shares the shell, so its export does. Concurrent-gate lock detection was SKIPPED:
-  gate-runner takes no lock and a consumer's lock has no declared path, so no cheap deterministic test.
+  shell); `eval` shares the shell, so its export does. Concurrent-gate lock detection was SKIPPED
+  and is no longer wanted: with a machine budget configured gate-runner takes machine-wide slot locks
+  itself and waits (`scripts/gate_pool.py`), and a consumer's own lock has no declared path.
   Wired for Edit/Write/Bash/Read/Agent PreToolUse by `configure` (deployed Option-A like the guard).
   The `Agent` matcher is LOAD-BEARING, not cosmetic: without it the hook is never invoked on a spawn
   and rule (5) is DEAD CODE that fails open silently. Never duplicates
@@ -132,7 +133,7 @@ Runtime (`scripts/`; canonical source is this repo):
   [--apply]` is the consent-based path that wires the floor hook + missing allow-list entries into
   settings.json, DEPLOYS the bundled guard to the stable `~/.claude/scripts/` path (so a fresh
   plugin install has a working floor; idempotent, refreshes a stale copy, warns on a missing source),
-  DEPLOYS the 20 bundled PR-lifecycle helpers (HELPER_NAMES) the same Option-A way (#133; #234 added
+  DEPLOYS the bundled helpers (HELPER_NAMES) the same Option-A way (#133; #234 added
   `gh-react.sh`, #303 added `run-paths.sh`, and the elmer front half added `cr-quota-watch.sh`,
   `elmer-enqueue.sh`, `elmer-triage.sh` + `elmer-tick.sh` - for those the stable path is LOAD-BEARING, since it is what keeps the
   unattended loop inside the existing wrapper grant instead of needing a broad `gh` one; retiring
@@ -207,6 +208,32 @@ Runtime (`scripts/`; canonical source is this repo):
   in its header): issues only `gh pr list`/`view`/`repo view` reads + the read-only helper, NEVER
   mutates, and is NEVER a reason to widen the `gh pr` allow-list. Fails soft per-PR, loud (exit 2)
   when it cannot determine the in-flight set.
+- `scripts/gate_pool.py` - the MACHINE-WIDE GATE POOL (#539; design of record
+  `skills/orchestrate/design/DESIGN-gate-pool.md`), so several worktrees gating at once cannot
+  oversubscribe the machine. OFF unless the USER wrote a `budget` into
+  `~/.claude/gate-queue/config.toml` (root override `GATEQ_HOME`); off, `gate-runner.py` never
+  imports it and its output and exit codes equal goldens recorded before the pool existed. On,
+  every gate-runner run takes its COST in budget units first (`[prep_pr] weight`, else Form B's
+  effective `jobs`, else the WHOLE budget, so an undeclared gate runs alone) and waits: one kernel
+  `flock` per unit under `slots/`, one flocked ticket per waiting or running process under
+  `waiters/`, and ONE short lock (`admit.lock`) around every scheduling pass. No lock can go
+  stale: the kernel drops each when its process dies. The POLICY is the pure `schedule()` (three
+  classes, backfill bounded by a bypass count, one thing per worktree); a run started BY a holder
+  in the same worktree goes under that holder's slots on three exact conditions (`GATEQ_HOLDER`,
+  the `.nest` chain) instead of waiting on itself. THE CONFIG READER LIVES IN `gate-runner.py`
+  (`_pool_config`), not here, because it must refuse a typo with the pool off: an unknown key
+  inside `[pool]`, a value that is no positive integer, or a `budget` with no `protocol` exits 2
+  for every gate, never "no budget". EXIT 75 IS "NOT RUN" (no slot within `wait_timeout_s`, or a
+  nested run heavier than its holder): neither a pass nor a failed gate, and any older receipt is
+  removed. The receipt snapshot and the `.gates.toml` read happen AFTER the grant. The module has
+  no default home (its caller passes the root), starts no child but `git` (for the worktree key,
+  resolved BEFORE `admit.lock`), and opens every lock descriptor non-inheritable. `POOL_PROTOCOL`
+  is bumped when ordering or on-disk meaning changes; a process never schedules, rewrites or
+  unlinks a record of another protocol. Deployed via `HELPER_NAMES`: a deployed runner with a
+  budget and no module beside it exits 2. DO NOT WRITE A BUDGET YET: enforcement of
+  `job_timeout_s`, the pool-aware command prose and the orphan watchdog are later PRs of #539, and
+  until they ship a foreground caller reads 75 as a failed gate. `test-gate-pool.py` mutation-proves
+  both files against COPIES and pins `GATEQ_HOME` to a temp directory, as `test-gate-runner.py` does.
 - `scripts/orchestrate_schemas.py` - versioned schema registry + stdlib validator (#225, part of
   the #220 epic): one source-of-truth schema per structured artifact one agent writes and another
   reads (`gate-receipt/v1`, `finding-fix-list/v1`, `finding-reply-slice/v1`), so producers/consumers
@@ -723,6 +750,14 @@ often gate at once) with `test-orchestrate-steer` and `test-elmer-tick`
 exclusive; a consumer repo must audit its steps for shared state first. CI runs
 the same steps the same way (`--jobs 4`, minus a lockstep-checked `--skip` set).
 
+Machine-wide gate pool (#539; OFF unless the user configured a budget, and then
+nothing above changes): `[prep_pr] weight = N` declares the machine cost units a
+gate occupies (a positive integer, validated whenever present, like `jobs`). With
+a budget in `~/.claude/gate-queue/config.toml` the runner first waits for its
+cost (`weight`, else Form B's effective `jobs`, else the whole budget) and exits
+75, NOT RUN, if none comes within `wait_timeout_s`. See `scripts/gate_pool.py`
+above and `skills/orchestrate/templates/gates.toml.md`.
+
 ```sh
 shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/orchestrate-authorize-merge.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh scripts/base-freshness.sh scripts/open-pr-staleness-sweep.sh scripts/run-paths.sh scripts/cr-quota-watch.sh scripts/elmer-enqueue.sh scripts/elmer-triage.sh scripts/elmer-tick.sh scripts/stack-preflight.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
 ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/gate_pool.py scripts/prefs-coverage.py scripts/settings-scrub.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-ci-gates-lockstep.py test-steer-nudge-length.py test-helper-deploy-coverage.py test-jq-quoting.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-gate-pool.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-safe-push-freshness.py test-prep-pr-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py test-cr-quota-watch.py test-elmer-enqueue.py test-elmer-triage.py test-elmer-tick.py test-bash32-constructs.py test-settings-scrub.py test-stack-preflight.py test-command-positional-args.py
@@ -762,7 +797,7 @@ python3 test-jq-quoting.py
 python3 test-stale-branch-sweep.py
 python3 test-codoki-quota-watch.py
 python3 test-gate-runner.py
-python3 test-gate-pool.py   # #539: the pure schedule() of the gate pool (DESIGN-gate-pool.md)
+python3 test-gate-pool.py   # #539: the gate pool and its gate-runner wiring (DESIGN-gate-pool.md)
 python3 test-prefs-coverage.py
 python3 test-prose-lint.py
 python3 test-resolve-threads.py
