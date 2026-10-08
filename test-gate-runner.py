@@ -1952,6 +1952,160 @@ def test_skip_refuses_doubt():
             check("--skip + --receipt= (empty) -> nothing ran", not os.path.exists(marker))
 
 
+# --- Part E: opt-in `--shard K/N` (CI splits the macOS leg across runners, #544) --
+
+def _load_runner():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("gate_runner_mod", RUNNER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _expected_shard(name, n):
+    """Independent restatement of the contract: sha256 of the UTF-8 name, mod N, 1-based."""
+    import hashlib
+    return 1 + int(hashlib.sha256(name.encode("utf-8")).hexdigest(), 16) % n
+
+
+def test_shard_function_partitions_and_is_stable():
+    mod = _load_runner()
+    import tomllib
+    repo = os.path.dirname(os.path.abspath(RUNNER)) + "/.."
+    with open(os.path.join(repo, ".gates.toml"), "rb") as fh:
+        real = [s["name"] for s in tomllib.load(fh)["prep_pr"]["steps"]]
+    synthetic = [f"step-{i}-é" for i in range(40)] + ["a", "b", "c"]
+    for label, names in (("real .gates.toml", real), ("synthetic", synthetic)):
+        for n in (1, 2, 3, 5):
+            got = [mod._shard_of(x, n) for x in names]
+            check(f"shard fn ({label}, N={n}): every name lands in one shard 1..N",
+                  all(1 <= k <= n for k in got))
+            check(f"shard fn ({label}, N={n}): matches the sha256 contract",
+                  got == [_expected_shard(x, n) for x in names])
+            check(f"shard fn ({label}, N={n}): stable across calls",
+                  got == [mod._shard_of(x, n) for x in names])
+    check("shard fn: N=1 puts everything in shard 1",
+          {mod._shard_of(x, 1) for x in real} == {1})
+
+
+def test_shard_runs_partition_end_to_end():
+    """3 shards x (serial, parallel) run each step exactly once between them."""
+    names = [f"s{i}" for i in range(9)]
+    with tempfile.TemporaryDirectory() as aux:
+        for jobs in (None, 4):
+            seen = {}
+            for k in (1, 2, 3):
+                marks = {n: os.path.join(aux, f"{n}-{jobs}-{k}") for n in names}
+                with tempfile.TemporaryDirectory() as root:
+                    git_init(root)
+                    write(root, ".gates.toml", _steps_cfg(
+                        [(n, f"touch {m}", "") for n, m in marks.items()], jobs))
+                    rc, out = run_runner(root, args=("--shard", f"{k}/3"))
+                    check(f"--shard {k}/3: exit 0 (jobs={jobs})", rc == 0)
+                    ran = {n for n, m in marks.items() if os.path.exists(m)}
+                    check(f"--shard {k}/3: ran exactly its hashed steps (jobs={jobs})",
+                          ran == {n for n in names if _expected_shard(n, 3) == k})
+                    check(f"--shard {k}/3: announces the shard (jobs={jobs})",
+                          f"shard {k}/3" in out)
+                    for n in ran:
+                        seen[n] = seen.get(n, 0) + 1
+            check(f"--shard: every step ran in exactly one shard (jobs={jobs})",
+                  sorted(seen) == sorted(names) and set(seen.values()) == {1})
+
+
+def test_shard_malformed_and_refusals():
+    with tempfile.TemporaryDirectory() as aux:
+        marker = os.path.join(aux, "ran")
+        cfg = _steps_cfg([("a", f"touch {marker}", "")])
+        bad = ["", "0/3", "4/3", "1/0", "a/b", "1", "1/3/5", "-1/3", " 1/3", "1/ 3",
+               "1.5/3", "/3", "1/"]
+        for v in bad:
+            with tempfile.TemporaryDirectory() as root:
+                git_init(root)
+                write(root, ".gates.toml", cfg)
+                rc, _ = run_runner(root, args=(f"--shard={v}",))
+                check(f"--shard={v!r} -> exit 2, nothing ran",
+                      rc == 2 and not os.path.exists(marker))
+        with tempfile.TemporaryDirectory() as root:
+            git_init(root)
+            write(root, ".gates.toml", cfg)
+            rc, _ = run_runner(root, args=("--shard",))
+            check("trailing --shard (no value) -> exit 2",
+                  rc == 2 and not os.path.exists(marker))
+        cases = [
+            ("Form A", f'[prep_pr]\ngate = "touch {marker}"\n'),
+            ("fallback chain", None),
+            ("duplicate step name",
+             _steps_cfg([("a", "true", ""), ("a", f"touch {marker}", "")])),
+        ]
+        for label, c in cases:
+            with tempfile.TemporaryDirectory() as root:
+                git_init(root)
+                if c is None:
+                    write(root, "Makefile", f"gate:\n\ttouch {marker}\n")
+                else:
+                    write(root, ".gates.toml", c)
+                rc, _ = run_runner(root, args=("--shard", "1/1"))
+                check(f"--shard refused ({label}) -> exit 2, nothing ran",
+                      rc == 2 and not os.path.exists(marker))
+        with tempfile.TemporaryDirectory() as root:
+            git_init(root)
+            write(root, ".gates.toml", cfg)
+            git_commit(root)
+            rpath = os.path.join(aux, "receipt.json")
+            for rarg in (("--receipt", rpath), ("--receipt=",)):
+                rc, _ = run_runner(root, args=("--shard", "1/1") + rarg)
+                check(f"--shard + {rarg[0]} -> exit 2", rc == 2)
+            check("--shard + --receipt -> no receipt, nothing ran",
+                  not os.path.exists(rpath) and not os.path.exists(marker))
+
+
+def test_shard_skip_interaction():
+    """Membership is computed from the FULL list, so --skip never moves a step
+    between shards; a skipped step reports [SKIP] in its own shard and runs nowhere."""
+    names = [f"s{i}" for i in range(9)]
+    victim = names[0]
+    vshard = _expected_shard(victim, 3)
+    with tempfile.TemporaryDirectory() as aux:
+        ran_all = {}
+        for k in (1, 2, 3):
+            marks = {n: os.path.join(aux, f"{n}-{k}") for n in names}
+            with tempfile.TemporaryDirectory() as root:
+                git_init(root)
+                write(root, ".gates.toml",
+                      _steps_cfg([(n, f"touch {m}", "") for n, m in marks.items()]))
+                rc, out = run_runner(root, args=("--shard", f"{k}/3", "--skip", victim))
+                check(f"--shard {k}/3 + --skip: exit 0 (a skip naming any shard's step is valid)",
+                      rc == 0)
+                ran = {n for n, m in marks.items() if os.path.exists(m)}
+                check(f"--shard {k}/3 + --skip: ran its hashed steps minus the skipped one",
+                      ran == {n for n in names if _expected_shard(n, 3) == k and n != victim})
+                check(f"--shard {k}/3 + --skip: [SKIP] line only in the skipped step's shard",
+                      (f"[SKIP] {victim}: --skip" in out) == (k == vshard))
+                for n in ran:
+                    ran_all[n] = ran_all.get(n, 0) + 1
+        check("--shard + --skip: union is every step but the skipped one, each once",
+              sorted(ran_all) == sorted(n for n in names if n != victim)
+              and set(ran_all.values()) == {1})
+        with tempfile.TemporaryDirectory() as root:
+            git_init(root)
+            write(root, ".gates.toml", _steps_cfg([("a", "true", "")]))
+            rc, _ = run_runner(root, args=("--shard", "1/1", "--skip", "nope"))
+            check("--shard + --skip of an unknown name still exits 2", rc == 2)
+
+
+def test_shard_absent_is_byte_identical():
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, ".gates.toml", _steps_cfg([("a", "echo out-a", ""), ("b", "echo out-b", "")]))
+        rc, out = run_runner(root)
+        check("--shard absent: both steps run, no shard text anywhere",
+              rc == 0 and "[PASS] a" in out and "[PASS] b" in out and "shard" not in out)
+        rc1, out1 = run_runner(root, args=("--shard", "1/1"))
+        check("--shard 1/1 runs the same steps as no flag",
+              rc1 == 0 and "[PASS] a" in out1 and "[PASS] b" in out1)
+
+
 def main():
     print("test-gate-runner.py")
     for fn in [
@@ -1998,6 +2152,9 @@ def main():
         test_terminate_groups_ignores_popen_lock,
         test_skip_named_steps_serial_and_parallel, test_skip_absent_is_byte_identical,
         test_skip_refuses_doubt,
+        test_shard_function_partitions_and_is_stable, test_shard_runs_partition_end_to_end,
+        test_shard_malformed_and_refusals, test_shard_skip_interaction,
+        test_shard_absent_is_byte_identical,
     ]:
         print(f"- {fn.__name__}")
         fn()

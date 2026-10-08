@@ -19,6 +19,8 @@ exclusive forms:
             1 = the serial path, byte-identical to before #501).
             Opt-in `--skip <name>` (repeatable) skips named Form B steps;
             CI uses it to leave lint to its dedicated pinned steps.
+            Opt-in `--shard K/N` runs only the steps whose name hashes to
+            shard K of N (CI splits the macOS leg across runners, #544).
 See skills/orchestrate/templates/gates.toml.md for the full schema.
 
 Fail-open fallback when `.gates.toml` is absent, in order:
@@ -133,13 +135,43 @@ def _step_names(steps):
             if isinstance(s, dict)}
 
 
-def run_prep_pr(prep, root, memoize_dir=None, cli_jobs=None, cli_skip=None):
+def _shard_of(name, n):
+    """The 1-based shard (1..n) a step name belongs to: sha256 of the UTF-8 name
+    mod n. A stable digest, never Python's per-process-seeded `hash()`, so the
+    assignment is identical across runs, machines and interpreters. The name
+    ALONE decides, so a step's shard never depends on which other steps exist
+    or are skipped (adding a `--skip` cannot move a step)."""
+    return 1 + int(hashlib.sha256(name.encode("utf-8")).hexdigest(), 16) % n
+
+
+def _apply_shard(steps, shard):
+    """Keep only the steps whose name hashes to shard (k, n), from the FULL
+    declared list. Unnamed steps use their derived `step-<index>` name, with the
+    index taken before filtering. Non-table entries are kept so each path still
+    warns about them exactly as it does unsharded."""
+    k, n = shard
+    kept = []
+    for i, s in enumerate(steps):
+        if not isinstance(s, dict):
+            kept.append(s)
+            continue
+        name = s.get("name") or f"step-{i}"
+        if _shard_of(name, n) == k:
+            kept.append(s if s.get("name") else {**s, "name": name})
+    return kept
+
+
+def run_prep_pr(prep, root, memoize_dir=None, cli_jobs=None, cli_skip=None,
+                cli_shard=None):
     """Run the [prep_pr] table. Return (exit_code, records). `cli_jobs` is the
     already-validated `--jobs` value (None = not given); it overrides the
     table's `jobs`, which is validated whenever present. `cli_skip` is the
     `--skip` name set (None = not given): every name must match a Form B step,
     else exit 2, because a skip that names nothing is a stale caller that would
-    silently run (or, after a rename, silently stop skipping) the wrong set."""
+    silently run (or, after a rename, silently stop skipping) the wrong set.
+    `cli_shard` is the validated `(k, n)` pair (None = not given): Form B only,
+    names must be unique, and the step list is filtered AFTER the `--skip`
+    names are validated against the full list."""
     has_gate = "gate" in prep
     has_steps = "steps" in prep
     if has_gate and has_steps:
@@ -154,19 +186,25 @@ def run_prep_pr(prep, root, memoize_dir=None, cli_jobs=None, cli_skip=None):
         warn("`--skip` applies only to Form B `steps`; refusing to run a gate "
              "that cannot honor it")
         return 2, _synth_records(2)
-    if cli_skip and isinstance(prep["steps"], list):
-        # A NAME SELECTS STEPS ONLY UNDER --skip, so duplicates are refused only here (a consumer
-        # with a reused name and no --skip is unaffected). Two steps sharing a name would both
-        # match one --skip, so a copied block whose `run` was changed but not its `name` would
-        # leave CI silently (PR review of ci/parallel-harnesses). Unnamed steps count by their
+    if cli_shard and not has_steps:
+        warn("`--shard` applies only to Form B `steps`; refusing to run a gate "
+             "that cannot honor it")
+        return 2, _synth_records(2)
+    if (cli_skip or cli_shard) and isinstance(prep.get("steps"), list):
+        # A NAME SELECTS STEPS ONLY UNDER --skip / --shard, so duplicates are refused only here (a
+        # consumer with a reused name and no flag is unaffected). Two steps sharing a name would
+        # both match one --skip, so a copied block whose `run` was changed but not its `name`
+        # would leave CI silently (PR review of ci/parallel-harnesses); under --shard they share
+        # a shard, so the duplicate would hide. Unnamed steps count by their
         # derived `step-<index>` name, which can collide with an explicit one.
+        flag = "--skip" if cli_skip else "--shard"
         all_names = [(s.get("name") or f"step-{i}") for i, s in enumerate(prep["steps"])
                      if isinstance(s, dict)]
         dupes = sorted({n for n in all_names if all_names.count(n) > 1})
         if dupes:
-            warn(f"`--skip` needs unique step names; duplicated: {', '.join(dupes)}")
+            warn(f"`{flag}` needs unique step names; duplicated: {', '.join(dupes)}")
             return 2, _synth_records(2)
-        unknown = sorted(cli_skip - _step_names(prep["steps"]))
+        unknown = sorted((cli_skip or frozenset()) - _step_names(prep["steps"]))
         if unknown:
             warn(f"`--skip` names no Form B step: {', '.join(unknown)}")
             return 2, _synth_records(2)
@@ -175,10 +213,15 @@ def run_prep_pr(prep, root, memoize_dir=None, cli_jobs=None, cli_skip=None):
             warn("`jobs` applies only to Form B `steps`; Form A runs serially")
         return run_form_a(prep["gate"], root)
     if has_steps:
+        steps = prep["steps"]
+        if cli_shard and isinstance(steps, list):
+            total = len(steps)
+            steps = _apply_shard(steps, cli_shard)
+            log(f"gate-runner: shard {cli_shard[0]}/{cli_shard[1]}: "
+                f"{len(steps)} of {total} steps")
         if jobs > 1:
-            return run_form_b_parallel(prep["steps"], root, memoize_dir, jobs,
-                                       cli_skip)
-        return run_form_b(prep["steps"], root, memoize_dir, cli_skip)
+            return run_form_b_parallel(steps, root, memoize_dir, jobs, cli_skip)
+        return run_form_b(steps, root, memoize_dir, cli_skip)
     warn("[prep_pr] has neither `gate` nor `steps`; nothing to run.")
     return 0, _synth_records(0)
 
@@ -1064,6 +1107,7 @@ def _parse_args(argv):
     memoize_dir = None
     jobs = None
     skip = None
+    shard = None
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -1093,15 +1137,27 @@ def _parse_args(argv):
             skip = (skip or []) + [argv[i] if i < len(argv) else ""]
         elif a.startswith("--skip="):
             skip = (skip or []) + [a[len("--skip="):]]
+        elif a == "--shard":
+            i += 1
+            shard = argv[i] if i < len(argv) else ""
+        elif a.startswith("--shard="):
+            shard = a[len("--shard="):]
         else:
             warn(f"unrecognized argument {a!r}; ignoring")
         i += 1
-    return receipt_path, memoize_dir, jobs, skip
+    return receipt_path, memoize_dir, jobs, skip, shard
 
 
-def _run_gates(root, memoize_dir, jobs=None, skip=None):
+def _run_gates(root, memoize_dir, jobs=None, skip=None, shard=None):
     """Resolve config and run the gates. Return (exit_code, records). `jobs` is
-    the raw --jobs string or None; `skip` the raw --skip list or None."""
+    the raw --jobs string or None; `skip` the raw --skip list or None; `shard`
+    the raw --shard string or None."""
+    if shard is not None:
+        m = re.fullmatch(r"([0-9]+)/([0-9]+)", shard)
+        if not m or not 1 <= int(m.group(1)) <= int(m.group(2)):
+            warn(f"--shard must be K/N with 1 <= K <= N (got {shard!r})")
+            return 2, _synth_records(2)
+        shard = (int(m.group(1)), int(m.group(2)))
     if skip is not None:
         if any(not s.strip() for s in skip):
             warn("--skip requires a step name")
@@ -1116,6 +1172,10 @@ def _run_gates(root, memoize_dir, jobs=None, skip=None):
     if not os.path.isfile(config_path):
         if skip:
             warn("`--skip` applies only to Form B `steps`; the fallback chain "
+                 "cannot honor it")
+            return 2, _synth_records(2)
+        if shard:
+            warn("`--shard` applies only to Form B `steps`; the fallback chain "
                  "cannot honor it")
             return 2, _synth_records(2)
         if jobs is not None and jobs > 1:
@@ -1134,12 +1194,17 @@ def _run_gates(root, memoize_dir, jobs=None, skip=None):
         warn(f"{CONFIG_NAME} is present but has no valid [prep_pr] table; failing closed.")
         return 2, _synth_records(2)
     log(f"gate-runner: using {config_path}")
-    return run_prep_pr(prep, root, memoize_dir, jobs, skip)
+    return run_prep_pr(prep, root, memoize_dir, jobs, skip, shard)
 
 
 def main(argv=None):
     argv = argv if argv is not None else sys.argv[1:]
-    receipt_path, memoize_dir, jobs, skip = _parse_args(argv)
+    receipt_path, memoize_dir, jobs, skip, shard = _parse_args(argv)
+    if receipt_path is not None and shard is not None:
+        # Same argument as --skip: a shard attests to a subset of the gate.
+        warn("`--shard` cannot be combined with `--receipt`: a receipt must "
+             "attest the whole gate")
+        return 2
     if receipt_path is not None and skip is not None:
         # A receipt attests that the gate PASSED; one written by a run that
         # skipped steps on request would attest to less than the gate. CI (the
@@ -1149,7 +1214,7 @@ def main(argv=None):
         return 2
     root = find_repo_root()
     pre = _snapshot(root, receipt_path) if receipt_path else None
-    rc, records = _run_gates(root, memoize_dir, jobs, skip)
+    rc, records = _run_gates(root, memoize_dir, jobs, skip, shard)
     if receipt_path:
         _write_receipt(receipt_path, root, rc, records, pre)
     return rc
