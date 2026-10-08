@@ -23,8 +23,15 @@ drift. That holds only while each step has a unique, explicit name, because CI d
 by name (--skip): a reused name would deselect two. Both gate-runner (under --skip) and this
 harness refuse duplicate or missing names. What this harness checks for harnesses therefore changes from "the
 two lists agree" to "CI cannot silently stop running the derived list":
-  - each OS leg (Linux, macOS) has exactly ONE gate-runner invocation, on a one-line `run:`,
-    gated by an exact `if: runner.os == '<OS>'`, with no `continue-on-error`;
+  - Linux has exactly ONE, unsharded gate-runner invocation, on a one-line `run:`, with no
+    `continue-on-error` anywhere in the workflow;
+  - macOS is SHARDED (#544): a matrix job runs `gate-runner --shard ${{ matrix.shard }}/N`,
+    every shard uses the same N, the matrix K values are exactly 1..N, and the union of the
+    shards (computed with gate-runner's own hash) is the leg's step list minus CI_SKIP, no step
+    in zero or two shards. The required context `gates (macos-latest)` is minted by an
+    AGGREGATE job that `needs` the shard job, runs `if: always()`, and fails unless the shard
+    result is exactly "success" (so failed, cancelled and skipped shards all fail it);
+    `gates (ubuntu-latest)` keeps its name, from a matrix of exactly [ubuntu-latest];
   - it passes `--jobs N` (N >= 2; that is the point of the change);
   - its `--skip` set equals that leg's CI_SKIP table EXACTLY, both directions, and every
     CI_SKIP entry carries a written reason and names a real .gates.toml step;
@@ -265,84 +272,194 @@ if missing:
 print(f"  [ok  ] every test-*.py is a gate step ({len(h_on_disk)} on disk)")
 
 # --- CI runs .gates.toml through gate-runner on BOTH legs ---------------------------------
-# Split ci.yml into step blocks (each starts at a `- name:` list item) and find every block
-# whose run line invokes gate-runner. The shapes accepted are deliberately narrow: an
-# unrecognized `if:` or a multi-line `run: |` is a FAILURE, never a guess.
-OS_IF_RE = re.compile(r"^\s*if:\s*runner\.os\s*==\s*'(Linux|macOS)'\s*$")
-blocks = re.split(r"^(?=\s*- name:)", ci_src, flags=re.M)
-invocations: dict[str, list[list[str]]] = {"Linux": [], "macOS": []}
-for block in blocks:
-    # Matches any INVOCATION spelling (`python3 scripts/...`, `./scripts/...`, `python ...`),
-    # not the bare filename, which the ruff step lints as a target.
-    if not re.search(r"(python3?\s+|\./)scripts/gate-runner\.py", block):
-        continue
-    if not re.search(r"^\s*- name:", block, re.M):
-        continue   # the preamble before the first step (comments only)
-    body = [ln for ln in block.split("\n") if ln.strip() and not ln.strip().startswith("#")]
-    name = body[0].strip()
-    runs = [ln for ln in body if re.match(r"^\s*run:", ln)]
-    if len(runs) != 1 or not re.match(r"^\s*run:\s*python3 scripts/gate-runner\.py(\s|$)", runs[0]):
-        fail(f"ci.yml step `{name}` mentions gate-runner.py but is not a one-line "
-             f"`run: python3 scripts/gate-runner.py ...` (unsupported shape)")
-    if any(re.match(r"^\s*continue-on-error:", ln) for ln in body):
-        fail(f"ci.yml step `{name}` sets continue-on-error, so the harnesses can fail "
-             f"without failing CI")
-    ifs = [ln for ln in body if re.match(r"^\s*if:", ln)]
-    if len(ifs) > 1:
-        fail(f"ci.yml step `{name}` has more than one `if:`")
-    if ifs:
-        m = OS_IF_RE.match(ifs[0])
-        if not m:
-            fail(f"ci.yml step `{name}` has an unrecognized condition {ifs[0].strip()!r}; "
-                 f"only `if: runner.os == 'Linux'` / `'macOS'` is accepted")
-        legs = [m.group(1)]
-    else:
-        legs = ["Linux", "macOS"]
-    argv = shlex.split(runs[0].split("run:", 1)[1])[2:]
-    for leg in legs:
-        invocations[leg].append(argv)
+# ci.yml is split into JOBS, then each job into step blocks (each starts at a `- name:` list
+# item). The Linux leg is one unsharded gate-runner step in the `gates (ubuntu-latest)` job. The
+# macOS leg is SHARDED (#544): a matrix job runs `gate-runner --shard K/N` once per shard, and a
+# separate aggregate job reports the REQUIRED context `gates (macos-latest)`. The shapes
+# accepted are deliberately narrow: an unrecognized `if:` or a multi-line `run: |` on a
+# gate-runner step is a FAILURE, never a guess.
+import importlib.util
 
-if not re.search(r"^\s*os:\s*\[ubuntu-latest,\s*macos-latest\]\s*$", ci_src, re.M):
-    fail("ci.yml's matrix is not exactly `os: [ubuntu-latest, macos-latest]`; the required "
-         "checks `gates (ubuntu-latest)` / `gates (macos-latest)` depend on it")
+_spec = importlib.util.spec_from_file_location(
+    "gate_runner_for_lockstep",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "gate-runner.py"))
+_gr = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_gr)   # the REAL hash, so this check can never drift from the runner
+
+OS_IF_RE = re.compile(r"^\s*if:\s*runner\.os\s*==\s*'(Linux|macOS)'\s*$")
+LINUX_JOB_NAME = "gates (${{ matrix.os }})"
+MACOS_REQUIRED = "gates (macos-latest)"
+CI_SHARD_REF = "${{ matrix.shard }}"
+
+
+def code_lines(text):
+    """Non-blank, non-comment lines: a comment saying `no continue-on-error` is not one."""
+    return [ln for ln in text.split("\n") if ln.strip() and not ln.strip().startswith("#")]
+
+
+def split_jobs(src):
+    m = re.search(r"^jobs:[ \t]*$", src, re.M)
+    if not m:
+        fail("ci.yml has no top-level `jobs:` (parse failed, not a drift)")
+    body = src[m.end():]
+    heads = list(re.finditer(r"^  ([\w-]+):[ \t]*$", body, re.M))
+    out = {}
+    for i, h in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(body)
+        out[h.group(1)] = body[h.end():end]
+    return out
+
+
+def job_field(lines, key):
+    """The value of a JOB-level (4-space indent) key, or None."""
+    for ln in lines:
+        m = re.match(rf"^    {re.escape(key)}:[ \t]*(.*?)[ \t]*$", ln)
+        if m:
+            return m.group(1)
+    return None
+
+
+def matrix_list(lines, key):
+    for ln in lines:
+        m = re.match(rf"^\s+{key}:\s*\[(.*)\]\s*$", ln)
+        if m:
+            return [v.strip() for v in m.group(1).split(",") if v.strip()]
+    return None
+
 
 problems = []
+jobs_ci = {jid: code_lines(txt) for jid, txt in split_jobs(ci_src).items()}
+jobs_raw = split_jobs(ci_src)
+if len(jobs_ci) < 3:
+    fail(f"ci.yml parsed only {len(jobs_ci)} jobs - the parse broke; fix it rather than the "
+         f"workflow (expected the Linux gates, the macOS shards and the macOS aggregate)")
+
+for jid, lines in jobs_ci.items():
+    if any(re.match(r"^\s*continue-on-error:", ln) for ln in lines):
+        problems.append(f"job `{jid}` sets continue-on-error, so its gates can fail without "
+                        f"failing CI")
+
+# --- the Linux job keeps `gates (ubuntu-latest)`; nothing else may mint the macOS name -------
+linux_jobs = [j for j, ls in jobs_ci.items() if job_field(ls, "name") == LINUX_JOB_NAME]
+if len(linux_jobs) != 1:
+    problems.append(f"expected exactly one job named `{LINUX_JOB_NAME}`, found {linux_jobs}")
+else:
+    os_list = matrix_list(jobs_ci[linux_jobs[0]], "os")
+    if os_list != ["ubuntu-latest"]:
+        problems.append(f"job `{linux_jobs[0]}` matrix os is {os_list}, not exactly "
+                        f"[ubuntu-latest]: `gates (ubuntu-latest)` is a required check and the "
+                        f"macOS leg is reported by the aggregate job, not this matrix")
+
+# --- gate-runner invocations, per leg ----------------------------------------------------------
+invocations: dict[str, list[tuple[str, list[str], list[int] | None]]] = {"Linux": [], "macOS": []}
+for jid, raw in jobs_raw.items():
+    lines = jobs_ci[jid]
+    runs_on = job_field(lines, "runs-on") or ""
+    if "matrix.os" in runs_on:
+        os_vals = matrix_list(lines, "os") or []
+    else:
+        os_vals = [runs_on]
+    job_legs = {("Linux" if "ubuntu" in v else "macOS" if "macos" in v else None) for v in os_vals}
+    shard_matrix = matrix_list(lines, "shard")
+    if shard_matrix is not None:
+        if not all(v.isdigit() for v in shard_matrix):
+            problems.append(f"job `{jid}` shard matrix {shard_matrix} is not a list of integers")
+            shard_matrix = []
+        else:
+            shard_matrix = [int(v) for v in shard_matrix]
+    for block in re.split(r"^(?=\s*- name:)", raw, flags=re.M):
+        # Matches any INVOCATION spelling (`python3 scripts/...`, `./scripts/...`, `python ...`),
+        # not the bare filename, which the ruff step lints as a target.
+        if not re.search(r"(python3?\s+|\./)scripts/gate-runner\.py", block):
+            continue
+        body = code_lines(block)
+        if not body or not re.match(r"^\s*- name:", body[0]):
+            continue   # the job preamble (comments / header), not a step
+        name = body[0].strip()
+        runs = [ln for ln in body if re.match(r"^\s*run:", ln)]
+        if len(runs) != 1 or not re.match(r"^\s*run:\s*python3 scripts/gate-runner\.py(\s|$)", runs[0]):
+            fail(f"ci.yml step `{name}` mentions gate-runner.py but is not a one-line "
+                 f"`run: python3 scripts/gate-runner.py ...` (unsupported shape)")
+        ifs = [ln for ln in body if re.match(r"^\s*if:", ln)]
+        if len(ifs) > 1:
+            fail(f"ci.yml step `{name}` has more than one `if:`")
+        legs = set(job_legs)
+        if ifs:
+            m = OS_IF_RE.match(ifs[0])
+            if not m:
+                fail(f"ci.yml step `{name}` has an unrecognized condition {ifs[0].strip()!r}; "
+                     f"only `if: runner.os == 'Linux'` / `'macOS'` is accepted")
+            legs &= {m.group(1)}
+        if None in legs:
+            fail(f"ci.yml job `{jid}` runs gate-runner on a runner this harness cannot classify "
+                 f"({runs_on!r})")
+        argv = shlex.split(runs[0].split("run:", 1)[1].replace(CI_SHARD_REF, "@SHARD@"))[2:]
+        for leg in legs:
+            invocations[leg].append((jid, argv, shard_matrix))
+
+macos_runs: list[tuple[int, int]] = []   # every (K, N) CI will execute on the macOS leg
 for leg, found in invocations.items():
-    if len(found) != 1:
+    if leg == "Linux" and len(found) != 1:
         problems.append(f"{leg}: expected exactly one gate-runner invocation, found {len(found)} "
                         f"(no gate-runner invocation for {leg} means CI stopped running the "
                         f"harnesses there)")
         continue
-    argv = found[0]
-    jobs, skip, i = None, set(), 0
-    while i < len(argv):
-        a = argv[i]
-        if a in ("--jobs", "--skip") and i + 1 < len(argv):
-            val = argv[i + 1]; i += 2
-        elif a.startswith(("--jobs=", "--skip=")):
-            a, val = a.split("=", 1); i += 1
-        else:
-            problems.append(f"{leg}: unexpected gate-runner argument {a!r}")
-            break
-        if a == "--jobs":
-            jobs = val
-        else:
-            skip.add(val)
-    if not (jobs and jobs.isdigit() and int(jobs) >= 2):
-        problems.append(f"{leg}: gate-runner is not run with `--jobs N` (N >= 2); got {jobs!r}")
-    want = set(CI_SKIP[leg])
-    if skip - want:
-        problems.append(f"{leg}: ci.yml --skips steps CI_SKIP gives no reason for -> "
-                        f"{sorted(skip - want)}")
-    if want - skip:
-        problems.append(f"{leg}: CI_SKIP lists steps ci.yml does not --skip -> "
-                        f"{sorted(want - skip)}")
-    not_steps = sorted(want - step_names)
-    if not_steps:
-        problems.append(f"{leg}: CI_SKIP names no .gates.toml step -> {not_steps}")
-    for step in steps:
-        if step.get("name") in skip:
+    if leg == "macOS" and not found:
+        problems.append("macOS: no gate-runner invocation for macOS (CI stopped running the "
+                        "harnesses there)")
+        continue
+    for jid, argv, shard_matrix in found:
+        jobs, skip, shard, i = None, set(), None, 0
+        while i < len(argv):
+            a = argv[i]
+            if a in ("--jobs", "--skip", "--shard") and i + 1 < len(argv):
+                val = argv[i + 1]; i += 2
+            elif a.startswith(("--jobs=", "--skip=", "--shard=")):
+                a, val = a.split("=", 1); i += 1
+            else:
+                problems.append(f"{leg}: unexpected gate-runner argument {a!r}")
+                break
+            if a == "--jobs":
+                jobs = val
+            elif a == "--shard":
+                shard = val
+            else:
+                skip.add(val)
+        if not (jobs and jobs.isdigit() and int(jobs) >= 2):
+            problems.append(f"{leg}: gate-runner is not run with `--jobs N` (N >= 2); got {jobs!r}")
+        want = set(CI_SKIP[leg])
+        if skip - want:
+            problems.append(f"{leg}: ci.yml --skips steps CI_SKIP gives no reason for -> "
+                            f"{sorted(skip - want)}")
+        if want - skip:
+            problems.append(f"{leg}: CI_SKIP lists steps ci.yml does not --skip -> "
+                            f"{sorted(want - skip)}")
+        if leg == "Linux":
+            if shard is not None:
+                problems.append("Linux: the Linux leg is unsharded; got --shard "
+                                f"{shard!r} (update this harness together with the workflow)")
             continue
+        sm = re.fullmatch(r"(\d+|@SHARD@)/(\d+)", shard or "")
+        if not sm:
+            problems.append(f"macOS: gate-runner in job `{jid}` has no usable `--shard K/N` "
+                            f"(got {shard!r}); an unsharded invocation in a shard job runs the "
+                            f"WHOLE list on every runner")
+            continue
+        n = int(sm.group(2))
+        if sm.group(1) == "@SHARD@":
+            if not shard_matrix:
+                problems.append(f"macOS: job `{jid}` passes `--shard {CI_SHARD_REF}/{n}` but has "
+                                f"no integer `shard:` matrix")
+                continue
+            macos_runs.extend((k, n) for k in shard_matrix)
+        else:
+            if shard_matrix:
+                problems.append(f"macOS: job `{jid}` has a shard matrix but a literal "
+                                f"--shard {shard}, so every matrix leg runs the same shard")
+            macos_runs.append((int(sm.group(1)), n))
+
+    names_to_check = [s for s in steps if s.get("name") not in CI_SKIP[leg]]
+    for step in names_to_check:
         if step.get("required", True) is not True:
             problems.append(f"{leg}: step '{step.get('name')}' is required = false, so CI "
                             f"cannot fail on it")
@@ -350,11 +467,68 @@ for leg, found in invocations.items():
             if step.get(pred):
                 problems.append(f"{leg}: step '{step.get('name')}' has {pred}, so CI can pass "
                                 f"it without running it (--skip it with a CI_SKIP reason)")
+    not_steps = sorted(set(CI_SKIP[leg]) - step_names)
+    if not_steps:
+        problems.append(f"{leg}: CI_SKIP names no .gates.toml step -> {not_steps}")
+
+# --- the macOS shards partition the leg's step list --------------------------------------------
+if macos_runs:
+    shard_ns = sorted({n for _, n in macos_runs})
+    if len(shard_ns) != 1:
+        problems.append(f"macOS: shards disagree on N -> {shard_ns}")
+    else:
+        n = shard_ns[0]
+        ks = sorted(k for k, _ in macos_runs)
+        if ks != list(range(1, n + 1)):
+            problems.append(f"macOS: shard K values must be exactly 1..N (N={n}); CI runs {ks}")
+        leg_steps = step_names - set(CI_SKIP["macOS"])
+        owners: dict[str, int] = {}
+        for k, _ in macos_runs:
+            for nm in leg_steps:
+                if 1 <= k <= n and _gr._shard_of(nm, n) == k:
+                    owners[nm] = owners.get(nm, 0) + 1
+        in_none = sorted(leg_steps - set(owners))
+        in_two = sorted(nm for nm, c in owners.items() if c > 1)
+        if in_none:
+            problems.append(f"macOS: steps in NO shard (CI never runs them) -> {in_none}")
+        if in_two:
+            problems.append(f"macOS: steps in TWO shards (a shard runs twice) -> {in_two}")
+
+# --- the aggregate job reports the REQUIRED context and cannot pass without every shard --------
+agg_jobs = [j for j, ls in jobs_ci.items() if job_field(ls, "name") == MACOS_REQUIRED]
+shard_job_ids = sorted({jid for jid, _, _ in invocations["macOS"]})
+if len(agg_jobs) != 1:
+    problems.append(f"expected exactly one job named `{MACOS_REQUIRED}` (the required check "
+                    f"context), found {agg_jobs}")
+elif len(shard_job_ids) != 1:
+    problems.append(f"macOS gate-runner runs in jobs {shard_job_ids}; the aggregate check "
+                    f"supports exactly one shard job")
+else:
+    agg, sj = agg_jobs[0], shard_job_ids[0]
+    al = jobs_ci[agg]
+    if agg == sj:
+        problems.append(f"job `{agg}` is both the shard job and the aggregate")
+    if job_field(al, "needs") != sj:
+        problems.append(f"aggregate `{agg}` must declare `needs: {sj}` (the shard job); got "
+                        f"{job_field(al, 'needs')!r}")
+    if job_field(al, "if") not in ("${{ always() }}", "always()"):
+        problems.append(f"aggregate `{agg}` must run `if: ${{{{ always() }}}}`; got "
+                        f"{job_field(al, 'if')!r} (a skipped aggregate reads as a passing or "
+                        f"missing required check when a shard fails)")
+    want_env = f"SHARD_RESULT: ${{{{ needs.{sj}.result }}}}"
+    if not any(ln.strip() == want_env for ln in al):
+        problems.append(f"aggregate `{agg}` must read `{want_env}`")
+    if not any(re.match(r'^\s*\[ "\$SHARD_RESULT" = "success" \] \|\|.*exit 1', ln) for ln in al):
+        problems.append(f"aggregate `{agg}` must fail unless the shard result is exactly "
+                        f"\"success\" (`[ \"$SHARD_RESULT\" = \"success\" ] || ... exit 1`): "
+                        f"failure, cancelled and skipped must all fail it")
 if problems:
     fail("CI's gate-runner wiring does not run the gated harnesses as required:\n  "
          + "\n  ".join(problems))
-print(f"  [ok  ] both legs run gate-runner with --jobs; --skip sets match CI_SKIP "
-      f"(Linux {len(CI_SKIP['Linux'])}, macOS {len(CI_SKIP['macOS'])})")
+print(f"  [ok  ] Linux runs gate-runner unsharded; macOS runs {len(macos_runs)} shards; "
+      f"--skip sets match CI_SKIP (Linux {len(CI_SKIP['Linux'])}, macOS {len(CI_SKIP['macOS'])})")
+print(f"  [ok  ] the macOS shards partition the leg's steps (K = 1..N, none in zero or two "
+      f"shards); `{MACOS_REQUIRED}` aggregates them")
 
 
 # --- mutation self-test: each check must be able to FAIL ----------------------------------
@@ -369,8 +543,10 @@ def _mutation_selftest():
     victim = sorted(gates_h)[0]
     step_line = f'run = "python3 {victim}"'
     linux_run = "run: python3 scripts/gate-runner.py --jobs 4 --skip shellcheck --skip ruff\n"
-    mac_run = ("run: python3 scripts/gate-runner.py --jobs 4 --skip shellcheck --skip ruff "
-               "--skip test-orchestrate-setup\n")
+    mac_run = ("run: python3 scripts/gate-runner.py --jobs 4 --shard ${{ matrix.shard }}/3 "
+               "--skip shellcheck --skip ruff --skip test-orchestrate-setup\n")
+    shard_axis = "        shard: [1, 2, 3]\n"
+    agg_check = '[ "$SHARD_RESULT" = "success" ] ||'
     gates, ci = ".gates.toml", ".github/workflows/ci.yml"
     cases = [
         # (label, file to mutate, old text, new text, message the failure must carry).
@@ -382,13 +558,40 @@ def _mutation_selftest():
         ("linux leg dropped", ci, linux_run, "run: true\n", "no gate-runner invocation for Linux"),
         ("mac leg dropped", ci, mac_run, "run: true\n", "no gate-runner invocation for macOS"),
         ("jobs dropped", ci, mac_run, mac_run.replace("--jobs 4 ", ""), "--jobs N"),
+        # #544: the macOS leg is sharded, so each new check needs a case that breaks it.
+        ("shard dropped", ci, shard_axis, "        shard: [1, 2]\n", "steps in NO shard"),
+        ("shard duplicated", ci, shard_axis, "        shard: [1, 1, 3]\n", "steps in TWO shards"),
+        ("shard K out of range", ci, shard_axis, "        shard: [1, 2, 4]\n",
+         "K values must be exactly 1..N"),
+        ("shard N mismatch", ci, mac_run, mac_run.replace("/3", "/4"),
+         "K values must be exactly 1..N"),
+        ("shard flag dropped", ci, mac_run, mac_run.replace("--shard ${{ matrix.shard }}/3 ", ""),
+         "no usable `--shard K/N`"),
+        ("literal shard in matrix job", ci, mac_run,
+         mac_run.replace("${{ matrix.shard }}", "1"), "every matrix leg runs the same shard"),
+        ("sharded Linux", ci, linux_run, linux_run.replace("--jobs 4 ", "--jobs 4 --shard 1/1 "),
+         "Linux leg is unsharded"),
+        ("ubuntu matrix regrows macos", ci, "os: [ubuntu-latest]", "os: [ubuntu-latest, macos-latest]",
+         "not exactly [ubuntu-latest]"),
+        ("aggregate renamed", ci, "name: gates (macos-latest)", "name: gates-macos-done",
+         "exactly one job named `gates (macos-latest)`"),
+        ("aggregate not always", ci, "if: ${{ always() }}", "if: ${{ success() }}",
+         "must run `if: ${{ always() }}`"),
+        ("aggregate needs dropped", ci, "    needs: gates-macos-shard\n", "",
+         "must declare `needs: gates-macos-shard`"),
+        ("aggregate reads wrong result", ci, "needs.gates-macos-shard.result", "needs.gates.result",
+         "must read `SHARD_RESULT"),
+        ("aggregate tolerates failure", ci, agg_check, '[ "$SHARD_RESULT" != "failure" ] ||',
+         "must fail unless the shard result is exactly"),
+        ("shard job continue-on-error", ci, "    runs-on: macos-latest\n",
+         "    runs-on: macos-latest\n    continue-on-error: true\n", "sets continue-on-error"),
         ("extra skip", ci, linux_run, linux_run.replace("ruff", f"ruff --skip {victim[:-3]}"),
          "CI_SKIP gives no reason"),
         ("skip dropped", ci, mac_run, mac_run.replace(" --skip test-orchestrate-setup", ""),
          "CI_SKIP lists steps ci.yml does not --skip"),
         ("continue-on-error", ci, linux_run, linux_run + "        continue-on-error: true\n",
          "continue-on-error"),
-        ("odd condition", ci, "if: runner.os == 'macOS'\n        run: python3 scripts/gate-runner",
+        ("odd condition", ci, "if: runner.os == 'Linux'\n        run: python3 scripts/gate-runner",
          "if: false\n        run: python3 scripts/gate-runner", "unrecognized condition"),
         ("duplicate step name", gates, step_line, step_line + f'\n\n  [[prep_pr.steps]]\n  name = "ruff"\n  run = "python3 {victim}"',
          "step names are not unique"),

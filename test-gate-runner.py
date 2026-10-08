@@ -28,6 +28,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -1135,15 +1136,20 @@ def _steps_cfg(steps, jobs=None):
 
 def _gone(pid, *, group):
     """True once the pid (or process group) no longer exists, waiting up to 3s
-    for the kernel/launchd to finish reaping."""
+    for the kernel/launchd to finish reaping.
+
+    EPERM counts as GONE, as in the runner's own `_group_alive` (#546). Every
+    process a step starts runs under this harness's uid, so a signal-0 probe of
+    a live one can never be refused. Measured on Darwin: a group holding only
+    zombies (killed, leader not yet reaped) answers EPERM, while a zombie leader
+    beside ONE live member answers success, so EPERM cannot hide a survivor. The
+    other source is a pid/pgid recycled to another user: the original is gone."""
     end = time.time() + 3
     while time.time() < end:
         try:
             (os.killpg if group else os.kill)(pid, 0)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             return True
-        except PermissionError:
-            return False
         time.sleep(0.05)
     return False
 
@@ -1544,6 +1550,7 @@ class _FakeProc:
     """Stands in for Popen: poll() returns None `holds` times, then `code`."""
     def __init__(self, code, holds=0):
         self.pid, self.code, self.holds = 999999, code, holds
+        self.returncode = None
 
     def poll(self):
         if self.holds:
@@ -1639,6 +1646,229 @@ def test_parallel_head_checked_once():
     check("#501: blocked head: memo lookup ran once per step", len(trees) == 3)
 
 
+# --- #546: an interrupt must never raise from inside Popen.poll() ------------
+
+class _LockProc(_FakeProc):
+    """A fake Popen whose poll() has the shape of Popen._internal_poll: a
+    non-blocking acquire of a non-reentrant lock, then a `try` whose `finally`
+    releases it. The FIRST poll signals this process between the two, which is
+    exactly where an exception raised from a signal handler leaks the lock (the
+    real hang: cleanup's wait() then blocks on it forever). First poll returns
+    `first`, every later one `then`."""
+    def __init__(self, sig, first=None, then=-15):
+        super().__init__(then)
+        self.sig, self.first, self.polls = sig, first, 0
+        self.lock = threading.Lock()
+
+    def _boundary(self):
+        """A Python-level call: a pending handler runs here at the latest."""
+
+    def poll(self):
+        if not self.lock.acquire(False):
+            return None
+        self.polls += 1
+        if self.polls == 1:
+            signal.raise_signal(self.sig); self._boundary()
+        try:
+            return self.first if self.polls == 1 else self.code
+        finally:
+            self.lock.release()
+
+
+def _with_outer_handlers(fn):
+    """Run fn() from the state a real runner starts in, made safe for the
+    harness: SIGINT on Python's own raising handler, TERM/HUP on a recording
+    one (their default would kill the harness if the runner installed nothing).
+    Returns (fn result, signals the OUTER handler saw, {sig: restored?})."""
+    seen = []
+
+    def outer(signum, frame):
+        seen.append(signum)
+    want = {signal.SIGINT: signal.default_int_handler,
+            signal.SIGTERM: outer, signal.SIGHUP: outer}
+    old = {s: signal.signal(s, h) for s, h in want.items()}
+    try:
+        res = fn()
+        restored = {s: signal.getsignal(s) is h for s, h in want.items()}
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
+    return res, seen, restored
+
+
+def test_parallel_interrupt_never_raises_in_poll():
+    """THE #546 regression: SIGINT, SIGTERM or SIGHUP landing inside poll(),
+    after its lock is taken and before its `try`, still ends the run as an
+    interrupt, and the lock is NOT left held."""
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        p = _LockProc(sig)
+        (rc, recs, out), seen, restored = _with_outer_handlers(
+            lambda: _inproc_parallel([{"name": "s", "run": "x"}], lambda *a, **k: p))
+        check(f"#546: {sig.name} inside poll(): the signal fired there, once",
+              p.polls >= 1 and seen == [])
+        check(f"#546: {sig.name} inside poll(): poll's lock is not leaked",
+              not p.lock.locked())
+        check(f"#546: {sig.name} inside poll(): still an interrupt (rc 130, step "
+              "cancelled)", rc == 130 and "gate-runner: interrupted" in out
+              and recs == [{"name": "s", "result": "fail", "cancelled": True}])
+        check(f"#546: {sig.name} inside poll(): previous handlers restored",
+              all(restored.values()))
+
+
+def test_parallel_interrupt_in_last_iteration():
+    """A signal recorded during the iteration that finishes the run is still an
+    interrupt: the loop's exit must not drop it and report success."""
+    p = _LockProc(signal.SIGTERM, first=0)
+    (rc, _, out), _, _ = _with_outer_handlers(
+        lambda: _inproc_parallel([{"name": "s", "run": "x"}], lambda *a, **k: p))
+    check("#546: signal in the final iteration -> rc 130, not a pass",
+          rc == 130 and "gate-runner: interrupted" in out and "all steps passed" not in out)
+
+
+def test_parallel_interrupt_in_launch_window():
+    """A signal that arrives while the launch window has it blocked is acted on
+    as soon as the step is registered: nothing further launches."""
+    launched = []
+
+    def popen(*a, **k):
+        launched.append(a[0])
+        signal.raise_signal(signal.SIGHUP)   # blocked here: pending until restore
+        return _FakeProc(0, holds=50)
+    (rc, recs, _), _, _ = _with_outer_handlers(
+        lambda: _inproc_parallel([{"name": "a", "run": "x"}, {"name": "b", "run": "y"}],
+                                 popen))
+    check("#546: signal in the launch window: the launched step is cancelled",
+          rc == 130 and recs == [{"name": "a", "result": "fail", "cancelled": True}])
+    check("#546: signal in the launch window: no further step launches",
+          launched == ["x"])
+
+
+def test_parallel_interrupt_before_launch():
+    """A signal recorded while the parent runs a step's skip predicate (or its
+    memo lookup) stops that step from launching at all: a step with side
+    effects must not start after the stop request."""
+    launched = []
+
+    def popen(*a, **k):
+        launched.append(a[0])
+        return _FakeProc(0, holds=50)
+
+    def noisy(orig):
+        def skip_reason(*a, **k):
+            signal.raise_signal(signal.SIGTERM)   # recorded, not raised
+            return orig(*a, **k)
+        return skip_reason
+    (rc, recs, _), _, _ = _with_outer_handlers(
+        lambda: _inproc_parallel([{"name": "a", "run": "x"}], popen,
+                                 patch={"_skip_reason": noisy}))
+    check("#546: signal during a skip predicate: still an interrupt (rc 130)",
+          rc == 130)
+    check("#546: signal during a skip predicate: the step never launches",
+          launched == [] and recs == [])
+
+
+def test_parallel_interrupt_during_output():
+    """Printing a finished block can block on a stalled stdout for as long as
+    the reader likes, so a signal THERE raises at once instead of waiting for
+    the write to return."""
+    after = []
+
+    def flush(fn):
+        def wrapped(plan, printed):
+            if not after:
+                signal.raise_signal(signal.SIGTERM)
+                after.append("returned")   # reached only if the signal did not raise
+            return fn(plan, printed)
+        return wrapped
+    (rc, _, _), _, _ = _with_outer_handlers(
+        lambda: _inproc_parallel([{"name": "s", "run": "x"}],
+                                 lambda *a, **k: _FakeProc(0, holds=50),
+                                 patch={"_flush_ready": flush}))
+    check("#546: signal during output raises there (rc 130)",
+          rc == 130 and after == [])
+
+
+def test_parallel_inherited_ignored_sigint():
+    """SIGINT inherited as SIG_IGN (a non-interactive shell's `&` job) stays
+    ignored: the run completes, and it is still ignored afterwards."""
+    old = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        p = _LockProc(signal.SIGINT, then=0)
+        rc, recs, _ = _inproc_parallel([{"name": "s", "run": "x"}], lambda *a, **k: p)
+        still = signal.getsignal(signal.SIGINT) == signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGINT, old)
+    check("#546: inherited-ignored SIGINT: the run completes (rc 0, step passes)",
+          rc == 0 and recs == [{"name": "s", "result": "pass"}] and p.polls >= 2)
+    check("#546: inherited-ignored SIGINT: still ignored after the run", still)
+
+
+# Runs in its OWN process: if cleanup did depend on Popen's lock it would block
+# forever, and only a parent with a timeout can turn that into a failed check.
+# Each case starts a real `sleep 60` in its own group, breaks Popen's view of it,
+# and calls _terminate_groups. `lock-held` gets a 30 s grace it must not need
+# (the grace leg); `lock-held-deaf` ignores SIGTERM and gets a 0.3 s grace, so
+# only the SIGKILL leg's final blocking reap can collect it.
+_REAP_DRIVER = """\
+import importlib.util, json, os, signal, subprocess, sys, time
+spec = importlib.util.spec_from_file_location("gate_runner_reap", sys.argv[1])
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+case = sys.argv[2]
+run = "exec sleep 60" if case != "lock-held-deaf" else "trap '' TERM; echo; exec sleep 60"
+p = subprocess.Popen(["/bin/sh", "-c", run], start_new_session=True,
+                     stdout=subprocess.PIPE)
+print(p.pid, flush=True)
+if case == "lock-held-deaf":
+    p.stdout.readline()              # the trap is installed before any signal
+if case == "already-reaped":         # reaped behind Popen's back: status lost
+    os.kill(p.pid, signal.SIGKILL); os.waitpid(p.pid, 0); seam = True
+else:                                # the #546 leak: held by nobody, forever
+    seam = p._waitpid_lock.acquire(False)
+print("seam" if seam else "no-seam", flush=True)
+t0 = time.monotonic()
+mod._terminate_groups({0: {"proc": p}}, grace=0.3 if case == "lock-held-deaf" else 30)
+took = time.monotonic() - t0
+try:
+    os.waitpid(p.pid, os.WNOHANG); reaped = False
+except ChildProcessError:
+    reaped = True
+print(json.dumps({"took": took, "returncode": p.returncode, "reaped": reaped}),
+      flush=True)
+"""
+
+
+def test_terminate_groups_ignores_popen_lock():
+    """Cleanup reaps without Popen's `_waitpid_lock`: with that lock held (what
+    an exception raised inside poll() leaves behind, from any source) it still
+    kills and reaps the child at once and leaves Popen's returncode set, on the
+    SIGTERM leg and on the SIGKILL leg; and a child already reaped behind
+    Popen's back does not fail or hang it."""
+    want = {"lock-held": -signal.SIGTERM, "lock-held-deaf": -signal.SIGKILL}
+    for case in ("lock-held", "lock-held-deaf", "already-reaped"):
+        proc = subprocess.Popen([sys.executable, "-c", _REAP_DRIVER, RUNNER, case],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            out, err = proc.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill(); out, err = proc.communicate()
+        lines = out.splitlines()
+        try:
+            r = json.loads(lines[2]) if len(lines) > 2 else {}
+        except ValueError:
+            r = {}
+        check(f"#546: cleanup, {case}: the case was set up (driver ran, seam taken)",
+              lines[1:2] == ["seam"])
+        check(f"#546: cleanup, {case}: returns well inside the grace, no hang "
+              f"({r.get('took', -1):.2f}s)", proc.returncode == 0 and 0 <= r.get("took", -1) < 15)
+        check(f"#546: cleanup, {case}: the child is reaped and Popen knows it",
+              r.get("reaped") is True and r.get("returncode") is not None)
+        if case in want:
+            check(f"#546: cleanup, {case}: returncode is the real status "
+                  f"({want[case]})", r.get("returncode") == want[case])
+        if lines and lines[0].isdigit():   # never leak the sleeper if cleanup broke
+            _cleanup_pids(int(lines[0]))
+
+
 # --- Part D: opt-in `--skip <name>` (CI leaves lint to its own pinned steps) --
 
 def test_skip_named_steps_serial_and_parallel():
@@ -1722,6 +1952,163 @@ def test_skip_refuses_doubt():
             check("--skip + --receipt= (empty) -> nothing ran", not os.path.exists(marker))
 
 
+# --- Part E: opt-in `--shard K/N` (CI splits the macOS leg across runners, #544) --
+
+def _load_runner():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("gate_runner_mod", RUNNER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _expected_shard(name, n):
+    """Independent restatement of the contract: sha256 of the UTF-8 name, mod N, 1-based."""
+    import hashlib
+    return 1 + int(hashlib.sha256(name.encode("utf-8")).hexdigest(), 16) % n
+
+
+def test_shard_function_partitions_and_is_stable():
+    mod = _load_runner()
+    import tomllib
+    repo = os.path.dirname(os.path.abspath(RUNNER)) + "/.."
+    with open(os.path.join(repo, ".gates.toml"), "rb") as fh:
+        real = [s["name"] for s in tomllib.load(fh)["prep_pr"]["steps"]]
+    synthetic = [f"step-{i}-é" for i in range(40)] + ["a", "b", "c"]
+    for label, names in (("real .gates.toml", real), ("synthetic", synthetic)):
+        for n in (1, 2, 3, 5):
+            got = [mod._shard_of(x, n) for x in names]
+            check(f"shard fn ({label}, N={n}): every name lands in one shard 1..N",
+                  all(1 <= k <= n for k in got))
+            check(f"shard fn ({label}, N={n}): matches the sha256 contract",
+                  got == [_expected_shard(x, n) for x in names])
+            check(f"shard fn ({label}, N={n}): stable across calls",
+                  got == [mod._shard_of(x, n) for x in names])
+    check("shard fn: N=1 puts everything in shard 1",
+          {mod._shard_of(x, 1) for x in real} == {1})
+
+
+def test_shard_runs_partition_end_to_end():
+    """3 shards x (serial, parallel) run each step exactly once between them."""
+    names = [f"s{i}" for i in range(9)]
+    with tempfile.TemporaryDirectory() as aux:
+        for jobs in (None, 4):
+            seen = {}
+            for k in (1, 2, 3):
+                marks = {n: os.path.join(aux, f"{n}-{jobs}-{k}") for n in names}
+                with tempfile.TemporaryDirectory() as root:
+                    git_init(root)
+                    write(root, ".gates.toml", _steps_cfg(
+                        [(n, f"touch {m}", "") for n, m in marks.items()], jobs))
+                    rc, out = run_runner(root, args=("--shard", f"{k}/3"))
+                    check(f"--shard {k}/3: exit 0 (jobs={jobs})", rc == 0)
+                    ran = {n for n, m in marks.items() if os.path.exists(m)}
+                    check(f"--shard {k}/3: ran exactly its hashed steps (jobs={jobs})",
+                          ran == {n for n in names if _expected_shard(n, 3) == k})
+                    check(f"--shard {k}/3: announces the shard (jobs={jobs})",
+                          f"shard {k}/3" in out)
+                    for n in ran:
+                        seen[n] = seen.get(n, 0) + 1
+            check(f"--shard: every step ran in exactly one shard (jobs={jobs})",
+                  sorted(seen) == sorted(names) and set(seen.values()) == {1})
+
+
+def test_shard_malformed_and_refusals():
+    with tempfile.TemporaryDirectory() as aux:
+        marker = os.path.join(aux, "ran")
+        cfg = _steps_cfg([("a", f"touch {marker}", "")])
+        bad = ["", "0/3", "4/3", "1/0", "a/b", "1", "1/3/5", "-1/3", " 1/3", "1/ 3",
+               "1.5/3", "/3", "1/"]
+        for v in bad:
+            with tempfile.TemporaryDirectory() as root:
+                git_init(root)
+                write(root, ".gates.toml", cfg)
+                rc, _ = run_runner(root, args=(f"--shard={v}",))
+                check(f"--shard={v!r} -> exit 2, nothing ran",
+                      rc == 2 and not os.path.exists(marker))
+        with tempfile.TemporaryDirectory() as root:
+            git_init(root)
+            write(root, ".gates.toml", cfg)
+            rc, _ = run_runner(root, args=("--shard",))
+            check("trailing --shard (no value) -> exit 2",
+                  rc == 2 and not os.path.exists(marker))
+        cases = [
+            ("Form A", f'[prep_pr]\ngate = "touch {marker}"\n'),
+            ("fallback chain", None),
+            ("duplicate step name",
+             _steps_cfg([("a", "true", ""), ("a", f"touch {marker}", "")])),
+            # A non-string name cannot be hashed: a config error, never a traceback.
+            ("non-string step name",
+             f'[prep_pr]\n[[prep_pr.steps]]\nname = 123\nrun = "touch {marker}"\n'),
+        ]
+        for label, c in cases:
+            with tempfile.TemporaryDirectory() as root:
+                git_init(root)
+                if c is None:
+                    write(root, "Makefile", f"gate:\n\ttouch {marker}\n")
+                else:
+                    write(root, ".gates.toml", c)
+                rc, _ = run_runner(root, args=("--shard", "1/1"))
+                check(f"--shard refused ({label}) -> exit 2, nothing ran",
+                      rc == 2 and not os.path.exists(marker))
+        with tempfile.TemporaryDirectory() as root:
+            git_init(root)
+            write(root, ".gates.toml", cfg)
+            git_commit(root)
+            rpath = os.path.join(aux, "receipt.json")
+            for rarg in (("--receipt", rpath), ("--receipt=",)):
+                rc, _ = run_runner(root, args=("--shard", "1/1") + rarg)
+                check(f"--shard + {rarg[0]} -> exit 2", rc == 2)
+            check("--shard + --receipt -> no receipt, nothing ran",
+                  not os.path.exists(rpath) and not os.path.exists(marker))
+
+
+def test_shard_skip_interaction():
+    """Membership is computed from the FULL list, so --skip never moves a step
+    between shards; a skipped step reports [SKIP] in its own shard and runs nowhere."""
+    names = [f"s{i}" for i in range(9)]
+    victim = names[0]
+    vshard = _expected_shard(victim, 3)
+    with tempfile.TemporaryDirectory() as aux:
+        ran_all = {}
+        for k in (1, 2, 3):
+            marks = {n: os.path.join(aux, f"{n}-{k}") for n in names}
+            with tempfile.TemporaryDirectory() as root:
+                git_init(root)
+                write(root, ".gates.toml",
+                      _steps_cfg([(n, f"touch {m}", "") for n, m in marks.items()]))
+                rc, out = run_runner(root, args=("--shard", f"{k}/3", "--skip", victim))
+                check(f"--shard {k}/3 + --skip: exit 0 (a skip naming any shard's step is valid)",
+                      rc == 0)
+                ran = {n for n, m in marks.items() if os.path.exists(m)}
+                check(f"--shard {k}/3 + --skip: ran its hashed steps minus the skipped one",
+                      ran == {n for n in names if _expected_shard(n, 3) == k and n != victim})
+                check(f"--shard {k}/3 + --skip: [SKIP] line only in the skipped step's shard",
+                      (f"[SKIP] {victim}: --skip" in out) == (k == vshard))
+                for n in ran:
+                    ran_all[n] = ran_all.get(n, 0) + 1
+        check("--shard + --skip: union is every step but the skipped one, each once",
+              sorted(ran_all) == sorted(n for n in names if n != victim)
+              and set(ran_all.values()) == {1})
+        with tempfile.TemporaryDirectory() as root:
+            git_init(root)
+            write(root, ".gates.toml", _steps_cfg([("a", "true", "")]))
+            rc, _ = run_runner(root, args=("--shard", "1/1", "--skip", "nope"))
+            check("--shard + --skip of an unknown name still exits 2", rc == 2)
+
+
+def test_shard_absent_is_byte_identical():
+    with tempfile.TemporaryDirectory() as root:
+        git_init(root)
+        write(root, ".gates.toml", _steps_cfg([("a", "echo out-a", ""), ("b", "echo out-b", "")]))
+        rc, out = run_runner(root)
+        check("--shard absent: both steps run, no shard text anywhere",
+              rc == 0 and "[PASS] a" in out and "[PASS] b" in out and "shard" not in out)
+        rc1, out1 = run_runner(root, args=("--shard", "1/1"))
+        check("--shard 1/1 runs the same steps as no flag",
+              rc1 == 0 and "[PASS] a" in out1 and "[PASS] b" in out1)
+
+
 def main():
     print("test-gate-runner.py")
     for fn in [
@@ -1759,8 +2146,18 @@ def main():
         test_parallel_receipt, test_parallel_double_interrupt_term_ignoring,
         test_parallel_soft_skip_memo, test_parallel_launch_error_and_tiebreak,
         test_parallel_launch_signal_mask, test_parallel_head_checked_once,
+        test_parallel_interrupt_never_raises_in_poll,
+        test_parallel_interrupt_in_last_iteration,
+        test_parallel_interrupt_in_launch_window,
+        test_parallel_interrupt_before_launch,
+        test_parallel_interrupt_during_output,
+        test_parallel_inherited_ignored_sigint,
+        test_terminate_groups_ignores_popen_lock,
         test_skip_named_steps_serial_and_parallel, test_skip_absent_is_byte_identical,
         test_skip_refuses_doubt,
+        test_shard_function_partitions_and_is_stable, test_shard_runs_partition_end_to_end,
+        test_shard_malformed_and_refusals, test_shard_skip_interaction,
+        test_shard_absent_is_byte_identical,
     ]:
         print(f"- {fn.__name__}")
         fn()

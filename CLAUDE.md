@@ -646,22 +646,30 @@ Runtime (`scripts/`; canonical source is this repo):
   harnesses never ran in CI). That half is now DERIVED, a deliberate REVERSAL of the original
   "do not derive CI's list from `.gates.toml`" decision: CI ran all 46 harnesses as SERIAL
   Actions steps (375s macOS / 230s ubuntu, nearly all subprocess-spawn cost), so each OS leg
-  now runs ONE `python3 scripts/gate-runner.py --jobs 4 --skip ...` step (same `exclusive`
-  barriers as local), so there is no second harness list to drift. That rests on unique,
+  now runs `python3 scripts/gate-runner.py --jobs 4 --skip ...` (same `exclusive`
+  barriers as local), so there is no second harness list to drift. #544: the macOS leg is
+  SHARDED, 3 runners each running `--shard K/3` (`gate-runner --shard K/N`, a sha256-of-name
+  partition, computed from the full list so `--skip` never moves a step), and the required
+  context `gates (macos-latest)` is minted by a separate AGGREGATE job (`if: always()`, passes
+  only on an exact `success` shard result); Linux stays one unsharded step. That rests on unique,
   explicit step names (CI deselects by name via `--skip`, and a reused name would deselect two),
   which gate-runner refuses under `--skip` and this harness asserts. The trade-off
   accepted: CI depends on parsing `.gates.toml`. The harness now asserts CI CANNOT SILENTLY
-  STOP running that list: exactly one gate-runner `run:` per leg under an exact
-  `if: runner.os == 'Linux'|'macOS'` (or none), no `continue-on-error`, `--jobs N>=2`, the
-  matrix still `[ubuntu-latest, macos-latest]` (the required check names), each leg's `--skip`
+  STOP running that list: one unsharded Linux gate-runner `run:`; on macOS the same `--shard N`
+  everywhere, K values exactly 1..N, the shards' union (via gate-runner's own hash) equal to the
+  leg's steps minus `CI_SKIP`, none in zero or two shards; an aggregate job named
+  `gates (macos-latest)` that `needs` the shard job, runs `if: always()` and fails unless the
+  result is exactly `success`; the ubuntu matrix exactly `[ubuntu-latest]` (the required check
+  names); no `continue-on-error` anywhere; `--jobs N>=2`; each leg's `--skip`
   set EQUAL to its `CI_SKIP` table (every entry a WRITTEN REASON naming a real step: lint on
   both legs, `test-orchestrate-setup` on macOS), and no CI-run step `required = false` or
   carrying `skip_if_absent`/`skip_if`. The FS leg still requires every `test-*.py` to be a
   `.gates.toml` step. shellcheck/ruff keep their dedicated Linux CI steps (digest-pinned image,
-  Linux-only ruff), so their lists stay hand-maintained and keep all three checks. A 13-case
+  Linux-only ruff), so their lists stay hand-maintained and keep all three checks. A 29-case
   MUTATION SELF-TEST proves each check fails when its invariant breaks. gate-runner's
   `--skip <name>` (repeatable, default off) exits 2 on a name matching no step, on Form A /
-  the fallback chain, and beside `--receipt` (a receipt must attest the whole gate).
+  the fallback chain, and beside `--receipt` (a receipt must attest the whole gate); `--shard K/N`
+  is refused the same three ways and on a malformed value or a duplicated step name.
 - `test-orchestrate-{guard,resources,setup}.py`, `test-planner-classify.py`, `test-gh-wrappers.py` -
   the proof harnesses (kept at repo root; dev tooling, not shipped in the skill).
 
