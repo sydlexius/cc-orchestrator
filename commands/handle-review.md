@@ -511,9 +511,18 @@ gate_rc=2
 [ "$leg" = plugin ] && { python3 '${CLAUDE_PLUGIN_ROOT}/scripts/gate-runner.py'; gate_rc=$?; }
 [ "$leg" = stable ] && { python3 ~/.claude/scripts/gate-runner.py; gate_rc=$?; }
 [ "$leg" = none ]   && echo "gate: NOT RUN (gate-runner.py not found on any leg: repo/plugin/deployed)" >&2
+[ "$gate_rc" = 75 ] && echo "gate: NOT RUN (gate_rc=75; the runner's own line above says why) - re-run this block ONCE, then stop and report; never \"fix\" it" >&2
 echo "gate_rc=$gate_rc leg=$leg"
 (exit "$gate_rc")
 ```
+
+**Machine gate pool (the rule is in `prep-pr.md`, "Machine gate pool").** First run
+`grep -Eq '^[[:blank:]]*budget[[:blank:]]*=' ~/.claude/gate-queue/config.toml 2>/dev/null && echo pool=on || echo pool=off`.
+On `pool=on` run the block above in the background and read `gate_rc=` from its output.
+`gate_rc=75` is `gate: NOT RUN` (the runner's own line above says why), never a failed gate
+and never a pass: re-run the block ONCE, then stop and report a second 75 to the maintainer
+instead of fixing anything or looping. Exit 130 with the pool on and no step line in the output is a SIGINT during the wait:
+also NOT RUN, not a failing gate to fix.
 
 The runner prints a per-step `[PASS]` / `[SKIP]` / `[FAIL]` line and exits
 non-zero on the first required-gate failure. A `gate: NOT RUN` line (no runner found on any
@@ -780,10 +789,21 @@ elif [ -n "$pr_base" ] && [ -z "$def_base" ]; then base_flag="--base $pr_base"; 
 [ "$gate_rc" = 0 ] && [ "$leg" = plugin ] && { bash '${CLAUDE_PLUGIN_ROOT}/scripts/safe-push.sh' "$(git branch --show-current)" --stale-ok $base_flag; push_rc=$?; }
 [ "$gate_rc" = 0 ] && [ "$leg" = stable ] && { bash ~/.claude/scripts/safe-push.sh "$(git branch --show-current)" --stale-ok $base_flag; push_rc=$?; }
 [ "$leg" = none ]   && echo "safe-push.sh not found (repo-local, plugin, or ~/.claude/scripts/); NOT pushing" >&2
-[ "$leg" != none ] && [ "$gate_rc" != 0 ] && echo "gate FAILED (gate_rc=$gate_rc); NOT pushing - fix, commit, re-run this block" >&2
+[ "$leg" != none ] && [ "$gate_rc" = 75 ] && echo "gate: NOT RUN (gate_rc=75; the runner's own line above says why); NOT pushing - re-run this block ONCE, then stop and report; nothing to fix" >&2
+[ "$leg" != none ] && [ "$gate_rc" != 0 ] && [ "$gate_rc" != 75 ] && echo "gate FAILED (gate_rc=$gate_rc); NOT pushing - fix, commit, re-run this block" >&2
 echo "gate_rc=$gate_rc push_rc=$push_rc leg=$leg"
 (exit "$push_rc")  # prep-pr-ok
 ```
+
+**Machine gate pool.** Run the pool check first (as in Step 5.5); on `pool=on` this block runs
+in the background and `gate_rc=` / `push_rc=` are read from its output. The push still runs
+ONLY on `gate_rc=0`. `gate_rc=75` prints `gate: NOT RUN`, not `gate FAILED` (the runner's own
+line above says why): re-run the block ONCE, then stop and report a second 75 to the
+maintainer, never loop. `gate_rc=130` with the pool on and no step line in the output is a
+SIGINT during the wait: also NOT RUN, not a failing gate to fix, whatever the block's
+`gate FAILED` line says. With a pre-push hook installed the push starts
+the hook's gate as well; a failed push whose output carries `gate-runner: NOT RUN` is likewise
+a gate that did not run (re-run, never fix).
 
 The push's `SAFE-PUSH: OK ... verified=ls-remote` line (with `push_rc=0`) IS the remote
 verification: do not follow it with `ls-remote` / `rev-parse origin/<b>` / `git status`. Only

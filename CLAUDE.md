@@ -250,9 +250,26 @@ Runtime (`scripts/`; canonical source is this repo):
   resolved BEFORE `admit.lock`), and opens every lock descriptor non-inheritable. `POOL_PROTOCOL`
   is bumped when ordering or on-disk meaning changes; a process never schedules, rewrites or
   unlinks a record of another protocol. Deployed via `HELPER_NAMES`: a deployed runner with a
-  budget and no module beside it exits 2. DO NOT WRITE A BUDGET YET: enforcement of
-  `job_timeout_s`, the pool-aware command prose and the orphan watchdog are later PRs of #539, and
-  until they ship a foreground caller reads 75 as a failed gate. `test-gate-pool.py` mutation-proves
+  budget and no module beside it exits 2. POOLED STEP PATH (A2, in
+  `gate-runner.py`, reached ONLY with the pool on): a serial step runs in its OWN PROCESS GROUP
+  (not a session, so its output still streams) with `/dev/null` as stdin; the runner FORWARDS
+  SIGINT, SIGTERM, SIGHUP and SIGQUIT to that group, waits, sweeps the group (TERM, then KILL) on
+  every exit path of the STEP, gives its slots back and then ends as the pool-off path ends for
+  that signal (a KeyboardInterrupt, or death by the same signal). That holds for a signal DURING
+  a step. A signal BETWEEN steps takes its default action, as with the pool off: the kernel frees
+  the slot locks and the next evaluator clears the ticket file. SIGTSTP is NOT forwarded, and a step that
+  reads or controls the terminal is unsupported with the pool on (stated differences). The whole
+  run, serial or parallel, is killed at `job_timeout_s` (default 5400, counted from the grant):
+  exit 1, `gate-runner: KILLED - exceeded job_timeout_s`, a fail receipt. That is a FAILED gate,
+  unlike 75. The command and charter prose reads 75 as NOT RUN and runs a pooled gate in the
+  background (`commands/prep-pr.md` "Machine gate pool"). The harness never lets a process die
+  of SIGQUIT (macOS reports it as a crash): that case stubs the final die-of-signal step.
+  DO NOT WRITE A BUDGET YET: A3 (the named heavy commands), A4 (the orphan watchdog) and the
+  release are not in, so a SIGKILLed holder frees its slots while its steps keep running. Two
+  known limits until then. An interrupted pooled run leaves an older pass receipt in place, as
+  pool-off does (it still binds its own tree). A nested runner's step that ignores SIGTERM can
+  outlive an outer runner that was signalled, with the slots free, until A4's watchdog.
+  `test-gate-pool.py` mutation-proves
   both files against COPIES and pins `GATEQ_HOME` to a temp directory, as `test-gate-runner.py` does.
 - `scripts/orchestrate_schemas.py` - versioned schema registry + stdlib validator (#225, part of
   the #220 epic): one source-of-truth schema per structured artifact one agent writes and another
@@ -775,7 +792,9 @@ nothing above changes): `[prep_pr] weight = N` declares the machine cost units a
 gate occupies (a positive integer, validated whenever present, like `jobs`). With
 a budget in `~/.claude/gate-queue/config.toml` the runner first waits for its
 cost (`weight`, else Form B's effective `jobs`, else the whole budget) and exits
-75, NOT RUN, if none comes within `wait_timeout_s`. See `scripts/gate_pool.py`
+75, NOT RUN, if none comes within `wait_timeout_s`. Once running it is killed at
+`job_timeout_s` (exit 1, `KILLED`, a fail receipt), and its serial steps run in
+their own process group with interrupts forwarded. See `scripts/gate_pool.py`
 above and `skills/orchestrate/templates/gates.toml.md`.
 
 ```sh

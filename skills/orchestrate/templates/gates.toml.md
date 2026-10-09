@@ -221,7 +221,7 @@ budget = 10                  # cost units. Absent (or no file, or no [pool] tabl
 backfill_bypass_limit = 2    # optional: how often a waiting gate may be passed (default 2)
 small_check_cap = 2          # optional: named commands at or below this weight go first (default 2)
 wait_timeout_s = 3600        # optional: a gate gives up WAITING after this (default 3600)
-job_timeout_s = 5400         # optional: validated now, enforced by a later release
+job_timeout_s = 5400         # optional: one RUN is killed after this (default 5400)
 ```
 
 Each of the six keys must be a positive integer when present. Any other key
@@ -267,6 +267,26 @@ run's verdict. A SIGINT while waiting exits 130 the same way; other signals take
 their default action and may leave an older receipt in place. A usage error in
 `--skip` or `--shard` is reported only after the slot is granted, so it can wait
 and can exit 75.
+
+**Once it runs, with the pool on.** The whole run is bounded by `job_timeout_s`,
+counted from the grant: past it the runner kills every step group, prints
+`gate-runner: KILLED - exceeded job_timeout_s (<N>s)`, exits 1 and (with
+`--receipt`) writes a fail receipt. That is a FAILED gate (a hung step), not a
+NOT RUN. A serial step (Form A, serial Form B, the fallback chain) runs in its
+own process group: SIGINT, SIGTERM, SIGHUP and SIGQUIT sent to the runner are
+forwarded to it, the group is swept when the step ends (a background job a step
+leaves behind does not outlive it), and the runner then ends exactly as it does
+with the pool off. Stated differences from pool-off: SIGTSTP (Ctrl-Z) stops
+the runner and NOT the step, which keeps running and keeps its slots; and a
+serial step gets `/dev/null` as stdin, so a step that reads its stdin reads EOF
+at once instead of the terminal (a `cat` exits 0; a prompt gets an empty
+answer), while one that opens `/dev/tty` or changes terminal settings is stopped
+by the kernel and ended only by `job_timeout_s`. A third, measured: with the
+pool on a step is a background process group, so under `stty tostop` a step that
+writes to the terminal is stopped by the kernel (SIGTTOU) and holds its slots
+until `job_timeout_s`. With the pool off none of this applies: no group, no
+forwarding, no timeout. The commands' pool check (`pool=on` / `pool=off`) reads
+`~/.claude/gate-queue/config.toml` only and does not follow `GATEQ_HOME`.
 
 A gate started BY a pooled gate in the same worktree (the pre-push hook under a
 gate step that uploads, a gate run from a step) runs under its holder's slots
