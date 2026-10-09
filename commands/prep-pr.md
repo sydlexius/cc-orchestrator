@@ -52,6 +52,40 @@ variant that slips past it runs a gate nobody can read. Report `<step>: NOT RUN 
 until the command is fixed or the human runs it; for an ADVISORY step (Step 8b prose-lint) report
 it skipped and continue. Other commands with gate steps point here.
 
+**Machine gate pool (#539).** A machine may cap how many gates run at once: the user writes a
+`budget` into `~/.claude/gate-queue/config.toml`. `gate-runner.py` then WAITS for its share
+before it runs anything (up to `wait_timeout_s`, 3600 by default, far past the Bash tool's
+10-minute ceiling), and a wait that gives up exits **75, which means NOT RUN**. With no such
+file, or no `budget` line in it, nothing in this section applies and every block behaves as it
+always has. Before ANY block that runs the gate, or that pushes in a repo with a pre-push hook
+installed (the hook runs the same gate), run this read-only check:
+
+```bash
+grep -Eq '^[[:blank:]]*budget[[:blank:]]*=' ~/.claude/gate-queue/config.toml 2>/dev/null && echo pool=on || echo pool=off
+```
+
+(The same anchored `budget =` line match `orchestrate-setup.py doctor` compares with its TOML
+parse; a false `pool=on` only costs a background run.) Then:
+
+- `pool=off`: run the block as written.
+- `pool=on`: run the SAME block with `run_in_background: true` and wait for its completion
+  notice. Read `gate_rc=` (or `push_rc=`) from the block's OWN output; the notice's exit status
+  is the wrapper's, not the gate's.
+- `gate_rc=75` is `gate: NOT RUN`; the runner's own line above it says why (no slot or a busy
+  worktree for the whole wait, a `.gates.toml` that changed during the wait, or a nested run
+  heavier than its holder). It is NEVER "fix the failing gate" and NEVER a pass: nothing ran,
+  so there is nothing to fix. Re-run the block ONCE; a second 75 is reported to the
+  maintainer, and you stop. Never loop on it.
+- `gate_rc=130` is NOT RUN only when the output carries the runner's line
+  `gate-runner: NOT RUN - interrupted while waiting for a gate slot`. Without that line the gate may have
+  started and been interrupted mid-step: never infer NOT RUN from a missing step line.
+- A failed push whose output carries the hook's `gate-runner: NOT RUN` line means the hook's
+  gate did not run: never fix, never bypass the hook. Re-run the block ONCE, and ONLY when that line is one of the three that exit 75 (`no gate slot within`, `.gates.toml changed during the wait`, or `reason=nested-over-holder`). Any other `gate-runner: NOT RUN` line (`interrupted while waiting`, exit 130; `pool error`, a config error or a missing `gate_pool.py`, exit 2) is reported as it is and NOT retried.
+- `gate-runner: KILLED - exceeded job_timeout_s` (exit 1) is different: the gate RAN and was
+  ended. Treat it as a failed gate (a hung step), not as NOT RUN.
+
+Every other command and charter that runs the gate points here.
+
 ---
 
 ## Step 1 -- Orient
@@ -293,9 +327,13 @@ gate_rc=2
 [ "$leg" = plugin ] && { python3 '${CLAUDE_PLUGIN_ROOT}/scripts/gate-runner.py' --receipt "$RECEIPT_PATH"; gate_rc=$?; }
 [ "$leg" = stable ] && { python3 ~/.claude/scripts/gate-runner.py --receipt "$RECEIPT_PATH"; gate_rc=$?; }
 [ "$leg" = none ]   && echo "gate: NOT RUN (gate-runner.py not found on any leg: repo/plugin/deployed)" >&2
+[ "$gate_rc" = 75 ] && echo "gate: NOT RUN (gate_rc=75; the runner's own line above says why) - re-run this block ONCE, then stop and report; never \"fix\" it" >&2
 echo "gate_rc=$gate_rc leg=$leg"
 (exit "$gate_rc")
 ```
+
+**Machine gate pool.** Run the pool check from "Machine gate pool" at the top of this file
+first; on `pool=on` this block runs in the background and `gate_rc` is read from its output.
 
 **What the receipt is for.** `.git/prep-pr-receipt.json` records
 `{commit_sha, tree_sha, result, steps[], producer}` for this run. It lives under
@@ -324,10 +362,19 @@ the `.py` files, the guard and steer `--self-test`s, and the `python3
 test-*.py` harnesses. Another target repo declares a different set (or relies on
 the fallback chain).
 
-If `gate_rc` is non-zero: print the runner's failure output, stop, and say:
+If `gate_rc` is 75: the gate did NOT RUN (machine gate pool; the runner's own line above
+says why). Do not fix anything and do not continue. Re-run the block ONCE; on a second 75,
+stop and report `gate: NOT RUN (gate_rc=75)` to the maintainer, never loop. Exit 130 is NOT RUN
+only when the output carries `gate-runner: NOT RUN - interrupted while waiting for a gate slot`;
+without that line the gate may have started and been interrupted, so never infer NOT RUN
+from a missing step line.
+
+If `gate_rc` is any other non-zero value: print the runner's failure output, stop, and say:
 "Fix the failing gate before proceeding. Do not push broken code." A `gate: NOT RUN`
-line (`leg=none`) is the same STOP - a gate that did not run is a failed gate - and the fix
-is to reinstall/update the plugin or re-run `orchestrate-setup.py configure --apply`.
+line with `leg=none` (NO RUNNER FOUND on any leg, `gate_rc=2`) is the same STOP - in that
+case, and only that one, a gate that did not run is a failed gate - and the fix is to
+reinstall/update the plugin or re-run `orchestrate-setup.py configure --apply`. That is not
+the pool's 75 above, which is never a failed gate.
 
 If `gate_rc` is 0: note it and continue to Step 2b.
 
@@ -870,6 +917,13 @@ elif [ -n "$pr_base" ] && [ -z "$def_base" ]; then base_flag="--base $pr_base"; 
 echo "push_rc=$push_rc"
 (exit "$push_rc")  # prep-pr-ok
 ```
+
+**Machine gate pool, with a pre-push hook installed.** The upload starts the hook's gate, and
+with a budget configured that gate waits on its own ticket (the Step 2 gate has exited, so
+nothing holds slots for it). Run the pool check from the top of this file first; on `pool=on`
+run this block in the background and read `push_rc=` from its output. A failed push whose
+output carries `gate-runner: NOT RUN` is a gate that did not run: never fix. Re-run the block
+ONCE, and ONLY when that line is one of the three that exit 75 (`no gate slot within`, `.gates.toml changed during the wait`, or `reason=nested-over-holder`). Any other `gate-runner: NOT RUN` line (`interrupted while waiting`, exit 130; `pool error`, a config error or a missing `gate_pool.py`, exit 2) is reported as it is and NOT retried; report a second one to the maintainer.
 
 **Step 1c carry-over (#492).** safe-push is git-only and cannot see review state, so it refuses a
 definitive BEHIND unless told otherwise. The block above re-derives Step 1c's **reviewed WARN

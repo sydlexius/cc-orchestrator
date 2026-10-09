@@ -448,16 +448,26 @@ gate_rc=2
 [ "$leg" = plugin ] && { python3 '${CLAUDE_PLUGIN_ROOT}/scripts/gate-runner.py'; gate_rc=$?; }
 [ "$leg" = stable ] && { python3 ~/.claude/scripts/gate-runner.py; gate_rc=$?; }
 [ "$leg" = none ]   && echo "gate: NOT RUN (gate-runner.py not found on any leg: repo/plugin/deployed)" >&2
+[ "$gate_rc" = 75 ] && echo "gate: NOT RUN (gate_rc=75; the runner's own line above says why) - re-run this block ONCE, then stop and report; never \"fix\" it" >&2
 echo "gate_rc=$gate_rc leg=$leg"
 (exit "$gate_rc")
 ```
+
+**Machine gate pool (the rule is in `prep-pr.md`, "Machine gate pool").** First run
+`grep -Eq '^[[:blank:]]*budget[[:blank:]]*=' ~/.claude/gate-queue/config.toml 2>/dev/null && echo pool=on || echo pool=off`.
+On `pool=on` run the block above in the background and read `gate_rc=` from its output.
 
 *Illustrative -- this repo's gates (from its `.gates.toml`):* `shellcheck` on
 the shell scripts, `ruff check --select F,E741` on the `.py` files, the
 guard/steer self-tests, and the `python3 test-*.py` harnesses. Another target
 repo declares a different set (or relies on the fallback chain).
 
-If `gate_rc` is non-zero, fix the failures before proceeding. A `gate: NOT RUN` line (no
+If `gate_rc` is 75 the gate did NOT RUN (the runner's own line above says why): fix
+nothing, re-run the block ONCE, then stop and report a second 75 to the maintainer, never
+loop. Exit 130 is NOT RUN only when the output carries
+`gate-runner: NOT RUN - interrupted while waiting for a gate slot`; without that line the gate
+may have started and been interrupted, so never infer NOT RUN from a missing step line. If `gate_rc` is any
+other non-zero value, fix the failures before proceeding. A `gate: NOT RUN` line (no
 runner found on any leg) is a FAILED gate, not a skip: stop and report it.
 
 If the repo uses templ and any `.templ` files were changed (self-skip when no

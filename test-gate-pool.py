@@ -1310,15 +1310,52 @@ def wait_for(what, fact, *procs, timeout=60.0):
         time.sleep(0.02)
 
 
-def spawn(root, home, *args, env=None):
-    """Start a runner in its own session, its output in files (`.out`, `.err`)."""
+# NO TEST PROCESS MAY DIE OF SIGQUIT: the kernel reports that as a crash (on macOS a crash
+# report and a dialog per process). The one case that sends SIGQUIT runs the runner through
+# this driver: SIGQUIT has a do-nothing handler before main() starts (so a runner that fails
+# to handle it survives it), and the final "die of the signal" step is replaced by its
+# documented fallback status, 128 + the signal, FOR SIGQUIT ALONE. The real `_die_of` runs for
+# SIGTERM and SIGHUP, whose default action is a plain termination. A case may also hand the
+# driver a PATCH (python source, run with `mod` bound, before main()) to open a window no
+# outside process can hit by timing: see LAUNCH_SIG_PATCH.
+QUIT_SAFE_DRIVER = """
+import importlib.util, os, signal, sys
+signal.signal(signal.SIGQUIT, lambda signum, frame: None)
+spec = importlib.util.spec_from_file_location("_gate_runner", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+_real_die = mod._die_of
+mod._die_of = lambda sig: 128 + sig if sig == signal.SIGQUIT else _real_die(sig)
+exec(os.environ.get("GATE_POOL_PATCH", ""))
+sys.exit(mod.main(sys.argv[2:]))
+"""
+
+
+def spawn(root, home, *args, env=None, stdin=None, session=True, quit_safe=False, patch=None,
+          ignore=()):
+    """Start a runner in its own session (so its pid is its process group), its output in
+    files (`.out`, `.err`). `stdin` is a file to read from; the default is /dev/null.
+    `session=False` gives it its own GROUP inside this harness's session instead: a group whose
+    leader's parent shares its session is not orphaned, so SIGTSTP can stop it.
+    `quit_safe=True` runs it through QUIT_SAFE_DRIVER; so does `patch` (source the driver
+    runs before main()). `ignore` names signals the runner INHERITS as ignored."""
+    head = [sys.executable, "-B", "-c", QUIT_SAFE_DRIVER, RUNNER] if quit_safe or patch else \
+        [sys.executable, "-B", RUNNER]
+    if patch:
+        env = {**(env or {}), "GATE_POOL_PATCH": patch}
+
+    def pre():
+        # A harness started with SIGINT ignored must not hand that to the interrupt cases.
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        for s in ignore:
+            signal.signal(s, signal.SIG_IGN)
     base = os.path.join(os.path.dirname(home), f"run{next(_SERIAL)}")
-    with open(base + ".out", "wb") as out, open(base + ".err", "wb") as err:
+    with open(base + ".out", "wb") as out, open(base + ".err", "wb") as err, \
+            open(stdin or os.devnull, "rb") as inp:
         p = subprocess.Popen(
-            [sys.executable, "-B", RUNNER, *args], cwd=root, env=runner_env(home, env),
-            stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True,
-            # A harness started with SIGINT ignored must not hand that to the interrupt case.
-            preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+            [*head, *args], cwd=root, env=runner_env(home, env),
+            stdin=inp, stdout=out, stderr=err, start_new_session=session,
+            process_group=None if session else 0, preexec_fn=pre)
     p.out, p.err = base + ".out", base + ".err"
     _LIVE.append(p)
     return p
@@ -1374,14 +1411,16 @@ def gated(tmp, tag):
     return f"echo x > '{started}'; cat '{fifo}' > /dev/null", started, fifo
 
 
+def _open_for_write(fifo):
+    try:                                   # ENXIO until a reader has the FIFO open
+        os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        return True
+    except OSError:
+        return False
+
+
 def let_go(fifo):
-    def opened():                          # ENXIO until the step's cat has the FIFO open
-        try:
-            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
-            return True
-        except OSError:
-            return False
-    wait_for(f"a reader on {os.path.basename(fifo)}", opened)
+    wait_for(f"a reader on {os.path.basename(fifo)}", lambda: _open_for_write(fifo))
 
 
 def one_step(run, head=""):
@@ -1906,6 +1945,469 @@ def case_e2e_holder_env(tmp, home):
          ("0\n", [f"{own}|{own}.nest"], 2, True))
 
 
+# --- the pooled serial step path (PR A2; doc section 4) -----------------------------------------
+# A terminal signal goes to the FOREGROUND PROCESS GROUP. Every runner here is its own session
+# and group leader (`spawn`), so `os.killpg(p.pid, sig)` is what a terminal does: with the pool
+# off it reaches the runner AND its serial step (one group), with the pool on the runner alone,
+# which must forward it. Every helper step ends itself after 60 s, so a mutant that loses one
+# cannot leave it behind for long, and no case kills a pid it did not just see alive.
+INFO_STEP = """
+import json, os, sys
+with open(sys.argv[1], "w") as f:
+    json.dump({"pgrp": os.getpgrp(), "stdin": sys.stdin.read()}, f)
+"""
+SIG_STEP = """
+import os, signal, sys
+started, record = sys.argv[1:3]
+got = []
+def note(signum, frame):
+    if got:                                # the first signal is the one recorded
+        return
+    got.append(signum)
+    with open(record, "w") as f:
+        f.write(signal.Signals(signum).name)
+    os._exit(9)
+for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+    signal.signal(s, note)
+signal.alarm(60)
+with open(started, "w") as f:
+    f.write("x")
+while True:
+    signal.pause()
+"""
+TSTP_STEP = """
+import json, os, signal, sys
+started, record, fifo = sys.argv[1:4]
+got = []
+signal.signal(signal.SIGTSTP, lambda n, f: got.append("SIGTSTP"))
+signal.alarm(60)
+with open(started, "w") as f:
+    f.write("x")
+with open(fifo) as f:                      # blocks until the case lets the step go
+    f.read()
+with open(record, "w") as f:
+    json.dump(got, f)
+"""
+# Records EVERY forwarded signal it gets (one name per line, appended) and ends itself, exit 9,
+# after `n` of them. Its started file (its pid) is written AFTER the handlers are in: that is
+# the handshake. With a fifo it blocks there until the case lets it go, then exits 0. SIGQUIT
+# is not handled: no case sends it one.
+REC_STEP = """
+import os, signal, sys
+started, record, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+fifo = sys.argv[4] if len(sys.argv) > 4 else None
+got = []
+def note(signum, frame):
+    got.append(signum)
+    with open(record, "a") as f:
+        f.write(signal.Signals(signum).name + "\\n")
+    if len(got) >= n:
+        os._exit(9)
+for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(s, note)
+signal.alarm(60)
+with open(started, "w") as f:
+    f.write(str(os.getpid()))
+if fifo:
+    with open(fifo) as f:                  # blocks until the case lets the step go
+        f.read()
+    sys.exit(0)
+while True:
+    signal.pause()
+"""
+# Run by QUIT_SAFE_DRIVER inside the runner: right after the REAL Popen of a pooled step
+# returns (the group exists, the forwarding handlers do not yet), the runner sends ITSELF
+# SIGTERM. With the launch-window mask held the signal is pending and is delivered once the
+# handlers are in; with no mask it kills the runner on the spot and the group is an orphan.
+LAUNCH_SIG_PATCH = """
+import subprocess as _sp
+_Popen = _sp.Popen
+class _SignalAtLaunch(_Popen):
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        pidf = os.environ["GATE_POOL_STEP_PID"]
+        if k.get("process_group") == 0 and not os.path.exists(pidf):
+            with open(pidf, "w") as f:
+                f.write(str(self.pid))
+            os.kill(os.getpid(), signal.SIGTERM)
+_sp.Popen = _SignalAtLaunch
+"""
+DIE_BY = ("SIGINT", "SIGTERM", "SIGHUP")   # compared pool on against pool off, to the death
+
+
+def py_step(tmp, name, source, *args):
+    """A step that runs a helper script, exec'd so the step's shell IS the script."""
+    script = put(os.path.join(tmp, name), source)
+    return "exec " + " ".join(f"'{a}'" for a in (sys.executable, script, *args))
+
+
+def off_home(tmp):
+    """A second, EMPTY pool root: the pool-off side of a comparison."""
+    home = os.path.join(tmp, "off", "gq")
+    os.makedirs(home, 0o700, exist_ok=True)
+    return home
+
+
+def ended(p, timeout=60):
+    """The exit status, or a string when the runner did not end (a FAIL by name, not a hang)."""
+    try:
+        return p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "still running"
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:                # somebody else's process now: ours is gone
+        return False
+    return True
+
+
+def gone(pid, timeout=10.0):
+    """True once `pid` is gone. A process just killed may be an unreaped zombie for an instant,
+    so this waits for the fact, bounded; a survivor costs the bound and reads False."""
+    end = time.monotonic() + timeout
+    while alive(pid):
+        if time.monotonic() > end:
+            return False
+        time.sleep(0.02)
+    return True
+
+
+def tail(p, root):
+    """What a caller sees last: every stdout line (durations and the root normalized) and the
+    last stderr line (an interrupt's traceback differs in its frames, never in that line)."""
+    _, out, err = normalized(root, 0, read(p.out), read(p.err))
+    return out, (err.splitlines() or [""])[-1]
+
+
+@e2e
+def case_serial_golden_on(tmp, home):
+    put(os.path.join(home, "config.toml"), CONFIG)
+    for form in FORMS:
+        root = form_repo(tmp, form, f"{form}-{next(_SERIAL)}")
+        same(f"serial golden on: {form} with the pool ON prints and exits exactly as the "
+             "pre-pool golden", normalized(root, *run_runner(root, home)), GOLDEN.get(form))
+    same("serial golden on: and the pool is left empty", listing(home), [])
+
+
+@e2e
+def case_serial_group(tmp, home):
+    typed = put(os.path.join(tmp, "typed"), "typed\n")
+    seen = {}
+    for label, pool_home in (("off", off_home(tmp)), ("on", home)):
+        info = os.path.join(tmp, f"info-{label}.json")
+        root = make_repo(tmp, f"g-{label}", one_step(py_step(tmp, "info.py", INFO_STEP, info)))
+        if label == "on":
+            put(os.path.join(home, "config.toml"), CONFIG)
+        p = spawn(root, pool_home, stdin=typed)
+        rec = (ended(p), _load_json(info))
+        seen[label] = (rec[0], rec[1].get("pgrp") == p.pid, rec[1].get("stdin"))
+    same("serial group: with the pool OFF a serial step shares the runner's process group and "
+         "reads the runner's stdin, as before the pool", seen["off"], (0, True, "typed\n"))
+    same("serial group: with the pool ON a serial step runs in a process group of its OWN",
+         seen["on"][:2], (0, False))
+    same("serial group: with the pool ON a serial step's stdin is /dev/null, not the runner's",
+         seen["on"][2], "")
+
+
+def _signalled(tmp, home, tag, sig, send, **kw):
+    """One runner with one SIG_STEP step, signalled once the step runs ->
+    (exit status, what the step recorded, stdout, last stderr line)."""
+    started, record = os.path.join(tmp, tag + ".started"), os.path.join(tmp, tag + ".record")
+    root = make_repo(tmp, tag, one_step(py_step(tmp, "sig.py", SIG_STEP, started, record)))
+    p = spawn(root, home, **kw)
+    wait_for(f"the {tag} step to start", lambda: os.path.exists(started), p)
+    send(p.pid, sig)
+    with contextlib.suppress(AssertionError):   # a lost signal is a FAIL of its check, by name
+        wait_for("the step's record", lambda: read(record) != "", timeout=10)
+    return (ended(p, timeout=20), read(record), *tail(p, root))
+
+
+@e2e
+def case_serial_signals(tmp, home):
+    put(os.path.join(home, "config.toml"), CONFIG)
+    off, left = off_home(tmp), []
+    for name in DIE_BY:
+        sig = getattr(signal, name)
+        # os.killpg on the runner's group is what a terminal does.
+        seen = {label: _signalled(tmp, pool_home, f"{name}-{label}", sig, os.killpg)
+                for label, pool_home in (("off", off), ("on", home))}
+        same(f"serial signals: with the pool OFF {name} from the terminal reaches the step and "
+             "ends the runner by that signal", seen["off"][:2], (-sig, name))
+        same(f"serial signals: {name} reaches a pooled serial step: the runner forwards it to "
+             "the step's group", seen["on"][1], name)
+        same(f"serial signals: {name} ends the pooled runner with the pool-off exit status and "
+             "final lines", (seen["on"][0], seen["on"][2:]), (seen["off"][0], seen["off"][2:]))
+        left.append(listing(home))         # read now: a later runner would unlink a dead ticket
+    same("serial signals: a runner ended by a forwarded signal gave its ticket back first",
+         left, [[], [], []])
+    # SIGQUIT: forwarding only, and to the runner's pid alone. No process here dies of it (see
+    # QUIT_SAFE_DRIVER), so there is NO pool-off run and no die-by-SIGQUIT status to compare.
+    rc, record, out, _ = _signalled(tmp, home, "SIGQUIT-on", signal.SIGQUIT, os.kill,
+                                    quit_safe=True)
+    same("serial signals: SIGQUIT reaches a pooled serial step: the runner forwards it to the "
+         "step's group", record, "SIGQUIT")
+    same("serial signals: after a forwarded SIGQUIT the runner prints no step verdict and goes "
+         "to die of SIGQUIT (stubbed in this case: exit 128+3)",
+         (rc, out), (128 + signal.SIGQUIT, seen["off"][2]))
+
+
+def _pid_of(path):
+    return int(read(path).strip() or 0)
+
+
+@e2e
+def case_serial_sweep(tmp, home):
+    put(os.path.join(home, "config.toml"), CONFIG)
+    # (a) A step that ends normally and leaves a background job in its group.
+    seen = {}
+    for label, pool_home in (("off", off_home(tmp)), ("on", home)):
+        pidf = os.path.join(tmp, f"bg-{label}.pid")
+        p = spawn(make_repo(tmp, f"bg-{label}", one_step(f"sleep 60 & echo $! > '{pidf}'")),
+                  pool_home)
+        rc, pid = ended(p), _pid_of(pidf)
+        if label == "off":
+            seen[label] = (rc, alive(pid))
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)   # seen alive on the line above: ours
+        else:
+            seen[label] = (rc, gone(pid), "[PASS] s (exit 0" in read(p.out))
+    same("serial sweep: with the pool OFF a step's background job outlives the runner, as "
+         "before the pool", seen["off"], (0, True))
+    same("serial sweep: with the pool ON a passing step's background job is swept before the "
+         "runner ends", seen["on"], (0, True, True))
+    # (b) An interrupt: the shell dies of the forwarded SIGINT, its background job ignores it
+    # (a non-interactive shell starts `&` jobs that way; RUN F5) and goes with the sweep.
+    pidf, started = os.path.join(tmp, "int.pid"), os.path.join(tmp, "int.started")
+    p = spawn(make_repo(tmp, "int", one_step(
+        f"sleep 60 & echo $! > '{pidf}'; echo x > '{started}'; wait")), home)
+    wait_for("the interrupted step to start", lambda: os.path.exists(started), p)
+    os.killpg(p.pid, signal.SIGINT)
+    same("serial sweep: after a forwarded SIGINT the step's background job, which ignores "
+         "SIGINT, is swept before the runner ends",
+         (ended(p), gone(_pid_of(pidf))), (-signal.SIGINT, True))
+    # (c) A step that ignores the forwarded signal AND the sweep's SIGTERM: the SIGKILL leg.
+    pidf, started = os.path.join(tmp, "deaf.pid"), os.path.join(tmp, "deaf.started")
+    p = spawn(make_repo(tmp, "deaf", one_step(
+        f"trap '' TERM; echo $$ > '{pidf}'; echo x > '{started}'; sleep 60")), home)
+    wait_for("the deaf step to start", lambda: os.path.exists(started), p)
+    os.killpg(p.pid, signal.SIGTERM)
+    same("serial sweep: a step that ignores the forwarded SIGTERM is killed with its group, and "
+         "the runner still ends by SIGTERM",
+         (ended(p), gone(_pid_of(pidf))), (-signal.SIGTERM, True))
+
+
+def _kill_seen_alive(pid):
+    """Cleanup after a FAILED check: a step a mutant left behind, seen alive just now."""
+    if pid and alive(pid):
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+
+
+def _rec(tmp, home, tag, n, tail="", fifo=None, **kw):
+    """One runner with one REC_STEP step, returned once the step's handlers are in ->
+    (runner, record file, the step's pid)."""
+    started, record = os.path.join(tmp, tag + ".started"), os.path.join(tmp, tag + ".record")
+    step = py_step(tmp, "rec.py", REC_STEP, started, record, str(n), *([fifo] if fifo else []))
+    if tail:                               # NOT exec'd: the shell stays, the script is its child
+        step = step[len("exec "):] + tail
+    p = spawn(make_repo(tmp, tag, one_step(step)), home, **kw)
+    wait_for(f"the {tag} step to start", lambda: read(started) != "", p)
+    return p, record, _pid_of(started)
+
+
+@e2e
+def case_serial_launch_window(tmp, home):
+    put(os.path.join(home, "config.toml"), CONFIG)
+    pidf = os.path.join(tmp, "launch.pid")
+    p = spawn(make_repo(tmp, "launch", one_step("sleep 30")), home, patch=LAUNCH_SIG_PATCH,
+              env={"GATE_POOL_STEP_PID": pidf})
+    rc, pid = ended(p, timeout=30), _pid_of(pidf)
+    same("serial launch window: a signal that lands between the step's Popen and the handler "
+         "install is not lost: it is forwarded, the step's group is gone, the ticket is given "
+         "back, and the runner ends by that signal",
+         (rc, bool(pid) and gone(pid, 3.0), listing(home)), (-signal.SIGTERM, True, []))
+    _kill_seen_alive(pid)
+
+
+@e2e
+def case_serial_two_signals(tmp, home):
+    put(os.path.join(home, "config.toml"), CONFIG)
+    # (a) Two DIFFERENT signals during one step. The second is sent only once the step has
+    # recorded the first, so the runner provably took them in this order.
+    p, record, pid = _rec(tmp, home, "two", 2)
+    os.kill(p.pid, signal.SIGTERM)
+    with contextlib.suppress(AssertionError):
+        wait_for("the first forwarded signal", lambda: read(record) != "", timeout=10)
+    os.kill(p.pid, signal.SIGHUP)
+    rc = ended(p, timeout=30)
+    same("serial two signals: two different signals during one step are EACH forwarded, once",
+         read(record).split(), ["SIGTERM", "SIGHUP"])
+    same("serial two signals: the FIRST signal decides how the runner ends, and the ticket is "
+         "given back", (rc, listing(home)), (-signal.SIGTERM, []))
+    _kill_seen_alive(pid)
+    # (b) A second signal DURING THE SWEEP. The step outlives every SIGTERM and records each:
+    # its second record line is the sweep's own SIGTERM, the fact that the runner is in its
+    # sweep (the SIGKILL comes KILL_GRACE_S later).
+    p, record, pid = _rec(tmp, home, "insweep", 99)
+    os.kill(p.pid, signal.SIGTERM)
+    with contextlib.suppress(AssertionError):
+        wait_for("the sweep's SIGTERM", lambda: len(read(record).split()) >= 2, timeout=15)
+    in_sweep = read(record).split()
+    os.kill(p.pid, signal.SIGHUP)
+    same("serial two signals: a second signal during the sweep does not abort it: the step's "
+         "group is gone when the runner ends, by the FIRST signal, its ticket given back",
+         (in_sweep, ended(p, timeout=30), gone(pid, 3.0), listing(home)),
+         (["SIGTERM", "SIGTERM"], -signal.SIGTERM, True, []))
+    _kill_seen_alive(pid)
+
+
+@e2e
+def case_serial_ignored(tmp, home):
+    put(os.path.join(home, "config.toml"), CONFIG)
+    fifo = os.path.join(tmp, "ign.fifo"); os.mkfifo(fifo)
+    p, record, pid = _rec(tmp, home, "ign", 99, fifo=fifo, ignore=(signal.SIGHUP,))
+    os.kill(p.pid, signal.SIGHUP)
+    # No fact marks "the runner did NOT act": the bound gives a wrongly forwarded signal time
+    # to reach the step. The exit status below does not depend on it.
+    with contextlib.suppress(AssertionError):
+        wait_for("a forwarded signal", lambda: read(record) != "", timeout=1.0)
+    with contextlib.suppress(AssertionError):
+        let_go(fifo)
+    same("serial ignored: a signal the runner INHERITED as ignored stays ignored with the pool "
+         "on: the step is not signalled, the gate passes, exit 0, no ticket left",
+         (ended(p, timeout=30), read(record), read(p.out).splitlines()[-1:], listing(home)),
+         (0, "", ["gate-runner: all steps passed."], []))
+    _kill_seen_alive(pid)
+
+
+@e2e
+def case_serial_group_signal(tmp, home):
+    put(os.path.join(home, "config.toml"), CONFIG)
+    # The step's shell is the group leader and the recording script is its CHILD.
+    p, record, pid = _rec(tmp, home, "child", 1, tail="; true")
+    os.kill(p.pid, signal.SIGHUP)
+    rc = ended(p, timeout=30)
+    same("serial group signal: a forwarded signal goes to the step's GROUP: a child the step's "
+         "shell started without exec gets it too",
+         (rc, read(record).split(), gone(pid, 3.0)), (-signal.SIGHUP, ["SIGHUP"], True))
+    _kill_seen_alive(pid)
+
+
+@e2e
+def case_serial_tstp(tmp, home):
+    put(os.path.join(home, "config.toml"), CONFIG)
+    started, record = os.path.join(tmp, "tstp.started"), os.path.join(tmp, "tstp.record")
+    fifo = os.path.join(tmp, "tstp.fifo"); os.mkfifo(fifo)
+    root = make_repo(tmp, "tstp", one_step(py_step(tmp, "tstp.py", TSTP_STEP, started, record,
+                                                   fifo)))
+    # Not a session of its own: the kernel discards SIGTSTP's stop for an orphaned group.
+    p = spawn(root, home, session=False)
+    wait_for("the step to start", lambda: os.path.exists(started), p)
+    os.kill(p.pid, signal.SIGTSTP)         # Ctrl-Z: the runner alone is in the foreground group
+
+    def stopped():                         # this harness is the runner's parent, so it can ask
+        pid, status = os.waitpid(p.pid, os.WUNTRACED | os.WNOHANG)
+        return pid == p.pid and os.WIFSTOPPED(status)
+    # THE HANDSHAKE: the runner being STOPPED is the fact that it has acted on the signal. A
+    # runner that forwards it instead never stops, and the bound below is then what gives the
+    # forwarded signal time to arrive: both checks fail, neither by luck.
+    try:
+        wait_for("the runner to stop", stopped, timeout=10)
+        runner_stopped = True
+    except AssertionError:
+        runner_stopped = False
+    # The step ends while the runner is still stopped. A step that is gone, or never records,
+    # is a FAIL of the check below by name, not a crash of the case.
+    with contextlib.suppress(AssertionError):
+        wait_for("a reader on the fifo", lambda: _open_for_write(fifo), timeout=15)
+        wait_for("the step's record", lambda: read(record) != "", timeout=15)
+    seen = read(record)
+    os.kill(p.pid, signal.SIGCONT)
+    same("serial tstp: SIGTSTP stops the runner and is NOT forwarded: the step never sees it "
+         "and runs on to its end while the runner is stopped", (runner_stopped, seen),
+         (True, "[]"))
+    same("serial tstp: continued, the runner ends with an ordinary pass",
+         (ended(p), read(p.out).splitlines()[-1:]), (0, ["gate-runner: all steps passed."]))
+
+
+# --- the hand-run timeout (PR A2; doc section 4, "The hand-run timeout") -------------------------
+# The step outlasts job_timeout_s BY CONSTRUCTION (it sleeps 20 s against a 1 s bound); nothing
+# here is ordered by a sleep. A mutant that never kills costs those 20 s and then fails by name.
+_KILLED = "gate-runner: KILLED - exceeded job_timeout_s (1s)"
+
+
+def _overrun(tmp, home, tag, head):
+    """One gate whose only step outlasts the bound -> (exit status, last stderr line, the
+    receipt's result, the step's shell gone, tickets left, stdout)."""
+    pidf, receipt = os.path.join(tmp, tag + ".pid"), os.path.join(tmp, tag + ".receipt.json")
+    root = make_repo(tmp, tag, one_step(f"echo $$ > '{pidf}'; sleep 20", head))
+    commit(root, "a tree for the receipt to bind")
+    put(receipt, '{"result": "pass"}\n')   # an older pass that must not survive
+    p = spawn(root, home, "--receipt", receipt)
+    rc = ended(p, timeout=40)
+    pid = _pid_of(pidf)
+    return (rc, (read(p.err).splitlines() or [""])[-1], _load_json(receipt).get("result"),
+            bool(pid) and gone(pid), listing(home), read(p.out))
+
+
+@e2e
+def case_job_timeout(tmp, home):
+    put(os.path.join(home, "config.toml"), CONFIG + "job_timeout_s = 1\n")
+    rc, last, result, swept, left, out = _overrun(tmp, home, "serial", "")
+    same("job timeout: a hand-run gate whose serial step outlasts job_timeout_s is KILLED: "
+         "exit 1 and the KILLED line", (rc, last), (1, _KILLED))
+    same("job timeout: the killed serial step's group is swept and the slots are given back",
+         (swept, left), (True, []))
+    same("job timeout: the killed gate leaves a FAIL receipt, never the older pass",
+         result, "fail")
+    same("job timeout: a killed step gets no PASS or FAIL verdict line of its own",
+         [ln for ln in out.splitlines() if ln.startswith(("[PASS]", "[FAIL]"))], [])
+    rc, last, result, swept, left, out = _overrun(tmp, home, "parallel", "jobs = 2")
+    same("job timeout: a PARALLEL gate is bounded the same way: exit 1, the KILLED line, a "
+         "fail receipt, its step group swept, its slots given back",
+         (rc, last, result, swept, left), (1, _KILLED, "fail", True, []))
+    # The bound is the pool's: with no budget the same key bounds nothing.
+    put(os.path.join(home, "config.toml"), "[pool]\nprotocol = 1\njob_timeout_s = 1\n")
+    root = make_repo(tmp, "unbounded", one_step("sleep 2; echo outlived-the-bound"))
+    rc, out, err = run_runner(root, home)
+    same("job timeout: with the pool OFF job_timeout_s bounds nothing: a step that outlasts it "
+         "passes", (rc, "outlived-the-bound" in out, err), (0, True, ""))
+    # Any positive integer is a valid bound; one no float can hold must not reach the clock.
+    put(os.path.join(home, "config.toml"), CONFIG + "job_timeout_s = 1" + "0" * 400 + "\n")
+    rc, out, err = run_runner(make_repo(tmp, "huge", one_step("echo huge-ran")), home)
+    same("job timeout: an absurdly large job_timeout_s is clamped: the gate runs and passes, "
+         "with no traceback and no ticket left",
+         (rc, "[PASS] s (exit 0" in out, err, listing(home)), (0, True, "", []))
+
+
+@e2e
+def case_nested_timeout(tmp, home):
+    # wait_timeout_s bounds the one way this can go wrong: a run that is NOT taken as nested
+    # would wait on the worktree its holder holds.
+    put(os.path.join(home, "config.toml"), CONFIG + "job_timeout_s = 1\nwait_timeout_s = 5\n")
+    root = make_repo(tmp, "nested", one_step("sleep 8"))
+    hold(home, root)
+    held = listing(home, suffix=".ticket")
+    env = {"GATEQ_HOLDER": os.path.join(home, "waiters", held[0])}
+    p = spawn(root, home, env=env)
+    same("nested timeout: a NESTED run is bounded by job_timeout_s too: KILLED, exit 1, and no "
+         "ticket of its own",
+         (ended(p, timeout=40), (read(p.err).splitlines() or [""])[-1],
+          listing(home, suffix=".ticket")), (1, _KILLED, held))
+    # The holder is by now OLDER than the bound (the run above took all of it), so a nested
+    # run measured from its holder's start would be killed before its first step.
+    put(os.path.join(root, ".gates.toml"), one_step("echo quick-ran"))
+    rc, out, err = run_runner(root, home, env=env)
+    same("nested timeout: the bound is measured from the nested run's OWN start: a quick one "
+         "under a holder older than job_timeout_s passes",
+         (rc, "quick-ran" in out, err), (0, True, ""))
+
+
 CONTEND_CHILD = """
 import fcntl, os, sys, time
 sys.path.insert(0, sys.argv[1])
@@ -2001,6 +2503,12 @@ CASES = [
     ("e2e-gates-edited", case_e2e_gates_edited), ("e2e-receipt", case_e2e_receipt),
     ("e2e-git-outside-lock", case_e2e_git_outside_lock), ("e2e-holder-env", case_e2e_holder_env),
     ("contention", case_contention),
+    ("serial-golden-on", case_serial_golden_on), ("serial-group", case_serial_group),
+    ("serial-signals", case_serial_signals), ("serial-sweep", case_serial_sweep),
+    ("serial-tstp", case_serial_tstp), ("job-timeout", case_job_timeout),
+    ("serial-launch-window", case_serial_launch_window),
+    ("serial-two-signals", case_serial_two_signals), ("serial-ignored", case_serial_ignored),
+    ("serial-group-signal", case_serial_group_signal), ("nested-timeout", case_nested_timeout),
 ]
 
 # --- mutation self-test: each assertion must be able to FAIL ---------------------------------
@@ -2341,6 +2849,133 @@ RUNNER_MUTATIONS = [
      "e2e-over-budget",
      "over budget: a weight above the budget runs, holding the WHOLE budget: nothing fits "
      "beside it"),
+]
+# --- the pooled serial step path (PR A2) ---
+_SIGS = "_FORWARD_SIGS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)"
+_SWEEP_CALL = "        _sweep_step(proc)\n        for s, handler in old.items():"
+_BG_SWEPT = ("serial sweep: with the pool ON a passing step's background job is swept before "
+             "the runner ends")
+_SAME_END = "ends the pooled runner with the pool-off exit status and final lines"
+RUNNER_MUTATIONS += [
+    ("SIGQUIT not forwarded to a pooled serial step",
+     _SIGS, _SIGS.replace(", signal.SIGQUIT", ""), "serial-signals",
+     "serial signals: SIGQUIT reaches a pooled serial step: the runner forwards it to the "
+     "step's group"),
+    ("SIGTSTP forwarded to a pooled serial step",
+     _SIGS, _SIGS.replace(")", ", signal.SIGTSTP)"), "serial-tstp",
+     "serial tstp: SIGTSTP stops the runner and is NOT forwarded: the step never sees it and "
+     "runs on to its end while the runner is stopped"),
+    ("a pooled serial step started in the runner's own process group",
+     "                process_group=0,\n", "", "serial-group",
+     "serial group: with the pool ON a serial step runs in a process group of its OWN"),
+    ("main() never switches the pooled step path on",
+     '            _POOL_RUN = {"deadline": time.monotonic() + limit}', "            pass",
+     "serial-group",
+     "serial group: with the pool ON a serial step runs in a process group of its OWN"),
+    ("a pooled serial step given the runner's stdin (the terminal)",
+     "command, shell=True, cwd=cwd, stdin=subprocess.DEVNULL,\n                process_group=0,",
+     "command, shell=True, cwd=cwd,\n                process_group=0,", "serial-group",
+     "serial group: with the pool ON a serial step's stdin is /dev/null, not the runner's"),
+    ("the pool-OFF serial path given the pooled step path (a group, a sweep)",
+     "    if _POOL_RUN is not None:              # pool ON", "    if True:", "serial-group",
+     "serial group: with the pool OFF a serial step shares the runner's process group and "
+     "reads the runner's stdin, as before the pool"),
+    ("the sweep skipped on the exit path of an interrupted step",
+     _SWEEP_CALL, _SWEEP_CALL.replace("        _sweep", "        if not caught:\n            _sweep"),
+     "serial-sweep",
+     "serial sweep: after a forwarded SIGINT the step's background job, which ignores SIGINT, "
+     "is swept before the runner ends"),
+    ("the sweep skipped on the exit path of a step that ended by itself",
+     _SWEEP_CALL, _SWEEP_CALL.replace("        _sweep", "        if caught:\n            _sweep"),
+     "serial-sweep", _BG_SWEPT),
+    ("the sweep leaves a finished step's background job alone",
+     "        _terminate_groups({}, [proc.pid])", "        pass", "serial-sweep", _BG_SWEPT),
+    ("the sweep leaves a step that outlived the forwarded signal running",
+     '    if not _reap(proc):\n        _terminate_groups({0: {"proc": proc}})',
+     "    if not _reap(proc):\n        pass", "serial-sweep",
+     "serial sweep: a step that ignores the forwarded SIGTERM is killed with its group, and "
+     "the runner still ends by SIGTERM"),
+    ("a forwarded SIGTERM read as a failed step (exit 1, a FAIL line)",
+     "        raise _PoolSignal(caught[0])", "        pass", "serial-signals",
+     "serial signals: SIGTERM " + _SAME_END),
+    ("a forwarded SIGINT ends the runner with no KeyboardInterrupt",
+     "        if caught[0] == signal.SIGINT:     # the traceback", "        if False:              # the traceback",
+     "serial-signals", "serial signals: SIGINT " + _SAME_END),
+    ("the runner dies of a forwarded signal before it gives its slots back",
+     "        raise _PoolSignal(caught[0])", "        _die_of(caught[0])", "serial-signals",
+     "serial signals: a runner ended by a forwarded signal gave its ticket back first"),
+]
+# --- the hand-run timeout (PR A2) ---
+_T_KILLED = ("job timeout: a hand-run gate whose serial step outlasts job_timeout_s is KILLED: "
+             "exit 1 and the KILLED line")
+_T_PARALLEL = ("job timeout: a PARALLEL gate is bounded the same way: exit 1, the KILLED line, a "
+               "fail receipt, its step group swept, its slots given back")
+RUNNER_MUTATIONS += [
+    ("a serial step is never checked against job_timeout_s",
+     "            if _pool_overdue():            # the sweep below is the kill",
+     "            if False:", "job-timeout", _T_KILLED),
+    ("a parallel run is never checked against job_timeout_s",
+     "            if _pool_overdue():            # pool on only",
+     "            if False:                      # pool on only", "job-timeout", _T_PARALLEL),
+    ("job_timeout_s from the config ignored (the default always applies)",
+     'limit = pool.get("job_timeout_s", JOB_TIMEOUT_S)', "limit = JOB_TIMEOUT_S", "job-timeout",
+     _T_KILLED),
+    ("a killed gate exits 0",
+     "            rc, records = 1, _synth_records(1)", "            rc, records = 0, _synth_records(0)",
+     "job-timeout", _T_KILLED),
+    ("a killed gate prints no KILLED line",
+     '            _pool_say(f"gate-runner: KILLED - exceeded job_timeout_s ({limit}s)")\n', "",
+     "job-timeout", _T_KILLED),
+    ("a killed gate read as an ordinary failed step (a FAIL line, no KILLED)",
+     "    if overdue:\n        raise _PoolTimeout\n", "", "job-timeout",
+     "job timeout: a killed step gets no PASS or FAIL verdict line of its own"),
+    ("a killed gate writes no receipt (the timeout escapes main's receipt step)",
+     "        except _PoolTimeout:\n", "        except ZeroDivisionError:\n", "job-timeout",
+     "job timeout: the killed gate leaves a FAIL receipt, never the older pass"),
+]
+# --- the A2 review rows: the launch window, the sweep, ignored and repeated signals, the clamp ---
+_RESTORE = "\n            signal.signal(s, handler)"
+_POOL_ON = '            _POOL_RUN = {"deadline": time.monotonic() + limit}'
+RUNNER_MUTATIONS += [
+    ("the forwarded signals are not blocked across the step's launch",
+     "    prev = signal.pthread_sigmask(signal.SIG_BLOCK, _FORWARD_SIGS)",
+     "    prev = signal.pthread_sigmask(signal.SIG_BLOCK, ())", "serial-launch-window",
+     "serial launch window: a signal that lands between the step's Popen and the handler "
+     "install is not lost: it is forwarded, the step's group is gone, the ticket is given "
+     "back, and the runner ends by that signal"),
+    ("the recording handlers taken out BEFORE the sweep",
+     _SWEEP_CALL + _RESTORE,
+     "        for s, handler in old.items():" + _RESTORE + "\n        _sweep_step(proc)",
+     "serial-two-signals",
+     "serial two signals: a second signal during the sweep does not abort it: the step's "
+     "group is gone when the runner ends, by the FIRST signal, its ticket given back"),
+    ("a signal inherited as ignored is taken over by the pooled step path",
+     "            if signal.getsignal(s) != signal.SIG_IGN:", "            if True:",
+     "serial-ignored",
+     "serial ignored: a signal the runner INHERITED as ignored stays ignored with the pool "
+     "on: the step is not signalled, the gate passes, exit 0, no ticket left"),
+    ("only the first signal of a step is forwarded",
+     "            if n > sent:", "            if n > sent and not sent:", "serial-two-signals",
+     "serial two signals: two different signals during one step are EACH forwarded, once"),
+    ("the LAST signal decides how the runner ends",
+     "        raise _PoolSignal(caught[0])", "        raise _PoolSignal(caught[-1])",
+     "serial-two-signals",
+     "serial two signals: the FIRST signal decides how the runner ends, and the ticket is "
+     "given back"),
+    ("a nested run gets no deadline",
+     _POOL_ON, _POOL_ON.replace("+ limit", '+ (limit if holder.nest is None else float("inf"))'),
+     "nested-timeout",
+     "nested timeout: a NESTED run is bounded by job_timeout_s too: KILLED, exit 1, and no "
+     "ticket of its own"),
+    ("a forwarded signal sent to the step's leader, not its group",
+     "                    _killpg(proc.pid, s)", "                    os.kill(proc.pid, s)",
+     "serial-group-signal",
+     "serial group signal: a forwarded signal goes to the step's GROUP: a child the step's "
+     "shell started without exec gets it too"),
+    ("job_timeout_s reaches the clock unclamped",
+     "            limit = min(limit, 10**9)\n", "", "job-timeout",
+     "job timeout: an absurdly large job_timeout_s is clamped: the gate runs and passes, "
+     "with no traceback and no ticket left"),
 ]
 if os.geteuid() != 0:                      # chmod does not bite for root, so that case skips
     RUNNER_MUTATIONS.append(

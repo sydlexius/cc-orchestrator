@@ -605,7 +605,8 @@ runner's process group and there is no pgid to register, sweep or time out. The 
   A COMPLETE GUARD: a step that calls terminal control from its own group (`tcsetattr`, for instance) can be stopped by SIGTTOU and
   stays stopped until `job_timeout_s` ends it with the SIGKILL leg of the sweep. Stdin from `/dev/null` closes only reads of stdin;
   a step that opens `/dev/tty` (a credential or passphrase prompt) is stopped by SIGTTIN the same way. No further mitigation is
-  attempted (REASONED, not run).
+  attempted (REASONED, not run). MEASURED in the A2 review: with the pool on a step is a background process group, so under
+  `stty tostop` a step that WRITES to the terminal is stopped by the kernel (SIGTTOU) and holds its slots until `job_timeout_s`.
 - DESCRIPTOR INHERITANCE, decided on purpose: slot descriptors are NON-inheritable, so the slots free the instant the holding gate
   process dies. The alternative (steps inherit the slot, so it stays held until every orphan exits) was rejected: one step that
   leaves a daemon behind would hold budget forever, which is the stale-lock wedge decision 9 forbids.

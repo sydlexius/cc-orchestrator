@@ -44,6 +44,10 @@ the machine budget as a hand-run gate (`[prep_pr] weight`, else Form B's
 effective `jobs`, else the whole budget) and waits for them; a wait that gives
 up is exit 75, NOT RUN, which is neither a pass nor a failed gate.
 
+With the pool on a serial step runs in its own process group with /dev/null as
+stdin, INT/TERM/HUP/QUIT are forwarded to it (SIGTSTP is not), and the whole
+run is killed at `job_timeout_s` (exit 1, `KILLED`, a fail receipt).
+
 Exit codes: 0 = all gates passed / skipped / fell open; 75 = NOT RUN (pool on,
 no slot in time); 130 = SIGINT while waiting for a slot (NOT RUN); other
 non-zero = a required gate failed (1) or a config error (2).
@@ -109,6 +113,8 @@ def _run_command(label, command, cwd):
     shell=True is the documented trusted-repo-config path (the command came from
     `.gates.toml` / CLAUDE.md, both trusted like a Makefile). No dynamic string
     is built here -- the command is passed through verbatim."""
+    if _POOL_RUN is not None:              # pool ON: its own group, interrupts forwarded
+        return _run_pooled_step(label, command, cwd)
     # Wall time is REPORTING only (#400): it never feeds the verdict, the exit
     # code, the memo cache, or the receipt.
     start = time.perf_counter()
@@ -434,6 +440,134 @@ def _terminate_groups(running, lingering=(), grace=KILL_GRACE_S):
             pass
 
 
+# --- Pooled serial step path (#539, PR A2; reached ONLY with the pool on) -----
+#
+# Design: DESIGN-gate-pool.md section 4, "Pooled serial step path". With the pool
+# OFF `_run_command` never comes here: no group, no handler, no sweep.
+
+_POOL_RUN = None    # set by main() once this run holds its slots; None = pool off
+JOB_TIMEOUT_S = 5400   # `[pool] job_timeout_s` when absent: one RUN is killed after this
+# The signals a terminal sends to the foreground group, which a step in its own
+# group no longer gets. SIGTSTP is NOT here, on purpose (a stated difference).
+_FORWARD_SIGS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+
+
+class _PoolSignal(BaseException):
+    """A forwarded SIGTERM, SIGHUP or SIGQUIT: main() gives its slots back, then
+    dies of the same signal, as the pool-off serial path does. BaseException, so
+    no `except Exception` on the way up can turn it into a failed step."""
+
+    def __init__(self, sig):
+        super().__init__(sig)
+        self.sig = sig
+
+
+class _PoolTimeout(BaseException):
+    """This run outlived `job_timeout_s`: its step groups are already swept.
+    main() turns it into exit 1, the KILLED line and a fail receipt."""
+
+
+def _pool_overdue():
+    """True once a pooled run has used up its `job_timeout_s`. Pool off: never."""
+    return _POOL_RUN is not None and time.monotonic() >= _POOL_RUN["deadline"]
+
+
+def _sweep_step(proc):
+    """The SIGTERM-then-SIGKILL sweep of one serial step's group, on EVERY exit
+    path. A leader still running (a step that outlived a forwarded signal) is
+    killed with its group and reaped; a leader already reaped may have left a
+    background job in the group, which must not outlive the slots."""
+    if not _reap(proc):
+        _terminate_groups({0: {"proc": proc}})
+    elif _group_alive(proc.pid):
+        _terminate_groups({}, [proc.pid])
+
+
+def _run_pooled_step(label, command, cwd):
+    """`_run_command` with the pool ON: same lines, same return value. The step
+    gets its OWN PROCESS GROUP (not a session: it keeps the terminal, so its
+    output streams as before) and /dev/null as stdin, since a background group
+    that reads the terminal is stopped by the kernel while it holds slots.
+    A terminal interrupt no longer reaches it, so INT/TERM/HUP/QUIT are
+    forwarded to the group; the runner then waits for the step, sweeps the
+    group, and ends as the pool-off path ends for that signal."""
+    if _pool_overdue():                    # used up between steps: start nothing more
+        raise _PoolTimeout
+    start = time.perf_counter()
+    caught = []
+    old = {}
+    # Blocked from before the group exists until the handlers that know it are
+    # in: a signal in between would kill the runner and orphan the group. The
+    # child inherits the mask through fork, so preexec_fn puts the caller's back.
+    prev = signal.pthread_sigmask(signal.SIG_BLOCK, _FORWARD_SIGS)
+    try:
+        try:
+            proc = subprocess.Popen(
+                command, shell=True, cwd=cwd, stdin=subprocess.DEVNULL,
+                process_group=0,
+                preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, prev))
+        except OSError as e:
+            log(f"[FAIL] {label}: could not launch ({e}), "
+                f"{time.perf_counter() - start:.1f}s")
+            return False
+        # The handlers only RECORD (#546: one that raises can land inside any
+        # call). A signal inherited as ignored stays ignored, runner and step
+        # alike, as with the pool off.
+        for s in _FORWARD_SIGS:
+            if signal.getsignal(s) != signal.SIG_IGN:
+                old[s] = signal.signal(s, lambda signum, frame: caught.append(signum))
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, prev)
+    sent, give_up, delay, overdue = 0, None, 0.001, False
+    try:
+        while not _reap(proc):
+            if _pool_overdue():            # the sweep below is the kill
+                overdue = True
+                break
+            n = len(caught)
+            if n > sent:
+                for s in caught[sent:n]:
+                    _killpg(proc.pid, s)
+                sent = n
+                if give_up is None:        # a step that ignores it gets the sweep
+                    give_up = time.monotonic() + KILL_GRACE_S
+            if give_up is not None and time.monotonic() >= give_up:
+                break
+            time.sleep(delay)
+            delay = min(delay * 2, POLL_S)
+    finally:
+        # The recording handlers stay in through the sweep: a second Ctrl-C
+        # cannot abort it, and is not lost either.
+        _sweep_step(proc)
+        for s, handler in old.items():
+            signal.signal(s, handler)
+    if caught:
+        if caught[0] == signal.SIGINT:     # the traceback and status of today
+            raise KeyboardInterrupt
+        raise _PoolSignal(caught[0])
+    if overdue:
+        raise _PoolTimeout
+    elapsed = time.perf_counter() - start
+    ok = proc.returncode == 0
+    log(f"[{'PASS' if ok else 'FAIL'}] {label} "
+        f"(exit {proc.returncode}, {elapsed:.1f}s)")
+    return ok
+
+
+def _die_of(sig):
+    """End this process the way an unhandled `sig` ends it (the pool-off serial
+    path has no handler, so that is its exit status). Returns only if the signal
+    could not kill (blocked or ignored by the caller): then the shell's code."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except (OSError, ValueError):
+            pass
+    signal.signal(sig, signal.SIG_DFL)
+    os.kill(os.getpid(), sig)
+    return 128 + sig
+
+
 def _print_block(e):
     """Print one finished step whole: its log lines, captured output, verdict."""
     for line in e["pre"]:
@@ -525,6 +659,8 @@ def run_form_b_parallel(steps, root, memoize_dir, jobs, cli_skip=None):
         while True:
             if got:
                 raise KeyboardInterrupt
+            if _pool_overdue():            # pool on only; the finally below kills every group
+                raise _PoolTimeout
             # Dispatch in declaration order. Skip predicates and memo lookups
             # run here in the parent ONCE per step (`checked`), when it first
             # reaches the head: a head blocked on capacity never re-runs them.
@@ -1373,6 +1509,7 @@ def _pool_enter(cfg, root, cost):
 
 
 def main(argv=None):
+    global _POOL_RUN
     argv = argv if argv is not None else sys.argv[1:]
     receipt_path, memoize_dir, jobs, skip, shard = _parse_args(argv)
     if receipt_path is not None and shard is not None:
@@ -1415,6 +1552,14 @@ def main(argv=None):
             os.environ.update(holder.child_env())
             if not os.environ["GATEQ_NEST"]:
                 del os.environ["GATEQ_NEST"]
+            # From here every serial step takes the pooled step path, and the RUN is on the
+            # clock: it starts at the grant, so a wait is never counted against it.
+            limit = pool.get("job_timeout_s", JOB_TIMEOUT_S)
+            # Clamped (about 31 years): any positive integer is a valid bound, and a
+            # 400-digit one would overflow the float add below (a traceback, a lost ticket).
+            limit = min(limit, 10**9)
+            _POOL_RUN = {"deadline": time.monotonic() + limit}
+    signalled = None
     try:
         if grew:
             _pool_say("gate-runner: NOT RUN - .gates.toml changed during the wait "
@@ -1424,15 +1569,26 @@ def main(argv=None):
             return 75
         # The snapshot is taken AFTER the grant, so a wait never widens what a receipt attests.
         pre = _snapshot(root, receipt_path) if receipt_path else None
-        rc, records = _run_gates(root, memoize_dir, jobs, skip, shard, raw=raw)
+        try:
+            rc, records = _run_gates(root, memoize_dir, jobs, skip, shard, raw=raw)
+        except _PoolTimeout:
+            # A hand-run gate bounds itself (the runner is alive while it waits on a step, so
+            # this needs no watchdog). A FAILED gate, exit 1: unlike 75, it did run.
+            _pool_say(f"gate-runner: KILLED - exceeded job_timeout_s ({limit}s)")
+            rc, records = 1, _synth_records(1)
         if receipt_path:
             _write_receipt(receipt_path, root, rc, records, pre)
+    except _PoolSignal as e:               # raised by the pooled step path alone
+        signalled = e.sig
     finally:
+        _POOL_RUN = None
         if holder is not None:
             try:
                 holder.release()
             except OSError as e:           # the kernel drops the locks at exit anyway
                 _pool_say(f"gate-runner: note: could not release the gate slots: {e}")
+    if signalled is not None:
+        return _die_of(signalled)
     return rc
 
 

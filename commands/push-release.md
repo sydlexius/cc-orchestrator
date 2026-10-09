@@ -97,6 +97,16 @@ The user may provide:
 
 4. **Run pre-checks.** Execute each command in `build.pre_checks` sequentially from
    `build.working_dir`. If any fails, stop and show the error. Do NOT skip pre-checks.
+   A pre-check may be the repo's gate (`gate-runner.py`). When a machine gate budget is
+   configured (`grep -Eq '^[[:blank:]]*budget[[:blank:]]*=' ~/.claude/gate-queue/config.toml 2>/dev/null && echo pool=on || echo pool=off`
+   prints `pool=on`), run each pre-check with `run_in_background: true`, ending the command
+   with `; echo "pre_check_rc=$?"`, and read that line from its output, never the completion
+   notice's exit status. `pre_check_rc=75` from the gate is `gate: NOT RUN` (the runner's
+   own line above says why): it is not a failed pre-check and not a pass. Re-run it ONCE; on
+   a second 75 stop the release and report NOT RUN to the maintainer, never loop. Exit 130
+   is NOT RUN only when the output carries
+   `gate-runner: NOT RUN - interrupted while waiting for a gate slot`; without that line the
+   gate may have started and been interrupted, so never infer NOT RUN from a missing step line.
 
 5. **Gather merged PRs.** Derive the set from the COMMIT RANGE, not from a date.
 
