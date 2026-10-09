@@ -521,8 +521,9 @@ echo "gate_rc=$gate_rc leg=$leg"
 On `pool=on` run the block above in the background and read `gate_rc=` from its output.
 `gate_rc=75` is `gate: NOT RUN` (the runner's own line above says why), never a failed gate
 and never a pass: re-run the block ONCE, then stop and report a second 75 to the maintainer
-instead of fixing anything or looping. Exit 130 with the pool on and no step line in the output is a SIGINT during the wait:
-also NOT RUN, not a failing gate to fix.
+instead of fixing anything or looping. Exit 130 is NOT RUN only when the output carries
+`gate-runner: NOT RUN - interrupted while waiting for a gate slot`; without that line the gate
+may have started and been interrupted, so never infer NOT RUN from a missing step line.
 
 The runner prints a per-step `[PASS]` / `[SKIP]` / `[FAIL]` line and exits
 non-zero on the first required-gate failure. A `gate: NOT RUN` line (no runner found on any
@@ -799,11 +800,11 @@ echo "gate_rc=$gate_rc push_rc=$push_rc leg=$leg"
 in the background and `gate_rc=` / `push_rc=` are read from its output. The push still runs
 ONLY on `gate_rc=0`. `gate_rc=75` prints `gate: NOT RUN`, not `gate FAILED` (the runner's own
 line above says why): re-run the block ONCE, then stop and report a second 75 to the
-maintainer, never loop. `gate_rc=130` with the pool on and no step line in the output is a
-SIGINT during the wait: also NOT RUN, not a failing gate to fix, whatever the block's
-`gate FAILED` line says. With a pre-push hook installed the push starts
+maintainer, never loop. `gate_rc=130` is NOT RUN only when the output carries
+`gate-runner: NOT RUN - interrupted while waiting for a gate slot` (whatever the block's
+`gate FAILED` line says); without that line the gate may have started and been interrupted. With a pre-push hook installed the push starts
 the hook's gate as well; a failed push whose output carries `gate-runner: NOT RUN` is likewise
-a gate that did not run (re-run, never fix).
+a gate that did not run (never fix). Re-run ONCE, and ONLY when that line is one of the three that exit 75 (`no gate slot within`, `.gates.toml changed during the wait`, or `reason=nested-over-holder`). Any other `gate-runner: NOT RUN` line (`interrupted while waiting`, exit 130; `pool error`, a config error or a missing `gate_pool.py`, exit 2) is reported as it is and NOT retried.
 
 The push's `SAFE-PUSH: OK ... verified=ls-remote` line (with `push_rc=0`) IS the remote
 verification: do not follow it with `ls-remote` / `rev-parse origin/<b>` / `git status`. Only

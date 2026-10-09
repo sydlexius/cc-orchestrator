@@ -464,8 +464,9 @@ repo declares a different set (or relies on the fallback chain).
 
 If `gate_rc` is 75 the gate did NOT RUN (the runner's own line above says why): fix
 nothing, re-run the block ONCE, then stop and report a second 75 to the maintainer, never
-loop. Exit 130 with the pool on and no step line in the output is a SIGINT during the wait:
-also NOT RUN, not a failing gate to fix. If `gate_rc` is any
+loop. Exit 130 is NOT RUN only when the output carries
+`gate-runner: NOT RUN - interrupted while waiting for a gate slot`; without that line the gate
+may have started and been interrupted, so never infer NOT RUN from a missing step line. If `gate_rc` is any
 other non-zero value, fix the failures before proceeding. A `gate: NOT RUN` line (no
 runner found on any leg) is a FAILED gate, not a skip: stop and report it.
 

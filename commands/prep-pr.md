@@ -76,10 +76,11 @@ parse; a false `pool=on` only costs a background run.) Then:
   heavier than its holder). It is NEVER "fix the failing gate" and NEVER a pass: nothing ran,
   so there is nothing to fix. Re-run the block ONCE; a second 75 is reported to the
   maintainer, and you stop. Never loop on it.
-- `gate_rc=130` with the pool on and no step line in the output is a SIGINT during the wait:
-  also NOT RUN, not a failing gate to fix.
-- A failed push whose output carries the hook's `gate-runner: NOT RUN` line is the same thing:
-  the hook's gate did not run. Re-run the block; never fix, never bypass the hook.
+- `gate_rc=130` is NOT RUN only when the output carries the runner's line
+  `gate-runner: NOT RUN - interrupted while waiting for a gate slot`. Without that line the gate may have
+  started and been interrupted mid-step: never infer NOT RUN from a missing step line.
+- A failed push whose output carries the hook's `gate-runner: NOT RUN` line means the hook's
+  gate did not run: never fix, never bypass the hook. Re-run the block ONCE, and ONLY when that line is one of the three that exit 75 (`no gate slot within`, `.gates.toml changed during the wait`, or `reason=nested-over-holder`). Any other `gate-runner: NOT RUN` line (`interrupted while waiting`, exit 130; `pool error`, a config error or a missing `gate_pool.py`, exit 2) is reported as it is and NOT retried.
 - `gate-runner: KILLED - exceeded job_timeout_s` (exit 1) is different: the gate RAN and was
   ended. Treat it as a failed gate (a hung step), not as NOT RUN.
 
@@ -363,9 +364,10 @@ the fallback chain).
 
 If `gate_rc` is 75: the gate did NOT RUN (machine gate pool; the runner's own line above
 says why). Do not fix anything and do not continue. Re-run the block ONCE; on a second 75,
-stop and report `gate: NOT RUN (gate_rc=75)` to the maintainer, never loop. Exit 130 with the
-pool on and no step line in the output is a SIGINT during the wait: also NOT RUN, not a
-failing gate to fix.
+stop and report `gate: NOT RUN (gate_rc=75)` to the maintainer, never loop. Exit 130 is NOT RUN
+only when the output carries `gate-runner: NOT RUN - interrupted while waiting for a gate slot`;
+without that line the gate may have started and been interrupted, so never infer NOT RUN
+from a missing step line.
 
 If `gate_rc` is any other non-zero value: print the runner's failure output, stop, and say:
 "Fix the failing gate before proceeding. Do not push broken code." A `gate: NOT RUN`
@@ -920,8 +922,8 @@ echo "push_rc=$push_rc"
 with a budget configured that gate waits on its own ticket (the Step 2 gate has exited, so
 nothing holds slots for it). Run the pool check from the top of this file first; on `pool=on`
 run this block in the background and read `push_rc=` from its output. A failed push whose
-output carries `gate-runner: NOT RUN` is a gate that did not run: re-run the block, never fix,
-and report a second one to the maintainer.
+output carries `gate-runner: NOT RUN` is a gate that did not run: never fix. Re-run the block
+ONCE, and ONLY when that line is one of the three that exit 75 (`no gate slot within`, `.gates.toml changed during the wait`, or `reason=nested-over-holder`). Any other `gate-runner: NOT RUN` line (`interrupted while waiting`, exit 130; `pool error`, a config error or a missing `gate_pool.py`, exit 2) is reported as it is and NOT retried; report a second one to the maintainer.
 
 **Step 1c carry-over (#492).** safe-push is git-only and cannot see review state, so it refuses a
 definitive BEHIND unless told otherwise. The block above re-derives Step 1c's **reviewed WARN

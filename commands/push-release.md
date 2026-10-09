@@ -104,8 +104,9 @@ The user may provide:
    notice's exit status. `pre_check_rc=75` from the gate is `gate: NOT RUN` (the runner's
    own line above says why): it is not a failed pre-check and not a pass. Re-run it ONCE; on
    a second 75 stop the release and report NOT RUN to the maintainer, never loop. Exit 130
-   with the pool on and no step line in the output is a SIGINT during the wait: also NOT RUN,
-   not a failing pre-check to fix.
+   is NOT RUN only when the output carries
+   `gate-runner: NOT RUN - interrupted while waiting for a gate slot`; without that line the
+   gate may have started and been interrupted, so never infer NOT RUN from a missing step line.
 
 5. **Gather merged PRs.** Derive the set from the COMMIT RANGE, not from a date.
 
