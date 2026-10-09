@@ -738,8 +738,8 @@ Run as `python3 <leg>/gate-runner.py --pool-run <name>`:
   root. Unknown or duplicated: exit 2, nothing run.
 - NO further argument is accepted (exit 2), and none is forwarded. A variant (another target, another profile) is another declared
   name. This is what keeps it "by name, never as argv".
-- Not combinable with `--receipt`, `--skip`, `--jobs` or `--memoize-dir` (exit 2). It never writes or touches a receipt: a named
-  check attests nothing about a tree.
+- Not combinable with `--receipt`, `--skip`, `--jobs`, `--memoize-dir` or `--shard` (exit 2). It never writes or touches a receipt:
+  a named check attests nothing about a tree.
 - It takes a ticket exactly as above, with `kind = "named"`, cost `min(weight, budget)`, the class derived from the weight, and the
   worktree claim. Then it runs `run` with `shell=True` in the repo root (the documented trusted-config path), in its own session,
   with the same SIGTERM-then-SIGKILL sweep and the same watchdog as a gate step.

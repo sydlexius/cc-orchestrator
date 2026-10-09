@@ -248,48 +248,60 @@ if _dupes:
     fail(f".gates.toml step names are not unique (one --skip would match several): {_dupes}")
 step_names = set(_names)
 gates_h = set()
-# #570: test-gate-pool.py is the ONE harness allowed to run as `--part` slices, so the step list
-# can spread its ~400 s of work across jobs and macOS shards. The accepted shapes are exactly
-# `python3 test-gate-pool.py --part cases|baseline|mutations K/N`; every other command naming it
-# still takes the unsupported-shape path below.
-GATE_POOL = "test-gate-pool.py"
-GATE_POOL_PART_RE = re.compile(
-    r"python3\s+test-gate-pool\.py\s+--part\s+(cases|baseline|mutations\s+([1-9][0-9]*)/([1-9][0-9]*))")
-pool_steps = []        # (step name, kind, K or None, N or None) for every `--part` step
-pool_bare = []         # step names running the whole harness in one process
+# #570: a SPLIT harness runs as `--part` slices, so the step list can spread its work across
+# jobs and macOS shards. SPLIT_HARNESSES names every harness allowed to; for each, the accepted
+# shapes are exactly `python3 <harness> --part cases|baseline|mutations K/N`, and every other
+# command naming it still takes the unsupported-shape path below. A3 added test-gate-pool-run.py,
+# split the same way; every check below runs once per entry.
+SPLIT_HARNESSES = ("test-gate-pool.py", "test-gate-pool-run.py")
+
+
+def _part_re(harness):
+    return re.compile(rf"python3\s+{re.escape(harness)}\s+--part\s+"
+                      r"(cases|baseline|mutations\s+([1-9][0-9]*)/([1-9][0-9]*))")
+
+
+SPLIT_PART_RE = {h: _part_re(h) for h in SPLIT_HARNESSES}
+split_steps = {h: [] for h in SPLIT_HARNESSES}   # (step name, kind, K or None, N or None)
+split_bare = {h: [] for h in SPLIT_HARNESSES}    # step names running the whole harness at once
 for step in steps:
     run = step.get("run", "").strip()
     m = HARNESS_STEP_RE.fullmatch(run)
-    pm = GATE_POOL_PART_RE.fullmatch(run)
-    if pm:
-        gates_h.add(GATE_POOL)
+    pm = next(((h, r.fullmatch(run)) for h, r in SPLIT_PART_RE.items() if r.fullmatch(run)),
+              (None, None))
+    if pm[1]:
+        h, pm = pm
+        gates_h.add(h)
         kind = pm.group(1).split()[0]
-        pool_steps.append((step["name"], kind, int(pm.group(2)) if pm.group(2) else None,
-                           int(pm.group(3)) if pm.group(3) else None))
+        split_steps[h].append((step["name"], kind, int(pm.group(2)) if pm.group(2) else None,
+                               int(pm.group(3)) if pm.group(3) else None))
     elif m:
         gates_h.add(m.group(1))
-        if m.group(1) == GATE_POOL:
-            pool_bare.append(step["name"])
+        if m.group(1) in split_bare:
+            split_bare[m.group(1)].append(step["name"])
     elif re.search(r"python3\s+test-", run):
         fail(f".gates.toml step '{step.get('name')}' names a harness in an unsupported shape "
              f"(only a bare `python3 test-<name>.py` counts as running it): {run!r}")
+# Every split harness's parts, for the checks that look at all of them at once.
+pool_steps = [p for h in SPLIT_HARNESSES for p in split_steps[h]]
 
 # --- the gate-pool parts must cover the harness exactly once (#570) ---------------------------
 # Splitting one harness into steps is only sound if the steps together are EXACTLY the harness:
 # a dropped slice silently stops running its mutation rows, a duplicate runs one twice, and a
 # stale N (harness and step list disagree) leaves rows in no slice. The harness's own row
 # partition is exact by construction for its MUTATION_PARTS; this proves the STEP LIST matches.
-MUTATION_PARTS = None
-try:
-    with open(os.path.join(ROOT, GATE_POOL), encoding="utf-8") as fh:
-        _mp = re.search(r"^MUTATION_PARTS = (\d+)\b", fh.read(), re.M)
-    MUTATION_PARTS = int(_mp.group(1)) if _mp else None
-except OSError as e:
-    fail(f"cannot read {GATE_POOL} to check MUTATION_PARTS: {e}")
+MUTATION_PARTS = {}
+for _h in SPLIT_HARNESSES:
+    try:
+        with open(os.path.join(ROOT, _h), encoding="utf-8") as fh:
+            _mp = re.search(r"^MUTATION_PARTS = (\d+)\b", fh.read(), re.M)
+        MUTATION_PARTS[_h] = int(_mp.group(1)) if _mp else None
+    except OSError as e:
+        fail(f"cannot read {_h} to check MUTATION_PARTS: {e}")
 
 
 def _skipped_pool_parts(parts, skip_table):
-    """The gate-pool parts a leg's CI_SKIP table skips (each one is a slice CI never runs)."""
+    """The split-harness parts a leg's CI_SKIP table skips (each one is a slice CI never runs)."""
     return sorted(nm for nm, _, _, _ in parts if nm in skip_table)
 
 
@@ -298,37 +310,39 @@ if len(gates_h) < 10 or len(steps) < 10:
          f"fix it rather than the config (an empty parse passes and proves nothing)")
 print(f"  [ok  ] harness parse is non-degenerate ({len(steps)} steps, {len(gates_h)} harnesses)")
 
-if not pool_steps:
-    fail(f"{GATE_POOL} has no `python3 {GATE_POOL} --part ...` steps (#570): run as one bare step "
-         f"it puts its ~400 s on one job and one macOS shard again")
-pool_problems = []
-if MUTATION_PARTS is None:
-    pool_problems.append(f"{GATE_POOL} has no `MUTATION_PARTS = <int>` line to check the step "
-                         f"list against")
-if pool_bare:
-    pool_problems.append(f"bare full-harness step(s) {pool_bare} run beside the `--part` "
-                         f"steps, so the whole harness would run twice")
-kinds = [k for _, k, _, _ in pool_steps]
-for want in ("cases", "baseline"):
-    if kinds.count(want) != 1:
-        pool_problems.append(f"gate-pool parts: expected exactly one `--part {want}` step, "
-                             f"found {kinds.count(want)}")
-ns = sorted({n for _, k, _, n in pool_steps if k == "mutations"})
-ks = sorted(k_ for _, kd, k_, _ in pool_steps if kd == "mutations")
-if len(ns) != 1:
-    pool_problems.append(f"gate-pool parts: the mutation steps disagree on N -> {ns}")
-else:
-    if MUTATION_PARTS is not None and ns[0] != MUTATION_PARTS:
-        pool_problems.append(f"gate-pool parts: steps use N={ns[0]} but {GATE_POOL} says "
-                             f"MUTATION_PARTS = {MUTATION_PARTS}")
-    if ks != list(range(1, ns[0] + 1)):
-        pool_problems.append(f"gate-pool parts: the mutation slices must be exactly 1..N "
-                             f"(N={ns[0]}), each once; the steps run {ks}")
-if pool_problems:
-    fail("the test-gate-pool.py `--part` steps do not cover the harness exactly once:\n  "
-         + "\n  ".join(pool_problems))
-print(f"  [ok  ] test-gate-pool.py runs as {len(pool_steps)} parts covering every slice "
-      f"exactly once (N={MUTATION_PARTS})")
+for _h in SPLIT_HARNESSES:
+    _parts, _n_harness = split_steps[_h], MUTATION_PARTS[_h]
+    if not _parts:
+        fail(f"{_h} has no `python3 {_h} --part ...` steps (#570): run as one bare step it puts "
+             f"all its work on one job and one macOS shard again")
+    pool_problems = []
+    if _n_harness is None:
+        pool_problems.append(f"{_h} has no `MUTATION_PARTS = <int>` line to check the step "
+                             f"list against")
+    if split_bare[_h]:
+        pool_problems.append(f"bare full-harness step(s) {split_bare[_h]} run beside the "
+                             f"`--part` steps, so the whole harness would run twice")
+    kinds = [k for _, k, _, _ in _parts]
+    for want in ("cases", "baseline"):
+        if kinds.count(want) != 1:
+            pool_problems.append(f"{_h} parts: expected exactly one `--part {want}` step, "
+                                 f"found {kinds.count(want)}")
+    ns = sorted({n for _, k, _, n in _parts if k == "mutations"})
+    ks = sorted(k_ for _, kd, k_, _ in _parts if kd == "mutations")
+    if len(ns) != 1:
+        pool_problems.append(f"{_h} parts: the mutation steps disagree on N -> {ns}")
+    else:
+        if _n_harness is not None and ns[0] != _n_harness:
+            pool_problems.append(f"{_h} parts: steps use N={ns[0]} but {_h} says "
+                                 f"MUTATION_PARTS = {_n_harness}")
+        if ks != list(range(1, ns[0] + 1)):
+            pool_problems.append(f"{_h} parts: the mutation slices must be exactly 1..N "
+                                 f"(N={ns[0]}), each once; the steps run {ks}")
+    if pool_problems:
+        fail(f"the {_h} `--part` steps do not cover the harness exactly once:\n  "
+             + "\n  ".join(pool_problems))
+    print(f"  [ok  ] {_h} runs as {len(_parts)} parts covering every slice "
+          f"exactly once (N={_n_harness})")
 
 h_on_disk = {os.path.basename(p) for p in glob.glob(os.path.join(ROOT, "test-*.py"))}
 ungated = sorted(h_on_disk - gates_h)
@@ -537,7 +551,7 @@ for leg, found in invocations.items():
                                 f"it without running it (--skip it with a CI_SKIP reason)")
     skipped_parts = _skipped_pool_parts(pool_steps, CI_SKIP[leg])
     if skipped_parts:
-        problems.append(f"{leg}: gate-pool part(s) {skipped_parts} are CI_SKIPped, so their "
+        problems.append(f"{leg}: split-harness part(s) {skipped_parts} are CI_SKIPped, so their "
                         f"slice of the harness never runs there")
     not_steps = sorted(set(CI_SKIP[leg]) - step_names)
     if not_steps:
@@ -565,16 +579,16 @@ if macos_runs:
             problems.append(f"macOS: steps in NO shard (CI never runs them) -> {in_none}")
         if in_two:
             problems.append(f"macOS: steps in TWO shards (a shard runs twice) -> {in_two}")
-        # #570: the point of splitting the harness is to SPREAD it. A shard may own at most
-        # ceil(parts / N) of the gate-pool parts, or one shard again carries the long pole.
-        if pool_steps:
+        # #570: the point of splitting a harness is to SPREAD it. A shard may own at most
+        # ceil(parts / N) of ONE split harness's parts, or one shard again carries its long pole.
+        for _h in SPLIT_HARNESSES:
             by_shard: dict[int, list[str]] = {}
-            for nm, _, _, _ in pool_steps:
+            for nm, _, _, _ in split_steps[_h]:
                 by_shard.setdefault(_gr._shard_of(nm, n), []).append(nm)
-            cap = -(-len(pool_steps) // n)
+            cap = -(-len(split_steps[_h]) // n)
             for k, nms in sorted(by_shard.items()):
                 if len(nms) > cap:
-                    problems.append(f"macOS: shard {k}/{n} owns {len(nms)} gate-pool parts "
+                    problems.append(f"macOS: shard {k}/{n} owns {len(nms)} {_h} parts "
                                     f"{sorted(nms)}; at most {cap} (ceil(parts/N)) so the "
                                     f"harness is spread, not piled on one shard")
 
@@ -619,48 +633,49 @@ print(f"  [ok  ] the macOS shards partition the leg's steps (K = 1..N, none in z
 # A drift guard that cannot fail is decorative. Re-run this file against a fixture copy of the
 # repo with ONE invariant broken, and require a non-zero exit carrying that check's message.
 # Skipped inside a fixture run (LOCKSTEP_ROOT set) so it never recurses.
-def _pool_mutation_cases(gates):
-    """#570: one broken fixture per gate-pool-parts invariant. Built from the parsed parts, so
-    the rows follow the real step names and N instead of hard-coding them."""
+def _pool_mutation_cases(gates, pool, tag):
+    """#570: one broken fixture per split-harness-parts invariant, for the split harness `pool`
+    (labels prefixed `tag`). Built from the parsed parts, so the rows follow the real step
+    names and N instead of hard-coding them."""
+    parts = split_steps[pool]
     by_kind = {}
-    for nm, kind, k_, n_ in pool_steps:
+    for nm, kind, k_, n_ in parts:
         by_kind.setdefault(kind, []).append((nm, k_, n_))
     cases_nm = by_kind["cases"][0][0]
     first_k = min(k_ for _, k_, _ in by_kind["mutations"])
     last_nm, last_k, last_n = max(by_kind["mutations"], key=lambda t: t[1])
-    all_runs = [f'run = "{gates_step_run(nm)}"' for nm, _, _, _ in pool_steps]
+    all_runs = [f'run = "{gates_step_run(nm)}"' for nm, _, _, _ in parts]
 
     def run_of(nm):
         return f'run = "{gates_step_run(nm)}"'
-    pool = GATE_POOL
     out = [
         ("pool parts all bare", gates, all_runs, [f'run = "python3 {pool}"'] * len(all_runs),
          f"has no `python3 {pool} --part ...` steps"),
         ("pool cases part dropped", gates, run_of(cases_nm), 'run = "true"',
-         "expected exactly one `--part cases` step, found 0"),
+         f"{pool} parts: expected exactly one `--part cases` step, found 0"),
         ("pool baseline part duplicated", gates, run_of(cases_nm),
          f'run = "python3 {pool} --part baseline"',
-         "expected exactly one `--part baseline` step, found 2"),
+         f"{pool} parts: expected exactly one `--part baseline` step, found 2"),
         ("pool mutation slice dropped", gates, run_of(last_nm), 'run = "true"',
-         "the mutation slices must be exactly 1..N"),
+         f"{pool} parts: the mutation slices must be exactly 1..N"),
         ("pool mutation slice duplicated", gates, run_of(last_nm),
          f'run = "python3 {pool} --part mutations {first_k}/{last_n}"',
-         "the mutation slices must be exactly 1..N"),
+         f"{pool} parts: the mutation slices must be exactly 1..N"),
         ("pool mutation steps disagree on N", gates, run_of(last_nm),
          f'run = "python3 {pool} --part mutations {last_k}/{last_n + 1}"',
-         "the mutation steps disagree on N"),
+         f"{pool} parts: the mutation steps disagree on N"),
         ("pool bare beside parts", gates, run_of(cases_nm),
-         run_of(cases_nm) + f'\n\n  [[prep_pr.steps]]\n  name = "pool-full"\n  run = "python3 {pool}"',
-         "bare full-harness step(s)"),
+         run_of(cases_nm) + f'\n\n  [[prep_pr.steps]]\n  name = "{tag}-full"\n  run = "python3 {pool}"',
+         f"the {pool} `--part` steps do not cover the harness exactly once:\n  bare full-harness step(s)"),
         ("pool part with trailing junk", gates, run_of(cases_nm),
          f'run = "python3 {pool} --part cases --only x"', "unsupported shape"),
         # The harness refuses a leading-zero slice at runtime; the lockstep must too.
         ("pool leading-zero slice", gates, run_of(last_nm),
          f'run = "python3 {pool} --part mutations 0{last_k}/{last_n}"', "unsupported shape"),
         ("pool N out of step with the harness", pool, f"MUTATION_PARTS = {last_n}",
-         f"MUTATION_PARTS = {last_n + 1}", "says MUTATION_PARTS"),
+         f"MUTATION_PARTS = {last_n + 1}", f"{pool} says MUTATION_PARTS"),
         ("pool MUTATION_PARTS line gone", pool, f"MUTATION_PARTS = {last_n}",
-         f"MUTATION_PARTS: int = {last_n}", "has no `MUTATION_PARTS = <int>` line"),
+         f"MUTATION_PARTS: int = {last_n}", f"{pool} has no `MUTATION_PARTS = <int>` line"),
     ]
     # Pile one shard past the cap: rename parts owned by other shards to names that hash (with
     # gate-runner's own hash, so no hard-coded names) to the shard already owning the most. The
@@ -668,21 +683,23 @@ def _pool_mutation_cases(gates):
     # there are always enough parts to move, and the row always exists.
     n_sh = 3
     load: dict[int, list[str]] = {}
-    for nm, _, _, _ in pool_steps:
+    for nm, _, _, _ in parts:
         load.setdefault(_gr._shard_of(nm, n_sh), []).append(nm)
     crowded = max(sorted(load), key=lambda k: len(load[k]))
-    cap = -(-len(pool_steps) // n_sh)
+    cap = -(-len(parts) // n_sh)
     movers = [nm for k, nms in sorted(load.items()) if k != crowded for nm in nms]
     movers = movers[:cap + 1 - len(load[crowded])]
-    fx_old, fx_new = [], []
+    fx_old, fx_new, crowd = [], [], list(load[crowded])
     for nm in movers:
         cand = next(f"{nm}-x{j}" for j in range(10000)
                     if _gr._shard_of(f"{nm}-x{j}", n_sh) == crowded)
         fx_old.append(f'name = "{nm}"')
         fx_new.append(f'name = "{cand}"')
+        crowd.append(cand)
     out.append(("pool parts piled on one shard", gates, fx_old, fx_new,
-                "(ceil(parts/N)) so the harness is spread"))
-    return out
+                f"owns {len(crowd)} {pool} parts {sorted(crowd)}; at most {cap} (ceil(parts/N))"))
+    # Labels: the original rows keep theirs ("pool ..."); every other harness gets its tag.
+    return [(label.replace("pool", tag, 1), *row) for label, *row in out]
 
 
 def _mutation_selftest():
@@ -698,13 +715,18 @@ def _mutation_selftest():
     shard_axis = "        shard: [1, 2, 3]\n"
     agg_check = '[ "$SHARD_RESULT" = "success" ] ||'
     gates, ci = ".gates.toml", ".github/workflows/ci.yml"
-    pool_cases = _pool_mutation_cases(gates)
+    # One full set of parts rows PER split harness: the original rows keep their "pool"
+    # labels for test-gate-pool.py, and test-gate-pool-run.py gets the same set as "pool-run".
+    tags = {"test-gate-pool.py": "pool", "test-gate-pool-run.py": "pool-run"}
+    pool_cases = [c for h in SPLIT_HARNESSES for c in _pool_mutation_cases(gates, h, tags[h])]
     # CI_SKIP is this file's own table, so no fixture can break it: prove the skipped-parts
-    # check has teeth in-process instead (a table naming a part must be reported).
-    _victim = pool_steps[0][0]
-    if (_skipped_pool_parts(pool_steps, {_victim: "a reason"}) != [_victim]
-            or _skipped_pool_parts(pool_steps, {"shellcheck": "a reason"})):
-        fail("mutation self-test: the CI_SKIPped gate-pool part check has no teeth")
+    # check has teeth in-process instead (a table naming a part must be reported), for every
+    # split harness's parts.
+    for _h in SPLIT_HARNESSES:
+        _victim = split_steps[_h][0][0]
+        if (_skipped_pool_parts(pool_steps, {_victim: "a reason"}) != [_victim]
+                or _skipped_pool_parts(pool_steps, {"shellcheck": "a reason"})):
+            fail(f"mutation self-test: the CI_SKIPped {_h} part check has no teeth")
     cases = [
         # (label, file to mutate, old text, new text, message the failure must carry).
         ("gates step removed", gates, step_line, 'run = "true"', "runs NONE of them"),
@@ -768,7 +790,7 @@ def _mutation_selftest():
                 shutil.copy(os.path.join(ROOT, f), os.path.join(fx, f))
             for p in glob.glob(os.path.join(ROOT, "scripts", "*.sh")) + glob.glob(os.path.join(ROOT, "test-*.py")):
                 dst = os.path.join(fx, os.path.relpath(p, ROOT))
-                if os.path.basename(p) == GATE_POOL:
+                if os.path.basename(p) in SPLIT_HARNESSES:
                     shutil.copy(p, dst)   # the parts check reads its MUTATION_PARTS line
                 else:
                     open(dst, "w").close()   # presence is all the filesystem checks read
