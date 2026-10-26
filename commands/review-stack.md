@@ -179,8 +179,8 @@ Each agent receives this task:
 > PR with no CR review is a normal state, not something to fix. **Codoki**
 > (`codoki-pr-intelligence[bot]`) is NOT IN SERVICE (subscription lapsed
 > 2026-07-12): it auto-reviews nothing, and this command must never post
-> `@codoki`. Poll for and triage whatever reviews already exist; if a CR
-> pass would help, note it and let the maintainer allocate one.
+> `@codoki`. Poll for and triage whatever reviews already exist, and say
+> nothing about CR availability.
 >
 > **Step B -- Poll for review readiness (geometric cooldown):**
 > Poll at 15s, 30s, 60s, 120s intervals. At each interval, with `pr_number` set to
@@ -634,8 +634,6 @@ After restacking (or skipping it), continue to the next PR that needs work.
 
 Parallelism: Steps 2-3 ran N agents concurrently (data gathering + pre-triage).
 Step 4 ran serially in dependency order (cascade constraint).
-
-Codoki is not in service, so it does not review the pushed PRs; Greptile (where installed) still may. CodeRabbit re-reviews only if the maintainer allocates a pass - this command never triggers one (CR auto-review is OFF org-wide).
 
 This is the Way.
 ```
