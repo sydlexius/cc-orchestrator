@@ -956,6 +956,10 @@ The check is PR-wide: it reads every CR root, including roots from earlier round
   bash HELPER_DIR/reply-comment.sh "$pr_number" '@coderabbitai resolve'
   ```
 
+  Exit 0 here only makes the resolve ELIGIBLE. It counts as posted only when this
+  `reply-comment.sh` call itself exits 0; a non-zero exit (a failed GitHub post) is reported
+  as not posted, never as posted.
+
 - **exit 1** (the listed threads are not yet satisfied): do NOT post it yet. CR adds its marker or
   reply roughly 15-30s AFTER your reply, so exit 1 within about a minute of the replies is
   EXPECTED. Re-run the check with this ONE block, passed as a `run_in_background: true` command
@@ -1088,7 +1092,7 @@ freehand. Compute each field from the data already collected in earlier steps:
 | Replied count | total open comments from Step 3 |
 | SHA | `git rev-parse --short HEAD` from Step 7 |
 | Branch | `git branch --show-current` |
-| Resolved | per bot that HAD findings this round. CR (CR rounds only, PR-wide state): `CR resolve posted` (Step 8 exit 0) / `CR threads unsatisfied: <ids>` (exit 1) / `CR resolve undetermined, stopped` (exit 2). Copilot, Greptile, Codoki: GraphQL threads resolved / skipped |
+| Resolved | per bot that HAD findings this round. CR (CR rounds only, PR-wide state): `CR resolve posted` (check exit 0 AND the `reply-comment.sh` post exited 0) / `CR resolve post failed` (check exit 0, post non-zero) / `CR threads unsatisfied: <ids>` (check exit 1) / `CR resolve undetermined, stopped` (check exit 2). Copilot, Greptile, Codoki: GraphQL threads resolved / skipped |
 | Fix-scoped pass | Step 5.6: `not owed` / `cleared before push` / `LATE (pending)` |
 
 **Name only the reviewers whose findings this round handled.** A Copilot-only round's summary
