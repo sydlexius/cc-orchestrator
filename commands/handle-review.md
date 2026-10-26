@@ -947,11 +947,18 @@ Step 0):
 bash HELPER_DIR/pr-unreplied-comments.sh --cr-unconfirmed "$pr_number"
 ```
 
+The check is PR-wide: it reads every CR root, including roots from earlier rounds, because
+`@coderabbitai resolve` acts on every thread. Report its result as PR-wide state.
+
 - **exit 0** (every CR root satisfied, or CR has no root comments): post the resolve:
 
   ```bash
   bash HELPER_DIR/reply-comment.sh "$pr_number" '@coderabbitai resolve'
   ```
+
+  Exit 0 here only makes the resolve ELIGIBLE. It counts as posted only when this
+  `reply-comment.sh` call itself exits 0; a non-zero exit (a failed GitHub post) is reported
+  as not posted, never as posted.
 
 - **exit 1** (the listed threads are not yet satisfied): do NOT post it yet. CR adds its marker or
   reply roughly 15-30s AFTER your reply, so exit 1 within about a minute of the replies is
@@ -1085,7 +1092,7 @@ freehand. Compute each field from the data already collected in earlier steps:
 | Replied count | total open comments from Step 3 |
 | SHA | `git rev-parse --short HEAD` from Step 7 |
 | Branch | `git branch --show-current` |
-| Resolved | per bot that HAD findings this round: CR resolve posted (CR rounds only) / GraphQL threads resolved (Copilot, Greptile, Codoki rounds) |
+| Resolved | per bot that HAD findings this round. CR (CR rounds only, PR-wide state): `CR resolve posted` (check exit 0 AND the `reply-comment.sh` post exited 0) / `CR resolve post failed` (check exit 0, post non-zero) / `CR threads unsatisfied: <ids>` (check exit 1) / `CR resolve undetermined, stopped` (check exit 2). Copilot, Greptile, Codoki: GraphQL threads resolved / skipped |
 | Fix-scoped pass | Step 5.6: `not owed` / `cleared before push` / `LATE (pending)` |
 
 **Name only the reviewers whose findings this round handled.** A Copilot-only round's summary
@@ -1106,6 +1113,6 @@ Assemble and print:
 - Noted: $noted_count comments (already-fixed)
 - Replied: $replied_count total
 - Pushed: $sha to $branch
-- Resolved: $resolve_status (only the bots that had findings this round)
+- Resolved: $resolve_status (only the bots that had findings this round; the CR part is PR-wide)
 - Fix-scoped pass: $fix_pass_status (not owed / cleared before push / LATE (pending))
 ```
