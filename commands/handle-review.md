@@ -155,9 +155,8 @@ cr_triggered=$(gh api "repos/$repo/issues/$pr_number/comments" \
 If none of those signals is present (`cr_reviews == 0` AND `cr_requested` empty
 AND `cr_triggered == 0`), CR is **not expected**: do NOT wait for it
 in Step 1.5 and do NOT trigger it. Triage whatever reviews already exist (CR only
-if it already reviewed). If a CR pass would help, you may
-note "a CR pass is available -- the maintainer can allocate one" and stop; never
-post the trigger yourself.
+if it already reviewed). Say nothing about CR either: no "a CR pass is
+available", no request to trigger one, and never post the trigger yourself.
 
 This mirrors `pr-watch.sh`'s opt-in CR logic (#173): waiting for -- or
 manufacturing -- a review that will never land is exactly the idle-hang that fix
@@ -933,6 +932,9 @@ out before the push, and this resolve runs after the push once guard-slice passe
 
 ### CodeRabbit threads -- `@coderabbitai resolve`
 
+**Run this subsection only when this round's triage (Step 3) handled at least one CodeRabbit
+finding.** A round with no CR findings posts no `@coderabbitai resolve` and reports nothing about CR.
+
 Post `@coderabbitai resolve` ONLY once CodeRabbit itself is satisfied with every thread. A CR
 root is satisfied when (a) CR EDITED it to append the line `✅ Confirmed as addressed by @<login>` (a
 verified FIX), or (b) CR's LATEST reply in the thread has the line `✅ Review thread resolved.` and
@@ -983,7 +985,8 @@ CR resolve also covers review body findings -- CodeRabbit tracks its
 own outside-diff items and will mark them resolved when the underlying code
 changes appear on the next push.
 
-Report whether CR resolve was requested, or which threads are still not satisfied.
+On a round with CR findings, report whether CR resolve was requested, or which threads are still
+not satisfied.
 
 ### Copilot + Greptile + Codoki threads -- GraphQL resolve
 
@@ -1082,8 +1085,14 @@ freehand. Compute each field from the data already collected in earlier steps:
 | Replied count | total open comments from Step 3 |
 | SHA | `git rev-parse --short HEAD` from Step 7 |
 | Branch | `git branch --show-current` |
-| Resolved | whether CR resolve was posted + Copilot/Greptile threads resolved |
+| Resolved | per bot that HAD findings this round: CR resolve posted (CR rounds only) / GraphQL threads resolved (Copilot, Greptile, Codoki rounds) |
 | Fix-scoped pass | Step 5.6: `not owed` / `cleared before push` / `LATE (pending)` |
+
+**Name only the reviewers whose findings this round handled.** A Copilot-only round's summary
+never mentions CodeRabbit, and vice versa: no "CR resolve: n/a", no note that the push dismissed a
+prior approval, no "needs a re-review", no "a CR pass is available". Triggering a review is the
+maintainer's call, and restating that is noise. Where merge readiness is mentioned, derive it
+from CI, threads and `mergeStateStatus`, never from any bot's approval state.
 
 If the push printed the behind WARN: update-branch after Step 8, then resync the worktree (see Step 7 note).
 
@@ -1097,10 +1106,6 @@ Assemble and print:
 - Noted: $noted_count comments (already-fixed)
 - Replied: $replied_count total
 - Pushed: $sha to $branch
-- Resolved: CR resolve $cr_status; GraphQL threads (Copilot + Greptile + Codoki) $graphql_resolve_status
+- Resolved: $resolve_status (only the bots that had findings this round)
 - Fix-scoped pass: $fix_pass_status (not owed / cleared before push / LATE (pending))
 ```
-
-Codoki is not in service, so it does not review the push; Greptile (where
-installed) still may. CodeRabbit reviews only if the maintainer has allocated a
-pass -- this command never triggers one.
