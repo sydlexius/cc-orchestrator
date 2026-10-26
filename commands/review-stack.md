@@ -651,5 +651,5 @@ This is the Way.
 - **Auto-dismiss obvious cross-stack repeats** without asking (e.g. "dead code" that's wired in a later PR).
 - **If a restack fails with conflicts,** stop and report. Don't auto-resolve.
 - **If a restack invalidates pre-triage,** note it during the fix phase and adjust.
-- **Codoki does not re-review (not in service) and CodeRabbit does not (auto-review OFF org-wide -- a CR pass is maintainer-allocated); Greptile, where installed, still may.**
+- **After the push, expect no re-review from Codoki (not in service) or CodeRabbit (auto-review OFF); Greptile, where installed, still may.** Say nothing about CR availability in the summary.
 - **Save the original branch** so you can return to it at the end.
