@@ -2301,9 +2301,17 @@ def case_serial_group_signal(tmp, home):
     p, record, pid = _rec(tmp, home, "child", 1, tail="; true")
     os.kill(p.pid, signal.SIGHUP)
     rc = ended(p, timeout=30)
+    # The shell dies of the forwarded HUP at once, and the runner then sweeps the group with
+    # TERM. On a slow host the child can still be inside its HUP handler when that TERM lands
+    # and record it too (seen on macOS CI): that TERM is the sweep doing its job. What this
+    # case proves is that the FORWARDED signal reached the child, so it checks the FIRST
+    # record, that HUP came once, and that nothing but the sweep's TERM follows. Sent to the
+    # leader alone (the mutation row), the child's first record is the sweep's TERM.
+    got = read(record).split()
     same("serial group signal: a forwarded signal goes to the step's GROUP: a child the step's "
          "shell started without exec gets it too",
-         (rc, read(record).split(), gone(pid, 3.0)), (-signal.SIGHUP, ["SIGHUP"], True))
+         (rc, got[:1], got.count("SIGHUP"), set(got) <= {"SIGHUP", "SIGTERM"}, gone(pid, 3.0)),
+         (-signal.SIGHUP, ["SIGHUP"], 1, True, True))
     _kill_seen_alive(pid)
 
 
