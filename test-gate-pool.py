@@ -42,6 +42,15 @@ with `--only <case>`. The run
 must exit non-zero AND print the named check's FAIL line. An unmutated copy runs first and must
 pass, so a broken fixture cannot read as a full set of kills. No working-tree file is ever
 opened for writing, so a concurrent `git add` can never capture a mutant.
+
+PARTS (#570). The full run was one ~400 s step that set the floor of every gate run. So the
+harness also runs in independent parts, each a `.gates.toml` step: `--part cases` (the cases
+on the working sources), `--part baseline` (every case on a clean copy), and
+`--part mutations K/N` (the K-th round-robin slice, `rows[K-1::N]`, of the mutation rows, with
+a prerequisite scoped to the cases that slice uses). N is MUTATION_PARTS; test-ci-gates-lockstep.py
+checks that the steps cover every part exactly once. A row's stable ID is (target file, label).
+No argument still runs everything, in the old order. Do not run cases concurrently in one
+interpreter: they share the module-level isolation state.
 """
 
 import ast
@@ -3003,7 +3012,30 @@ def _rerun(scripts_dir, *args):
     return r.returncode, r.stdout + r.stderr
 
 
-def mutation_selftest():
+MUTATION_PARTS = 5   # #570: how many `--part mutations K/N` slices .gates.toml runs; lockstep-checked
+
+
+def mutation_rows():
+    """Every mutation row as (target file, row), in the one declaration order the K/N slices
+    index into. A row's stable ID is (target file, label); a duplicate ID is a harness bug."""
+    rows = [("gate_pool.py", m) for m in MUTATIONS] + [("gate-runner.py", m)
+                                                       for m in RUNNER_MUTATIONS]
+    ids = [(name, m[0]) for name, m in rows]
+    dup = sorted({i for i in ids if ids.count(i) > 1})
+    if dup:
+        raise SystemExit(f"test-gate-pool.py: duplicate mutation row ID(s): {dup}")
+    return rows
+
+
+def part_rows(rows, k, n):
+    """The K-th (1-based) of N round-robin slices of `rows`: an exact partition by construction."""
+    return rows[k - 1::n]
+
+
+def mutation_selftest(part=None):
+    """The mutation self-test: the unmutated copy first, then each row against its own mutated
+    copy. `part` = (K, N) runs only that slice of the rows, with a prerequisite scoped to the
+    cases that slice uses; None runs everything (the full harness)."""
     known = {name for name, _ in CASES}
     # The module, the runner that imports it, and the schema module the runner validates a
     # receipt with: one scripts directory, as deployed.
@@ -3017,16 +3049,33 @@ def mutation_selftest():
         for n, text in srcs.items():
             put(os.path.join(d, n), mutated if n == name else text)
         return d
-    rows = [("gate_pool.py", m) for m in MUTATIONS] + [("gate-runner.py", m)
-                                                       for m in RUNNER_MUTATIONS]
+    all_rows = mutation_rows()
+    # #570 review M1: the lockstep checks only the STEP list, so a part_rows() edit that drops
+    # rows would keep every gate green. Prove here, in every mode, that the MUTATION_PARTS
+    # slices cover each row index exactly once.
+    idx = list(range(len(all_rows)))
+    covered = sorted(i for k in range(1, MUTATION_PARTS + 1)
+                     for i in part_rows(idx, k, MUTATION_PARTS))
+    check(f"mutation self-test: the {MUTATION_PARTS} part slices cover all "
+          f"{len(all_rows)} rows exactly once", covered == idx)
+    rows = all_rows if part is None else part_rows(all_rows, *part)
+    # i is the row's index in the FULL list, so a mutant's directory name is part-independent.
+    indexed = [(all_rows.index(r), r) for r in rows]
     with tempfile.TemporaryDirectory(prefix="gate-pool-mut-") as tmp:
         clean = copy_to(os.path.join(tmp, "clean"))
-        rc, out = _rerun(clean)
-        check("mutation self-test: the UNMUTATED copy passes", rc == 0)
+        if part is None:
+            rc, out = _rerun(clean)
+            check("mutation self-test: the UNMUTATED copy passes", rc == 0)
+        else:
+            need = sorted({r[1][3] for _, r in indexed if r[1][3] in known})
+            args = [x for c in need for x in ("--only", c)]
+            rc, out = _rerun(clean, *args)
+            check(f"mutation self-test: the UNMUTATED copy passes the {len(need)} case(s) "
+                  f"part {part[0]}/{part[1]} uses", rc == 0)
         if rc != 0:
             print(out)
             return
-        for i, (name, (label, old, new, case, want)) in enumerate(rows):
+        for i, (name, (label, old, new, case, want)) in indexed:
             src = srcs[name]
             if src.count(old) != 1 or case not in known:
                 check(f"mutation self-test: '{label}' is stale "
@@ -3038,18 +3087,72 @@ def mutation_selftest():
             check(f"mutation: {label} -> killed by '{case}'", killed)
             if not killed:
                 print(f"         exit {rc}; wanted the FAIL line of: {want}")
+    if part is not None:
+        print(f"mutation part {part[0]}/{part[1]}: {len(rows)} of {len(all_rows)} rows")
+
+
+USAGE = ("usage: test-gate-pool.py [--only <case>]... | --part cases | --part baseline | "
+         "--part mutations K/N   (N = MUTATION_PARTS)")
+
+
+def parse_part(words):
+    """['cases'] | ['baseline'] | ['mutations', 'K/N'] -> (kind, (K, N) or None); None if
+    malformed. N must equal MUTATION_PARTS, so a step list built for another N cannot run
+    silently."""
+    if words in (["cases"], ["baseline"]):
+        return words[0], None
+    if len(words) == 2 and words[0] == "mutations":
+        m = re.fullmatch(r"([1-9][0-9]*)/([1-9][0-9]*)", words[1])
+        if m and int(m.group(2)) == MUTATION_PARTS and 1 <= int(m.group(1)) <= MUTATION_PARTS:
+            return "mutations", (int(m.group(1)), int(m.group(2)))
+    return None
+
+
+def baseline_selftest():
+    """The full clean-copy run of every case (the unmutated prerequisite), as its own part."""
+    srcs = {name: read(os.path.join(SCRIPTS, name))
+            for name in ("gate_pool.py", "gate-runner.py", "orchestrate_schemas.py")}
+    with tempfile.TemporaryDirectory(prefix="gate-pool-base-") as tmp:
+        clean = os.path.join(tmp, "clean")
+        os.mkdir(clean)
+        for n, text in srcs.items():
+            put(os.path.join(clean, n), text)
+        rc, out = _rerun(clean)
+        check("baseline: the UNMUTATED copy passes every case", rc == 0)
+        if rc != 0:
+            print(out)
 
 
 def main():
-    only = None
-    if len(sys.argv) == 3 and sys.argv[1] == "--only":
-        only = sys.argv[2]
-    elif len(sys.argv) != 1:
-        print("usage: test-gate-pool.py [--only <case>]", file=sys.stderr)
+    args = sys.argv[1:]
+    only, part = [], None
+    while args:
+        if args[0] == "--only" and len(args) >= 2 and part is None:
+            only.append(args[1])
+            args = args[2:]
+        elif args[0] == "--part" and len(args) >= 2 and part is None and not only:
+            words = args[1:3] if args[1] == "mutations" else args[1:2]
+            part = parse_part(words)
+            if part is None:
+                print(f"test-gate-pool.py: bad --part {' '.join(words)!r}\n{USAGE}",
+                      file=sys.stderr)
+                return 2
+            args = args[1 + len(words):]
+        else:
+            print(USAGE, file=sys.stderr)
+            return 2
+    if part is not None and os.environ.get("GATE_POOL_SCRIPTS"):
+        print("test-gate-pool.py: --part is for the real tree, not a re-run against a copy",
+              file=sys.stderr)
         return 2
-    selected = [(n, fn) for n, fn in CASES if only in (None, n)]
-    if not selected:
+    kind = part[0] if part else None
+    selected = [(n, fn) for n, fn in CASES if (not only or n in only) and kind in (None, "cases")]
+    if kind in (None, "cases") and not selected:
         print(f"test-gate-pool.py: no case named {only!r}", file=sys.stderr)
+        return 2
+    unknown = [o for o in only if o not in {n for n, _ in CASES}]
+    if unknown:
+        print(f"test-gate-pool.py: no case named {unknown!r}", file=sys.stderr)
         return 2
     for name, fn in selected:
         print(f"{name}:")
@@ -3058,10 +3161,16 @@ def main():
         except Exception as e:             # a crash is a FAIL line, never a lost verdict
             check(f"{name}: the case ran to its end (raised {type(e).__name__}: {e})", False)
     # Skipped inside a re-run against a copy, so the self-test never recurses.
-    if only is None and not os.environ.get("GATE_POOL_SCRIPTS"):
+    if kind == "baseline":
+        print("baseline:")
+        baseline_selftest()
+    elif kind == "mutations":
+        print(f"mutation self-test (part {part[1][0]}/{part[1][1]}):")
+        mutation_selftest(part[1])
+    elif not only and not os.environ.get("GATE_POOL_SCRIPTS") and kind is None:
         print("mutation self-test:")
         mutation_selftest()
-    elif only is None:
+    elif not only and kind is None:
         print("mutation self-test: skipped (GATE_POOL_SCRIPTS is set: this is a re-run "
               "against a copy)")
 

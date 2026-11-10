@@ -271,6 +271,14 @@ Runtime (`scripts/`; canonical source is this repo):
   outlive an outer runner that was signalled, with the slots free, until A4's watchdog.
   `test-gate-pool.py` mutation-proves
   both files against COPIES and pins `GATEQ_HOME` to a temp directory, as `test-gate-runner.py` does.
+  #570: run whole it took ~400 s and set the floor of every gate run and one macOS shard, so
+  `.gates.toml` runs it as `--part` steps: `--part cases`, `--part baseline` (every case on a clean
+  copy) and `--part mutations K/N`, the round-robin slice `rows[K-1::N]` of the mutation rows with a
+  prerequisite scoped to the cases that slice uses. N is the harness's `MUTATION_PARTS`; no
+  argument still runs the full harness. `test-ci-gates-lockstep.py` checks the steps cover every
+  part exactly once and that no macOS shard owns more than ceil(parts/3) of them. The step names
+  use a DOT (`test-gate-pool.mutations-K`) only because sha256 of the hyphen names piled 4 of 7
+  parts on one shard; if N changes, re-check the cap (the lockstep fails loudly if it is broken).
 - `scripts/orchestrate_schemas.py` - versioned schema registry + stdlib validator (#225, part of
   the #220 epic): one source-of-truth schema per structured artifact one agent writes and another
   reads (`gate-receipt/v1`, `finding-fix-list/v1`, `finding-reply-slice/v1`), so producers/consumers
@@ -812,6 +820,9 @@ ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.
 python3 test-orchestrate-guard.py
 python3 test-orchestrate-authorize-merge.py
 python3 test-orchestrate-steer.py
+python3 test-pr-unreplied-comments.py   # #570: the heaviest steps lead each region between exclusive steps
+python3 test-ship-gate-preflight.py
+python3 test-safe-push.py
 python3 test-steer-nudge-length.py
 python3 test-helper-deploy-coverage.py
 python3 test-orchestrate-context-meter.py
@@ -824,11 +835,8 @@ python3 test-finding-channel.py
 python3 test-planner-classify.py
 python3 test-gh-wrappers.py
 python3 test-gh-react.py
-python3 test-ship-gate-preflight.py
 python3 test-patch-coverage.py
-python3 test-pr-unreplied-comments.py
 python3 test-pr-read-comments.py
-python3 test-safe-push.py
 python3 test-pr-watch.py
 python3 test-issue-watch.py
 python3 test-version-lockstep.py
@@ -840,7 +848,6 @@ python3 test-jq-quoting.py
 python3 test-stale-branch-sweep.py
 python3 test-codoki-quota-watch.py
 python3 test-gate-runner.py
-python3 test-gate-pool.py   # #539: the gate pool and its gate-runner wiring (DESIGN-gate-pool.md)
 python3 test-prefs-coverage.py
 python3 test-prose-lint.py
 python3 test-resolve-threads.py
@@ -856,6 +863,13 @@ python3 test-cr-quota-watch.py
 python3 test-elmer-enqueue.py
 python3 test-elmer-triage.py
 python3 test-elmer-tick.py
+python3 test-gate-pool.py --part mutations 1/5   # #539 gate pool harness, run as #570 parts (no args = the whole harness)
+python3 test-gate-pool.py --part mutations 2/5
+python3 test-gate-pool.py --part mutations 3/5
+python3 test-gate-pool.py --part mutations 4/5
+python3 test-gate-pool.py --part mutations 5/5
+python3 test-gate-pool.py --part baseline
+python3 test-gate-pool.py --part cases
 python3 test-stack-preflight.py
 ```
 

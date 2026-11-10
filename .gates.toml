@@ -57,6 +57,18 @@ jobs = 4
   exclusive = true  # timing-sensitive perf check; runs with nothing else in flight
 
   [[prep_pr.steps]]
+  name = "test-pr-unreplied-comments"
+  run = "python3 test-pr-unreplied-comments.py"
+
+  [[prep_pr.steps]]
+  name = "test-ship-gate-preflight"
+  run = "python3 test-ship-gate-preflight.py"
+
+  [[prep_pr.steps]]
+  name = "test-safe-push"
+  run = "python3 test-safe-push.py"
+
+  [[prep_pr.steps]]
   name = "test-steer-nudge-length"
   run = "python3 test-steer-nudge-length.py"
 
@@ -105,24 +117,12 @@ jobs = 4
   run = "python3 test-gh-react.py"
 
   [[prep_pr.steps]]
-  name = "test-ship-gate-preflight"
-  run = "python3 test-ship-gate-preflight.py"
-
-  [[prep_pr.steps]]
   name = "test-patch-coverage"
   run = "python3 test-patch-coverage.py"
-
-[[prep_pr.steps]]
-  name = "test-pr-unreplied-comments"
-  run = "python3 test-pr-unreplied-comments.py"
 
   [[prep_pr.steps]]
   name = "test-pr-read-comments"
   run = "python3 test-pr-read-comments.py"
-
-  [[prep_pr.steps]]
-  name = "test-safe-push"
-  run = "python3 test-safe-push.py"
 
   [[prep_pr.steps]]
   name = "test-run-paths"
@@ -148,6 +148,42 @@ jobs = 4
   name = "test-elmer-tick"
   run = "python3 test-elmer-tick.py"
   exclusive = true  # contention can hide a real race in its 8-way lock test
+
+  [[prep_pr.steps]]
+  # #570: test-gate-pool.py runs as `--part` steps so --jobs and the macOS --shard spread
+  # its ~400 s; test-ci-gates-lockstep.py checks the parts cover it exactly once and that no
+  # shard owns more than ceil(parts/3). The heaviest steps lead each region between
+  # `exclusive` barriers, so declaration-order dispatch starts them first.
+  name = "test-gate-pool.mutations-1"
+  run = "python3 test-gate-pool.py --part mutations 1/5"
+
+  [[prep_pr.steps]]
+  name = "test-gate-pool.mutations-2"
+  run = "python3 test-gate-pool.py --part mutations 2/5"
+
+  [[prep_pr.steps]]
+  name = "test-gate-pool.mutations-3"
+  run = "python3 test-gate-pool.py --part mutations 3/5"
+
+  [[prep_pr.steps]]
+  name = "test-gate-pool.mutations-4"
+  run = "python3 test-gate-pool.py --part mutations 4/5"
+
+  [[prep_pr.steps]]
+  name = "test-gate-pool.mutations-5"
+  run = "python3 test-gate-pool.py --part mutations 5/5"
+
+  [[prep_pr.steps]]
+  name = "test-gate-pool.baseline"
+  run = "python3 test-gate-pool.py --part baseline"
+
+  [[prep_pr.steps]]
+  name = "test-gate-pool.cases"
+  run = "python3 test-gate-pool.py --part cases"
+
+  [[prep_pr.steps]]
+  name = "test-stack-preflight"
+  run = "python3 test-stack-preflight.py"
 
   [[prep_pr.steps]]
   name = "test-pr-watch"
@@ -195,10 +231,6 @@ jobs = 4
   run = "python3 test-gate-runner.py"
 
   [[prep_pr.steps]]
-  name = "test-gate-pool"
-  run = "python3 test-gate-pool.py"
-
-  [[prep_pr.steps]]
   name = "test-prefs-coverage"
   run = "python3 test-prefs-coverage.py"
 
@@ -233,10 +265,6 @@ jobs = 4
   [[prep_pr.steps]]
   name = "test-open-pr-staleness-sweep"
   run = "python3 test-open-pr-staleness-sweep.py"
-
-  [[prep_pr.steps]]
-  name = "test-stack-preflight"
-  run = "python3 test-stack-preflight.py"
 
 [merge_pr]
 # cc-orchestrator is a stdlib-only shell/Python repo with no coverage service;
