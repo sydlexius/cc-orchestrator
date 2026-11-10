@@ -363,7 +363,7 @@ value is read first, `GATEQ_HOME`, which the harness needs: an absolute director
 PATH                 tool_dirs joined with ":"          HOME, USER, LOGNAME   from the password database
 LANG, LC_ALL         C.UTF-8                            TMPDIR                <GATEQ_HOME>/ctl-tmp
 GATEQ_HOME           the validated root                 GIT_TERMINAL_PROMPT   0
-GIT_SSH_COMMAND      "ssh -o BatchMode=yes" (constant)  GH_PROMPT_DISABLED    1
+SSH_ASKPASS_REQUIRE  "force" + SSH_ASKPASS=failing prog (#568)  GH_PROMPT_DISABLED  1
 GIT_OPTIONAL_LOCKS   0                                  (so the dispatcher's `git status` never takes `index.lock`)
 ```
 

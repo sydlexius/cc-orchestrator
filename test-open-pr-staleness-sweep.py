@@ -27,7 +27,6 @@ recorded for assertion.
 Run: python3 test-open-pr-staleness-sweep.py
 """
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -91,7 +90,9 @@ GIT_STUB = (
     '  # base-freshness) so the sweep\'s OWN head-fetch env can be asserted.\n'
     '  { echo "ARGS=$*"\n'
     '    echo "GIT_TERMINAL_PROMPT=${GIT_TERMINAL_PROMPT:-<unset>}"\n'
-    '    echo "GIT_SSH_COMMAND=${GIT_SSH_COMMAND:-<unset>}"; } >>"${FETCHLOG:-/dev/null}"\n'
+    '    echo "GIT_SSH_COMMAND=${GIT_SSH_COMMAND:-<unset>}"\n'
+    '    echo "SSH_ASKPASS=${SSH_ASKPASS:-<unset>}"\n'
+    '    echo "SSH_ASKPASS_REQUIRE=${SSH_ASKPASS_REQUIRE:-<unset>}"; } >>"${FETCHLOG:-/dev/null}"\n'
     '  [ -n "${FETCH_FAIL_REF:-}" ] && [ "$3" = "$FETCH_FAIL_REF" ] && exit 1\n'
     '  exit "${FETCH_RC:-0}"\n'
     "fi\n"
@@ -114,8 +115,11 @@ def view_recheck(reviews="0", comments="0"):
     return TAB.join([reviews, comments])
 
 
+FALSE_PROG = next((p for p in ("/usr/bin/false", "/bin/false") if os.path.exists(p)), None)
+
+
 def run(args, *, open_prs="", views=None, views_recheck=None, view_rcs=None, behind="0",
-        list_rc=0, update_rc=0, fetch_fail_ref="", ssh_command=None, freshness_stub=None,
+        list_rc=0, update_rc=0, fetch_fail_ref="", ssh_command=None, askpass=None, askpass_prog=None, freshness_stub=None,
         checkout_repo=None):
     """Invoke open-pr-staleness-sweep.sh with stubbed gh + git.
     Returns (rc, stdout, stderr, gh_invocations, fetchlog)."""
@@ -161,6 +165,14 @@ def run(args, *, open_prs="", views=None, views_recheck=None, view_rcs=None, beh
             env["GIT_SSH_COMMAND"] = ssh_command
         else:
             env.pop("GIT_SSH_COMMAND", None)
+        if askpass is not None:
+            env["SSH_ASKPASS_REQUIRE"] = askpass
+        else:
+            env.pop("SSH_ASKPASS_REQUIRE", None)
+        if askpass_prog is not None:
+            env["SSH_ASKPASS"] = askpass_prog
+        else:
+            env.pop("SSH_ASKPASS", None)
         for n, line in (views or {}).items():
             env[f"VIEW_{n}"] = line
         for n, line in (views_recheck or {}).items():
@@ -190,21 +202,12 @@ def updates_for(calls):
 
 
 def fetch_block(fetchlog, ref):
-    """Return the (ARGS, TERMINAL, SSH) 3-line block of the fetch whose ARGS names <ref>, or None."""
+    """Return the (ARGS, TERMINAL, SSH, ASKPASS) 5-line block of the fetch whose ARGS names <ref>, or None."""
     lines = fetchlog.splitlines()
-    for i in range(0, len(lines) - 2, 3):
+    for i in range(0, len(lines) - 4, 5):
         if lines[i].startswith("ARGS=") and f" {ref} " in (lines[i] + " "):
-            return "\n".join(lines[i:i + 3])
+            return "\n".join(lines[i:i + 5])
     return None
-
-
-def effective_batchmode(block):
-    """The LAST BatchMode value ssh honors in a fetch block's GIT_SSH_COMMAND (later -o wins)."""
-    lines = [ln for ln in block.splitlines() if ln.startswith("GIT_SSH_COMMAND=")]
-    if not lines:
-        return None
-    vals = re.findall(r"BatchMode=(\w+)", lines[-1])
-    return vals[-1] if vals else None
 
 
 def main():
@@ -342,18 +345,38 @@ def main():
     check("the cap is surfaced", "100" in out and ("truncat" in out.lower() or "cap" in out.lower()))
     check("no unqualified 'nothing to do' claim", "nothing to do" not in out)
 
-    print("== NON-INTERACTIVE: the sweep's OWN head fetch is GIT_TERMINAL_PROMPT=0 + BatchMode=yes ==")
-    # A caller BatchMode=no must NOT survive as the effective setting on the head fetch.
+    print("== NON-INTERACTIVE: the sweep's OWN head fetch is GIT_TERMINAL_PROMPT=0 + SSH_ASKPASS_REQUIRE=force + failing SSH_ASKPASS, no ssh override (#568) ==")
     rc, out, err, calls, flog = run(
         ["101", "owner/name"], open_prs="101 120", behind="4",
-        views={120: view(head="feat/hf", reviews="0", comments="0")},
-        ssh_command="ssh -o BatchMode=no")
+        views={120: view(head="feat/hf", reviews="0", comments="0")})
     head_blk = fetch_block(flog, "feat/hf")
     check("the head fetch was recorded", head_blk is not None)
     check("GIT_TERMINAL_PROMPT=0 on the head fetch", "GIT_TERMINAL_PROMPT=0" in (head_blk or ""))
-    check("caller BatchMode=no preserved on the head fetch", "BatchMode=no" in (head_blk or ""))
-    check("but the EFFECTIVE head-fetch BatchMode is yes (our -o appended LAST wins)",
-          effective_batchmode(head_blk or "") == "yes")
+    check("unset caller: SSH_ASKPASS_REQUIRE=force", "SSH_ASKPASS_REQUIRE=force" in (head_blk or ""))
+    check("unset caller: SSH_ASKPASS is the failing program", FALSE_PROG is not None and f"SSH_ASKPASS={FALSE_PROG}\n" in (head_blk or "") + "\n")
+    check("GIT_SSH_COMMAND not set by the sweep", "GIT_SSH_COMMAND=<unset>" in (head_blk or ""))
+    check("no BatchMode", "BatchMode" not in (head_blk or ""))
+    rc, out, err, calls, flog = run(
+        ["101", "owner/name"], open_prs="101 120", behind="4",
+        views={120: view(head="feat/hf", reviews="0", comments="0")},
+        ssh_command="ssh -i /k/id", askpass="force")
+    head_blk = fetch_block(flog, "feat/hf")
+    check("caller GIT_SSH_COMMAND passes through unchanged", "GIT_SSH_COMMAND=ssh -i /k/id\n" in ((head_blk or "") + "\n"))
+    check("caller SSH_ASKPASS_REQUIRE preserved", "SSH_ASKPASS_REQUIRE=force" in (head_blk or ""))
+    rc, out, err, calls, flog = run(
+        ["101", "owner/name"], open_prs="101 120", behind="4",
+        views={120: view(head="feat/hf", reviews="0", comments="0")},
+        askpass="prefer", askpass_prog="/opt/gui-askpass")
+    head_blk = fetch_block(flog, "feat/hf")
+    check("explicit caller REQUIRE=prefer preserved", "SSH_ASKPASS_REQUIRE=prefer" in (head_blk or ""))
+    check("explicit caller SSH_ASKPASS preserved", "SSH_ASKPASS=/opt/gui-askpass\n" in (head_blk or "") + "\n")
+    rc, out, err, calls, flog = run(
+        ["101", "owner/name"], open_prs="101 120", behind="4",
+        views={120: view(head="feat/hf", reviews="0", comments="0")},
+        askpass="", askpass_prog="/opt/gui-askpass")
+    head_blk = fetch_block(flog, "feat/hf")
+    check("empty caller REQUIRE treated as unset -> force", "SSH_ASKPASS_REQUIRE=force" in (head_blk or ""))
+    check("empty caller REQUIRE -> failing SSH_ASKPASS replaces GUI askpass", FALSE_PROG is not None and f"SSH_ASKPASS={FALSE_PROG}\n" in (head_blk or "") + "\n")
 
     print("== TOCTOU: not-reviewed at snapshot but REVIEWED at re-check -> NOT refreshed ==")
     # The snapshot shows 0 reviews / 0 comments (would refresh), but a review lands before the

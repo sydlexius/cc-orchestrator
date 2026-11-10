@@ -359,12 +359,43 @@ elif [ -n "$branch" ]; then
       # (recoverable, and stale-branch-sweep.sh catches it later), and failing closed here
       # would resurrect the exact #302 pathology of a network condition aborting a cleanup
       # that has already done its local work. Do not "fix" this into a hard failure.
-      # GIT_TERMINAL_PROMPT=0 + SSH BatchMode so an auth-required origin fails FAST rather
-      # than hanging cleanup on a credential prompt (the house pattern from
-      # base-freshness.sh); a caller's own GIT_SSH_COMMAND is preserved.
-      if GIT_TERMINAL_PROMPT=0 \
-         GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes" \
-         git ls-remote --exit-code origin "refs/heads/$branch" >/dev/null 2>&1; then
+      # GIT_TERMINAL_PROMPT=0 + a forced failing askpass so an auth-required origin fails
+      # FAST rather than hanging cleanup on a credential prompt (the house pattern from
+      # base-freshness.sh). No GIT_SSH_COMMAND override: CC Safety Net (git.ssh-env) denies
+      # it (#568); a caller's own GIT_SSH_COMMAND passes through. With a tty ssh prompts on
+      # /dev/tty and SSH_ASKPASS_REQUIRE=never does not stop that, so unless the caller set
+      # SSH_ASKPASS_REQUIRE (empty = unset) force a failing SSH_ASKPASS (BatchMode-equivalent;
+      # git's HTTPS credential prompt then fails fast too). An explicit caller value leaves
+      # both variables alone. SCOPED TO THIS ONE CALL (inline env prefix, nothing exported):
+      # the later ordinary `git fetch --prune` must keep the caller's own SSH_ASKPASS.
+      _cw_req=""
+      _cw_pass=""
+      if [ -z "${SSH_ASKPASS_REQUIRE:-}" ]; then
+        if [ -x /usr/bin/false ]; then
+          _cw_req=force
+          _cw_pass=/usr/bin/false
+        elif [ -x /bin/false ]; then
+          _cw_req=force
+          _cw_pass=/bin/false
+        else
+          # No failing program on this host: fall back to never (does NOT stop a tty prompt).
+          _cw_req=never
+        fi
+      fi
+      _cw_ls_remote() {
+        if [ "$_cw_req" = force ]; then
+          GIT_TERMINAL_PROMPT=0 SSH_ASKPASS_REQUIRE=force SSH_ASKPASS="$_cw_pass" \
+            git ls-remote --exit-code origin "refs/heads/$1" >/dev/null 2>&1
+        elif [ "$_cw_req" = never ]; then
+          GIT_TERMINAL_PROMPT=0 SSH_ASKPASS_REQUIRE=never \
+            git ls-remote --exit-code origin "refs/heads/$1" >/dev/null 2>&1
+        else
+          # Caller set a non-empty SSH_ASKPASS_REQUIRE: both variables pass through untouched.
+          GIT_TERMINAL_PROMPT=0 \
+            git ls-remote --exit-code origin "refs/heads/$1" >/dev/null 2>&1
+        fi
+      }
+      if _cw_ls_remote "$branch"; then
         # Ref STILL PRESENT: a genuine failure regardless of what the API reported.
         echo "Error: failed to delete remote branch '$branch' (ref still present on origin):" >&2
         # An `if`, not `[ -s ] && cat`: under `set -e` that AND-list returns 1 when the

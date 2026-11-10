@@ -415,8 +415,11 @@ Runtime (`scripts/`; canonical source is this repo):
 - `scripts/base-freshness.sh` - the git-only base-freshness check (#282). Answers ONE question: is
   <head> current with origin/<base>? The base is ALWAYS caller-supplied - it NEVER infers or
   hard-codes `main`, which is what makes a backport / release-base branch correct by construction.
-  Non-interactive by construction (GIT_TERMINAL_PROMPT=0 + SSH BatchMode, a caller's own
-  GIT_SSH_COMMAND preserved), so an unreachable/auth-required origin fails FAST instead of hanging a
+  Non-interactive by construction (GIT_TERMINAL_PROMPT=0 + SSH_ASKPASS_REQUIRE=force with SSH_ASKPASS=<the first existing of /usr/bin/false, /bin/false>, set together only when the caller left SSH_ASKPASS_REQUIRE unset or empty - an explicit caller value keeps both untouched; `never` does NOT stop an ssh passphrase/host-key prompt on a controlling tty, `force`+false does and also fails git's HTTPS credential prompt fast; the
+  script NEVER sets GIT_SSH_COMMAND, since CC Safety Net rule git.ssh-env denies any GIT_SSH*/core.sshCommand
+  override and that denial blocked every command block running the helper, #568; a caller's own
+  GIT_SSH_COMMAND passes through; `test-no-ssh-override.py` bans
+  the override repo-wide), so an unreachable/auth-required origin fails FAST instead of hanging a
   push path. Best-effort `git fetch origin <base>` then `git rev-list --count`; exactly one labeled
   `freshness:` line every time: fresh / behind N (with the count + a refresh pointer) / unknown
   (unresolvable ref, fetch failure, shallow clone). EXIT CONTRACT: 0 for fresh AND unknown
@@ -799,7 +802,7 @@ above and `skills/orchestrate/templates/gates.toml.md`.
 
 ```sh
 shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/orchestrate-authorize-merge.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh scripts/base-freshness.sh scripts/open-pr-staleness-sweep.sh scripts/run-paths.sh scripts/cr-quota-watch.sh scripts/elmer-enqueue.sh scripts/elmer-triage.sh scripts/elmer-tick.sh scripts/stack-preflight.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
-ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/gate_pool.py scripts/prefs-coverage.py scripts/settings-scrub.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-ci-gates-lockstep.py test-steer-nudge-length.py test-helper-deploy-coverage.py test-jq-quoting.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-gate-pool.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-safe-push-freshness.py test-prep-pr-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py test-cr-quota-watch.py test-elmer-enqueue.py test-elmer-triage.py test-elmer-tick.py test-bash32-constructs.py test-settings-scrub.py test-stack-preflight.py test-command-positional-args.py
+ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/gate_pool.py scripts/prefs-coverage.py scripts/settings-scrub.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-ci-gates-lockstep.py test-steer-nudge-length.py test-helper-deploy-coverage.py test-jq-quoting.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-gate-pool.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-safe-push-freshness.py test-prep-pr-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py test-cr-quota-watch.py test-elmer-enqueue.py test-elmer-triage.py test-elmer-tick.py test-bash32-constructs.py test-settings-scrub.py test-stack-preflight.py test-command-positional-args.py test-no-ssh-override.py
 ./scripts/orchestrate-guard.sh --self-test    # MUST use ./ - the self-test re-invokes "$0";
                                               # `bash scripts/orchestrate-guard.sh` makes $0 a bare name -> 127
 ./scripts/orchestrate-guard.sh --assert-coverage  # #324: no deny is unreachable behind the perf
@@ -832,6 +835,7 @@ python3 test-version-lockstep.py
 python3 test-ci-gates-lockstep.py
 python3 test-bash32-constructs.py   # #463: bash-4-only syntax (macOS /bin/bash is 3.2)
 python3 test-command-positional-args.py   # #507: no $<digit> token in commands/*.md
+python3 test-no-ssh-override.py   # #568: no GIT_SSH*/core.sshCommand override (CC Safety Net git.ssh-env)
 python3 test-jq-quoting.py
 python3 test-stale-branch-sweep.py
 python3 test-codoki-quota-watch.py

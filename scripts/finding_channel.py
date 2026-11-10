@@ -170,23 +170,27 @@ def _git(repo, *args):
 
     ls-remote/fetch against an auth-required origin would otherwise block on a
     credential prompt and hang the guard indefinitely (Codoki #255). Force
-    GIT_TERMINAL_PROMPT=0 (never prompt for HTTP creds) and default SSH to
-    BatchMode (fail fast instead of prompting) so an unreachable/auth-required
+    GIT_TERMINAL_PROMPT=0 (never prompt for HTTP creds) and force a
+    failing SSH_ASKPASS unless the caller set SSH_ASKPASS_REQUIRE (no ssh prompt, tty or not) so an unreachable/auth-required
     remote fails fast to the 'error' verdict (exit 2, safe-block) rather than
     stalling the pipeline. This preserves the read-only behavior."""
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
-    # GIT_TERMINAL_PROMPT=0 stops HTTP credential prompts but NOT an SSH
-    # password / host-key prompt -- that needs BatchMode. If the parent env
-    # already sets GIT_SSH_COMMAND (a custom identity/port/wrapper) WITHOUT
-    # BatchMode, appending it preserves their command while still guaranteeing
-    # non-interactive behavior (Codoki #255 High); an explicit BatchMode (yes or
-    # no) is left untouched so a user can deliberately opt back into prompts.
-    ssh_cmd = env.get("GIT_SSH_COMMAND")
-    if not ssh_cmd:
-        env["GIT_SSH_COMMAND"] = "ssh -oBatchMode=yes"
-    elif "batchmode" not in ssh_cmd.lower():
-        env["GIT_SSH_COMMAND"] = ssh_cmd + " -oBatchMode=yes"
+    # GIT_TERMINAL_PROMPT=0 stops HTTP credential prompts. We never set GIT_SSH_COMMAND:
+    # CC Safety Net (rule git.ssh-env) denies any such override (#568), and a caller's own
+    # value passes through unchanged. With a controlling tty ssh prompts on /dev/tty and
+    # SSH_ASKPASS_REQUIRE=never does NOT stop that, so unless the caller set
+    # SSH_ASKPASS_REQUIRE (empty counts as unset) force a failing SSH_ASKPASS: the prompt
+    # fails at once (BatchMode-equivalent; git's HTTPS credential prompt fails fast too).
+    # Both are set together so a caller's GUI askpass cannot pop a dialog; an explicit
+    # caller SSH_ASKPASS_REQUIRE leaves both untouched. No failing program -> "never".
+    if not env.get("SSH_ASKPASS_REQUIRE"):
+        fail_prog = next((p for p in ("/usr/bin/false", "/bin/false") if os.path.exists(p)), None)
+        if fail_prog:
+            env["SSH_ASKPASS"] = fail_prog
+            env["SSH_ASKPASS_REQUIRE"] = "force"
+        else:
+            env["SSH_ASKPASS_REQUIRE"] = "never"
     proc = subprocess.run(["git", "-C", repo, *args], env=env,
                           capture_output=True, text=True, check=False)
     return proc.returncode, proc.stdout.strip()

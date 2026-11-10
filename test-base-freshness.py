@@ -5,7 +5,9 @@ staleness sweep) paths.
 
 Contract under test:
   - The base is ALWAYS caller-supplied; the script never infers or hard-codes `main`.
-  - Non-interactive by construction: GIT_TERMINAL_PROMPT=0 (+ SSH BatchMode) so an
+  - Non-interactive by construction: GIT_TERMINAL_PROMPT=0 + SSH_ASKPASS_REQUIRE=force with a failing
+    SSH_ASKPASS (an unset/empty caller value; an explicit caller value keeps both untouched; never a
+    GIT_SSH_COMMAND override: CC Safety Net denies it, #568) so an
     auth-required / unreachable origin fails FAST instead of hanging a push path.
   - Exactly one labeled `freshness:` line on every path: fresh / behind / unknown.
   - EXIT CONTRACT: 0 for fresh AND unknown (best-effort degradation never blocks);
@@ -20,7 +22,6 @@ for fetch / ref-resolution / rev-list so each degradation branch is driven direc
 Run: python3 test-base-freshness.py
 """
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -36,16 +37,6 @@ def check(label, ok):
         FAILS.append(label)
 
 
-def effective_batchmode(log):
-    """The LAST BatchMode value ssh would honor across the recorded GIT_SSH_COMMAND (later -o wins).
-    Returns 'yes' / 'no' / None. Matches both `-oBatchMode=X` and `-o BatchMode=X` spellings."""
-    lines = [ln for ln in log.splitlines() if ln.startswith("GIT_SSH_COMMAND=")]
-    if not lines:
-        return None
-    vals = re.findall(r"BatchMode=(\w+)", lines[-1])
-    return vals[-1] if vals else None
-
-
 GIT_STUB = (
     "#!/usr/bin/env bash\n"
     "set -u\n"
@@ -57,6 +48,8 @@ GIT_STUB = (
     '  # Record the non-interactive env of the FETCH invocation (the one network call).\n'
     '  { echo "GIT_TERMINAL_PROMPT=${GIT_TERMINAL_PROMPT:-<unset>}"\n'
     '    echo "GIT_SSH_COMMAND=${GIT_SSH_COMMAND:-<unset>}"\n'
+    '    echo "SSH_ASKPASS_REQUIRE=${SSH_ASKPASS_REQUIRE:-<unset>}"\n'
+    '    echo "SSH_ASKPASS=${SSH_ASKPASS:-<unset>}"\n'
     '    echo "ARGS=$*"; } >>"$FETCHLOG"\n'
     '  exit "${FETCH_RC:-0}"\n'
     "fi\n"
@@ -76,8 +69,10 @@ GIT_STUB = (
 )
 
 
+FALSE_PROG = next((p for p in ("/usr/bin/false", "/bin/false") if os.path.exists(p)), None)
+
 def run(args, *, behind="0", fetch_rc=0, base_ref_rc=0, head_ref_rc=0,
-        revlist_rc=0, shallow="false", ssh_command=None):
+        revlist_rc=0, shallow="false", ssh_command=None, askpass=None, askpass_prog=None):
     """Invoke base-freshness.sh with a stubbed git. Returns (rc, stdout, stderr, fetchlog)."""
     with tempfile.TemporaryDirectory() as td:
         bindir = os.path.join(td, "bin"); os.makedirs(bindir)
@@ -105,6 +100,14 @@ def run(args, *, behind="0", fetch_rc=0, base_ref_rc=0, head_ref_rc=0,
             env["GIT_SSH_COMMAND"] = ssh_command
         else:
             env.pop("GIT_SSH_COMMAND", None)
+        if askpass is not None:
+            env["SSH_ASKPASS_REQUIRE"] = askpass
+        else:
+            env.pop("SSH_ASKPASS_REQUIRE", None)
+        if askpass_prog is not None:
+            env["SSH_ASKPASS"] = askpass_prog
+        else:
+            env.pop("SSH_ASKPASS", None)
 
         p = subprocess.run(["bash", SCRIPT] + args, env=env,
                            capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
@@ -170,22 +173,30 @@ def main():
     check("rev-list failure -> exit 0", rc == 0)
     check("rev-list failure is labeled unknown", "freshness: unknown" in out)
 
-    print("== NON-INTERACTIVE: GIT_TERMINAL_PROMPT=0 + SSH BatchMode on the fetch ==")
+    print("== NON-INTERACTIVE: GIT_TERMINAL_PROMPT=0 + forced failing askpass, NO ssh override ==")
     rc, out, err, log = run(["main"], behind="0")
     check("fetch was invoked", "ARGS=" in log)
     check("GIT_TERMINAL_PROMPT=0 was set on the fetch", "GIT_TERMINAL_PROMPT=0" in log)
-    check("SSH BatchMode was set on the fetch", "BatchMode=yes" in log)
+    check("unset caller: SSH_ASKPASS_REQUIRE=force", "SSH_ASKPASS_REQUIRE=force\n" in log)
+    check("unset caller: SSH_ASKPASS is the failing program", FALSE_PROG is not None and f"SSH_ASKPASS={FALSE_PROG}\n" in log)
+    check("GIT_SSH_COMMAND is NOT set by the script (#568)", "GIT_SSH_COMMAND=<unset>" in log)
+    check("no BatchMode anywhere", "BatchMode" not in log)
 
-    print("== NON-INTERACTIVE: a caller GIT_SSH_COMMAND is PRESERVED, BatchMode appended ==")
+    print("== a caller GIT_SSH_COMMAND passes through UNCHANGED ==")
     rc, out, err, log = run(["main"], ssh_command="ssh -i /k/id -p 2222")
-    check("caller ssh command preserved", "-i /k/id -p 2222" in log)
-    check("BatchMode still enforced", "BatchMode=yes" in log)
+    check("caller ssh command unchanged", "GIT_SSH_COMMAND=ssh -i /k/id -p 2222\n" in log)
+    check("no BatchMode appended", "BatchMode" not in log)
 
-    print("== NON-INTERACTIVE: a caller BatchMode=no cannot survive (effective BatchMode=yes) ==")
-    rc, out, err, log = run(["main"], ssh_command="ssh -oBatchMode=no")
-    check("caller ssh BatchMode=no is preserved in the command", "BatchMode=no" in log)
-    check("but the EFFECTIVE BatchMode is yes (our -o BatchMode=yes appended LAST wins)",
-          effective_batchmode(log) == "yes")
+    print("== a caller SSH_ASKPASS_REQUIRE is preserved ==")
+    rc, out, err, log = run(["main"], askpass="force")
+    check("caller SSH_ASKPASS_REQUIRE=force preserved", "SSH_ASKPASS_REQUIRE=force" in log)
+    rc, out, err, log = run(["main"], askpass="prefer", askpass_prog="/opt/gui-askpass")
+    check("explicit caller REQUIRE=prefer preserved", "SSH_ASKPASS_REQUIRE=prefer\n" in log)
+    check("explicit caller SSH_ASKPASS preserved", "SSH_ASKPASS=/opt/gui-askpass\n" in log)
+    print("== an EMPTY caller SSH_ASKPASS_REQUIRE is treated as unset ==")
+    rc, out, err, log = run(["main"], askpass="", askpass_prog="/opt/gui-askpass")
+    check("empty caller REQUIRE -> force", "SSH_ASKPASS_REQUIRE=force\n" in log)
+    check("empty caller REQUIRE -> failing SSH_ASKPASS replaces a caller GUI askpass", FALSE_PROG is not None and f"SSH_ASKPASS={FALSE_PROG}\n" in log)
 
     print("== malformed invocation -> exit 2 ==")
     rc, out, err, log = run([])

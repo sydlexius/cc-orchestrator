@@ -9,7 +9,7 @@
 # just before PASS), `git ls-remote --symref origin HEAD` (the LIVE default branch), and a
 # `git fetch` (base-freshness's, plus one to bring a PR slice's head commit local) that may update
 # the object DB and remote-tracking refs, nothing else. Non-interactive: GIT_TERMINAL_PROMPT=0 +
-# SSH BatchMode.
+# SSH_ASKPASS_REQUIRE=force + a failing SSH_ASKPASS (no GIT_SSH_COMMAND override, #568).
 #
 # Slices are given BOTTOM TO TOP. Each is detected, never guessed:
 #   all digits            -> a PR slice (`gh pr view <n>`), checked FIRST
@@ -71,8 +71,26 @@ case "${1:-}" in
 esac
 
 export GIT_TERMINAL_PROMPT=0
-if [ -n "${GIT_SSH_COMMAND:-}" ]; then GIT_SSH_COMMAND="$GIT_SSH_COMMAND -o BatchMode=yes"; else GIT_SSH_COMMAND="ssh -o BatchMode=yes"; fi
-export GIT_SSH_COMMAND
+# CC Safety Net (rule git.ssh-env) DENIES any GIT_SSH*/core.sshCommand override on a network git
+# call, so this script must not set GIT_SSH_COMMAND (#568). With a controlling terminal ssh
+# prompts on /dev/tty and SSH_ASKPASS_REQUIRE=never does NOT stop that, so (unless the caller
+# set SSH_ASKPASS_REQUIRE, empty counts as unset) force a failing askpass program: the prompt
+# fails at once, the equivalent of BatchMode. SSH_ASKPASS is set together with it so a caller's
+# GUI askpass cannot pop a dialog. Git also uses SSH_ASKPASS for HTTPS credential prompts, which
+# then fail fast too (after credential helpers). An explicit caller SSH_ASKPASS_REQUIRE leaves
+# both variables untouched.
+if [ -z "${SSH_ASKPASS_REQUIRE:-}" ]; then
+  if [ -x /usr/bin/false ]; then
+    export SSH_ASKPASS=/usr/bin/false
+    export SSH_ASKPASS_REQUIRE=force
+  elif [ -x /bin/false ]; then
+    export SSH_ASKPASS=/bin/false
+    export SSH_ASKPASS_REQUIRE=force
+  else
+    # No failing program on this host: fall back to never (does NOT stop a tty prompt).
+    export SSH_ASKPASS_REQUIRE=never
+  fi
+fi
 
 SELF_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd) || { echo "stack-preflight: cannot resolve own directory" >&2; exit 2; }
 

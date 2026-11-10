@@ -11,11 +11,11 @@
 # branch is measured against its OWN declared base, so being behind `main` is never mistaken for
 # staleness.
 #
-# NON-INTERACTIVE BY CONSTRUCTION: GIT_TERMINAL_PROMPT=0 (no HTTP credential prompt) plus SSH
-# BatchMode (no SSH password / host-key prompt; a caller's own GIT_SSH_COMMAND is PRESERVED and
-# `-o BatchMode=yes` appended LAST, so it OVERRIDES any caller BatchMode=no - the effective setting
-# is always yes). An unreachable or auth-required origin therefore FAILS FAST instead of hanging a
-# push path. (Same pattern as finding_channel.py.)
+# NON-INTERACTIVE BY CONSTRUCTION: GIT_TERMINAL_PROMPT=0 (no HTTP credential prompt) plus
+# SSH_ASKPASS_REQUIRE=force + a failing SSH_ASKPASS (default; a caller's explicit
+# SSH_ASKPASS_REQUIRE keeps both untouched), so an ssh prompt fails even WITH a tty. The script NEVER sets GIT_SSH_COMMAND: CC Safety
+# Net denies any such override (#568), and a caller's own GIT_SSH_COMMAND passes through unchanged.
+# An unreachable or auth-required origin therefore FAILS FAST instead of hanging a push path.
 #
 # Exactly ONE labeled `freshness:` line is printed on every path:
 #   freshness: fresh   - <head> contains every commit on origin/<base> (0 behind).
@@ -73,16 +73,26 @@ fi
 
 # --- Non-interactive git (fail fast, never hang) ---
 export GIT_TERMINAL_PROMPT=0
-# GIT_TERMINAL_PROMPT=0 stops HTTP credential prompts but NOT an SSH password / host-key prompt -
-# that needs BatchMode. Preserve a caller's custom GIT_SSH_COMMAND (identity/port/wrapper) but ALWAYS
-# append `-o BatchMode=yes` LAST: ssh honors the LAST `-o` for a given option, so this overrides any
-# earlier BatchMode=no the caller set and guarantees the EFFECTIVE setting is non-interactive.
-if [ -n "${GIT_SSH_COMMAND:-}" ]; then
-  GIT_SSH_COMMAND="$GIT_SSH_COMMAND -o BatchMode=yes"
-else
-  GIT_SSH_COMMAND="ssh -o BatchMode=yes"
+# CC Safety Net (rule git.ssh-env) DENIES any GIT_SSH*/core.sshCommand override on a network git
+# call, so this script must not set GIT_SSH_COMMAND (#568). With a controlling terminal ssh
+# prompts on /dev/tty and SSH_ASKPASS_REQUIRE=never does NOT stop that, so (unless the caller
+# set SSH_ASKPASS_REQUIRE, empty counts as unset) force a failing askpass program: the prompt
+# fails at once, the equivalent of BatchMode. SSH_ASKPASS is set together with it so a caller's
+# GUI askpass cannot pop a dialog. Git also uses SSH_ASKPASS for HTTPS credential prompts, which
+# then fail fast too (after credential helpers). An explicit caller SSH_ASKPASS_REQUIRE leaves
+# both variables untouched.
+if [ -z "${SSH_ASKPASS_REQUIRE:-}" ]; then
+  if [ -x /usr/bin/false ]; then
+    export SSH_ASKPASS=/usr/bin/false
+    export SSH_ASKPASS_REQUIRE=force
+  elif [ -x /bin/false ]; then
+    export SSH_ASKPASS=/bin/false
+    export SSH_ASKPASS_REQUIRE=force
+  else
+    # No failing program on this host: fall back to never (does NOT stop a tty prompt).
+    export SSH_ASKPASS_REQUIRE=never
+  fi
 fi
-export GIT_SSH_COMMAND
 
 unknown() {
   echo "freshness: unknown - $1"
