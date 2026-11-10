@@ -389,7 +389,9 @@ without the variables finds no repository at all (a bare repo plus
 `GIT_WORK_TREE`), there is nothing to compare and the check passes. The gate's
 exit code is not changed by this check. Limits: config passed through the
 environment (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, which `git -c` exports
-into hooks) is not one of those variables, so an exclude rule set that way hides
+into hooks) is removed for root discovery and for the comparison view, but it does
+not change the work tree, git dir or index path, so the comparison cannot see it.
+The clean check and the steps both keep it, so an exclude rule set that way hides
 a file from the clean check the same way a `.gitignore` entry does. A bare repo
 whose `GIT_WORK_TREE` lies inside another repository fails with
 `git-env-mismatch` (fail closed, no false pass). A relative `GIT_DIR` exported
