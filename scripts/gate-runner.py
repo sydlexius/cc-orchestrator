@@ -1603,6 +1603,7 @@ def _named_command(root, name):
     cmd = found[0]
 
     def bad(what):
+        """A bad declaration -> (None, (slug, message)); the caller exits 2."""
         return None, ("bad-command", f"{CONFIG_NAME}: [[pool.command]] {name!r} {what}")
     unknown = sorted(k for k in cmd if k not in POOL_COMMAND_KEYS)
     # Echoed through repr(): a quoted TOML key may hold a newline, and must not print a line
@@ -1638,6 +1639,7 @@ def _pool_run(argv):
     shown = name if name is not None and re.fullmatch(POOL_RUN_NAME, name) else "<invalid>"
 
     def not_run(code, slug, message=None):
+        """Print the NOT RUN line (and the runner's own line, if any); return `code`."""
         if message:
             _pool_say(f"gate-runner: NOT RUN - {message}")
         _pool_run_line(shown, f"NOT RUN reason={slug}")

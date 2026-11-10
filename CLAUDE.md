@@ -279,8 +279,10 @@ Runtime (`scripts/`; canonical source is this repo):
   same sweep, bounded by `timeout_s`, else (pool on) `job_timeout_s`, else nothing. The exit
   code is the command's own (124 killed at its bound, 128 + the signal when the run was
   signalled), so the run ENDS WITH ONE STDERR LINE: `POOL-RUN: <name> ran exit=<n>` or
-  `POOL-RUN: <name> NOT RUN reason=<slug>`. NO SUCH LINE MEANS IT DID NOT RUN, whatever the
-  exit code: a runner that predates the flag warns, ignores it and runs the FULL GATE. That is
+  `POOL-RUN: <name> NOT RUN reason=<slug>`. NO SUCH LINE IS NEVER A RESULT, whatever the
+  exit code: a runner that predates the flag warns, ignores it and runs the FULL GATE (NOT RUN),
+  and a runner killed before the line leaves an UNKNOWN outcome whose command may still be
+  running (nothing reaps it until A4), so a caller checks for it before any retry. That is
   why a caller first checks its leg with `grep -q -- '--pool-run' <leg>`, and why the dispatch
   in `main()` sits BEFORE `_parse_args`. A bad `[[pool.command]]` exits 2 for that invocation
   only and never affects a gate. The declared-name rule and its stated limit (a heavy command

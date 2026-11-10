@@ -274,8 +274,9 @@ counted from the grant: past it the runner kills every step group, prints
 `--receipt`) writes a fail receipt. That is a FAILED gate (a hung step), not a
 NOT RUN. A serial step (Form A, serial Form B, the fallback chain) runs in its
 own process group: SIGINT, SIGTERM, SIGHUP and SIGQUIT sent to the runner are
-forwarded to it, the group is swept when the step ends (a background job a step
-leaves behind does not outlive it), and the runner then ends exactly as it does
+forwarded to it, the group is swept when the step ends (a background job left in the
+step's process group does not outlive it; a child that starts a session of
+its own leaves the group and is not swept), and the runner then ends exactly as it does
 with the pool off. Stated differences from pool-off: SIGTSTP (Ctrl-Z) stops
 the runner and NOT the step, which keeps running and keeps its slots; and a
 serial step gets `/dev/null` as stdin, so a step that reads its stdin reads EOF
@@ -342,8 +343,9 @@ one.
   budget on later changes nothing a caller types.
 - **How it runs.** In its own session, with `/dev/null` as stdin; SIGINT,
   SIGTERM, SIGHUP and SIGQUIT sent to the runner are forwarded to it and its
-  process group is swept when it ends, so a background job it leaves behind
-  does not outlive it.
+  process group is swept when it ends, so a background job left in that
+  group does not outlive it. A child that starts a session of its own
+  (`setsid`, a daemonizing tool) leaves the group and is NOT swept.
 - **Exit code and the closing line.** The exit code is the command's own (124
   when it was killed at its bound; 128 + the signal when the run was signalled
   or the command died of one). The pool's own outcomes are 75 and 2, and a
@@ -354,11 +356,16 @@ one.
   `nested-over-holder`, `changed-during-wait`, `interrupted`,
   `launch-failed`, and the pool's own `pool-*` errors). An invalid name is
   printed as `<invalid>`.
-- **No `POOL-RUN:` line means the command did NOT run**, whatever the exit
-  code. A `gate-runner.py` that predates the flag warns `unrecognized argument
-  '--pool-run'`, ignores it and the name, and runs the repo's FULL GATE. A
-  caller therefore checks its leg first (`grep -q -- '--pool-run' <the literal
-  leg path>`, beside the usual `[ -f ]` test), skips a leg that fails like a
+- **No `POOL-RUN:` line is never a result**, whatever the exit code: never a
+  pass and never "ran". It has two causes. A `gate-runner.py` that predates the
+  flag warns `unrecognized argument '--pool-run'`, ignores it and the name, and
+  runs the repo's FULL GATE: that warning is the one case a caller reports as
+  NOT RUN. Otherwise the runner was killed before it could print the line, and
+  the command may STILL BE RUNNING (until the A4 watchdog, nothing reaps it):
+  report the outcome as UNKNOWN, and check for the command's live processes
+  before any retry, since a blind retry can run it twice in one worktree. A
+  caller checks its leg first (`grep -q -- '--pool-run' <the literal leg
+  path>`, beside the usual `[ -f ]` test), skips a leg that fails like a
   missing file, and reports NOT RUN with no capable leg.
 
 LIMIT: this bounds what is started by name. A heavy command typed raw is

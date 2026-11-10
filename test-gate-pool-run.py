@@ -703,10 +703,12 @@ def case_stale_leg(tmp, home):
           "unrecognized argument '--pool-run'" in err), (0, True, False, [], True))
     rule = {name: tp.read(os.path.join(DOCS, name)) for name in RULE_FILES}
     same("stale leg: the three charters and SKILL.md each carry the declared-name rule: the "
-         "pre-check as a command, the closing line, and that no such line means NOT RUN",
+         "pre-check as a command, the closing line, that no such line is never a pass, and that "
+         "it runs from the target worktree",
          {name: (PRECHECK in text, "POOL-RUN: <name> ran exit=<n>" in text,
-                 "no such line means it did NOT run" in text, "--pool-run <name>" in text)
-          for name, text in rule.items()}, {name: (True,) * 4 for name in RULE_FILES})
+                 "No such line is never a pass" in text, "the outcome is UNKNOWN" in text,
+                 "target worktree as the working directory" in text, "--pool-run <name>" in text)
+          for name, text in rule.items()}, {name: (True,) * 6 for name in RULE_FILES})
     same("stale leg: and each states the limit: a raw heavy command is neither budgeted nor "
          "excluded, and nothing detects it",
          {name: "is NOT budgeted and NOT excluded" in text for name, text in rule.items()},
@@ -744,7 +746,8 @@ _HANDED = ("pool on: the command is handed its runner's OWN ticket as GATEQ_HOLD
 _T_OFF = ("timeout: with the pool OFF a command that outlasts its timeout_s is killed with its "
           "group and reported as ran exit=124")
 _RULE = ("stale leg: the three charters and SKILL.md each carry the declared-name rule: the "
-         "pre-check as a command, the closing line, and that no such line means NOT RUN")
+         "pre-check as a command, the closing line, that no such line is never a pass, and that "
+         "it runs from the target worktree")
 _KEY = "            key = gate_pool.worktree_key(root)"
 _ENTER = '_pool_enter(machine, root, cost, "named", name)'
 _STATUS = "status = proc.returncode if proc.returncode >= 0 else 128 - proc.returncode"
@@ -922,7 +925,11 @@ MUTATIONS = [
     ("a charter without the pre-check", "templates/implementer-charter.md",
      [(PRECHECK, "grep -q pool-run")], "stale-leg", _RULE),
     ("SKILL.md without the closing-line rule", "SKILL.md",
-     [("no such line means it did NOT run", "no such line is a warning")], "stale-leg", _RULE),
+     [("No such line is never a pass", "No such line is a warning")], "stale-leg", _RULE),
+    ("a charter that reads a missing line as NOT RUN", "templates/adversarial-review-charter.md",
+     [("the outcome is UNKNOWN", "it did NOT run")], "stale-leg", _RULE),
+    ("a charter without the worktree cwd rule", "templates/adversarial-prep-charter.md",
+     [("target worktree as the working directory", "runner")], "stale-leg", _RULE),
     ("a charter without the stated limit", "templates/adversarial-review-charter.md",
      [("is NOT budgeted and NOT excluded", "may not be budgeted")], "stale-leg",
      "stale leg: and each states the limit: a raw heavy command is neither budgeted nor excluded, "

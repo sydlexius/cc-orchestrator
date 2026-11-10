@@ -746,7 +746,8 @@ Run as `python3 <leg>/gate-runner.py --pool-run <name>`:
 - Exit code: the command's own. The pool's own outcomes are 75 (no slot or no worktree within `wait_timeout_s`) and 2 (usage or
   config). Because a command may itself exit 75 or 2, the runner ends with ONE stderr line that disambiguates: `POOL-RUN: <name> ran
   exit=<n>` or `POOL-RUN: <name> NOT RUN reason=<slug>`. A caller that must tell them apart reads that line.
-- AN ABSENT `POOL-RUN:` LINE MEANS THE NAMED COMMAND DID NOT RUN, whatever the exit code. READ (`_parse_args`): a runner that
+- AN ABSENT `POOL-RUN:` LINE IS NEVER A RESULT, whatever the exit code (a runner killed before printing it leaves an UNKNOWN
+  outcome whose command may still be running; see `templates/gates.toml.md`). READ (`_parse_args`): a runner that
   predates this flag warns `unrecognized argument '--pool-run'`, ignores it and the name, and runs the repo's FULL GATE. A stale
   deployed or plugin-cache copy would therefore answer a request for a 2-unit mutation check with an unpooled full gate and exit
   0. So the charter rule and every caller treat "no `POOL-RUN:` line" as NOT RUN and report it; a pass is only ever `POOL-RUN:
@@ -771,7 +772,7 @@ the queue):
 > A heavy check (a race or sanitizer run, a mutation run, a fuzz or accessibility suite, a container build: anything that runs the
 > toolchain for more than a few seconds or rewrites files in place) is run ONLY through a name declared in the repo's `.gates.toml`
 > (`gate-runner.py --pool-run <name>`), in the background, from a runner copy that contains `--pool-run`. It ran only if the output ends with `POOL-RUN: <name> ran exit=<n>`; no
-> such line means it did NOT run, whatever the exit code. If the check you need has no declared name, report that to the lead
+> such line is never a pass (NOT RUN with the stale-runner warning, else UNKNOWN), whatever the exit code. If the check you need has no declared name, report that to the lead
 > instead of running it raw; declaring one is a reviewed edit to trusted config.
 
 This does not reverse `implementer-charter.md` line 44 (the implementer still runs the FULL gate) or the adversarial-prep role; it
