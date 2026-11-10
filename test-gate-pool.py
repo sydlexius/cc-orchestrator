@@ -1913,6 +1913,31 @@ def case_e2e_git_outside_lock(tmp, home):
          (0, [], True, True))
 
 
+@e2e
+def case_e2e_gitdir_root(tmp, home):
+    # #575: GIT_DIR exported (a git hook), caller in a SUBDIRECTORY. Unscrubbed, git names the
+    # subdirectory the work tree top: the runner would read that directory's .gates.toml and
+    # claim ANOTHER worktree key, so it would run beside a gate holding the real worktree.
+    put(os.path.join(home, "config.toml"), CONFIG)
+    run, started, fifo = gated(tmp, "gd")
+    root = make_repo(tmp, "gd-repo", one_step(run, "weight = 1"))
+    sub = os.path.join(root, "sub"); os.mkdir(sub)
+    holder = spawn(root, home)
+    wait_for("the holding gate's step to start", lambda: os.path.exists(started), holder)
+    second = spawn(sub, home, env={"GIT_DIR": os.path.join(root, ".git")})
+    line = "gate-runner: waiting for this worktree (held by gate pid %d)" % holder.pid
+    with contextlib.suppress(AssertionError):   # a runner that never waits is a FAIL by name
+        wait_for("the second runner to wait", lambda: line in read(second.err), second,
+                 timeout=10)
+    same("gitdir root: a runner started from a subdirectory with GIT_DIR exported has the "
+         "SAME worktree key as one started at the root: it waits for that worktree's holder",
+         line in read(second.err), True)
+    let_go(fifo)                       # the holder's step ends; the second one's step then starts
+    first = ended(holder)
+    let_go(fifo)
+    same("gitdir root: and both gates then finish and pass", (first, ended(second)), (0, 0))
+
+
 HOLDER_STEP = """
 echo "${GATEQ_HOLDER-unset}|${GATEQ_NEST-unset}" >> "$1/env"
 if [ -z "$GATE_POOL_INNER" ]; then
@@ -2518,7 +2543,7 @@ CASES = [
     ("e2e-undeclared", case_e2e_undeclared), ("e2e-timeout", case_e2e_timeout),
     ("e2e-interrupt", case_e2e_interrupt), ("e2e-budget-removed", case_e2e_budget_removed),
     ("e2e-gates-edited", case_e2e_gates_edited), ("e2e-receipt", case_e2e_receipt),
-    ("e2e-git-outside-lock", case_e2e_git_outside_lock), ("e2e-holder-env", case_e2e_holder_env),
+    ("e2e-git-outside-lock", case_e2e_git_outside_lock), ("e2e-gitdir-root", case_e2e_gitdir_root), ("e2e-holder-env", case_e2e_holder_env),
     ("contention", case_contention),
     ("serial-golden-on", case_serial_golden_on), ("serial-group", case_serial_group),
     ("serial-signals", case_serial_signals), ("serial-sweep", case_serial_sweep),
@@ -2993,6 +3018,13 @@ RUNNER_MUTATIONS += [
      "            limit = min(limit, 10**9)\n", "", "job-timeout",
      "job timeout: an absurdly large job_timeout_s is clamped: the gate runs and passes, "
      "with no traceback and no ticket left"),
+]
+RUNNER_MUTATIONS += [
+    ("find_repo_root does not scrub the git location variables (#575)",
+     "    order = [None, scrubbed] if \"GIT_WORK_TREE\" in os.environ else [scrubbed, None]\n",
+     "    order = [None]\n", "e2e-gitdir-root",
+     "gitdir root: a runner started from a subdirectory with GIT_DIR exported has the "
+     "SAME worktree key as one started at the root: it waits for that worktree's holder"),
 ]
 if os.geteuid() != 0:                      # chmod does not bite for root, so that case skips
     RUNNER_MUTATIONS.append(

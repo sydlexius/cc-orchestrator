@@ -103,20 +103,94 @@ def warn(msg):
     print(f"WARN: {msg}", file=sys.stderr, flush=True)
 
 
-def find_repo_root():
-    """Repo root via `git rev-parse --show-toplevel`; fall back to cwd."""
+_SCRUB_NAMES = None
+
+
+def _git_env_scrubbed():
+    """The inherited environment without git's repository-local variables (#575). With
+    GIT_DIR exported and GIT_WORK_TREE not (a git hook, a wrapper), git takes the CURRENT
+    DIRECTORY as the top of the work tree, so a run from a subdirectory would name that
+    subdirectory as the repo root. The names are what `git rev-parse --local-env-vars`
+    prints (git's own list; it runs outside a repo); if that fails or prints nothing, every
+    GIT_* is removed. Computed once per process."""
+    global _SCRUB_NAMES
+    if _SCRUB_NAMES is None:
+        names = set()
+        try:
+            out = subprocess.run(["git", "rev-parse", "--local-env-vars"],
+                                 capture_output=True, text=True, check=False)
+            if out.returncode == 0:
+                names = {n.strip() for n in out.stdout.splitlines() if n.strip()}
+        except OSError:
+            pass
+        _SCRUB_NAMES = names or False       # False: fall back to every GIT_*
+    if _SCRUB_NAMES is False:
+        return {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    return {k: v for k, v in os.environ.items() if k not in _SCRUB_NAMES}
+
+
+def _toplevel(env):
+    """`git rev-parse --show-toplevel` from cwd under `env`; the path, or None."""
     try:
         out = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, check=False, env=env,
         )
-        if out.returncode == 0:
-            root = out.stdout.strip()
-            if root:
-                return root
     except OSError:
-        pass
+        return None
+    if out.returncode == 0:
+        return out.stdout.strip() or None
+    return None
+
+
+def find_repo_root():
+    """Repo root via `git rev-parse --show-toplevel`; fall back to cwd (#575).
+
+    The location variables are ignored for DISCOVERY only. With GIT_WORK_TREE exported the
+    caller has named the tree: the inherited environment is tried first, then the
+    scrubbed one. Otherwise (GIT_DIR alone makes git take cwd as the top, the #575 bug)
+    the scrubbed environment is tried first, then the inherited one. Then cwd. The runner's
+    own git queries and the steps use the caller's environment; _git_env_mismatch() checks
+    that the two views of this root are the same."""
+    scrubbed = _git_env_scrubbed()
+    order = [None, scrubbed] if "GIT_WORK_TREE" in os.environ else [scrubbed, None]
+    for env in order:
+        root = _toplevel(env)
+        if root:
+            return root
     return os.getcwd()
+
+
+def _view(env, root):
+    """(toplevel, absolute git dir, index path) of root under env, each a realpath; or
+    None when git fails there."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel", "--absolute-git-dir",
+             "--git-path", "index"],
+            cwd=root, env=env, capture_output=True, text=True, check=False)
+    except OSError:
+        return None
+    lines = out.stdout.splitlines()
+    if out.returncode != 0 or len(lines) != 3:
+        return None
+    return tuple(os.path.realpath(os.path.join(root, ln)) for ln in lines)
+
+
+def _git_env_mismatch(root):
+    """Why the caller's git view of root differs from the view without git's
+    repository-local variables, else "". No competing view (the scrubbed run fails, e.g. a
+    bare repo plus GIT_WORK_TREE) is not a mismatch. An unreadable or unparseable caller
+    view (a git failure, a path with a newline) IS one: fail closed, never pass on doubt."""
+    mine, clean = _view(None, root), _view(_git_env_scrubbed(), root)
+    if clean is None:
+        return ""
+    if mine is None:
+        return "git-env-mismatch: the caller's git view of the root is unreadable"
+    for what, a, b in zip(("work tree", "git dir", "index"), mine, clean):
+        if a != b:
+            return f"git-env-mismatch: {what} is {a} under the caller's environment but {b} without it"
+    return ""
 
 
 def _run_command(label, command, cwd):
@@ -1024,6 +1098,8 @@ def _memoizable_tree(root):
     tree = _git_out(["rev-parse", "HEAD^{tree}"], root)
     if not tree:
         return None
+    if _git_env_mismatch(root):             # the steps may look at another tree: no memo
+        return None
     if not _worktree_clean(root):
         return None
     return tree
@@ -1110,8 +1186,10 @@ def _write_receipt(path, root, rc, records, pre):
     # not adopted, because it needs a concurrent editor (outside the
     # honest-actor model), costs a full extra checkout per run, and breaks
     # gates that read untracked config or caches from the live worktree.
-    reason = ""
-    if pre_dirty:
+    reason = _git_env_mismatch(root)
+    if reason:
+        pass
+    elif pre_dirty:
         reason = "dirty-before-run: " + pre_dirty
     else:
         post_tree = _git_out(["rev-parse", "HEAD^{tree}"], root)

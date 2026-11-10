@@ -372,10 +372,31 @@ LIMIT: this bounds what is started by name. A heavy command typed raw is
 neither budgeted nor excluded from its worktree, and nothing detects it; the
 charters carry the rule.
 
-LIMIT: with `GIT_DIR` exported and the caller in a subdirectory, the runner's
-repo root resolves to that subdirectory, so `--pool-run` reads THAT directory's
-`.gates.toml` and claims a different worktree key; run it from the repo root,
-or without `GIT_DIR`. Tracked in #575.
+Repo root discovery (#575): the runner finds the root with `git rev-parse
+--show-toplevel`, ignoring git's repository-local variables (the names `git
+rev-parse --local-env-vars` prints; every `GIT_*` if that fails), so an exported
+`GIT_DIR` (a git hook, a wrapper) cannot make a subdirectory the root. An
+exported `GIT_WORK_TREE` means the caller named the tree, so the inherited
+environment is tried first. The working directory is the last fallback. The
+runner's own git queries (receipt, memo, clean-tree checks) use the caller's
+environment, the same as the gate steps. Before a receipt is written as a pass,
+or a memo entry is read or written, the runner compares the caller's git view of
+the root (work tree, git dir, index path) with its view after removing those
+repository-local variables: if they differ, or the caller's view cannot be read,
+the receipt is `result=fail` with a `reason` starting `git-env-mismatch:` (an
+older receipt is removed), and no memo is used for that run. When the view
+without the variables finds no repository at all (a bare repo plus
+`GIT_WORK_TREE`), there is nothing to compare and the check passes. The gate's
+exit code is not changed by this check. Limits: config passed through the
+environment (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, which `git -c` exports
+into hooks) is removed for root discovery and for the comparison view, but it does
+not change the work tree, git dir or index path, so the comparison cannot see it.
+The clean check and the steps both keep it, so an exclude rule set that way hides
+a file from the clean check the same way a `.gitignore` entry does. A bare repo
+whose `GIT_WORK_TREE` lies inside another repository fails with
+`git-env-mismatch` (fail closed, no false pass). A relative `GIT_DIR` exported
+from a subdirectory does not resolve at the root, so steps that use git fail
+there.
 
 ---
 
