@@ -52,6 +52,18 @@ Exit codes: 0 = all gates passed / skipped / fell open; 75 = NOT RUN (pool on,
 no slot in time); 130 = SIGINT while waiting for a slot (NOT RUN); other
 non-zero = a required gate failed (1) or a config error (2).
 
+NAMED HEAVY COMMANDS (`--pool-run <name>`, #539). A heavy NON-gate command (a
+race, mutation or fuzz run) declared in `.gates.toml` as a `[[pool.command]]` is
+started by its NAME and by nothing else: no other argument is accepted and none
+is forwarded. With the pool on it takes its declared `weight` and its worktree
+like a gate; with the pool off it just runs. The exit code is the command's own,
+so the run ends with ONE stderr line that says what happened: `POOL-RUN: <name>
+ran exit=<n>` or `POOL-RUN: <name> NOT RUN reason=<slug>`. NO SUCH LINE IS NEVER
+A PASS, whatever the exit code: a runner that predates the flag ignores it and
+runs the full gate (NOT RUN), and a runner killed before the line leaves an
+UNKNOWN outcome whose command may still be running, so a caller checks for its
+live processes before any retry.
+
 Run: python3 gate-runner.py   (from anywhere inside the repo)
 """
 import glob
@@ -489,7 +501,7 @@ def _run_group(command, cwd, session=False, env=None):
     used up its bound and was killed by the sweep. An OSError from the launch propagates.
 
     The group is NOT a session by default (a gate step keeps the terminal, so its output
-    streams as before); `session=True` makes it a session of its own instead. stdin is
+    streams as before); `session=True` gives a named command a session of its own. stdin is
     /dev/null, since a background group that reads the terminal is stopped by the kernel
     while it holds slots. A terminal interrupt no longer reaches the group, so
     INT/TERM/HUP/QUIT are forwarded to it; the runner then waits for the leader and sweeps
@@ -1475,14 +1487,19 @@ def _pool_say(line):
     """A pool line: stderr, no `WARN:` prefix (a wait is not a warning)."""
     try:
         print(line, file=sys.stderr, flush=True)
-    except OSError:                        # a closed stderr must not change the exit code
+    except OSError:
+        # A CLOSED stderr descriptor does not change the exit code. A broken PIPE does: the
+        # write error is swallowed here, but Python's exit-time flush of stderr then fails
+        # and the exit code becomes 120.
         pass
 
 
-def _pool_enter(cfg, root, cost):
-    """Take `cost` units as a hand-run gate (kind `gate`, class 2), waiting for them ->
-    (holder, None), or (None, exit code) with the reason already printed: 2 for a pool this
-    code cannot use, 75 for a wait that gave up (NOT RUN), 130 for an interrupted wait.
+def _pool_enter(cfg, root, cost, kind="gate", name="gate"):
+    """Take `cost` units, waiting for them -> (holder, None, None), or (None, exit code,
+    reason slug) with the reason already printed: 2 for a pool this code cannot use, 75 for
+    a wait that gave up (NOT RUN), 130 for an interrupted wait. `kind` is `gate` (a hand-run
+    gate or the hook: class 2) or `named` (`--pool-run`: the class follows from the cost the
+    ticket carries, never from anything else this call is given).
     A run started BY a holder in this worktree goes under that holder's slots instead
     (gate_pool decides, from GATEQ_HOLDER). The module is imported only here."""
     here = os.path.dirname(os.path.abspath(__file__))
@@ -1492,7 +1509,7 @@ def _pool_enter(cfg, root, cost):
     if where is None:
         # Never fall back to running unpooled: the user configured a bound.
         _pool_say("gate-runner: NOT RUN - pool configured but gate_pool.py is missing")
-        return None, 2
+        return None, 2, "pool-module-missing"
     try:
         if where not in sys.path:          # a runner reached through a symlink
             sys.path.insert(0, where)
@@ -1504,25 +1521,217 @@ def _pool_enter(cfg, root, cost):
             # The worktree key runs git, so it is resolved HERE, before admit.lock is ever
             # taken, from the worktree ROOT (a subdirectory would get a different key).
             key = gate_pool.worktree_key(root)
-            return pool.acquire("gate", "gate", cost, key, environ=os.environ,
-                                say=_pool_say), None
+            return pool.acquire(kind, name, cost, key, environ=os.environ,
+                                say=_pool_say), None, None
         except gate_pool.NotRun as e:
             _pool_say(e.message)
-            return None, e.code
+            return None, e.code, e.reason
         except KeyboardInterrupt:          # the ticket was given up by acquire()
             _pool_say("gate-runner: NOT RUN - interrupted while waiting for a gate slot")
-            return None, 130
+            return None, 130, "interrupted"
         except OSError as e:               # a pool directory this run cannot use: never unpooled
             _pool_say(f"gate-runner: NOT RUN - pool error: {e}")
-            return None, 2
+            return None, 2, "pool-error"
     except Exception as e:                 # a broken gate_pool.py: never a traceback, never unpooled
         _pool_say(f"gate-runner: NOT RUN - pool error: {type(e).__name__}: {e}")
-        return None, 2
+        return None, 2, "pool-error"
+
+
+# --- Named heavy commands (#539, PR A3: `--pool-run <name>`) ------------------
+#
+# Design: DESIGN-gate-pool.md section 3 ("`[[pool.command]]`") and section 5 ("Named heavy
+# commands"). Several reviewers each running a race or mutation check recreate the load the
+# pool exists to bound, because those are not gate runs. So a repo DECLARES its heavy
+# commands in `.gates.toml` and they are started by name: the run takes the declared weight
+# from the machine budget and its worktree like a gate, and the class it waits in comes from
+# that weight against the machine's cap. Nothing a caller passes can change the command, its
+# cost or its class: the name is the only input.
+
+POOL_RUN_NAME = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}"
+POOL_COMMAND_KEYS = ("name", "run", "weight", "timeout_s")
+# The flags that mean something to a GATE. Beside --pool-run each is refused by name; a
+# named command attests nothing about a tree, so it never writes or touches a receipt.
+POOL_RUN_REFUSES = ("--receipt", "--skip", "--jobs", "--memoize-dir", "--shard")
+EX_NOT_RUN = 75        # the pool's own: no slot or worktree in time, or heavier than its holder
+EX_TIMED_OUT = 124     # the command outlasted its bound and was killed (`ran exit=124`)
+
+
+def _pool_run_args(argv):
+    """-> (name, rest): the value of the FIRST `--pool-run` (None when it has none), and
+    every other argument in order. A second `--pool-run` is just another extra argument."""
+    name, rest, seen, i = None, [], False, 0
+    while i < len(argv):
+        a = argv[i]
+        if not seen and a == "--pool-run":
+            seen = True
+            i += 1
+            name = argv[i] if i < len(argv) else None
+        elif not seen and a.startswith("--pool-run="):
+            seen, name = True, a[len("--pool-run="):]
+        else:
+            rest.append(a)
+        i += 1
+    return name, rest
+
+
+def _named_command(root, name):
+    """The ONE `[[pool.command]]` named `name` in <root>/.gates.toml -> (table, None), or
+    (None, (reason slug, message)). Reads the file and nothing else; called outside every
+    lock. Only the table asked for is judged (a bad declaration under another name is that
+    invocation's problem), but an entry whose name cannot be read is refused: it might be
+    this one. An unknown key is refused too, so a misspelled `timeout_s` cannot silently
+    drop the bound it meant to set."""
+    path = os.path.join(root, CONFIG_NAME)
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except FileNotFoundError:
+        return None, ("unknown-name", f"no {CONFIG_NAME} at the repo root declares {name!r}")
+    except (OSError, ValueError) as e:     # ValueError: a TOML or a UTF-8 decode error
+        return None, ("config", f"could not parse {CONFIG_NAME}: {e}")
+    table = data.get("pool", {})
+    cmds = table.get("command", []) if isinstance(table, dict) else None
+    if not isinstance(cmds, list) or any(
+            not isinstance(c, dict) or not isinstance(c.get("name"), str) for c in cmds):
+        return None, ("config", f"{CONFIG_NAME}: [[pool.command]] must be an array of "
+                                "tables, each with a string `name`")
+    found = [c for c in cmds if c["name"] == name]
+    if len(found) != 1:
+        if not found:
+            return None, ("unknown-name", f"{CONFIG_NAME} declares no [[pool.command]] "
+                                          f"named {name!r}")
+        return None, ("duplicate-name", f"{CONFIG_NAME} declares [[pool.command]] {name!r} "
+                                        f"{len(found)} times")
+    cmd = found[0]
+
+    def bad(what):
+        """A bad declaration -> (None, (slug, message)); the caller exits 2."""
+        return None, ("bad-command", f"{CONFIG_NAME}: [[pool.command]] {name!r} {what}")
+    unknown = sorted(k for k in cmd if k not in POOL_COMMAND_KEYS)
+    # Echoed through repr(): a quoted TOML key may hold a newline, and must not print a line
+    # of its own.
+    if unknown:
+        return bad(f"has unknown key(s): {unknown!r}")
+    if not isinstance(cmd.get("run"), str) or not cmd["run"].strip():
+        return bad("needs `run`, a non-empty string")
+    if not _valid_jobs(cmd.get("weight")):  # REQUIRED: a heavy command has no default cost
+        return bad("needs `weight`, a positive integer (there is no default)")
+    if "timeout_s" in cmd and not _valid_jobs(cmd["timeout_s"]):
+        return bad("has a `timeout_s` that is no positive integer")
+    return cmd, None
+
+
+def _pool_run_line(shown, what):
+    """THE closing line, the last thing a `--pool-run` writes: `POOL-RUN: <name> ran
+    exit=<n>` or `POOL-RUN: <name> NOT RUN reason=<slug>`. The exit code alone cannot say
+    which (a command may itself exit 75 or 2). NO such line is never a pass: NOT RUN when a
+    stale runner warned `unrecognized argument`, else UNKNOWN (this runner died before the
+    line, and its command may still be running; check before any retry)."""
+    _pool_say(f"POOL-RUN: {shown} {what}")
+
+
+def _pool_run(argv):
+    """`--pool-run <name>` -> the exit status: the command's own once it ran (124 when it
+    was killed at its bound, 128 + the signal when the run was signalled), else the pool's
+    (75 no slot or worktree in time, 130 an interrupted wait) or 2 (usage, config). Every
+    way out that RETURNS prints the one closing line, and prints it LAST. A signal that takes
+    its default action during the wait ends the process with no such line, before any
+    command started (callers see a missing line and report UNKNOWN; nothing is running)."""
+    global _POOL_RUN
+    name, rest = _pool_run_args(argv)
+    # An invalid name is never echoed: it could carry a newline and forge a closing line.
+    shown = name if name is not None and re.fullmatch(POOL_RUN_NAME, name) else "<invalid>"
+
+    def not_run(code, slug, message=None):
+        """Print the NOT RUN line (and the runner's own line, if any); return `code`."""
+        if message:
+            _pool_say(f"gate-runner: NOT RUN - {message}")
+        _pool_run_line(shown, f"NOT RUN reason={slug}")
+        return code
+
+    if name is None:
+        return not_run(2, "usage", f"--pool-run requires a name declared in {CONFIG_NAME}")
+    if rest:                               # by name, never as argv: nothing is forwarded
+        for flag in POOL_RUN_REFUSES:
+            if any(a == flag or a.startswith(flag + "=") for a in rest):
+                return not_run(2, "usage", f"--pool-run cannot be combined with {flag}")
+        return not_run(2, "usage", "--pool-run takes one declared name and no other "
+                                   "argument; a variant is another declared name")
+    if shown != name:
+        return not_run(2, "bad-name", f"a --pool-run name must match {POOL_RUN_NAME}")
+    root = find_repo_root()
+    cmd, bad = _named_command(root, name)
+    if bad:
+        return not_run(2, *bad)
+    state, machine = _pool_config()
+    if state == "error":                   # a typo never runs the command unpooled
+        return not_run(2, "pool-config", machine)
+    holder, env, limit = None, None, cmd.get("timeout_s")
+    if state == "on":
+        # Cost first, outside every lock: the declared weight, clamped to the budget. The
+        # ticket carries it, and the class is read from it against the machine's cap.
+        cost = min(cmd["weight"], machine["budget"])
+        holder, code, slug = _pool_enter(machine, root, cost, "named", name)
+        if holder is None:
+            return not_run(code, slug)
+    refused = status = None
+    try:
+        if holder is not None:
+            # Granted. The declaration is read AGAIN and that one runs; one that now costs
+            # more than this run holds is NOT RUN, so a run is never wider than its slots.
+            cmd, bad = _named_command(root, name)
+            recost = cost if bad else min(cmd["weight"], machine["budget"])
+            if bad:
+                refused = (2, *bad)
+            elif recost > cost:
+                refused = (EX_NOT_RUN, "changed-during-wait",
+                           f"{CONFIG_NAME} changed during the wait (cost {cost} -> "
+                           f"{recost}); run it again")
+            else:
+                # The command gets the holder from THIS run's own state, never an
+                # inherited value.
+                env = {**os.environ, **holder.child_env()}
+                if not env["GATEQ_NEST"]:
+                    del env["GATEQ_NEST"]
+                limit = cmd.get("timeout_s", machine.get("job_timeout_s", JOB_TIMEOUT_S))
+        if refused is None:
+            # The bound: `timeout_s`, else (pool on) `job_timeout_s`, else none. Counted
+            # from here, so a wait is never charged to the run.
+            _POOL_RUN = {"deadline": float("inf") if limit is None
+                         else time.monotonic() + min(limit, 10**9)}
+            try:
+                proc, caught, overdue = _run_group(cmd["run"], root, session=True, env=env)
+            except (OSError, ValueError) as e:   # ValueError: a NUL in `run`
+                refused = (2, "launch-failed", f"could not launch {name!r}: {e}")
+            else:
+                if caught:                 # the run was signalled: forwarded, waited for, swept
+                    status = 128 + caught[0]
+                elif overdue:
+                    _pool_say(f"gate-runner: KILLED - {name!r} exceeded its timeout ({limit}s)")
+                    status = EX_TIMED_OUT
+                else:                      # a command that died of a signal: the shell's code
+                    status = proc.returncode if proc.returncode >= 0 else 128 - proc.returncode
+    finally:
+        _POOL_RUN = None
+        if holder is not None:
+            try:
+                holder.release()
+            except OSError as e:           # the kernel drops the locks at exit anyway
+                _pool_say(f"gate-runner: note: could not release the gate slots: {e}")
+    # After the release, so the closing line is the LAST one.
+    if refused is not None:
+        return not_run(*refused)
+    _pool_run_line(shown, f"ran exit={status}")
+    return status
 
 
 def main(argv=None):
     global _POOL_RUN
     argv = argv if argv is not None else sys.argv[1:]
+    # A named heavy command, never a gate. Decided BEFORE _parse_args, which warns about an
+    # argument it does not know and runs the gate anyway.
+    if any(a == "--pool-run" or a.startswith("--pool-run=") for a in argv):
+        return _pool_run(argv)
     receipt_path, memoize_dir, jobs, skip, shard = _parse_args(argv)
     if receipt_path is not None and shard is not None:
         # Same argument as --skip: a shard attests to a subset of the gate.
@@ -1549,7 +1758,7 @@ def main(argv=None):
         # ticket: it falls through and _run_gates rejects the bytes that were judged.
         cost, raw = _pool_cost(root, jobs, pool["budget"])
         if cost is not None:
-            holder, code = _pool_enter(pool, root, cost)
+            holder, code, _ = _pool_enter(pool, root, cost)
             if holder is None:
                 if receipt_path:
                     _remove_stale(receipt_path)

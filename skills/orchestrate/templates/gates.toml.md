@@ -274,8 +274,9 @@ counted from the grant: past it the runner kills every step group, prints
 `--receipt`) writes a fail receipt. That is a FAILED gate (a hung step), not a
 NOT RUN. A serial step (Form A, serial Form B, the fallback chain) runs in its
 own process group: SIGINT, SIGTERM, SIGHUP and SIGQUIT sent to the runner are
-forwarded to it, the group is swept when the step ends (a background job a step
-leaves behind does not outlive it), and the runner then ends exactly as it does
+forwarded to it, the group is swept when the step ends (a background job left in the
+step's process group does not outlive it; a child that starts a session of
+its own leaves the group and is not swept), and the runner then ends exactly as it does
 with the pool off. Stated differences from pool-off: SIGTSTP (Ctrl-Z) stops
 the runner and NOT the step, which keeps running and keeps its slots; and a
 serial step gets `/dev/null` as stdin, so a step that reads its stdin reads EOF
@@ -293,6 +294,88 @@ gate step that uploads, a gate run from a step) runs under its holder's slots
 instead of waiting on them, one such nested run at a time; one that would cost
 more than its holder exits 75 at once. The runner sets `GATEQ_HOLDER` (and
 `GATEQ_NEST`) for its steps for that purpose; a step never sets them itself.
+
+### Named heavy commands (`[[pool.command]]`, `--pool-run`, #539)
+
+A heavy command that is NOT the gate (a race or sanitizer run, a mutation run, a
+fuzz suite, a container build) loads the machine exactly like a gate, so a repo
+DECLARES each one and it is started by its name:
+
+```toml
+[[pool.command]]
+name = "mutate-guard"      # [A-Za-z0-9][A-Za-z0-9_.-]{0,63}, unique in the file
+run = "python3 test-orchestrate-guard.py"   # trusted config, like a step's `run`
+weight = 2                 # REQUIRED positive integer: machine cost units. No default
+timeout_s = 1800           # optional positive integer: kill the run after this
+```
+
+```sh
+python3 <leg>/gate-runner.py --pool-run mutate-guard
+```
+
+| Key         | Type   | Default  | Meaning |
+|-------------|--------|----------|---------|
+| `name`      | string | required | The only thing a caller passes. It must match the pattern above and exactly ONE declaration; an unknown or duplicated name exits 2 and runs nothing. |
+| `run`       | string | required | The command, run with the shell in the repo root. Trusted config, like a step's `run`. |
+| `weight`    | int    | required | The cost in budget units. There is no default: a missing or invalid `weight` exits 2. At or below the machine's `small_check_cap` the command waits in the highest class (served ahead of waiting gates, within the starvation bound); above it, in the same class as a hand-run gate. The class is read from the CLAMPED cost `min(weight, budget)`, so on a machine whose `budget` is at or below `small_check_cap` every named command is in the highest class, whatever weight it declares. Nothing a caller passes changes that. |
+| `timeout_s` | int    | (none)   | The run is killed after this many seconds and reported as `ran exit=124`. Absent: with the pool on the bound is the machine's `job_timeout_s`; with the pool off there is none. |
+
+Any other key in the table exits 2 (a misspelled `timeout_s` must not silently
+drop the bound). A bad declaration exits 2 for THAT invocation only: it never
+affects the gate, and a bad declaration under another name does not stop this
+one.
+
+- **By name, never as argv.** `--pool-run <name>` (or `--pool-run=<name>`)
+  accepts NO other argument and forwards none; a variant (another target,
+  another profile) is another declared name. `--receipt`, `--skip`, `--jobs`,
+  `--memoize-dir` and `--shard` beside it exit 2: a named command attests
+  nothing about a tree and never writes or touches a receipt.
+- **Pool on.** It takes a ticket like a gate: cost `min(weight, budget)`, the
+  worktree claim (one thing per worktree: a check waits for that worktree's
+  gate and a gate for its check), the same wait lines, the same exit 75 when no
+  slot or worktree comes within `wait_timeout_s`. The declaration is read again
+  after the wait and THAT one runs; one that now costs more than the run holds
+  is NOT RUN (75). Started from a gate step it runs under that gate's slots
+  when its weight is at or below the gate's cost, and exits 75 at once when it
+  is heavier (raise the gate's `weight`).
+- **Pool off.** The name is resolved and the command runs directly: no ticket,
+  no wait. So "always use the name" holds on every machine, and turning the
+  budget on later changes nothing a caller types.
+- **How it runs.** In its own session, with `/dev/null` as stdin; SIGINT,
+  SIGTERM, SIGHUP and SIGQUIT sent to the runner are forwarded to it and its
+  process group is swept when it ends, so a background job left in that
+  group does not outlive it. A child that starts a session of its own
+  (`setsid`, a daemonizing tool) leaves the group and is NOT swept.
+- **Exit code and the closing line.** The exit code is the command's own (124
+  when it was killed at its bound; 128 + the signal when the run was signalled
+  or the command died of one). The pool's own outcomes are 75 and 2, and a
+  command may itself exit 75 or 2, so the run ENDS with one stderr line that
+  says which: `POOL-RUN: <name> ran exit=<n>` or `POOL-RUN: <name> NOT RUN
+  reason=<slug>` (`usage`, `bad-name`, `unknown-name`, `duplicate-name`,
+  `bad-command`, `config`, `pool-config`, `wait-timeout`,
+  `nested-over-holder`, `changed-during-wait`, `interrupted`,
+  `launch-failed`, and the pool's own `pool-*` errors). An invalid name is
+  printed as `<invalid>`.
+- **No `POOL-RUN:` line is never a result**, whatever the exit code: never a
+  pass and never "ran". It has two causes. A `gate-runner.py` that predates the
+  flag warns `unrecognized argument '--pool-run'`, ignores it and the name, and
+  runs the repo's FULL GATE: that warning is the one case a caller reports as
+  NOT RUN. Otherwise the runner was killed before it could print the line, and
+  the command may STILL BE RUNNING (until the A4 watchdog, nothing reaps it):
+  report the outcome as UNKNOWN, and check for the command's live processes
+  before any retry, since a blind retry can run it twice in one worktree. A
+  caller checks its leg first (`grep -q -- '--pool-run' <the literal leg
+  path>`, beside the usual `[ -f ]` test), skips a leg that fails like a
+  missing file, and reports NOT RUN with no capable leg.
+
+LIMIT: this bounds what is started by name. A heavy command typed raw is
+neither budgeted nor excluded from its worktree, and nothing detects it; the
+charters carry the rule.
+
+LIMIT: with `GIT_DIR` exported and the caller in a subdirectory, the runner's
+repo root resolves to that subdirectory, so `--pool-run` reads THAT directory's
+`.gates.toml` and claims a different worktree key; run it from the repo root,
+or without `GIT_DIR`. Tracked in #575.
 
 ---
 

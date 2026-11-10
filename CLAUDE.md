@@ -264,11 +264,40 @@ Runtime (`scripts/`; canonical source is this repo):
   unlike 75. The command and charter prose reads 75 as NOT RUN and runs a pooled gate in the
   background (`commands/prep-pr.md` "Machine gate pool"). The harness never lets a process die
   of SIGQUIT (macOS reports it as a crash): that case stubs the final die-of-signal step.
-  DO NOT WRITE A BUDGET YET: A3 (the named heavy commands), A4 (the orphan watchdog) and the
-  release are not in, so a SIGKILLed holder frees its slots while its steps keep running. Two
+  NAMED HEAVY COMMANDS (A3): `gate-runner.py --pool-run <name>` runs a heavy NON-gate command
+  (a race, mutation or fuzz run) that the repo declared in `.gates.toml` as a `[[pool.command]]`
+  (`name`, `run`, a REQUIRED `weight`, an optional `timeout_s`). The name is the ONLY input: it
+  must match `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}` and exactly one declaration, any other argument
+  exits 2 and none is forwarded, and `--receipt`, `--skip`, `--jobs`, `--memoize-dir` and
+  `--shard` beside it are refused. With the pool on it takes a ticket of kind `named` at
+  `min(weight, budget)` with the worktree claim, and its class is read from THAT clamped cost
+  against the machine's `small_check_cap`, from nothing a caller can pass (0 at or below the
+  cap, else 2); so on a machine whose `budget` is at or below the cap EVERY named command is
+  class 0, whatever weight it declares. It nests under `GATEQ_HOLDER` exactly as a gate does. With the pool off
+  it runs the command directly: no ticket, no wait, no module imported. Either way the command
+  runs in the repo root in its OWN SESSION with `/dev/null` as stdin, forwarded signals and the
+  same sweep, bounded by `timeout_s`, else (pool on) `job_timeout_s`, else nothing. The exit
+  code is the command's own (124 killed at its bound, 128 + the signal when the run was
+  signalled), so the run ENDS WITH ONE STDERR LINE: `POOL-RUN: <name> ran exit=<n>` or
+  `POOL-RUN: <name> NOT RUN reason=<slug>`. NO SUCH LINE IS NEVER A RESULT, whatever the
+  exit code: a runner that predates the flag warns, ignores it and runs the FULL GATE (NOT RUN),
+  and a runner killed before the line leaves an UNKNOWN outcome whose command may still be
+  running (nothing reaps it until A4), so a caller checks for it before any retry. That is
+  why a caller first checks its leg with `grep -q -- '--pool-run' <leg>`, and why the dispatch
+  in `main()` sits BEFORE `_parse_args`. A bad `[[pool.command]]` exits 2 for that invocation
+  only and never affects a gate. The declared-name rule and its stated limit (a heavy command
+  typed raw is neither budgeted nor excluded, and nothing detects it) are in the implementer,
+  adversarial-review and adversarial-prep charters and in SKILL.md. `test-gate-pool-run.py`
+  covers it, loading `test-gate-pool.py` as a module for its isolation pins and fixtures. It is
+  split into `--part` steps the same way as `test-gate-pool.py` (below; its `MUTATION_PARTS` is 4,
+  steps `test-gate-pool-run.<kind>`, the mutation ones `.mutation-K` singular because the plural
+  names put 4 of its 6 parts on one macOS shard), and the lockstep checks both split harnesses.
+  DO NOT WRITE A BUDGET YET: A4 (the orphan watchdog) and the release are not in, so a
+  SIGKILLed holder frees its slots while its steps (or its named command) keep running. Two
   known limits until then. An interrupted pooled run leaves an older pass receipt in place, as
-  pool-off does (it still binds its own tree). A nested runner's step that ignores SIGTERM can
-  outlive an outer runner that was signalled, with the slots free, until A4's watchdog.
+  pool-off does (it still binds its own tree). A nested runner's step, or a nested NAMED
+  COMMAND, that ignores SIGTERM can outlive an outer runner that was signalled, or an outer
+  gate killed at `job_timeout_s`, with the slots free, until A4's watchdog.
   `test-gate-pool.py` mutation-proves
   both files against COPIES and pins `GATEQ_HOME` to a temp directory, as `test-gate-runner.py` does.
   Issue #570: run whole it took ~400 s and set the floor of every gate run and one macOS shard, so
@@ -810,7 +839,7 @@ above and `skills/orchestrate/templates/gates.toml.md`.
 
 ```sh
 shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/orchestrate-authorize-merge.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh scripts/base-freshness.sh scripts/open-pr-staleness-sweep.sh scripts/run-paths.sh scripts/cr-quota-watch.sh scripts/elmer-enqueue.sh scripts/elmer-triage.sh scripts/elmer-tick.sh scripts/stack-preflight.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
-ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/gate_pool.py scripts/prefs-coverage.py scripts/settings-scrub.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-ci-gates-lockstep.py test-steer-nudge-length.py test-helper-deploy-coverage.py test-jq-quoting.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-gate-pool.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-safe-push-freshness.py test-prep-pr-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py test-cr-quota-watch.py test-elmer-enqueue.py test-elmer-triage.py test-elmer-tick.py test-bash32-constructs.py test-settings-scrub.py test-stack-preflight.py test-command-positional-args.py test-no-ssh-override.py
+ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/gate_pool.py scripts/prefs-coverage.py scripts/settings-scrub.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-ci-gates-lockstep.py test-steer-nudge-length.py test-helper-deploy-coverage.py test-jq-quoting.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-gate-pool.py test-gate-pool-run.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-safe-push-freshness.py test-prep-pr-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py test-cr-quota-watch.py test-elmer-enqueue.py test-elmer-triage.py test-elmer-tick.py test-bash32-constructs.py test-settings-scrub.py test-stack-preflight.py test-command-positional-args.py test-no-ssh-override.py
 ./scripts/orchestrate-guard.sh --self-test    # MUST use ./ - the self-test re-invokes "$0";
                                               # `bash scripts/orchestrate-guard.sh` makes $0 a bare name -> 127
 ./scripts/orchestrate-guard.sh --assert-coverage  # #324: no deny is unreachable behind the perf
@@ -863,6 +892,12 @@ python3 test-cr-quota-watch.py
 python3 test-elmer-enqueue.py
 python3 test-elmer-triage.py
 python3 test-elmer-tick.py
+python3 test-gate-pool-run.py --part mutations 2/4   # #539: named heavy commands (`gate-runner.py --pool-run <name>`), run as parts like test-gate-pool.py
+python3 test-gate-pool-run.py --part mutations 1/4
+python3 test-gate-pool-run.py --part mutations 4/4
+python3 test-gate-pool-run.py --part mutations 3/4
+python3 test-gate-pool-run.py --part baseline
+python3 test-gate-pool-run.py --part cases
 python3 test-gate-pool.py --part mutations 1/5   # #539 gate pool harness, run as #570 parts (no args = the whole harness)
 python3 test-gate-pool.py --part mutations 2/5
 python3 test-gate-pool.py --part mutations 3/5
