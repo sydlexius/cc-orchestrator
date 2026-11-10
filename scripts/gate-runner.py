@@ -483,17 +483,17 @@ def _sweep_step(proc):
         _terminate_groups({}, [proc.pid])
 
 
-def _run_pooled_step(label, command, cwd):
-    """`_run_command` with the pool ON: same lines, same return value. The step
-    gets its OWN PROCESS GROUP (not a session: it keeps the terminal, so its
-    output streams as before) and /dev/null as stdin, since a background group
-    that reads the terminal is stopped by the kernel while it holds slots.
-    A terminal interrupt no longer reaches it, so INT/TERM/HUP/QUIT are
-    forwarded to the group; the runner then waits for the step, sweeps the
-    group, and ends as the pool-off path ends for that signal."""
-    if _pool_overdue():                    # used up between steps: start nothing more
-        raise _PoolTimeout
-    start = time.perf_counter()
+def _run_group(command, cwd, session=False, env=None):
+    """Run `command` to its end in a process group of its OWN -> (proc, caught, overdue).
+    `caught` lists the forwarded signals in arrival order; `overdue` is True when the run
+    used up its bound and was killed by the sweep. An OSError from the launch propagates.
+
+    The group is NOT a session by default (a gate step keeps the terminal, so its output
+    streams as before); `session=True` makes it a session of its own instead. stdin is
+    /dev/null, since a background group that reads the terminal is stopped by the kernel
+    while it holds slots. A terminal interrupt no longer reaches the group, so
+    INT/TERM/HUP/QUIT are forwarded to it; the runner then waits for the leader and sweeps
+    the group on EVERY way out."""
     caught = []
     old = {}
     # Blocked from before the group exists until the handlers that know it are
@@ -501,15 +501,10 @@ def _run_pooled_step(label, command, cwd):
     # child inherits the mask through fork, so preexec_fn puts the caller's back.
     prev = signal.pthread_sigmask(signal.SIG_BLOCK, _FORWARD_SIGS)
     try:
-        try:
-            proc = subprocess.Popen(
-                command, shell=True, cwd=cwd, stdin=subprocess.DEVNULL,
-                process_group=0,
-                preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, prev))
-        except OSError as e:
-            log(f"[FAIL] {label}: could not launch ({e}), "
-                f"{time.perf_counter() - start:.1f}s")
-            return False
+        proc = subprocess.Popen(
+            command, shell=True, cwd=cwd, stdin=subprocess.DEVNULL, env=env,
+            process_group=None if session else 0, start_new_session=session,
+            preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, prev))
         # The handlers only RECORD (#546: one that raises can land inside any
         # call). A signal inherited as ignored stays ignored, runner and step
         # alike, as with the pool off.
@@ -541,6 +536,23 @@ def _run_pooled_step(label, command, cwd):
         _sweep_step(proc)
         for s, handler in old.items():
             signal.signal(s, handler)
+    return proc, caught, overdue
+
+
+def _run_pooled_step(label, command, cwd):
+    """`_run_command` with the pool ON: same lines, same return value. The step
+    runs through `_run_group` (its own process group, /dev/null as stdin,
+    interrupts forwarded, the group swept), and the runner then ends as the
+    pool-off path ends for that signal."""
+    if _pool_overdue():                    # used up between steps: start nothing more
+        raise _PoolTimeout
+    start = time.perf_counter()
+    try:
+        proc, caught, overdue = _run_group(command, cwd)
+    except OSError as e:
+        log(f"[FAIL] {label}: could not launch ({e}), "
+            f"{time.perf_counter() - start:.1f}s")
+        return False
     if caught:
         if caught[0] == signal.SIGINT:     # the traceback and status of today
             raise KeyboardInterrupt

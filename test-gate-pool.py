@@ -2301,9 +2301,17 @@ def case_serial_group_signal(tmp, home):
     p, record, pid = _rec(tmp, home, "child", 1, tail="; true")
     os.kill(p.pid, signal.SIGHUP)
     rc = ended(p, timeout=30)
+    # The shell dies of the forwarded HUP at once, and the runner then sweeps the group with
+    # TERM. On a slow host the child can still be inside its HUP handler when that TERM lands
+    # and record it too (seen on macOS CI): that TERM is the sweep doing its job. What this
+    # case proves is that the FORWARDED signal reached the child, so it checks the FIRST
+    # record, that HUP came once, and that nothing but the sweep's TERM follows. Sent to the
+    # leader alone (the mutation row), the child's first record is the sweep's TERM.
+    got = read(record).split()
     same("serial group signal: a forwarded signal goes to the step's GROUP: a child the step's "
          "shell started without exec gets it too",
-         (rc, read(record).split(), gone(pid, 3.0)), (-signal.SIGHUP, ["SIGHUP"], True))
+         (rc, got[:1], got.count("SIGHUP"), set(got) <= {"SIGHUP", "SIGTERM"}, gone(pid, 3.0)),
+         (-signal.SIGHUP, ["SIGHUP"], 1, True, True))
     _kill_seen_alive(pid)
 
 
@@ -2875,15 +2883,15 @@ RUNNER_MUTATIONS += [
      "serial tstp: SIGTSTP stops the runner and is NOT forwarded: the step never sees it and "
      "runs on to its end while the runner is stopped"),
     ("a pooled serial step started in the runner's own process group",
-     "                process_group=0,\n", "", "serial-group",
+     "process_group=None if session else 0,", "process_group=None,", "serial-group",
      "serial group: with the pool ON a serial step runs in a process group of its OWN"),
     ("main() never switches the pooled step path on",
      '            _POOL_RUN = {"deadline": time.monotonic() + limit}', "            pass",
      "serial-group",
      "serial group: with the pool ON a serial step runs in a process group of its OWN"),
     ("a pooled serial step given the runner's stdin (the terminal)",
-     "command, shell=True, cwd=cwd, stdin=subprocess.DEVNULL,\n                process_group=0,",
-     "command, shell=True, cwd=cwd,\n                process_group=0,", "serial-group",
+     "command, shell=True, cwd=cwd, stdin=subprocess.DEVNULL, env=env,",
+     "command, shell=True, cwd=cwd, env=env,", "serial-group",
      "serial group: with the pool ON a serial step's stdin is /dev/null, not the runner's"),
     ("the pool-OFF serial path given the pooled step path (a group, a sweep)",
      "    if _POOL_RUN is not None:              # pool ON", "    if True:", "serial-group",
