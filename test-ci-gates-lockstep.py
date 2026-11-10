@@ -254,7 +254,7 @@ gates_h = set()
 # still takes the unsupported-shape path below.
 GATE_POOL = "test-gate-pool.py"
 GATE_POOL_PART_RE = re.compile(
-    r"python3\s+test-gate-pool\.py\s+--part\s+(cases|baseline|mutations\s+(\d+)/(\d+))")
+    r"python3\s+test-gate-pool\.py\s+--part\s+(cases|baseline|mutations\s+([1-9][0-9]*)/([1-9][0-9]*))")
 pool_steps = []        # (step name, kind, K or None, N or None) for every `--part` step
 pool_bare = []         # step names running the whole harness in one process
 for step in steps:
@@ -284,8 +284,8 @@ try:
     with open(os.path.join(ROOT, GATE_POOL), encoding="utf-8") as fh:
         _mp = re.search(r"^MUTATION_PARTS = (\d+)\b", fh.read(), re.M)
     MUTATION_PARTS = int(_mp.group(1)) if _mp else None
-except OSError:
-    pass
+except OSError as e:
+    fail(f"cannot read {GATE_POOL} to check MUTATION_PARTS: {e}")
 
 
 def _skipped_pool_parts(parts, skip_table):
@@ -654,6 +654,9 @@ def _pool_mutation_cases(gates):
          "bare full-harness step(s)"),
         ("pool part with trailing junk", gates, run_of(cases_nm),
          f'run = "python3 {pool} --part cases --only x"', "unsupported shape"),
+        # The harness refuses a leading-zero slice at runtime; the lockstep must too.
+        ("pool leading-zero slice", gates, run_of(last_nm),
+         f'run = "python3 {pool} --part mutations 0{last_k}/{last_n}"', "unsupported shape"),
         ("pool N out of step with the harness", pool, f"MUTATION_PARTS = {last_n}",
          f"MUTATION_PARTS = {last_n + 1}", "says MUTATION_PARTS"),
         ("pool MUTATION_PARTS line gone", pool, f"MUTATION_PARTS = {last_n}",

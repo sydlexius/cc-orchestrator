@@ -271,7 +271,7 @@ Runtime (`scripts/`; canonical source is this repo):
   outlive an outer runner that was signalled, with the slots free, until A4's watchdog.
   `test-gate-pool.py` mutation-proves
   both files against COPIES and pins `GATEQ_HOME` to a temp directory, as `test-gate-runner.py` does.
-  #570: run whole it took ~400 s and set the floor of every gate run and one macOS shard, so
+  Issue #570: run whole it took ~400 s and set the floor of every gate run and one macOS shard, so
   `.gates.toml` runs it as `--part` steps: `--part cases`, `--part baseline` (every case on a clean
   copy) and `--part mutations K/N`, the round-robin slice `rows[K-1::N]` of the mutation rows with a
   prerequisite scoped to the cases that slice uses. N is the harness's `MUTATION_PARTS`; no

@@ -3147,12 +3147,9 @@ def main():
         return 2
     kind = part[0] if part else None
     selected = [(n, fn) for n, fn in CASES if (not only or n in only) and kind in (None, "cases")]
-    if kind in (None, "cases") and not selected:
-        print(f"test-gate-pool.py: no case named {only!r}", file=sys.stderr)
-        return 2
     unknown = [o for o in only if o not in {n for n, _ in CASES}]
-    if unknown:
-        print(f"test-gate-pool.py: no case named {unknown!r}", file=sys.stderr)
+    if unknown or (kind in (None, "cases") and not selected):
+        print(f"test-gate-pool.py: no case named {unknown or only!r}", file=sys.stderr)
         return 2
     for name, fn in selected:
         print(f"{name}:")
