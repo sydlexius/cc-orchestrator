@@ -24,6 +24,7 @@ Run: python3 test-gate-runner.py
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -101,15 +102,17 @@ def write(root, relpath, content, *, executable=False):
     return path
 
 
-def run_runner(root, *, extra_path=None, drop_tools=(), args=()):
+def run_runner(root, *, extra_path=None, drop_tools=(), args=(), cwd=None, env_extra=None):
     """Invoke the real gate-runner.py inside `root`. Returns (rc, stdout+stderr).
 
     extra_path: a dir prepended to PATH (so a fake tool resolves).
     drop_tools: tool names to make absent -- we build a SANITIZED PATH of
     symlinks to the real binaries EXCEPT the dropped ones, so shutil.which()
     returns None for them regardless of the host.
-    args: extra CLI args appended after the runner path (e.g. --receipt)."""
+    args: extra CLI args appended after the runner path (e.g. --receipt).
+    cwd: run from here instead of `root` (#575: a subdirectory); env_extra: extra env vars."""
     env = dict(os.environ)
+    env.update(env_extra or {})
     parts = []
     if extra_path:
         parts.append(extra_path)
@@ -138,7 +141,7 @@ def run_runner(root, *, extra_path=None, drop_tools=(), args=()):
     elif parts:
         env["PATH"] = os.pathsep.join(parts + [os.environ.get("PATH", "")])
     proc = subprocess.run(
-        [sys.executable, RUNNER, *args], cwd=root, env=env,
+        [sys.executable, RUNNER, *args], cwd=cwd or root, env=env,
         capture_output=True, text=True, check=False,
     )
     return proc.returncode, proc.stdout + proc.stderr
@@ -2120,6 +2123,146 @@ def test_shard_absent_is_byte_identical():
               rc1 == 0 and "[PASS] a" in out1 and "[PASS] b" in out1)
 
 
+def test_gitdir_exported_subdirectory_575():
+    # #575: GIT_DIR exported (a git hook) and GIT_WORK_TREE not -> git calls the CURRENT
+    # DIRECTORY the work tree top. The runner must still find the real repo root.
+    with tempfile.TemporaryDirectory() as root:
+        root = os.path.realpath(root)
+        git_init(root)
+        write(root, ".gates.toml",
+              '[prep_pr]\ngate = "echo caller-gitdir=${GIT_DIR-unset}"\n')
+        write(root, "sub/keep", "x\n")
+        git_commit(root)
+        head = git_head(root)
+        sub = os.path.join(root, "sub")
+        gitdir = os.path.join(root, ".git")
+        rc, out = run_runner(root, cwd=sub, env_extra={"GIT_DIR": gitdir})
+        check("#575(a): from a subdirectory with GIT_DIR exported the runner reads the "
+              "repo root's .gates.toml", rc == 0 and f"using {root}/.gates.toml" in out)
+        check("#575(d): the gate step still sees the caller's GIT_DIR",
+              f"caller-gitdir={gitdir}" in out)
+        rc, out = run_runner(root, cwd=sub)
+        check("#575(b): the same from a subdirectory with no GIT_DIR (unchanged)",
+              rc == 0 and f"using {root}/.gates.toml" in out)
+        check("#575(b): and a step then sees no GIT_DIR", "caller-gitdir=unset" in out)
+        rpath = os.path.join(root, ".git", "receipt.json")
+        rc, out = run_runner(root, cwd=sub, env_extra={"GIT_DIR": gitdir},
+                             args=("--receipt", rpath))
+        r = _load_receipt(rpath) if os.path.isfile(rpath) else {}
+        want_tree = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], cwd=root,
+                                   env=git_env(root), capture_output=True, text=True,
+                                   check=True).stdout.strip()
+        check("#575(c): a receipt written with GIT_DIR exported binds the worktree's HEAD, "
+              "tree and root",
+              rc == 0 and r.get("result") == "pass" and r.get("commit_sha") == head
+              and r.get("tree_sha") == want_tree
+              and os.path.realpath(r.get("worktree", "")) == root)
+    # (e) A bare repo plus GIT_WORK_TREE: the exported variables are the ONLY way git finds
+    # the tree, so the root comes from the inherited environment, and the runner's own git
+    # queries must use that same environment or the receipt is skipped ("not a git repo").
+    with tempfile.TemporaryDirectory() as base:
+        base = os.path.realpath(base)
+        bare, wt = os.path.join(base, "repo.git"), os.path.join(base, "wt")
+        os.mkdir(wt)
+        subprocess.run(["git", "init", "-q", "--bare", bare], env=git_env(wt), check=True)
+        env = dict(git_env(wt), GIT_DIR=bare, GIT_WORK_TREE=wt)
+        write(wt, ".gates.toml", '[prep_pr]\ngate = "true"\n')
+        for cmd in (["add", "-A"], ["-c", "user.email=t@example.com", "-c", "user.name=t",
+                                    "commit", "-q", "-m", "init"]):
+            subprocess.run(["git"] + cmd, cwd=wt, env=env, check=True, capture_output=True)
+        rpath = os.path.join(base, "receipt.json")
+        rc, out = run_runner(wt, env_extra={"GIT_DIR": bare, "GIT_WORK_TREE": wt},
+                             args=("--receipt", rpath))
+        r = _load_receipt(rpath) if os.path.isfile(rpath) else {}
+        check("#575(e): a bare repo plus GIT_WORK_TREE still gets a pass receipt (the caller's "
+              "environment is used for the runner's git queries; no competing view)",
+              rc == 0 and r.get("result") == "pass"
+              and os.path.realpath(r.get("worktree", "")) == wt)
+
+
+def _gx(cwd, root, *args):
+    subprocess.run(["git", "-c", "user.email=t@example.com", "-c", "user.name=t", *args],
+                   cwd=cwd, env=git_env(root), check=True, capture_output=True)
+
+
+def test_git_env_agreement_575():
+    # The runner's own git queries use the CALLER's environment, like the steps. Where that
+    # view and the variable-free view of the same root differ, a receipt must not be a pass.
+    with tempfile.TemporaryDirectory() as base:
+        base = os.path.realpath(base)
+        m, w = os.path.join(base, "M"), os.path.join(base, "W")
+        os.mkdir(m); git_init(m)
+        write(m, "ok.sh", "exit 0\n")
+        write(m, ".gates.toml",
+              '[prep_pr]\njobs = 1\n[[prep_pr.steps]]\nname = "syn"\n'
+              'run = "for f in $(git ls-files \'*.sh\'); do bash -n \\"$f\\" || exit 1; done"\n'
+              'pure = true\n')
+        git_commit(m)
+        _gx(m, base, "worktree", "add", "-q", "-b", "wb", w)
+        write(w, "bad.sh", "if then\n")
+        git_commit(w)
+        env = {"GIT_DIR": os.path.join(m, ".git")}
+        rpath = os.path.join(base, "rA.json")
+        rc, out = run_runner(w, env_extra=env, args=("--receipt", rpath))
+        r = _load_receipt(rpath) if os.path.isfile(rpath) else {}
+        check("#575(f): linked worktree + GIT_DIR=<main .git>: receipt is NOT a pass",
+              r.get("result") != "pass" and r.get("reason", "").startswith("git-env-mismatch:"))
+    # (g) an exported GIT_INDEX_FILE: the steps would read another index.
+    with tempfile.TemporaryDirectory() as root:
+        root = os.path.realpath(root)
+        git_init(root)
+        write(root, ".gates.toml", '[prep_pr]\ngate = "true"\n')
+        git_commit(root)
+        rpath = os.path.join(root, "..", os.path.basename(root) + "-g.json")
+        rc, out = run_runner(root, env_extra={"GIT_INDEX_FILE": os.path.join(root, "nope-index")},
+                             args=("--receipt", rpath))
+        r = _load_receipt(rpath) if os.path.isfile(rpath) else {}
+        check("#575(g): GIT_INDEX_FILE pointing elsewhere: receipt is NOT a pass, reason is "
+              "git-env-mismatch (it is checked before the dirty-tree reasons)",
+              r.get("result") != "pass" and r.get("reason", "").startswith("git-env-mismatch:"))
+        if os.path.isfile(rpath):
+            os.unlink(rpath)
+    # (i) memo: a COPY of the real index at another path keeps the tree clean and the memo
+    # otherwise eligible, so only the agreement check stops a pure step being cached.
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as aux:
+        root, aux = os.path.realpath(root), os.path.realpath(aux)
+        git_init(root)
+        write(root, ".gates.toml",
+              '[prep_pr]\njobs = 1\n[[prep_pr.steps]]\nname = "p"\nrun = "true"\npure = true\n')
+        git_commit(root)
+        shutil.copy(os.path.join(root, ".git", "index"), os.path.join(aux, "idx"))
+        memo = os.path.join(aux, "memo")
+        rc, out = run_runner(root, args=("--memoize-dir", memo))
+        check("#575(i): control: without the variable the pure step is memoized on run 1",
+              rc == 0 and os.path.isdir(memo) and len(os.listdir(memo)) == 1)
+        shutil.rmtree(memo)
+        env = {"GIT_INDEX_FILE": os.path.join(aux, "idx")}
+        for n in (1, 2):
+            rc, out = run_runner(root, env_extra=env, args=("--memoize-dir", memo))
+            check(f"#575(i): run {n} under the index mismatch is not a cached pass",
+                  rc == 0 and "[MEMO]" not in out)
+        check("#575(i): and no memo entry was written",
+              not os.path.isdir(memo) or not os.listdir(memo))
+    # (h) from repo B with GIT_DIR/GIT_WORK_TREE naming M: M is the root (an exported
+    # GIT_WORK_TREE names the tree); never a pass bound to B.
+    with tempfile.TemporaryDirectory() as base:
+        base = os.path.realpath(base)
+        m, b = os.path.join(base, "M"), os.path.join(base, "B")
+        for d, g in ((m, "echo gates-of-M"), (b, "echo gates-of-B")):
+            os.mkdir(d); git_init(d)
+            write(d, ".gates.toml", f'[prep_pr]\ngate = "{g}"\n')
+            git_commit(d)
+        rpath = os.path.join(base, "rH.json")
+        rc, out = run_runner(b, env_extra={"GIT_DIR": os.path.join(m, ".git"),
+                                           "GIT_WORK_TREE": m},
+                             args=("--receipt", rpath))
+        r = _load_receipt(rpath) if os.path.isfile(rpath) else {}
+        check("#575(h): GIT_DIR+GIT_WORK_TREE naming M, run from B: M's .gates.toml is used",
+              f"using {m}/.gates.toml" in out and "gates-of-M" in out)
+        check("#575(h): and a receipt, if written, is not a pass bound to B",
+              not r or (r.get("result") != "pass" or os.path.realpath(r["worktree"]) == m))
+
+
 def main():
     print("test-gate-runner.py")
     for fn in [
@@ -2169,6 +2312,7 @@ def main():
         test_shard_function_partitions_and_is_stable, test_shard_runs_partition_end_to_end,
         test_shard_malformed_and_refusals, test_shard_skip_interaction,
         test_shard_absent_is_byte_identical,
+        test_gitdir_exported_subdirectory_575, test_git_env_agreement_575,
     ]:
         print(f"- {fn.__name__}")
         fn()
