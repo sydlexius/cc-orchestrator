@@ -86,7 +86,7 @@ GIT_STUB = (
     '  "branch -d") exit "${BRANCH_D_RC:-0}" ;;\n'
     '  "branch -D") exit "${BRANCH_BIG_D_RC:-0}" ;;\n'
     '  "ls-remote --exit-code") echo "ENV GIT_TERMINAL_PROMPT=${GIT_TERMINAL_PROMPT:-<unset>}"'
-    ' "GIT_SSH_COMMAND=${GIT_SSH_COMMAND:-<unset>}" "SSH_ASKPASS_REQUIRE=${SSH_ASKPASS_REQUIRE:-<unset>}" >>"$GITLOG"\n'
+    ' "GIT_SSH_COMMAND=${GIT_SSH_COMMAND:-<unset>}" "SSH_ASKPASS_REQUIRE=${SSH_ASKPASS_REQUIRE:-<unset>}" "SSH_ASKPASS=${SSH_ASKPASS:-<unset>}" >>"$GITLOG"\n'
     '                         exit "${LS_REMOTE_RC:-1}" ;;\n'
     '  "fetch --prune") exit "${FETCH_RC:-0}" ;;\n'
     "esac\n"
@@ -133,6 +133,9 @@ def porcelain(main_wt, feature_wt):
         f"worktree {main_wt}\nHEAD {'0' * 40}\nbranch refs/heads/main\n\n"
         f"worktree {feature_wt}\nHEAD {'1' * 40}\nbranch refs/heads/feat/thing\n\n"
     )
+
+
+FALSE_PROG = next((p for p in ("/usr/bin/false", "/bin/false") if os.path.exists(p)), None)
 
 
 def run_cleanup(td, *, suffix="1234", delete_rc=0, delete_stderr="", ls_remote_rc=1,
@@ -194,6 +197,7 @@ def run_cleanup(td, *, suffix="1234", delete_rc=0, delete_stderr="", ls_remote_r
     env.pop("CC_SKIP_GLOBAL_LINT_CACHE_CLEAN", None)
     env.pop("GIT_SSH_COMMAND", None)
     env.pop("SSH_ASKPASS_REQUIRE", None)
+    env.pop("SSH_ASKPASS", None)
     if extra_env:
         env.update(extra_env)
 
@@ -330,14 +334,16 @@ def main():
 
     # #568: the verifying ls-remote must not carry a GIT_SSH_COMMAND override (CC Safety Net
     # rule git.ssh-env denies it); it is non-interactive via GIT_TERMINAL_PROMPT=0 +
-    # SSH_ASKPASS_REQUIRE=never, and a caller's explicit values pass through.
+    # a forced failing askpass (unset/empty caller; stops a /dev/tty prompt too), and a
+    # caller's explicit values pass through.
     print("\nCASE C2 -- ls-remote env: no ssh override, askpass suppressed, caller values kept")
     with tempfile.TemporaryDirectory() as td:
         rc, out, err, _, git_log, _, _ = run_cleanup(
             td, delete_rc=1, delete_stderr=ERR_422_REF_GONE, ls_remote_rc=1)
         check("ls-remote env recorded", "ENV " in git_log)
         check("GIT_TERMINAL_PROMPT=0 on ls-remote", "GIT_TERMINAL_PROMPT=0" in git_log)
-        check("SSH_ASKPASS_REQUIRE defaults to never", "SSH_ASKPASS_REQUIRE=never" in git_log)
+        check("unset caller: SSH_ASKPASS_REQUIRE=force", "SSH_ASKPASS_REQUIRE=force" in git_log)
+        check("unset caller: SSH_ASKPASS is the failing program", FALSE_PROG is not None and f"SSH_ASKPASS={FALSE_PROG}" in git_log)
         check("GIT_SSH_COMMAND not set by cleanup", "GIT_SSH_COMMAND=<unset>" in git_log)
         check("no BatchMode", "BatchMode" not in git_log)
     with tempfile.TemporaryDirectory() as td:
@@ -346,6 +352,18 @@ def main():
             extra_env={"GIT_SSH_COMMAND": "ssh -i /k/id", "SSH_ASKPASS_REQUIRE": "force"})
         check("caller GIT_SSH_COMMAND passes through unchanged", "GIT_SSH_COMMAND=ssh -i /k/id" in git_log)
         check("caller SSH_ASKPASS_REQUIRE preserved", "SSH_ASKPASS_REQUIRE=force" in git_log)
+    with tempfile.TemporaryDirectory() as td:
+        rc, out, err, _, git_log, _, _ = run_cleanup(
+            td, delete_rc=1, delete_stderr=ERR_422_REF_GONE, ls_remote_rc=1,
+            extra_env={"SSH_ASKPASS_REQUIRE": "prefer", "SSH_ASKPASS": "/opt/gui-askpass"})
+        check("explicit caller REQUIRE=prefer preserved", "SSH_ASKPASS_REQUIRE=prefer" in git_log)
+        check("explicit caller SSH_ASKPASS preserved", "SSH_ASKPASS=/opt/gui-askpass" in git_log)
+    with tempfile.TemporaryDirectory() as td:
+        rc, out, err, _, git_log, _, _ = run_cleanup(
+            td, delete_rc=1, delete_stderr=ERR_422_REF_GONE, ls_remote_rc=1,
+            extra_env={"SSH_ASKPASS_REQUIRE": "", "SSH_ASKPASS": "/opt/gui-askpass"})
+        check("empty caller REQUIRE treated as unset -> force", "SSH_ASKPASS_REQUIRE=force" in git_log)
+        check("empty caller REQUIRE -> failing SSH_ASKPASS replaces GUI askpass", FALSE_PROG is not None and f"SSH_ASKPASS={FALSE_PROG}" in git_log)
 
     # The inverse trap: the API reports SUCCESS but the ref survives. Trusting the exit
     # code would report a clean delete; verification catches it.

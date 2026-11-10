@@ -161,12 +161,25 @@ err_file=$(mktemp)
 del_rc=0
 gh api "repos/$repo/git/refs/heads/$encoded_branch" -X DELETE >/dev/null 2>"$err_file" || del_rc=$?
 
-# GIT_TERMINAL_PROMPT=0 + SSH_ASKPASS_REQUIRE=never so an auth-required origin fails
+# GIT_TERMINAL_PROMPT=0 + a forced failing askpass so an auth-required origin fails
 # FAST rather than hanging cleanup on a credential prompt. No GIT_SSH_COMMAND override
-# (CC Safety Net denies it, #568); a caller's own value passes through. Matches
-# scripts/cleanup-worktree.sh exactly.
+# (CC Safety Net denies it, #568); a caller's own value passes through. With a tty ssh
+# prompts on /dev/tty and SSH_ASKPASS_REQUIRE=never does not stop that, so unless the
+# caller set SSH_ASKPASS_REQUIRE (empty = unset) force a failing SSH_ASKPASS; an explicit
+# caller value leaves both alone. Matches scripts/cleanup-worktree.sh exactly.
+if [ -z "${SSH_ASKPASS_REQUIRE:-}" ]; then
+  if [ -x /usr/bin/false ]; then
+    export SSH_ASKPASS=/usr/bin/false
+    export SSH_ASKPASS_REQUIRE=force
+  elif [ -x /bin/false ]; then
+    export SSH_ASKPASS=/bin/false
+    export SSH_ASKPASS_REQUIRE=force
+  else
+    # No failing program on this host: fall back to never (does NOT stop a tty prompt).
+    export SSH_ASKPASS_REQUIRE=never
+  fi
+fi
 if GIT_TERMINAL_PROMPT=0 \
-   SSH_ASKPASS_REQUIRE="${SSH_ASKPASS_REQUIRE:-never}" \
    git ls-remote --exit-code origin "refs/heads/$branch" >/dev/null 2>&1; then
   # Ref STILL PRESENT: a genuine failure regardless of what the API reported.
   # This also catches the inverse trap -- a DELETE that reports success while the

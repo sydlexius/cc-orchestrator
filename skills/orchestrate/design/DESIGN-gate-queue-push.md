@@ -51,7 +51,7 @@ pool document.)
 ADOPTED BY DEFAULT 2026-10-07 (the maintainer may revisit): a restarted runner may open a missing PR after a list-first check.
 WITHDRAWN and still withdrawn: "the runner may itself merge the base into a behind first-push branch". READ from this machine's git
 config: `commit.gpgsign=true`, `gpg.format=ssh`, and the signing program is an approval-prompting desktop signer. A merge made by a
-DETACHED process waits for an approval that `GIT_TERMINAL_PROMPT=0` and `SSH_ASKPASS_REQUIRE=never` do not govern (REASONED, not run: a test would
+DETACHED process waits for an approval that `GIT_TERMINAL_PROMPT=0` and the forced failing `SSH_ASKPASS` (`SSH_ASKPASS_REQUIRE=force`) do not govern (REASONED, not run: a test would
 prompt the maintainer), and where signing is not forced it would be UNSIGNED and surface only at a `required_signatures` merge gate
 (#333). It is open question 1.
 
@@ -315,7 +315,7 @@ The control environment (queue section 4) removes what a SESSION could inject. I
 - (a) A push that works only through a caller-exported `GIT_SSH_COMMAND` fails with ssh's own error. The remedy is `~/.ssh/config`
   (the control environment does not pass the variable through). The runner sets NO `GIT_SSH_COMMAND` of its own (#568: CC Safety
   Net rule `git.ssh-env` denies any such override, and a constant one would also override a user's `core.sshCommand`, RUN H1,
-  round-3 reviewer), so a user's `core.sshCommand` now works as a remedy since nothing overrides it; it sets `SSH_ASKPASS_REQUIRE=never` and `GIT_TERMINAL_PROMPT=0` instead.
+  round-3 reviewer), so a user's `core.sshCommand` now works as a remedy since nothing overrides it; it sets `SSH_ASKPASS_REQUIRE=force` with `SSH_ASKPASS` a failing program (`never` does not stop a tty prompt) and `GIT_TERMINAL_PROMPT=0` instead.
 - (b) An HTTPS remote authenticates through git's credential helper. READ: this repo's `origin` is HTTPS and the user's git config
   names `gh auth git-credential` for it, so the push needs `gh`'s own store to answer with no token variable. REASONED to work
   detached, NOT RUN. A setup that relies ONLY on a token variable fails the push over HTTPS, or gets a pushed branch and `error` at
@@ -388,7 +388,7 @@ PR, stack linking, the merge, cleanup. The runner never commits, comments, edits
 | `gh` rate limit, outage or hang at `classify` | each call ended at `call_timeout_s`; three tries | `error` `gh-unreadable`. Never read as "no PR exists" |
 | `gh` failure at create | three re-reads | found: `done`; not found: `error` `pr-create-failed`, `pushed=yes` |
 | Behind its base at slot grant, or the base moved before the push | step 3, or `safe-push.sh` | `refused` `stale-base`; a second gate for a `/prep-pr` job; nothing bounds a repeat (section 4) |
-| The push needs an interactive approval, or a credential the helper cannot produce unattended | `SSH_ASKPASS_REQUIRE=never`, `GIT_TERMINAL_PROMPT=0`, stdin `/dev/null`: REASONED to fail fast, NOT RUN | `refused` or `failed`, else `push-timeout`. Both transports are UAT items |
+| The push needs an interactive approval, or a credential the helper cannot produce unattended | `SSH_ASKPASS_REQUIRE=force` + failing `SSH_ASKPASS`, `GIT_TERMINAL_PROMPT=0`, stdin `/dev/null`: REASONED to fail fast, NOT RUN | `refused` or `failed`, else `push-timeout`. Both transports are UAT items |
 | A pre-push hook appears after a cost-0 admission | The worker re-tests before the push | BOUNCE, cost pinned to the gate weight (queue section 5) |
 
 ---
@@ -475,6 +475,6 @@ BEFORE the remote read at 535; an additive re-push is classified fast-forward at
 `commands/handle-review.md` (the Step 7 gated-push block writes the receipt and today always passes `--stale-ok`).
 
 Reasoned, not run: GitHub rejecting a second `gh pr create` for an open head and base; a detached merge waiting on an
-approval-prompting signer (not run on purpose); a detached push failing fast with no tty and `SSH_ASKPASS_REQUIRE=never` over SSH and authenticating through the
+approval-prompting signer (not run on purpose); a detached push failing fast with no tty and the forced failing askpass over SSH and authenticating through the
 `gh` credential helper over HTTPS (UAT items for C1); the marker and the origin-first read; a server landing a push after its client
 was killed.

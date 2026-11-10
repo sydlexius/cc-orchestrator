@@ -6,7 +6,7 @@ GIT_SSH_COMMAND / GIT_SSH / GIT_SSH_VARIANT / core.sshCommand override, and the 
 every command line statically, so a helper that sets one makes every command block running it
 denied before anything executes (the gate does not run). Re-spelling the override does not help
 (`-c core.sshCommand=`, inline `GIT_SSH_COMMAND=`, `GIT_CONFIG_KEY_n=core.sshCommand` are all
-denied). Non-interactive behavior comes from GIT_TERMINAL_PROMPT=0 + SSH_ASKPASS_REQUIRE=never.
+denied). Non-interactive behavior comes from GIT_TERMINAL_PROMPT=0 + a forced failing SSH_ASKPASS.
 
 WHAT IS SCANNED (non-comment lines only; prose and `#` comment lines are allowed):
   - scripts/*.sh and scripts/*.py
@@ -44,9 +44,14 @@ READ_PATTERNS = [
 BANNED = [
     re.compile(r"\b(?:%s)\b" % NAMES),
     re.compile(r"sshCommand", re.I),
-    re.compile(r"GIT_CONFIG_VALUE_\d+\s*=\s*[\"']?ssh\b"),
+    # GIT_CONFIG_VALUE_<n> carrying an ssh command: shell `=`, Python `env["..."] =` / dict `"...":`,
+    # or the key as the last token on the line (value on the next line of a multi-line literal).
+    re.compile(r"GIT_CONFIG_VALUE_\d+[\"']?\s*\]?\s*[=:]\s*(?:[\"']?ssh\b|$)"),
 ]
-FENCE = re.compile(r"^\s*```\s*([A-Za-z0-9_+-]*)")
+# CommonMark fences: a run of >= 3 backticks or tildes opens; only a run of the SAME char, at least
+# as long, with nothing after it closes (so a shorter fence inside a longer one is content).
+FENCE_OPEN = re.compile(r"^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+-]*)([^\n]*)$")
+FENCE_CLOSE = re.compile(r"^\s*(`{3,}|~{3,})\s*$")
 SHELL_LANGS = {"bash", "sh", "shell", "zsh"}
 MIN_SH, MIN_PY, MIN_MD, MIN_BLOCKS = 30, 5, 10, 100  # parse-sanity floors
 
@@ -56,17 +61,22 @@ def violations(text, fenced_md=False):
     Also returns the number of shell blocks seen (md mode) via the second tuple element."""
     hits, blocks = [], 0
     in_block, in_fence = False, False
+    fch, flen = "", 0
     for n, line in enumerate(text.splitlines(), 1):
         if fenced_md:
-            m = FENCE.match(line)
-            if m:
-                if in_fence:
+            if in_fence:
+                c = FENCE_CLOSE.match(line)
+                if c and c.group(1)[0] == fch and len(c.group(1)) >= flen:
                     in_fence = in_block = False
-                else:
-                    in_fence = True
-                    in_block = m.group(1).lower() in SHELL_LANGS
+                    continue
+            else:
+                m = FENCE_OPEN.match(line)
+                # a backtick fence's info string may not contain a backtick (else it is inline code)
+                if m and not (m.group(1)[0] == "`" and "`" in m.group(3)):
+                    in_fence, fch, flen = True, m.group(1)[0], len(m.group(1))
+                    in_block = m.group(2).lower() in SHELL_LANGS
                     blocks += in_block
-                continue
+                    continue
             if not in_block:
                 continue
         if line.lstrip().startswith("#"):
@@ -123,23 +133,42 @@ MUTANTS = [
     ("py", 'env["GIT_SSH_COMMAND"]: str = "ssh"'),
     ("md", '```bash\nGIT_SSH_COMMAND="ssh -o BatchMode=yes" git ls-remote origin\n```'),
     ("md", '```sh\ngit -c core.sshCommand=ssh fetch\n```'),
+    # #568 review: Python mapping assignment of the GIT_CONFIG_* injection spelling
+    ("py", 'env["GIT_CONFIG_VALUE_0"] = "ssh -o BatchMode=yes"'),
+    ("py", 'env["GIT_CONFIG_KEY_0"] = "core.sshCommand"'),
+    ("py", 'env.update({"GIT_CONFIG_VALUE_0": "ssh -o BatchMode=yes"})'),
+    # multi-line literals: key on its own line, value on the next, call spanning lines
+    ("py", 'env.update({\n    "GIT_SSH_COMMAND": "ssh -o BatchMode=yes",\n})'),
+    ("py", 'env.update({\n    "GIT_CONFIG_VALUE_0":\n        "ssh -o BatchMode=yes",\n})'),
+    ("py", 'subprocess.run(cmd, env=dict(\n    os.environ,\n    GIT_SSH_COMMAND="ssh"))'),
+    # #568 review: fence handling (tilde, 4-backtick, shorter inner fence must not close)
+    ("md", '~~~bash\nGIT_SSH_COMMAND="ssh -o BatchMode=yes" git fetch\n~~~'),
+    ("md", '````bash\nGIT_SSH_COMMAND="ssh -o BatchMode=yes" git fetch\n````'),
+    ("md", '````bash\n```\nGIT_SSH_COMMAND=ssh git fetch\n````'),
+    ("md", '```bash\ngit fetch\n``` trailing\nGIT_SSH_COMMAND=ssh git fetch\n```'),
+    ("md", '~~~~sh\n~~~\ngit -c core.sshCommand=ssh fetch\n~~~~'),
 ]
 ALLOWED = [
     ("sh", '[ -n "${GIT_SSH_COMMAND:-}" ] && echo custom-ssh'),
     ("sh", 'echo "ssh is $GIT_SSH_COMMAND"'),
     ("sh", 'unset GIT_SSH_COMMAND'),
     ("sh", '# GIT_SSH_COMMAND="ssh -o BatchMode=yes" is denied by CC Safety Net'),
-    ("sh", 'export SSH_ASKPASS_REQUIRE="${SSH_ASKPASS_REQUIRE:-never}"'),
+    ("sh", 'export SSH_ASKPASS_REQUIRE=force'),
     ("py", 'ssh = env.get("GIT_SSH_COMMAND")'),
     ("py", 'env.pop("GIT_SSH_COMMAND", None)'),
     ("py", 'if "GIT_SSH_COMMAND" in os.environ:'),
     ("py", 'x = env["GIT_SSH_COMMAND"]'),
     ("py", 'if env["GIT_SSH_COMMAND"] == "ssh":'),
     ("py", '# env["GIT_SSH_COMMAND"] = "ssh"'),
-    ("py", 'env.setdefault("SSH_ASKPASS_REQUIRE", "never")'),
+    ("py", 'env["SSH_ASKPASS_REQUIRE"] = "force"'),
     ("md", 'Prose may say GIT_SSH_COMMAND and core.sshCommand freely.\n```bash\ngit fetch origin\n```'),
     ("md", '```text\nGIT_SSH_COMMAND=x\n```'),
     ("md", '```bash\n# GIT_SSH_COMMAND=x is denied\ngit fetch origin\n```'),
+    ("py", 'x = env["GIT_CONFIG_VALUE_0"]'),
+    ("py", 'env.update({\n    "GIT_TERMINAL_PROMPT": "0",\n})'),
+    ("md", '~~~text\nGIT_SSH_COMMAND=x\n~~~'),
+    ("md", '````text\n```bash\nGIT_SSH_COMMAND=x\n```\n````\n```bash\ngit fetch\n```'),
+    ("md", '```bash\ngit fetch\n```\nGIT_SSH_COMMAND=x in prose after the block'),
 ]
 
 

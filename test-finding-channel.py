@@ -207,6 +207,9 @@ def test_liveness_nonint_deadline_is_usage_exit2():
         check("liveness: non-integer --deadline-secs -> exit 2 (usage)", rc == 2)
 
 
+FALSE_PROG = next((p for p in ("/usr/bin/false", "/bin/false") if os.path.exists(p)), None)
+
+
 def _record_git_env(root, extra_env=None):
     """Shim `git` on PATH so it records its env and exits 1; run a guard-reply
     (whose first git call is rev-parse) and return the recorded env text."""
@@ -221,6 +224,7 @@ def _record_git_env(root, extra_env=None):
     env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
     env.pop("GIT_SSH_COMMAND", None)
     env.pop("SSH_ASKPASS_REQUIRE", None)
+    env.pop("SSH_ASKPASS", None)
     if extra_env:
         env.update(extra_env)
     subprocess.run([sys.executable, HELPER, "guard-reply", "--repo", root,
@@ -241,14 +245,17 @@ def _env_value(recorded, name):
 
 def test_git_calls_are_non_interactive():
     # git subprocesses must be non-interactive so ls-remote/fetch cannot hang on a
-    # credential prompt: GIT_TERMINAL_PROMPT=0 and SSH_ASKPASS_REQUIRE=never. The helper
+    # credential prompt: GIT_TERMINAL_PROMPT=0 and (unset caller) SSH_ASKPASS_REQUIRE=force
+    # with a failing SSH_ASKPASS, which stops a /dev/tty ssh prompt too. The helper
     # must NOT set GIT_SSH_COMMAND (CC Safety Net rule git.ssh-env denies it, #568).
     with tempfile.TemporaryDirectory() as root:
         recorded = _record_git_env(root)
         check("git calls set GIT_TERMINAL_PROMPT=0 (non-interactive, no hang)",
               "GIT_TERMINAL_PROMPT=0" in recorded)
-        check("git calls default SSH_ASKPASS_REQUIRE to never",
-              _env_value(recorded, "SSH_ASKPASS_REQUIRE") == "never")
+        check("git calls default SSH_ASKPASS_REQUIRE to force",
+              _env_value(recorded, "SSH_ASKPASS_REQUIRE") == "force")
+        check("git calls default SSH_ASKPASS to the failing program",
+              FALSE_PROG is not None and _env_value(recorded, "SSH_ASKPASS") == FALSE_PROG)
         check("git calls do NOT set GIT_SSH_COMMAND",
               _env_value(recorded, "GIT_SSH_COMMAND") is None)
 
@@ -266,6 +273,20 @@ def test_ssh_askpass_require_caller_value_preserved():
         recorded = _record_git_env(root, {"SSH_ASKPASS_REQUIRE": "force"})
         check("caller SSH_ASKPASS_REQUIRE=force preserved",
               _env_value(recorded, "SSH_ASKPASS_REQUIRE") == "force")
+    with tempfile.TemporaryDirectory() as root:
+        recorded = _record_git_env(root, {"SSH_ASKPASS_REQUIRE": "prefer",
+                                          "SSH_ASKPASS": "/opt/gui-askpass"})
+        check("explicit caller REQUIRE=prefer preserved",
+              _env_value(recorded, "SSH_ASKPASS_REQUIRE") == "prefer")
+        check("explicit caller SSH_ASKPASS preserved",
+              _env_value(recorded, "SSH_ASKPASS") == "/opt/gui-askpass")
+    with tempfile.TemporaryDirectory() as root:
+        recorded = _record_git_env(root, {"SSH_ASKPASS_REQUIRE": "",
+                                          "SSH_ASKPASS": "/opt/gui-askpass"})
+        check("empty caller REQUIRE treated as unset -> force",
+              _env_value(recorded, "SSH_ASKPASS_REQUIRE") == "force")
+        check("empty caller REQUIRE -> failing SSH_ASKPASS replaces GUI askpass",
+              FALSE_PROG is not None and _env_value(recorded, "SSH_ASKPASS") == FALSE_PROG)
 
 
 def test_validate_missing_file():

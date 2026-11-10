@@ -5,8 +5,9 @@ staleness sweep) paths.
 
 Contract under test:
   - The base is ALWAYS caller-supplied; the script never infers or hard-codes `main`.
-  - Non-interactive by construction: GIT_TERMINAL_PROMPT=0 + SSH_ASKPASS_REQUIRE=never (never a GIT_SSH_COMMAND
-    override: CC Safety Net denies it, #568) so an
+  - Non-interactive by construction: GIT_TERMINAL_PROMPT=0 + SSH_ASKPASS_REQUIRE=force with a failing
+    SSH_ASKPASS (an unset/empty caller value; an explicit caller value keeps both untouched; never a
+    GIT_SSH_COMMAND override: CC Safety Net denies it, #568) so an
     auth-required / unreachable origin fails FAST instead of hanging a push path.
   - Exactly one labeled `freshness:` line on every path: fresh / behind / unknown.
   - EXIT CONTRACT: 0 for fresh AND unknown (best-effort degradation never blocks);
@@ -48,6 +49,7 @@ GIT_STUB = (
     '  { echo "GIT_TERMINAL_PROMPT=${GIT_TERMINAL_PROMPT:-<unset>}"\n'
     '    echo "GIT_SSH_COMMAND=${GIT_SSH_COMMAND:-<unset>}"\n'
     '    echo "SSH_ASKPASS_REQUIRE=${SSH_ASKPASS_REQUIRE:-<unset>}"\n'
+    '    echo "SSH_ASKPASS=${SSH_ASKPASS:-<unset>}"\n'
     '    echo "ARGS=$*"; } >>"$FETCHLOG"\n'
     '  exit "${FETCH_RC:-0}"\n'
     "fi\n"
@@ -67,8 +69,10 @@ GIT_STUB = (
 )
 
 
+FALSE_PROG = next((p for p in ("/usr/bin/false", "/bin/false") if os.path.exists(p)), None)
+
 def run(args, *, behind="0", fetch_rc=0, base_ref_rc=0, head_ref_rc=0,
-        revlist_rc=0, shallow="false", ssh_command=None, askpass=None):
+        revlist_rc=0, shallow="false", ssh_command=None, askpass=None, askpass_prog=None):
     """Invoke base-freshness.sh with a stubbed git. Returns (rc, stdout, stderr, fetchlog)."""
     with tempfile.TemporaryDirectory() as td:
         bindir = os.path.join(td, "bin"); os.makedirs(bindir)
@@ -100,6 +104,10 @@ def run(args, *, behind="0", fetch_rc=0, base_ref_rc=0, head_ref_rc=0,
             env["SSH_ASKPASS_REQUIRE"] = askpass
         else:
             env.pop("SSH_ASKPASS_REQUIRE", None)
+        if askpass_prog is not None:
+            env["SSH_ASKPASS"] = askpass_prog
+        else:
+            env.pop("SSH_ASKPASS", None)
 
         p = subprocess.run(["bash", SCRIPT] + args, env=env,
                            capture_output=True, text=True, timeout=120)  # load-tolerant: CI runs harnesses 4-wide
@@ -165,11 +173,12 @@ def main():
     check("rev-list failure -> exit 0", rc == 0)
     check("rev-list failure is labeled unknown", "freshness: unknown" in out)
 
-    print("== NON-INTERACTIVE: GIT_TERMINAL_PROMPT=0 + SSH_ASKPASS_REQUIRE=never, NO ssh override ==")
+    print("== NON-INTERACTIVE: GIT_TERMINAL_PROMPT=0 + forced failing askpass, NO ssh override ==")
     rc, out, err, log = run(["main"], behind="0")
     check("fetch was invoked", "ARGS=" in log)
     check("GIT_TERMINAL_PROMPT=0 was set on the fetch", "GIT_TERMINAL_PROMPT=0" in log)
-    check("SSH_ASKPASS_REQUIRE defaults to never", "SSH_ASKPASS_REQUIRE=never" in log)
+    check("unset caller: SSH_ASKPASS_REQUIRE=force", "SSH_ASKPASS_REQUIRE=force\n" in log)
+    check("unset caller: SSH_ASKPASS is the failing program", FALSE_PROG is not None and f"SSH_ASKPASS={FALSE_PROG}\n" in log)
     check("GIT_SSH_COMMAND is NOT set by the script (#568)", "GIT_SSH_COMMAND=<unset>" in log)
     check("no BatchMode anywhere", "BatchMode" not in log)
 
@@ -181,6 +190,13 @@ def main():
     print("== a caller SSH_ASKPASS_REQUIRE is preserved ==")
     rc, out, err, log = run(["main"], askpass="force")
     check("caller SSH_ASKPASS_REQUIRE=force preserved", "SSH_ASKPASS_REQUIRE=force" in log)
+    rc, out, err, log = run(["main"], askpass="prefer", askpass_prog="/opt/gui-askpass")
+    check("explicit caller REQUIRE=prefer preserved", "SSH_ASKPASS_REQUIRE=prefer\n" in log)
+    check("explicit caller SSH_ASKPASS preserved", "SSH_ASKPASS=/opt/gui-askpass\n" in log)
+    print("== an EMPTY caller SSH_ASKPASS_REQUIRE is treated as unset ==")
+    rc, out, err, log = run(["main"], askpass="", askpass_prog="/opt/gui-askpass")
+    check("empty caller REQUIRE -> force", "SSH_ASKPASS_REQUIRE=force\n" in log)
+    check("empty caller REQUIRE -> failing SSH_ASKPASS replaces a caller GUI askpass", FALSE_PROG is not None and f"SSH_ASKPASS={FALSE_PROG}\n" in log)
 
     print("== malformed invocation -> exit 2 ==")
     rc, out, err, log = run([])

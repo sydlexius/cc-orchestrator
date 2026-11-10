@@ -359,13 +359,27 @@ elif [ -n "$branch" ]; then
       # (recoverable, and stale-branch-sweep.sh catches it later), and failing closed here
       # would resurrect the exact #302 pathology of a network condition aborting a cleanup
       # that has already done its local work. Do not "fix" this into a hard failure.
-      # GIT_TERMINAL_PROMPT=0 + SSH_ASKPASS_REQUIRE=never so an auth-required origin fails
+      # GIT_TERMINAL_PROMPT=0 + a forced failing askpass so an auth-required origin fails
       # FAST rather than hanging cleanup on a credential prompt (the house pattern from
       # base-freshness.sh). No GIT_SSH_COMMAND override: CC Safety Net (git.ssh-env) denies
-      # it (#568); a caller's own GIT_SSH_COMMAND passes through, and so does an explicit
-      # SSH_ASKPASS_REQUIRE.
+      # it (#568); a caller's own GIT_SSH_COMMAND passes through. With a tty ssh prompts on
+      # /dev/tty and SSH_ASKPASS_REQUIRE=never does not stop that, so unless the caller set
+      # SSH_ASKPASS_REQUIRE (empty = unset) force a failing SSH_ASKPASS (BatchMode-equivalent;
+      # git's HTTPS credential prompt then fails fast too). An explicit caller value leaves
+      # both variables alone.
+      if [ -z "${SSH_ASKPASS_REQUIRE:-}" ]; then
+        if [ -x /usr/bin/false ]; then
+          export SSH_ASKPASS=/usr/bin/false
+          export SSH_ASKPASS_REQUIRE=force
+        elif [ -x /bin/false ]; then
+          export SSH_ASKPASS=/bin/false
+          export SSH_ASKPASS_REQUIRE=force
+        else
+          # No failing program on this host: fall back to never (does NOT stop a tty prompt).
+          export SSH_ASKPASS_REQUIRE=never
+        fi
+      fi
       if GIT_TERMINAL_PROMPT=0 \
-         SSH_ASKPASS_REQUIRE="${SSH_ASKPASS_REQUIRE:-never}" \
          git ls-remote --exit-code origin "refs/heads/$branch" >/dev/null 2>&1; then
         # Ref STILL PRESENT: a genuine failure regardless of what the API reported.
         echo "Error: failed to delete remote branch '$branch' (ref still present on origin):" >&2

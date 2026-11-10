@@ -415,10 +415,10 @@ Runtime (`scripts/`; canonical source is this repo):
 - `scripts/base-freshness.sh` - the git-only base-freshness check (#282). Answers ONE question: is
   <head> current with origin/<base>? The base is ALWAYS caller-supplied - it NEVER infers or
   hard-codes `main`, which is what makes a backport / release-base branch correct by construction.
-  Non-interactive by construction (GIT_TERMINAL_PROMPT=0 + a defaulted SSH_ASKPASS_REQUIRE=never; the
+  Non-interactive by construction (GIT_TERMINAL_PROMPT=0 + SSH_ASKPASS_REQUIRE=force with SSH_ASKPASS=<the first existing of /usr/bin/false, /bin/false>, set together only when the caller left SSH_ASKPASS_REQUIRE unset or empty - an explicit caller value keeps both untouched; `never` does NOT stop an ssh passphrase/host-key prompt on a controlling tty, `force`+false does and also fails git's HTTPS credential prompt fast; the
   script NEVER sets GIT_SSH_COMMAND, since CC Safety Net rule git.ssh-env denies any GIT_SSH*/core.sshCommand
   override and that denial blocked every command block running the helper, #568; a caller's own
-  GIT_SSH_COMMAND passes through, and no tty already fails a prompt fast; `test-no-ssh-override.py` bans
+  GIT_SSH_COMMAND passes through; `test-no-ssh-override.py` bans
   the override repo-wide), so an unreachable/auth-required origin fails FAST instead of hanging a
   push path. Best-effort `git fetch origin <base>` then `git rev-list --count`; exactly one labeled
   `freshness:` line every time: fresh / behind N (with the count + a refresh pointer) / unknown
