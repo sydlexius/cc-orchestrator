@@ -27,7 +27,6 @@ recorded for assertion.
 Run: python3 test-open-pr-staleness-sweep.py
 """
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -91,7 +90,8 @@ GIT_STUB = (
     '  # base-freshness) so the sweep\'s OWN head-fetch env can be asserted.\n'
     '  { echo "ARGS=$*"\n'
     '    echo "GIT_TERMINAL_PROMPT=${GIT_TERMINAL_PROMPT:-<unset>}"\n'
-    '    echo "GIT_SSH_COMMAND=${GIT_SSH_COMMAND:-<unset>}"; } >>"${FETCHLOG:-/dev/null}"\n'
+    '    echo "GIT_SSH_COMMAND=${GIT_SSH_COMMAND:-<unset>}"\n'
+    '    echo "SSH_ASKPASS_REQUIRE=${SSH_ASKPASS_REQUIRE:-<unset>}"; } >>"${FETCHLOG:-/dev/null}"\n'
     '  [ -n "${FETCH_FAIL_REF:-}" ] && [ "$3" = "$FETCH_FAIL_REF" ] && exit 1\n'
     '  exit "${FETCH_RC:-0}"\n'
     "fi\n"
@@ -115,7 +115,7 @@ def view_recheck(reviews="0", comments="0"):
 
 
 def run(args, *, open_prs="", views=None, views_recheck=None, view_rcs=None, behind="0",
-        list_rc=0, update_rc=0, fetch_fail_ref="", ssh_command=None, freshness_stub=None,
+        list_rc=0, update_rc=0, fetch_fail_ref="", ssh_command=None, askpass=None, freshness_stub=None,
         checkout_repo=None):
     """Invoke open-pr-staleness-sweep.sh with stubbed gh + git.
     Returns (rc, stdout, stderr, gh_invocations, fetchlog)."""
@@ -161,6 +161,10 @@ def run(args, *, open_prs="", views=None, views_recheck=None, view_rcs=None, beh
             env["GIT_SSH_COMMAND"] = ssh_command
         else:
             env.pop("GIT_SSH_COMMAND", None)
+        if askpass is not None:
+            env["SSH_ASKPASS_REQUIRE"] = askpass
+        else:
+            env.pop("SSH_ASKPASS_REQUIRE", None)
         for n, line in (views or {}).items():
             env[f"VIEW_{n}"] = line
         for n, line in (views_recheck or {}).items():
@@ -190,21 +194,12 @@ def updates_for(calls):
 
 
 def fetch_block(fetchlog, ref):
-    """Return the (ARGS, TERMINAL, SSH) 3-line block of the fetch whose ARGS names <ref>, or None."""
+    """Return the (ARGS, TERMINAL, SSH, ASKPASS) 4-line block of the fetch whose ARGS names <ref>, or None."""
     lines = fetchlog.splitlines()
-    for i in range(0, len(lines) - 2, 3):
+    for i in range(0, len(lines) - 3, 4):
         if lines[i].startswith("ARGS=") and f" {ref} " in (lines[i] + " "):
-            return "\n".join(lines[i:i + 3])
+            return "\n".join(lines[i:i + 4])
     return None
-
-
-def effective_batchmode(block):
-    """The LAST BatchMode value ssh honors in a fetch block's GIT_SSH_COMMAND (later -o wins)."""
-    lines = [ln for ln in block.splitlines() if ln.startswith("GIT_SSH_COMMAND=")]
-    if not lines:
-        return None
-    vals = re.findall(r"BatchMode=(\w+)", lines[-1])
-    return vals[-1] if vals else None
 
 
 def main():
@@ -342,18 +337,23 @@ def main():
     check("the cap is surfaced", "100" in out and ("truncat" in out.lower() or "cap" in out.lower()))
     check("no unqualified 'nothing to do' claim", "nothing to do" not in out)
 
-    print("== NON-INTERACTIVE: the sweep's OWN head fetch is GIT_TERMINAL_PROMPT=0 + BatchMode=yes ==")
-    # A caller BatchMode=no must NOT survive as the effective setting on the head fetch.
+    print("== NON-INTERACTIVE: the sweep's OWN head fetch is GIT_TERMINAL_PROMPT=0 + SSH_ASKPASS_REQUIRE=never, no ssh override (#568) ==")
     rc, out, err, calls, flog = run(
         ["101", "owner/name"], open_prs="101 120", behind="4",
-        views={120: view(head="feat/hf", reviews="0", comments="0")},
-        ssh_command="ssh -o BatchMode=no")
+        views={120: view(head="feat/hf", reviews="0", comments="0")})
     head_blk = fetch_block(flog, "feat/hf")
     check("the head fetch was recorded", head_blk is not None)
     check("GIT_TERMINAL_PROMPT=0 on the head fetch", "GIT_TERMINAL_PROMPT=0" in (head_blk or ""))
-    check("caller BatchMode=no preserved on the head fetch", "BatchMode=no" in (head_blk or ""))
-    check("but the EFFECTIVE head-fetch BatchMode is yes (our -o appended LAST wins)",
-          effective_batchmode(head_blk or "") == "yes")
+    check("SSH_ASKPASS_REQUIRE defaults to never", "SSH_ASKPASS_REQUIRE=never" in (head_blk or ""))
+    check("GIT_SSH_COMMAND not set by the sweep", "GIT_SSH_COMMAND=<unset>" in (head_blk or ""))
+    check("no BatchMode", "BatchMode" not in (head_blk or ""))
+    rc, out, err, calls, flog = run(
+        ["101", "owner/name"], open_prs="101 120", behind="4",
+        views={120: view(head="feat/hf", reviews="0", comments="0")},
+        ssh_command="ssh -i /k/id", askpass="force")
+    head_blk = fetch_block(flog, "feat/hf")
+    check("caller GIT_SSH_COMMAND passes through unchanged", "GIT_SSH_COMMAND=ssh -i /k/id\n" in ((head_blk or "") + "\n"))
+    check("caller SSH_ASKPASS_REQUIRE preserved", "SSH_ASKPASS_REQUIRE=force" in (head_blk or ""))
 
     print("== TOCTOU: not-reviewed at snapshot but REVIEWED at re-check -> NOT refreshed ==")
     # The snapshot shows 0 reviews / 0 comments (would refresh), but a review lands before the

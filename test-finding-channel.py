@@ -219,6 +219,8 @@ def _record_git_env(root, extra_env=None):
     os.chmod(shim, 0o755)
     env = dict(os.environ)
     env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+    env.pop("GIT_SSH_COMMAND", None)
+    env.pop("SSH_ASKPASS_REQUIRE", None)
     if extra_env:
         env.update(extra_env)
     subprocess.run([sys.executable, HELPER, "guard-reply", "--repo", root,
@@ -230,45 +232,40 @@ def _record_git_env(root, extra_env=None):
     return ""
 
 
-def _ssh_cmd_line(recorded):
+def _env_value(recorded, name):
     for line in recorded.splitlines():
-        if line.startswith("GIT_SSH_COMMAND="):
-            return line[len("GIT_SSH_COMMAND="):]
+        if line.startswith(name + "="):
+            return line[len(name) + 1:]
     return None
 
 
 def test_git_calls_are_non_interactive():
-    # Codoki hardening: git subprocesses must be non-interactive so ls-remote/fetch
-    # cannot hang on a credential prompt. The first git call must carry
-    # GIT_TERMINAL_PROMPT=0 and a BatchMode SSH command.
+    # git subprocesses must be non-interactive so ls-remote/fetch cannot hang on a
+    # credential prompt: GIT_TERMINAL_PROMPT=0 and SSH_ASKPASS_REQUIRE=never. The helper
+    # must NOT set GIT_SSH_COMMAND (CC Safety Net rule git.ssh-env denies it, #568).
     with tempfile.TemporaryDirectory() as root:
         recorded = _record_git_env(root)
         check("git calls set GIT_TERMINAL_PROMPT=0 (non-interactive, no hang)",
               "GIT_TERMINAL_PROMPT=0" in recorded)
-        check("git calls default GIT_SSH_COMMAND to BatchMode",
-              "batchmode=yes" in (_ssh_cmd_line(recorded) or "").lower())
+        check("git calls default SSH_ASKPASS_REQUIRE to never",
+              _env_value(recorded, "SSH_ASKPASS_REQUIRE") == "never")
+        check("git calls do NOT set GIT_SSH_COMMAND",
+              _env_value(recorded, "GIT_SSH_COMMAND") is None)
 
 
-def test_git_ssh_command_preset_without_batchmode_gets_it():
-    # Codoki High: a parent env pre-setting GIT_SSH_COMMAND WITHOUT BatchMode must
-    # still be made non-interactive -- inject -oBatchMode=yes, preserving the user's
-    # command (identity file / port / wrapper).
+def test_git_ssh_command_preset_passes_through_unchanged():
     with tempfile.TemporaryDirectory() as root:
-        recorded = _record_git_env(root, {"GIT_SSH_COMMAND": "ssh -i /tmp/k"})
-        ssh = _ssh_cmd_line(recorded) or ""
-        check("preset GIT_SSH_COMMAND w/o BatchMode -> BatchMode injected",
-              "batchmode=yes" in ssh.lower())
-        check("preset GIT_SSH_COMMAND w/o BatchMode -> user's command preserved",
-              "-i /tmp/k" in ssh)
-
-
-def test_git_ssh_command_preset_with_batchmode_not_doubled():
-    with tempfile.TemporaryDirectory() as root:
-        preset = "ssh -oBatchMode=yes -i /tmp/k"
+        preset = "ssh -i /tmp/k"
         recorded = _record_git_env(root, {"GIT_SSH_COMMAND": preset})
-        ssh = _ssh_cmd_line(recorded) or ""
-        check("preset GIT_SSH_COMMAND w/ BatchMode -> not double-appended",
-              ssh == preset)
+        check("preset GIT_SSH_COMMAND passes through unchanged (no BatchMode appended)",
+              _env_value(recorded, "GIT_SSH_COMMAND") == preset)
+
+
+def test_ssh_askpass_require_caller_value_preserved():
+    with tempfile.TemporaryDirectory() as root:
+        recorded = _record_git_env(root, {"SSH_ASKPASS_REQUIRE": "force"})
+        check("caller SSH_ASKPASS_REQUIRE=force preserved",
+              _env_value(recorded, "SSH_ASKPASS_REQUIRE") == "force")
 
 
 def test_validate_missing_file():
@@ -588,8 +585,8 @@ def main():
         test_liveness_zero_deadline_is_usage_exit2,
         test_liveness_nonint_deadline_is_usage_exit2,
         test_git_calls_are_non_interactive,
-        test_git_ssh_command_preset_without_batchmode_gets_it,
-        test_git_ssh_command_preset_with_batchmode_not_doubled,
+        test_git_ssh_command_preset_passes_through_unchanged,
+        test_ssh_askpass_require_caller_value_preserved,
         test_validate_missing_file, test_validate_invalid_utf8_is_io_exit2,
         test_validate_unknown_kind,
         test_liveness_missing, test_liveness_fresh, test_liveness_slow,

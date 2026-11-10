@@ -359,11 +359,13 @@ elif [ -n "$branch" ]; then
       # (recoverable, and stale-branch-sweep.sh catches it later), and failing closed here
       # would resurrect the exact #302 pathology of a network condition aborting a cleanup
       # that has already done its local work. Do not "fix" this into a hard failure.
-      # GIT_TERMINAL_PROMPT=0 + SSH BatchMode so an auth-required origin fails FAST rather
-      # than hanging cleanup on a credential prompt (the house pattern from
-      # base-freshness.sh); a caller's own GIT_SSH_COMMAND is preserved.
+      # GIT_TERMINAL_PROMPT=0 + SSH_ASKPASS_REQUIRE=never so an auth-required origin fails
+      # FAST rather than hanging cleanup on a credential prompt (the house pattern from
+      # base-freshness.sh). No GIT_SSH_COMMAND override: CC Safety Net (git.ssh-env) denies
+      # it (#568); a caller's own GIT_SSH_COMMAND passes through, and so does an explicit
+      # SSH_ASKPASS_REQUIRE.
       if GIT_TERMINAL_PROMPT=0 \
-         GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes" \
+         SSH_ASKPASS_REQUIRE="${SSH_ASKPASS_REQUIRE:-never}" \
          git ls-remote --exit-code origin "refs/heads/$branch" >/dev/null 2>&1; then
         # Ref STILL PRESENT: a genuine failure regardless of what the API reported.
         echo "Error: failed to delete remote branch '$branch' (ref still present on origin):" >&2

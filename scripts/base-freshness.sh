@@ -11,11 +11,11 @@
 # branch is measured against its OWN declared base, so being behind `main` is never mistaken for
 # staleness.
 #
-# NON-INTERACTIVE BY CONSTRUCTION: GIT_TERMINAL_PROMPT=0 (no HTTP credential prompt) plus SSH
-# BatchMode (no SSH password / host-key prompt; a caller's own GIT_SSH_COMMAND is PRESERVED and
-# `-o BatchMode=yes` appended LAST, so it OVERRIDES any caller BatchMode=no - the effective setting
-# is always yes). An unreachable or auth-required origin therefore FAILS FAST instead of hanging a
-# push path. (Same pattern as finding_channel.py.)
+# NON-INTERACTIVE BY CONSTRUCTION: GIT_TERMINAL_PROMPT=0 (no HTTP credential prompt) plus
+# SSH_ASKPASS_REQUIRE=never (default; a caller's explicit value is preserved). With no tty an ssh
+# password / host-key prompt already fails fast. The script NEVER sets GIT_SSH_COMMAND: CC Safety
+# Net denies any such override (#568), and a caller's own GIT_SSH_COMMAND passes through unchanged.
+# An unreachable or auth-required origin therefore FAILS FAST instead of hanging a push path.
 #
 # Exactly ONE labeled `freshness:` line is printed on every path:
 #   freshness: fresh   - <head> contains every commit on origin/<base> (0 behind).
@@ -73,16 +73,11 @@ fi
 
 # --- Non-interactive git (fail fast, never hang) ---
 export GIT_TERMINAL_PROMPT=0
-# GIT_TERMINAL_PROMPT=0 stops HTTP credential prompts but NOT an SSH password / host-key prompt -
-# that needs BatchMode. Preserve a caller's custom GIT_SSH_COMMAND (identity/port/wrapper) but ALWAYS
-# append `-o BatchMode=yes` LAST: ssh honors the LAST `-o` for a given option, so this overrides any
-# earlier BatchMode=no the caller set and guarantees the EFFECTIVE setting is non-interactive.
-if [ -n "${GIT_SSH_COMMAND:-}" ]; then
-  GIT_SSH_COMMAND="$GIT_SSH_COMMAND -o BatchMode=yes"
-else
-  GIT_SSH_COMMAND="ssh -o BatchMode=yes"
-fi
-export GIT_SSH_COMMAND
+# CC Safety Net (rule git.ssh-env) DENIES any GIT_SSH*/core.sshCommand override on a network git
+# call, so this script must not set GIT_SSH_COMMAND (#568). No tty means an ssh host-key/password
+# prompt already fails fast; SSH_ASKPASS_REQUIRE=never keeps an askpass helper from popping a GUI
+# prompt (what BatchMode used to give). A caller's explicit value is preserved.
+export SSH_ASKPASS_REQUIRE="${SSH_ASKPASS_REQUIRE:-never}"
 
 unknown() {
   echo "freshness: unknown - $1"

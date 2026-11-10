@@ -92,15 +92,13 @@ case "$merged_pr" in
 esac
 
 # --- Non-interactive git (fail fast, never hang) for this script's OWN head fetch ---
-# base-freshness.sh sets its own; the sweep's head fetch below needs the SAME guarantee. Append
-# `-o BatchMode=yes` LAST so it overrides any caller BatchMode=no (ssh honors the last -o).
+# base-freshness.sh sets its own; the sweep's head fetch below needs the SAME guarantee.
 export GIT_TERMINAL_PROMPT=0
-if [ -n "${GIT_SSH_COMMAND:-}" ]; then
-  GIT_SSH_COMMAND="$GIT_SSH_COMMAND -o BatchMode=yes"
-else
-  GIT_SSH_COMMAND="ssh -o BatchMode=yes"
-fi
-export GIT_SSH_COMMAND
+# CC Safety Net (rule git.ssh-env) DENIES any GIT_SSH*/core.sshCommand override on a network git
+# call, so this script must not set GIT_SSH_COMMAND (#568). No tty means an ssh host-key/password
+# prompt already fails fast; SSH_ASKPASS_REQUIRE=never keeps an askpass helper from popping a GUI
+# prompt (what BatchMode used to give). A caller's explicit value is preserved.
+export SSH_ASKPASS_REQUIRE="${SSH_ASKPASS_REQUIRE:-never}"
 
 # --- Locate the behind-check helper (sibling; repo layout AND deployed ~/.claude/scripts layout) ---
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

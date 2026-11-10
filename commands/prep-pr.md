@@ -52,6 +52,12 @@ variant that slips past it runs a gate nobody can read. Report `<step>: NOT RUN 
 until the command is fixed or the human runs it; for an ADVISORY step (Step 8b prose-lint) report
 it skipped and continue. Other commands with gate steps point here.
 
+A CC Safety Net (`cc-safety-net`) denial of a plugin helper's OWN command (for example rule
+`git.ssh-env` on a `GIT_SSH_COMMAND` override a helper set) is a PLUGIN DEFECT, not a gap in the
+user's configuration: report it (file an issue naming the rule and the helper line) rather than
+asking the user to loosen their hook (#568). Helpers must not set `GIT_SSH_COMMAND`, `GIT_SSH`,
+`GIT_SSH_VARIANT` or `core.sshCommand`; `test-no-ssh-override.py` enforces it.
+
 **Machine gate pool (#539).** A machine may cap how many gates run at once: the user writes a
 `budget` into `~/.claude/gate-queue/config.toml`. `gate-runner.py` then WAITS for its share
 before it runs anything (up to `wait_timeout_s`, 3600 by default, far past the Bash tool's

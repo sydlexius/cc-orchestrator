@@ -161,11 +161,12 @@ err_file=$(mktemp)
 del_rc=0
 gh api "repos/$repo/git/refs/heads/$encoded_branch" -X DELETE >/dev/null 2>"$err_file" || del_rc=$?
 
-# GIT_TERMINAL_PROMPT=0 + SSH BatchMode so an auth-required origin fails FAST
-# rather than hanging cleanup on a credential prompt; a caller's own
-# GIT_SSH_COMMAND is preserved. Matches scripts/cleanup-worktree.sh exactly.
+# GIT_TERMINAL_PROMPT=0 + SSH_ASKPASS_REQUIRE=never so an auth-required origin fails
+# FAST rather than hanging cleanup on a credential prompt. No GIT_SSH_COMMAND override
+# (CC Safety Net denies it, #568); a caller's own value passes through. Matches
+# scripts/cleanup-worktree.sh exactly.
 if GIT_TERMINAL_PROMPT=0 \
-   GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes" \
+   SSH_ASKPASS_REQUIRE="${SSH_ASKPASS_REQUIRE:-never}" \
    git ls-remote --exit-code origin "refs/heads/$branch" >/dev/null 2>&1; then
   # Ref STILL PRESENT: a genuine failure regardless of what the API reported.
   # This also catches the inverse trap -- a DELETE that reports success while the

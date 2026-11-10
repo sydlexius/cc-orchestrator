@@ -570,6 +570,38 @@ def main():
     rc, out = scenario(unenterable)
     check("unenterable dir -> exit 2", rc == 2); check("clear message", "cannot be entered" in out)
 
+    print("network git env (#568): no GIT_SSH_COMMAND override, askpass suppressed, caller values kept")
+    def envlog(fx, extra):
+        # A git wrapper that records the env of each network call, then runs the real git.
+        real = subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip()
+        log = os.path.join(fx.td, "netenv.log")
+        wrap = os.path.join(fx.bindir, "git")
+        with open(wrap, "w") as f:
+            f.write("#!/usr/bin/env bash\n"
+                    'for a in "$@"; do case "$a" in fetch|ls-remote) '
+                    'echo "VERB=$a TP=${GIT_TERMINAL_PROMPT:-<unset>} SSH=${GIT_SSH_COMMAND:-<unset>} '
+                    f'ASK=${{SSH_ASKPASS_REQUIRE:-<unset>}}" >>{log}; break ;; esac; done\n'
+                    f'exec {real} "$@"\n')
+        os.chmod(wrap, 0o755)
+        env = {k: v for k, v in os.environ.items() if k not in ("GIT_SSH_COMMAND", "SSH_ASKPASS_REQUIRE")}
+        env.update(PATH=fx.bindir + os.pathsep + os.environ["PATH"], GH_DIR=fx.ghdir, GH_FAIL="0", **extra)
+        subprocess.run([BASH, SCRIPT, fx.wt1, fx.wt2], cwd=fx.clone, env=env,
+                       capture_output=True, text=True, timeout=60)
+        return open(log).read() if os.path.exists(log) else ""
+    def lines(rec):
+        return [ln for ln in rec.splitlines() if ln]
+    rec = scenario(lambda fx: envlog(fx, {}))
+    ls = lines(rec)
+    check("a network git call was recorded", rec != "")
+    check("stack-preflight's own ls-remote --symref call was recorded", any(ln.startswith("VERB=ls-remote ") for ln in ls))
+    check("EVERY network call has GIT_TERMINAL_PROMPT=0", bool(ls) and all(" TP=0 " in ln for ln in ls))
+    check("EVERY network call has SSH_ASKPASS_REQUIRE=never", bool(ls) and all(ln.endswith(" ASK=never") for ln in ls))
+    check("GIT_SSH_COMMAND unset on EVERY call", bool(ls) and all(" SSH=<unset> " in ln for ln in ls))
+    rec = scenario(lambda fx: envlog(fx, {"GIT_SSH_COMMAND": "ssh -i /k/id", "SSH_ASKPASS_REQUIRE": "force"}))
+    ls = lines(rec)
+    check("caller GIT_SSH_COMMAND passes through unchanged on EVERY call", bool(ls) and all(" SSH=ssh -i /k/id " in ln for ln in ls))
+    check("caller SSH_ASKPASS_REQUIRE preserved on EVERY call", bool(ls) and all(ln.endswith(" ASK=force") for ln in ls))
+
     print("read-only: no slice is modified")
     def readonly(fx):
         before = [git(fx.clone, "rev-parse", r) for r in ("s1", "s2", "origin/trunk")]

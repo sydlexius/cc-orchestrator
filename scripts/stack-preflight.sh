@@ -9,7 +9,7 @@
 # just before PASS), `git ls-remote --symref origin HEAD` (the LIVE default branch), and a
 # `git fetch` (base-freshness's, plus one to bring a PR slice's head commit local) that may update
 # the object DB and remote-tracking refs, nothing else. Non-interactive: GIT_TERMINAL_PROMPT=0 +
-# SSH BatchMode.
+# SSH_ASKPASS_REQUIRE=never (no GIT_SSH_COMMAND override, #568).
 #
 # Slices are given BOTTOM TO TOP. Each is detected, never guessed:
 #   all digits            -> a PR slice (`gh pr view <n>`), checked FIRST
@@ -71,8 +71,11 @@ case "${1:-}" in
 esac
 
 export GIT_TERMINAL_PROMPT=0
-if [ -n "${GIT_SSH_COMMAND:-}" ]; then GIT_SSH_COMMAND="$GIT_SSH_COMMAND -o BatchMode=yes"; else GIT_SSH_COMMAND="ssh -o BatchMode=yes"; fi
-export GIT_SSH_COMMAND
+# CC Safety Net (rule git.ssh-env) DENIES any GIT_SSH*/core.sshCommand override on a network git
+# call, so this script must not set GIT_SSH_COMMAND (#568). No tty means an ssh host-key/password
+# prompt already fails fast; SSH_ASKPASS_REQUIRE=never keeps an askpass helper from popping a GUI
+# prompt (what BatchMode used to give). A caller's explicit value is preserved.
+export SSH_ASKPASS_REQUIRE="${SSH_ASKPASS_REQUIRE:-never}"
 
 SELF_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd) || { echo "stack-preflight: cannot resolve own directory" >&2; exit 2; }
 
