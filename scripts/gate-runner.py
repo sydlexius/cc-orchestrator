@@ -58,9 +58,11 @@ started by its NAME and by nothing else: no other argument is accepted and none
 is forwarded. With the pool on it takes its declared `weight` and its worktree
 like a gate; with the pool off it just runs. The exit code is the command's own,
 so the run ends with ONE stderr line that says what happened: `POOL-RUN: <name>
-ran exit=<n>` or `POOL-RUN: <name> NOT RUN reason=<slug>`. NO SUCH LINE MEANS IT
-DID NOT RUN, whatever the exit code: a runner that predates the flag ignores it
-and runs the full gate.
+ran exit=<n>` or `POOL-RUN: <name> NOT RUN reason=<slug>`. NO SUCH LINE IS NEVER
+A PASS, whatever the exit code: a runner that predates the flag ignores it and
+runs the full gate (NOT RUN), and a runner killed before the line leaves an
+UNKNOWN outcome whose command may still be running, so a caller checks for its
+live processes before any retry.
 
 Run: python3 gate-runner.py   (from anywhere inside the repo)
 """
@@ -1622,7 +1624,9 @@ def _named_command(root, name):
 def _pool_run_line(shown, what):
     """THE closing line, the last thing a `--pool-run` writes: `POOL-RUN: <name> ran
     exit=<n>` or `POOL-RUN: <name> NOT RUN reason=<slug>`. The exit code alone cannot say
-    which (a command may itself exit 75 or 2), and a caller reads NO such line as NOT RUN."""
+    which (a command may itself exit 75 or 2). NO such line is never a pass: NOT RUN when a
+    stale runner warned `unrecognized argument`, else UNKNOWN (this runner died before the
+    line, and its command may still be running; check before any retry)."""
     _pool_say(f"POOL-RUN: {shown} {what}")
 
 
@@ -1631,8 +1635,8 @@ def _pool_run(argv):
     was killed at its bound, 128 + the signal when the run was signalled), else the pool's
     (75 no slot or worktree in time, 130 an interrupted wait) or 2 (usage, config). Every
     way out that RETURNS prints the one closing line, and prints it LAST. A signal that takes
-    its default action during the wait ends the process with no such line (NOT RUN, by the
-    callers' rule)."""
+    its default action during the wait ends the process with no such line, before any
+    command started (callers see a missing line and report UNKNOWN; nothing is running)."""
     global _POOL_RUN
     name, rest = _pool_run_args(argv)
     # An invalid name is never echoed: it could carry a newline and forge a closing line.
