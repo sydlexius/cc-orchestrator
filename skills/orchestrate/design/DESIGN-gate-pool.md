@@ -637,13 +637,32 @@ is gone, SIGKILL included) the watchdog SIGKILLs the groups still listed. RUN (E
   then writes `-<pgid>`, as the FIRST thing after reaping the leader. The watchdog never signals a pruned pgid. RESIDUAL, stated
   plainly: a runner SIGKILLed in the instants between that reap and that write leaves a listed pgid whose number is free; harm
   needs the kernel to hand that exact number to a new group before the watchdog reads EOF (milliseconds). The earlier text called
-  this "safe against pid reuse"; it is narrow, not closed. WHERE `os.waitid` EXISTS the window is closed instead: the runner learns
-  of the leader's exit with `WNOWAIT` (the leader stays an unreaped zombie, so its number cannot be reused), sweeps the group,
-  writes `-<pgid>`, and only then reaps. That is every Linux, and macOS from Python 3.13 (PRIOR, from the Python docs; not run).
-  On an older macOS Python the order above applies and the residual stands.
+  this "safe against pid reuse"; it is narrow, not closed. WHERE THE WINDOW IS CLOSED, exactly (A4 as built, corrected in its
+  review): the runner learns of the leader's exit with `os.waitid(..., WNOWAIT)` (the leader stays an unreaped zombie, so its
+  number cannot be reused), writes `-<pgid>` once the group reads as gone, and only then reaps. That holds ONLY for a leader that
+  was ALONE in its group, on the pooled serial step sweep (`_sweep_step`) and the parallel leader poll (`_poll_leader`), and only
+  where the platform reports a zombie-only group as gone: macOS (MEASURED: `killpg(pgid, 0)` on a zombie-only group raises EPERM).
+  Everywhere else THE REAP STILL COMES FIRST and the residual above stands: the serial sweep's background-job branch (it reaps the
+  leader before sweeping what the leader left), `_terminate_groups` (the cancelled, overdue and give-up paths reap every proc before
+  `_prune_watched`), the parallel path's lingering groups, and Linux as coded (a zombie counts as a member there, so a group reads
+  as alive until its leader is reaped). Where `os.waitid` is missing (macOS before Python 3.13) the reap-first order applies on
+  every path.
+- LINUX ZOMBIES. `killpg(g, 0)` succeeds on Linux while any member is an unreaped zombie, so a killed group whose leaders wait
+  on a parent that has not reaped them (or a PID 1 that never reaps: a container with no init) would read as alive forever, the
+  watchdog would re-send SIGKILL each second, and that worktree's `.sweep` claim would never free. So the watchdog's "gone" test
+  also reads `/proc`: a group whose members `/proc` shows are ALL zombies (state `Z` or `X`) is gone, since a zombie runs
+  nothing. No `/proc` (macOS, where `killpg` already raises EPERM on a zombie-only group), an unreadable `/proc`, or a group
+  `killpg` can signal but `/proc` does not show (a `hidepid` mount) keeps the `killpg` answer: alive, on doubt. MEASURED in PR
+  #581: the first Linux CI run failed on exactly this (the harness, the leaders' parent, reaps after the watchdog's exit), and a
+  non-root Linux container reproduced it on the unfixed commit and passed with the `/proc` check. This is the WATCHDOG's test
+  only; the runner's own `_group_alive` is unchanged, since the runner reaps its own leaders.
+- A CLAIM THE WATCHDOG CANNOT TAKE FAILS FAST. An `S<path>` it cannot open or lock ends the watchdog's reading at once: it kills
+  whatever it lists and exits 3, so the holder's claim wait (`CLAIM_WAIT_S`, 10 s, under `admit.lock`) ends at the watchdog's
+  exit instead of its timeout, and the run is NOT RUN with reason `pool-watchdog`. The pool root is made ABSOLUTE where gate-runner
+  resolves it: the watchdog runs with cwd `/`, so a relative `GATEQ_HOME` would otherwise send it a path naming nothing.
 - THE WORKTREE STAYS CLAIMED UNTIL THE SWEEP IS DONE (PR #543 review). A SIGKILLed holder's ticket lock frees at once, about a
   second before the watchdog has killed its step groups, and a waiter must not start in that worktree beside an orphaned mutation
-  step. So with the pool on, a holder creates `waiters/<ticket name>.sweep` (`{pool_protocol, worktree}`) in the same `admit.lock`
+  step. So with the pool on, a holder creates `waiters/<ticket name>.sweep` (`{pool_protocol, worktree, pid}`, `pid` the watchdog's) in the same `admit.lock`
   section as its commit and sends the path to its watchdog over the pipe. The WATCHDOG opens that file itself and holds an
   exclusive `flock` on it (its own open, nothing inherited, so rule 1 of the locks section holds); the holder starts its first step
   only once a try-lock on the file fails. `busy` is the worktree keys of held tickets PLUS held `.sweep` files. On EOF the watchdog
@@ -656,14 +675,30 @@ is gone, SIGKILL included) the watchdog SIGKILLs the groups still listed. RUN (E
 - EVERY RUNNER WITH A WATCHDOG HOLDS A CLAIM, NESTED ONES INCLUDED (PR #543 review). A nested gate or `--pool-run` takes no
   ticket, but it starts its own step groups under its own watchdog. If the outer holder is SIGKILLed, the outer watchdog is done as
   soon as the nested RUNNER is dead, while the nested watchdog may still be killing the nested step group; with only the outer
-  claim, a waiter could start beside that orphan. So a nested run creates its own `waiters/<holder ticket name>.<its pid>.sweep`
-  with the same worktree key, and its own watchdog locks it, exactly as above. `busy` counts EVERY held `.sweep` file, whoever made
+  claim, a waiter could start beside that orphan. So a nested run creates its own
+  `waiters/<holder ticket name>.<its pid>.<random hex>.sweep` with the same worktree key (its record adds `nest`, the basename of
+  the child lock it holds), and its own watchdog locks it, exactly as above. `busy` counts EVERY held `.sweep` file, whoever made
   it, so the worktree stays claimed until the last watchdog in the tree is done.
+- A CLAIM IS NEVER WRITTEN OVER ANOTHER (PR #581 review). Every `.sweep` record is staged in `tmp/` and HARD-LINKED into place,
+  which refuses an existing path, and the nested name carries a random part. With a pid-only name and a rename, a nested runner
+  whose pid was reused under the same holder replaced a claim whose OLD inode an orphan watchdog still flocked, and every scan then
+  saw only the new file: a same-worktree waiter could start beside that orphan once the visible claims were free.
+- A NESTED RUN WAITS ON AN EARLIER NESTED SWEEP (PR #581 review). A nested run frees its child lock when it ends, while its
+  watchdog may still be killing its groups; the next nested run under the same holder takes that free lock, so the lock alone
+  does not keep it out. So under `admit.lock`, after it takes its child lock, a nested run looks at every HELD
+  `<holder ticket>.*.sweep` other than the holder's own and WAITS (`waiting for a nested sweep under this holder to finish`) while
+  one is not an ANCESTOR's. An ancestor is a run holding a shorter child lock of this run's chain (`<ticket>.nest` up to the
+  parent's): it is still running and this run is its child, so waiting on it would deadlock. A record with no readable `nest`
+  is doubt and waits. STATED LIMIT: a SIGKILLed ancestor's claim still reads as an ancestor's, so its live descendants keep
+  running beside its orphan (they already were).
 - NO UNLOCKED WINDOW: whoever creates a `.sweep` file does so under `admit.lock` and keeps `admit.lock` until its try-lock on the
   file fails (its watchdog has it; milliseconds, and the only thing ever waited for under that lock). A `.sweep` whose lock is free
   therefore always belongs to a finished watchdog, and any evaluator unlinks it. NOT COVERED, stated plainly: SLOTS are not held through the sweep (they free with the holder), so for
   about a second the machine can run an orphan's load on top of a full budget; and a watchdog killed together with its holder
-  claims nothing. REASONED, not run; A4 adds both sides (the watchdog's lock and the `busy` reader) and the test.
+  claims nothing. REASONED, not run; A4 adds both sides (the watchdog's lock and the `busy` reader) and the test. Also NOT
+  COVERED: a dead `.sweep` of ANOTHER pool protocol (its lock free) is never unlinked, since no process touches a record of another
+  protocol, and doctor's dead-foreign scan covers tickets only; it claims nothing (a free claim adds nothing to `busy`) but stays
+  on disk until the user deletes it.
 
 The watchdog is started with `Popen` and `close_fds=True` like every other child, so it INHERITS no lock descriptor. The one lock
 it holds is the `.sweep` file it opened itself (above); it never holds a slot, a ticket or `admit.lock`. It covers the

@@ -268,6 +268,7 @@ import json, os, sys
 with open(sys.argv[1], "w") as f:
     json.dump({"leader": os.getsid(0) == os.getpid(), "sid": os.getsid(0),
                "stdin": sys.stdin.read(), "cwd": os.getcwd(),
+               "devnull": os.path.samestat(os.fstat(0), os.stat(os.devnull)),
                "holder": os.environ.get("GATEQ_HOLDER"), "nest": os.environ.get("GATEQ_NEST")}, f)
 """
 
@@ -300,7 +301,8 @@ def case_exit_code(tmp, home):
     # The spawned runner leads a session of its own, so its session id is its pid.
     same("exit code: the command is the leader of a SESSION of its own, not the runner's",
          (rec.get("leader"), rec.get("sid") not in (None, p.pid)), (True, True))
-    same("exit code: its stdin is /dev/null, not the runner's", rec.get("stdin"), "")
+    same("exit code: its stdin is /dev/null, not the runner's",
+         (rec.get("stdin"), rec.get("devnull")), ("", True))
     rc, out, err = pool_run(root, home, "--pool-run", "c", runner=runner)
     same("exit code: pool OFF runs the command with NO gate_pool.py beside the runner (the "
          "module is never imported), and leaves the runner's directory alone",
@@ -460,11 +462,16 @@ def case_nested(tmp, home):
     rc, out, err = tp.run_runner(root, home)
     ls = tp.read(os.path.join(seen, "ls")).split()
     ticket = next((n for n in ls if n.endswith(".ticket")), "?")
+    # Since A4 each runner with a watchdog also holds a `.sweep` claim: the gate's own
+    # (`<ticket>.sweep`) and the nested run's (`<ticket>.<its pid>.<random hex>.sweep`).
+    own_sweep = [n for n in ls
+                 if re.fullmatch(re.escape(ticket) + r"\.[0-9]+\.[0-9a-f]{8}\.sweep", n)]
     same("nested: --pool-run inside a gate step, at a weight the gate's own covers, runs "
          "UNDER the gate (GATEQ_HOLDER): no ticket of its own, one child lock, exit 0",
          (rc, tp.read(os.path.join(seen, "small.rc")), tp.read(os.path.join(seen, "small.out")),
-          sorted(ls)),
-         (0, "0\n", "POOL-RUN: small ran exit=0\n", [ticket, ticket + ".nest"]))
+          sorted(n for n in ls if n not in own_sweep), len(own_sweep)),
+         (0, "0\n", "POOL-RUN: small ran exit=0\n",
+          [ticket, ticket + ".nest", ticket + ".sweep"], 1))
     path = os.path.join(home, "waiters", ticket)
     same("nested: its command is handed the holder it runs under and the lock it holds",
          tp.read(os.path.join(seen, "env")), f"{path}|{path}.nest\n")
@@ -558,15 +565,21 @@ def case_signals(tmp, home):
     same("signals: SIGINT likewise: exit 130, never a traceback in place of the closing line",
          _signalled(tmp, home, "int-off", signal.SIGINT),
          (130, "SIGINT", "POOL-RUN: s ran exit=130", []))
-    pidf = os.path.join(tmp, "bg.pid")
-    root = tp.make_repo(tmp, "bg", command("bg", f"sleep 60 & echo $! > '{pidf}'"))
+    pidf, go = os.path.join(tmp, "bg.pid"), os.path.join(tmp, "bg.go")
+    root = tp.make_repo(tmp, "bg", command(
+        "bg", f"sleep 60 & echo $! > '{pidf}'; while [ ! -e '{go}' ]; do sleep 0.05; done"))
     # Spawned with its output in FILES: through a pipe the runner's caller would wait for the
-    # background job (it holds the pipe open), and by then nothing could be told apart.
+    # background job (it holds the pipe open), and by then nothing could be told apart. The
+    # watchdog (A4) is STOPPED before the command ends: its end-of-run kill of a still-listed
+    # session would otherwise stand in for a skipped sweep.
     p = tp.spawn(root, home, "--pool-run", "bg")
-    rc, pid = tp.ended(p), tp._pid_of(pidf)
+    tp.wait_for("the bg command's job", lambda: tp._pid_of(pidf) != 0, p)
+    with tp.watchdog_stopped(p.pid):
+        tp.put(go, "x\n")
+        rc, pid = tp.ended(p), tp._pid_of(pidf)
+        swept = bool(pid) and tp.gone(pid, timeout=3.0)
     same("signals: a background job the command leaves behind is swept before the closing line",
-         (rc, tp.read(p.err), bool(pid) and tp.gone(pid, timeout=3.0)),
-         (0, "POOL-RUN: bg ran exit=0\n", True))
+         (rc, tp.read(p.err), swept), (0, "POOL-RUN: bg ran exit=0\n", True))
     if pid and tp.alive(pid):              # a mutant's survivor: seen alive just now
         os.kill(pid, signal.SIGTERM)
     tp.put(os.path.join(home, "config.toml"), tp.CONFIG)
@@ -819,8 +832,8 @@ MUTATIONS = [
     ("the command run in a process group inside the runner's session", R,
      [('_run_group(cmd["run"], root, session=True, env=env)', '_run_group(cmd["run"], root, session=False, env=env)')],
      "exit-code", "exit code: the command is the leader of a SESSION of its own, not the runner's"),
-    ("the command given the runner's stdin", R,
-     [("command, shell=True, cwd=cwd, stdin=subprocess.DEVNULL, env=env,", "command, shell=True, cwd=cwd, env=env,")],
+    ("the command left on its start pipe instead of /dev/null", R,
+     [("|| exit 1; exec </dev/null; exec /bin/sh", "|| exit 1; exec /bin/sh")],
      "exit-code", "exit code: its stdin is /dev/null, not the runner's"),
     ("a background job the command left behind is not swept", R,
      [("        _terminate_groups({}, [proc.pid])", "        pass")], "signals",

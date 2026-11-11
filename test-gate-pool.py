@@ -1988,7 +1988,8 @@ def case_e2e_holder_env(tmp, home):
 INFO_STEP = """
 import json, os, sys
 with open(sys.argv[1], "w") as f:
-    json.dump({"pgrp": os.getpgrp(), "stdin": sys.stdin.read()}, f)
+    json.dump({"pgrp": os.getpgrp(), "stdin": sys.stdin.read(),
+               "devnull": os.path.samestat(os.fstat(0), os.stat(os.devnull))}, f)
 """
 SIG_STEP = """
 import os, signal, sys
@@ -2082,6 +2083,11 @@ def off_home(tmp):
     return home
 
 
+# The bound on a pooled runner's end once its deaf step is swept: gate-runner's KILL_GRACE_S
+# (3 s) SIGTERM grace plus a margin for a loaded machine.
+DEAF_END_S = 3.0 + 12.0
+
+
 def ended(p, timeout=60):
     """The exit status, or a string when the runner did not end (a FAIL by name, not a hang)."""
     try:
@@ -2109,6 +2115,39 @@ def gone(pid, timeout=10.0):
             return False
         time.sleep(0.02)
     return True
+
+
+def watchdog_of(runner_pid, timeout=10.0):
+    """The pid of the orphan watchdog (A4) the runner `runner_pid` started: its child whose
+    command line carries the watchdog's `-I -B -c`. 0 when none appeared within `timeout`."""
+    end = time.monotonic() + timeout
+    while True:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,command="], capture_output=True,
+                             text=True, errors="replace").stdout
+        for line in out.splitlines():
+            f = line.split(None, 2)
+            if len(f) == 3 and f[1] == str(runner_pid) and "-I -B -c" in f[2]:
+                return int(f[0])
+        if time.monotonic() > end:
+            return 0
+        time.sleep(0.05)
+
+
+@contextlib.contextmanager
+def watchdog_stopped(runner_pid):
+    """SIGSTOP the runner's watchdog for the block, so a check inside it sees what the runner
+    ITSELF did: the watchdog SIGKILLs every group still listed when the runner ends, which
+    would make a skipped sweep look done. The runner's close() waits at most 5 s for it, then
+    moves on. SIGCONT on the way out: it reads its EOF and kills whatever a mutant left."""
+    wd = watchdog_of(runner_pid)
+    if not wd:
+        raise AssertionError(f"no orphan watchdog under runner {runner_pid}")
+    os.kill(wd, signal.SIGSTOP)
+    try:
+        yield wd
+    finally:
+        with contextlib.suppress(OSError):
+            os.kill(wd, signal.SIGCONT)
 
 
 def tail(p, root):
@@ -2139,13 +2178,15 @@ def case_serial_group(tmp, home):
             put(os.path.join(home, "config.toml"), CONFIG)
         p = spawn(root, pool_home, stdin=typed)
         rec = (ended(p), _load_json(info))
-        seen[label] = (rec[0], rec[1].get("pgrp") == p.pid, rec[1].get("stdin"))
+        seen[label] = (rec[0], rec[1].get("pgrp") == p.pid, rec[1].get("stdin"),
+                       rec[1].get("devnull"))
     same("serial group: with the pool OFF a serial step shares the runner's process group and "
-         "reads the runner's stdin, as before the pool", seen["off"], (0, True, "typed\n"))
+         "reads the runner's stdin, as before the pool", seen["off"],
+         (0, True, "typed\n", False))
     same("serial group: with the pool ON a serial step runs in a process group of its OWN",
          seen["on"][:2], (0, False))
     same("serial group: with the pool ON a serial step's stdin is /dev/null, not the runner's",
-         seen["on"][2], "")
+         seen["on"][2:], ("", True))
 
 
 def _signalled(tmp, home, tag, sig, send, **kw):
@@ -2197,42 +2238,67 @@ def _pid_of(path):
 @e2e
 def case_serial_sweep(tmp, home):
     put(os.path.join(home, "config.toml"), CONFIG)
-    # (a) A step that ends normally and leaves a background job in its group.
+    # (a) A step that ends normally and leaves a background job in its group. A SECOND step
+    # records whether that job is still alive while it runs: the watchdog also kills a listed
+    # group, but only when the runner ends (A4), so only the step's OWN sweep can make the
+    # job gone before the next step starts. (It polls up to 2 s: a swept job may still be a
+    # zombie for a moment, and `kill -0` succeeds on a zombie.)
     seen = {}
     for label, pool_home in (("off", off_home(tmp)), ("on", home)):
-        pidf = os.path.join(tmp, f"bg-{label}.pid")
-        p = spawn(make_repo(tmp, f"bg-{label}", one_step(f"sleep 60 & echo $! > '{pidf}'")),
-                  pool_home)
+        pidf, chk = os.path.join(tmp, f"bg-{label}.pid"), os.path.join(tmp, f"bg-{label}.chk")
+        probe = (f"P=$(cat '{pidf}'); i=0; while kill -0 $P 2>/dev/null && [ $i -lt 20 ]; "
+                 f"do sleep 0.1; i=$((i+1)); done; "
+                 f"if kill -0 $P 2>/dev/null; then echo alive > '{chk}'; "
+                 f"else echo gone > '{chk}'; fi")
+        gates = (one_step(f"sleep 60 & echo $! > '{pidf}'")
+                 + f'\n[[prep_pr.steps]]\nname = "t"\nrun = "{probe}"\n')
+        p = spawn(make_repo(tmp, f"bg-{label}", gates), pool_home)
         rc, pid = ended(p), _pid_of(pidf)
         if label == "off":
-            seen[label] = (rc, alive(pid))
+            seen[label] = (rc, read(chk).strip(), alive(pid))
             with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGKILL)   # seen alive on the line above: ours
         else:
-            seen[label] = (rc, gone(pid), "[PASS] s (exit 0" in read(p.out))
-    same("serial sweep: with the pool OFF a step's background job outlives the runner, as "
-         "before the pool", seen["off"], (0, True))
-    same("serial sweep: with the pool ON a passing step's background job is swept before the "
-         "runner ends", seen["on"], (0, True, True))
+            seen[label] = (rc, read(chk).strip(), gone(pid), "[PASS] s (exit 0" in read(p.out))
+    same("serial sweep: with the pool OFF a step's background job outlives its step and the "
+         "runner, as before the pool", seen["off"], (0, "alive", True))
+    same(_BG_SWEPT, seen["on"], (0, "gone", True, True))
     # (b) An interrupt: the shell dies of the forwarded SIGINT, its background job ignores it
-    # (a non-interactive shell starts `&` jobs that way; RUN F5) and goes with the sweep.
+    # (a non-interactive shell starts `&` jobs that way; RUN F5) and goes with the sweep. The
+    # runner ends with no next step, so the watchdog is STOPPED for the check: its end-of-run
+    # kill would otherwise stand in for a skipped sweep.
     pidf, started = os.path.join(tmp, "int.pid"), os.path.join(tmp, "int.started")
     p = spawn(make_repo(tmp, "int", one_step(
         f"sleep 60 & echo $! > '{pidf}'; echo x > '{started}'; wait")), home)
     wait_for("the interrupted step to start", lambda: os.path.exists(started), p)
-    os.killpg(p.pid, signal.SIGINT)
+    with watchdog_stopped(p.pid):
+        os.killpg(p.pid, signal.SIGINT)
+        rec = (ended(p), gone(_pid_of(pidf)))
     same("serial sweep: after a forwarded SIGINT the step's background job, which ignores "
-         "SIGINT, is swept before the runner ends",
-         (ended(p), gone(_pid_of(pidf))), (-signal.SIGINT, True))
+         "SIGINT, is swept by the runner itself (its watchdog stopped) before the runner ends",
+         rec, (-signal.SIGINT, True))
+    _kill_seen_alive(_pid_of(pidf))
     # (c) A step that ignores the forwarded signal AND the sweep's SIGTERM: the SIGKILL leg.
+    # Its sleep (600 s) far outlasts the bound on the runner's end (the sweep's SIGTERM grace
+    # plus a margin), so a runner that waits on the step instead of killing it reads as "still
+    # running", never as a pass once the sleep happens to finish by itself.
     pidf, started = os.path.join(tmp, "deaf.pid"), os.path.join(tmp, "deaf.started")
     p = spawn(make_repo(tmp, "deaf", one_step(
-        f"trap '' TERM; echo $$ > '{pidf}'; echo x > '{started}'; sleep 60")), home)
+        f"trap '' TERM; echo $$ > '{pidf}'; echo x > '{started}'; sleep 600")), home)
     wait_for("the deaf step to start", lambda: os.path.exists(started), p)
+    deaf = _pid_of(pidf)
     os.killpg(p.pid, signal.SIGTERM)
-    same("serial sweep: a step that ignores the forwarded SIGTERM is killed with its group, and "
-         "the runner still ends by SIGTERM",
-         (ended(p), gone(_pid_of(pidf))), (-signal.SIGTERM, True))
+    try:
+        same("serial sweep: a step that ignores the forwarded SIGTERM is killed with its group, "
+             "and the runner still ends by SIGTERM",
+             (ended(p, timeout=DEAF_END_S), gone(deaf)), (-signal.SIGTERM, True))
+    finally:
+        if p.poll() is None:               # a mutant's runner, waiting on the deaf step
+            with contextlib.suppress(OSError):
+                os.killpg(deaf, signal.SIGKILL)   # the step's own group: ours, seen above
+            with contextlib.suppress(OSError):
+                p.kill()
+            p.wait(timeout=30)
 
 
 def _kill_seen_alive(pid):
@@ -2895,8 +2961,8 @@ RUNNER_MUTATIONS = [
 # --- the pooled serial step path (PR A2) ---
 _SIGS = "_FORWARD_SIGS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)"
 _SWEEP_CALL = "        _sweep_step(proc)\n        for s, handler in old.items():"
-_BG_SWEPT = ("serial sweep: with the pool ON a passing step's background job is swept before "
-             "the runner ends")
+_BG_SWEPT = ("serial sweep: with the pool ON a passing step's background job is swept when its "
+             "step ends, before the next step runs")
 _SAME_END = "ends the pooled runner with the pool-off exit status and final lines"
 RUNNER_MUTATIONS += [
     ("SIGQUIT not forwarded to a pooled serial step",
@@ -2914,9 +2980,8 @@ RUNNER_MUTATIONS += [
      '            _POOL_RUN = {"deadline": time.monotonic() + limit}', "            pass",
      "serial-group",
      "serial group: with the pool ON a serial step runs in a process group of its OWN"),
-    ("a pooled serial step given the runner's stdin (the terminal)",
-     "command, shell=True, cwd=cwd, stdin=subprocess.DEVNULL, env=env,",
-     "command, shell=True, cwd=cwd, env=env,", "serial-group",
+    ("a pooled serial step left on its start pipe instead of /dev/null",
+     "|| exit 1; exec </dev/null; exec /bin/sh", "|| exit 1; exec /bin/sh", "serial-group",
      "serial group: with the pool ON a serial step's stdin is /dev/null, not the runner's"),
     ("the pool-OFF serial path given the pooled step path (a group, a sweep)",
      "    if _POOL_RUN is not None:              # pool ON", "    if True:", "serial-group",
@@ -2926,15 +2991,15 @@ RUNNER_MUTATIONS += [
      _SWEEP_CALL, _SWEEP_CALL.replace("        _sweep", "        if not caught:\n            _sweep"),
      "serial-sweep",
      "serial sweep: after a forwarded SIGINT the step's background job, which ignores SIGINT, "
-     "is swept before the runner ends"),
+     "is swept by the runner itself (its watchdog stopped) before the runner ends"),
     ("the sweep skipped on the exit path of a step that ended by itself",
      _SWEEP_CALL, _SWEEP_CALL.replace("        _sweep", "        if caught:\n            _sweep"),
      "serial-sweep", _BG_SWEPT),
     ("the sweep leaves a finished step's background job alone",
      "        _terminate_groups({}, [proc.pid])", "        pass", "serial-sweep", _BG_SWEPT),
     ("the sweep leaves a step that outlived the forwarded signal running",
-     '    if not _reap(proc):\n        _terminate_groups({0: {"proc": proc}})',
-     "    if not _reap(proc):\n        pass", "serial-sweep",
+     '    if not _leader_gone(proc):\n        _terminate_groups({0: {"proc": proc}})',
+     "    if not _leader_gone(proc):\n        pass", "serial-sweep",
      "serial sweep: a step that ignores the forwarded SIGTERM is killed with its group, and "
      "the runner still ends by SIGTERM"),
     ("a forwarded SIGTERM read as a failed step (exit 1, a FAIL line)",

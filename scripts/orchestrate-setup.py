@@ -183,6 +183,13 @@ POOL_BUDGET_LINE_RE = re.compile(r"^[ \t]*budget[ \t]*=", re.MULTILINE)
 # by a comment): any other import spelling (`from gate_pool import ...`, `import gate_pool as g`)
 # reads as "predates the pool", and a matching line inside a string literal reads as capable.
 POOL_IMPORT_RE = re.compile(r"^[ \t]*import gate_pool[ \t]*(?:#.*)?$", re.MULTILINE)
+# The third part of pool-capable (#539 A4): the orphan watchdog's marker, a plain assignment at
+# COLUMN 0 (DESIGN-gate-pool.md section 4). The import and the module alone pass an A1-A3 copy,
+# whose SIGKILLed holder frees its slots while its steps keep running. A CONTRACT with the real
+# runner's exact line: indented, another value, or another spelling reads as "no watchdog".
+# It is a LINE match, not a parse: like POOL_IMPORT_RE, a column-0 `POOL_WATCHDOG = 1` line
+# inside a string literal reads as capable (a stated limit, pinned by test-orchestrate-setup.py).
+POOL_WATCHDOG_RE = re.compile(r"^POOL_WATCHDOG = 1[ \t]*(?:#.*)?$", re.MULTILINE)
 
 # #428: the orchestrate ROLE DEFINITIONS (#427) - Claude Code subagent files whose `tools:` allowlist
 # the harness enforces. They deploy to USER scope (~/.claude/agents) rather than shipping in the
@@ -2303,9 +2310,14 @@ def _pool_incapable(scripts_dir):
     parts = []
     try:
         with open(runner, encoding="utf-8", errors="replace") as f:
-            if not POOL_IMPORT_RE.search(f.read()):
-                parts.append("its gate-runner.py has no `import gate_pool` statement, so it "
-                             "predates the pool and gates UNPOOLED")
+            text = f.read()
+        if not POOL_IMPORT_RE.search(text):
+            parts.append("its gate-runner.py has no `import gate_pool` statement, so it "
+                         "predates the pool and gates UNPOOLED")
+        if not POOL_WATCHDOG_RE.search(text):
+            parts.append("its gate-runner.py has no `POOL_WATCHDOG = 1` line, so it has no "
+                         "orphan watchdog: a SIGKILLed gate there frees its slots while its "
+                         "steps keep running")
     except OSError as e:
         parts.append(f"its gate-runner.py is unreadable ({e.strerror})")
     if not os.path.isfile(os.path.join(scripts_dir, "gate_pool.py")):
@@ -2443,8 +2455,8 @@ def check_gate_pool():
             seen_copies = "no gate-runner copy was found to check"
         else:
             seen_copies = (f"the {copies} gate-runner cop{'y' if copies == 1 else 'ies'} doctor "
-                           f"can see {'has' if copies == 1 else 'have'} the pool import and "
-                           "module (watchdog marker not checked until A4)")
+                           f"can see {'is' if copies == 1 else 'are'} pool-capable (the pool "
+                           "import, the module beside it and the watchdog marker)")
         return _emit(PASS, f"gate pool: budget {info['budget']} configured (protocol "
                            f"{info['protocol']}); {seen_copies}")
     return _emit(PASS, f"gate pool: {home} exists, no budget configured (pool OFF)")

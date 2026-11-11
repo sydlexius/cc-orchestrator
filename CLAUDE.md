@@ -212,10 +212,13 @@ Runtime (`scripts/`; canonical source is this repo):
   another protocol (`gate_pool.dead_foreign_tickets`; no evaluator ever clears one, so the user
   deletes it by hand), and, with a budget, each runner copy that is not pool-capable (the deployed
   leg, the bundled copy, each `orchestrate@*` `installPath` in `installed_plugins.json`), saying
-  which part failed (the PASS line says the copies "have the pool import and module", not
-  "pool-capable"); a configured `protocol` differing from the bundled `POOL_PROTOCOL` is a WARN
-  (every gate exits 2); other cached plugin versions are ONE line. The `POOL_WATCHDOG` part of
-  pool-capable is NOT checked yet (the design assigns it to A4). KNOWN LIMIT: doctor does not
+  which part failed; pool-capable has THREE parts, all a text check of the copy: the `import
+  gate_pool` statement, `gate_pool.py` beside it, and (A4) the line `POOL_WATCHDOG = 1` at
+  COLUMN 0 (`POOL_WATCHDOG_RE`; indented, another value or another spelling reads as absent),
+  without which an A1-A3 copy would pass while its SIGKILLed holder frees its slots beside
+  running steps. Only then does the PASS line say the copies are "pool-capable". A configured
+  `protocol` differing from the bundled `POOL_PROTOCOL` is a WARN
+  (every gate exits 2); other cached plugin versions are ONE line. KNOWN LIMIT: doctor does not
   check that `slots/` and `waiters/` are usable directories, so a pool with a broken
   subdirectory can PASS doctor while a gate exits 2.
 - `uat-autobuild.sh` - repo-agnostic UAT auto-rebuild watcher: polls a branch HEAD, runs a
@@ -282,7 +285,8 @@ Runtime (`scripts/`; canonical source is this repo):
   `POOL-RUN: <name> NOT RUN reason=<slug>`. NO SUCH LINE IS NEVER A RESULT, whatever the
   exit code: a runner that predates the flag warns, ignores it and runs the FULL GATE (NOT RUN),
   and a runner killed before the line leaves an UNKNOWN outcome whose command may still be
-  running (nothing reaps it until A4), so a caller checks for it before any retry. That is
+  running (for about a second, until the orphan watchdog below kills its group, or longer for a
+  process the kernel will not kill), so a caller checks for it before any retry. That is
   why a caller first checks its leg with `grep -q -- '--pool-run' <leg>`, and why the dispatch
   in `main()` sits BEFORE `_parse_args`. A bad `[[pool.command]]` exits 2 for that invocation
   only and never affects a gate. The declared-name rule and its stated limit (a heavy command
@@ -292,12 +296,52 @@ Runtime (`scripts/`; canonical source is this repo):
   split into `--part` steps the same way as `test-gate-pool.py` (below; its `MUTATION_PARTS` is 4,
   steps `test-gate-pool-run.<kind>`, the mutation ones `.mutation-K` singular because the plural
   names put 4 of its 6 parts on one macOS shard), and the lockstep checks both split harnesses.
-  DO NOT WRITE A BUDGET YET: A4 (the orphan watchdog) and the release are not in, so a
-  SIGKILLed holder frees its slots while its steps (or its named command) keep running. Two
-  known limits until then. An interrupted pooled run leaves an older pass receipt in place, as
-  pool-off does (it still binds its own tree). A nested runner's step, or a nested NAMED
-  COMMAND, that ignores SIGTERM can outlive an outer runner that was signalled, or an outer
-  gate killed at `job_timeout_s`, with the slots free, until A4's watchdog.
+  THE ORPHAN WATCHDOG (A4, `gate-runner.py`, NOT `gate_pool.py`: it works pool-off, where the
+  module is never imported). A runner that starts step groups (the parallel path pool on or
+  off, the pooled serial path, `--pool-run`; never the pool-off serial path, which stays
+  byte-identical and starts nothing) starts ONE `python3 -I -c` child in its own session with
+  `close_fds=True`, fed `+<pgid>` / `-<pgid>` / `S<path>` over its stdin pipe; on EOF (the
+  runner died, SIGKILL included) it SIGKILLs every listed group, re-sends each second until all
+  are gone (NO time limit), then exits. A step starts HELD (`_HOLD`: its shell reads one start
+  byte from its stdin pipe, then takes `/dev/null` and execs `/bin/sh -c <run>` in the same
+  pid), and the byte is sent only after `+<pgid>`, so a runner killed between `Popen` and the
+  byte leaves nothing running. PRUNE ORDER: `-<pgid>` the instant the group is seen empty. The
+  prune comes BEFORE the reap (`os.waitid` with `WNOWAIT` leaves the leader an unreaped zombie
+  that keeps its number) ONLY for a leader that was ALONE in its group, on the pooled serial
+  step sweep and the parallel leader poll, where the platform reports a zombie-only group as
+  gone (macOS with Python 3.13 or later, where `os.waitid` exists; measured). Older macOS
+  Pythons take the reap-first order below, and CI pins Python 3.12, so macOS CI exercises
+  reap-first. Everywhere else the reap comes first and the narrow residual stands
+  (milliseconds, needing exact pid reuse): the serial sweep's background-job branch,
+  `_terminate_groups` (the cancel, overdue and give-up paths), parallel lingering groups, and
+  Linux as coded (it counts the zombie as a member). LINUX ZOMBIES: `killpg(g, 0)` counts a
+  zombie as a group member on Linux, so the WATCHDOG's "gone" test also reads `/proc`: a group
+  whose members `/proc` shows are ALL zombies is gone (a zombie runs nothing), so a sweep ends
+  even while the dead runner's step leaders wait to be reaped, or under a PID 1 that never
+  reaps. No `/proc`, or a group `/proc` does not show, keeps the `killpg` answer (alive, on
+  doubt). MEASURED in a Linux container (non-root): without it the `protocol` and `claim-fast`
+  cases hang, exactly as the first PR #581 CI run failed. THE SWEEP CLAIM: with the pool on the grant writes `waiters/<ticket>.sweep`
+  (`{pool_protocol, worktree, pid}`; a nested run its own
+  `<holder ticket>.<its pid>.<random hex>.sweep`, whose record adds `nest`, the child lock it
+  holds) under `admit.lock`, staged and HARD-LINKED into place so an existing path is REFUSED,
+  never written over (PR #581 review: a reused pid must not hide a claim an orphan watchdog
+  still holds), hands it to the watchdog, and keeps `admit.lock` until a try-lock on it
+  FAILS (the WATCHDOG holds the lock, from its own open); `busy` counts every held `.sweep`
+  (`held by sweep pid <n>`), a free one of this protocol is unlinked by any evaluator. A NESTED
+  run also waits (never fails) while a held nested claim under its holder that is not one of
+  its ancestors' exists, i.e. an earlier nested run is done but its watchdog still sweeps
+  (`waiting for a nested sweep under this holder to finish`). So a
+  SIGKILLed holder frees its SLOTS at once and its WORKTREE once its orphans are gone. With the
+  pool on a watchdog that cannot start or take the claim is NOT RUN (exit 2, reason
+  `pool-watchdog`); pool off it is one warning. An `S<path>` the watchdog cannot open or lock
+  ends it at once (it kills what it lists, exits 3), so the claim fails fast instead of waiting
+  `CLAIM_WAIT_S` under `admit.lock`, and the pool root is made ABSOLUTE where it is resolved (the
+  watchdog runs with cwd `/`, so a relative `GATEQ_HOME` once made every pooled gate NOT RUN). `POOL_WATCHDOG = 1` is the marker doctor reads; `test-gate-watchdog.py` ties it to a
+  working watchdog and mutation-proves the A4 row. STILL OPEN: the release is not cut, so DO
+  NOT WRITE A BUDGET until it is; SLOTS are not held through the sweep (about a second of
+  orphan load on top of a full budget); a watchdog killed together with its runner claims
+  nothing; an interrupted pooled run leaves an older pass receipt in place, as pool-off does (it
+  still binds its own tree).
   `test-gate-pool.py` mutation-proves
   both files against COPIES and pins `GATEQ_HOME` to a temp directory, as `test-gate-runner.py` does.
   Issue #570: run whole it took ~400 s and set the floor of every gate run and one macOS shard, so
@@ -839,7 +883,7 @@ above and `skills/orchestrate/templates/gates.toml.md`.
 
 ```sh
 shellcheck scripts/orchestrate-guard.sh scripts/orchestrate-steer.sh scripts/orchestrate-context-meter.sh scripts/orchestrate-feedback.sh scripts/orchestrate-status.sh scripts/orchestrate-authorize-merge.sh scripts/uat-autobuild.sh scripts/ship-gate-preflight.sh scripts/gh-api-get.sh scripts/gh-codeql-dismiss.sh scripts/gh-resolve-thread.sh scripts/gh-comment.sh scripts/gh-codeql-autofix.sh scripts/gh-delete-branch.sh scripts/gh-react.sh scripts/stale-branch-sweep.sh scripts/codoki-quota-watch.sh scripts/pr-watch.sh scripts/issue-watch.sh scripts/pr-unreplied-comments.sh scripts/pr-read-comments.sh scripts/reply-comment.sh scripts/resolve-threads.sh scripts/cleanup-worktree.sh scripts/patch-coverage.sh scripts/pr-codeql-autofixes.sh scripts/safe-push.sh scripts/pre-push-hook.sh scripts/prose-lint.sh scripts/cache-reclaim.sh scripts/base-freshness.sh scripts/open-pr-staleness-sweep.sh scripts/run-paths.sh scripts/cr-quota-watch.sh scripts/elmer-enqueue.sh scripts/elmer-triage.sh scripts/elmer-tick.sh scripts/stack-preflight.sh  # v0.11.0 (CI-pinned; install shellcheck v0.11.0 locally to match)
-ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/gate_pool.py scripts/prefs-coverage.py scripts/settings-scrub.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-ci-gates-lockstep.py test-steer-nudge-length.py test-helper-deploy-coverage.py test-jq-quoting.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-gate-pool.py test-gate-pool-run.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-safe-push-freshness.py test-prep-pr-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py test-cr-quota-watch.py test-elmer-enqueue.py test-elmer-triage.py test-elmer-tick.py test-bash32-constructs.py test-settings-scrub.py test-stack-preflight.py test-command-positional-args.py test-no-ssh-override.py
+ruff check --select F,E741 scripts/orchestrate-*.py scripts/orchestrate_schemas.py scripts/finding_channel.py scripts/planner_classify.py scripts/gate-runner.py scripts/gate_pool.py scripts/prefs-coverage.py scripts/settings-scrub.py test-orchestrate-*.py test-finding-channel.py test-planner-classify.py test-gh-wrappers.py test-gh-react.py test-ship-gate-preflight.py test-pr-unreplied-comments.py test-pr-read-comments.py test-safe-push.py test-pr-watch.py test-issue-watch.py test-version-lockstep.py test-ci-gates-lockstep.py test-steer-nudge-length.py test-helper-deploy-coverage.py test-jq-quoting.py test-stale-branch-sweep.py test-codoki-quota-watch.py test-gate-runner.py test-gate-pool.py test-gate-pool-run.py test-gate-watchdog.py test-prefs-coverage.py test-prose-lint.py test-resolve-threads.py test-cache-reclaim.py test-patch-coverage.py test-base-freshness.py test-safe-push-freshness.py test-prep-pr-freshness.py test-open-pr-staleness-sweep.py test-run-paths.py test-cleanup-worktree.py test-cr-quota-watch.py test-elmer-enqueue.py test-elmer-triage.py test-elmer-tick.py test-bash32-constructs.py test-settings-scrub.py test-stack-preflight.py test-command-positional-args.py test-no-ssh-override.py
 ./scripts/orchestrate-guard.sh --self-test    # MUST use ./ - the self-test re-invokes "$0";
                                               # `bash scripts/orchestrate-guard.sh` makes $0 a bare name -> 127
 ./scripts/orchestrate-guard.sh --assert-coverage  # #324: no deny is unreachable behind the perf
@@ -892,6 +936,7 @@ python3 test-cr-quota-watch.py
 python3 test-elmer-enqueue.py
 python3 test-elmer-triage.py
 python3 test-elmer-tick.py
+python3 test-gate-watchdog.py   # #539 A4: the orphan watchdog (death pipe, held launch, .sweep claim)
 python3 test-gate-pool-run.py --part mutations 2/4   # #539: named heavy commands (`gate-runner.py --pool-run <name>`), run as parts like test-gate-pool.py
 python3 test-gate-pool-run.py --part mutations 1/4
 python3 test-gate-pool-run.py --part mutations 4/4
