@@ -1575,6 +1575,12 @@ class _FakeProc:
         return self.code
 
 
+def _cmd_of(argv):
+    """The step command a parallel launch hands Popen. Since #539 A4 a step starts HELD:
+    `["/bin/sh", "-c", <hold>, "sh", <command>]`, the command last."""
+    return argv[-1] if isinstance(argv, list) else argv
+
+
 def _inproc_parallel(steps, popen, jobs=2, patch=None):
     """Run run_form_b_parallel in-process with Popen replaced. Returns
     (rc, records, output)."""
@@ -1583,13 +1589,21 @@ def _inproc_parallel(steps, popen, jobs=2, patch=None):
     mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
     mod.subprocess = types.SimpleNamespace(Popen=popen, DEVNULL=subprocess.DEVNULL,
                                            STDOUT=subprocess.STDOUT)
+    # #539 A4: no REAL orphan watchdog here. A _FakeProc's pid (999999) is no group of ours,
+    # and a real watchdog listing it would SIGKILL that number at this process's exit.
+    def no_watchdog():
+        return None
+    mod._watchdog = no_watchdog
     for k, v in (patch or {}).items():
         setattr(mod, k, v(getattr(mod, k)))
     buf = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
     with tempfile.TemporaryDirectory() as root, contextlib.redirect_stdout(buf), \
             contextlib.redirect_stderr(buf):
-        rc, records = mod.run_form_b_parallel(steps, root, "/nonexistent-memo", jobs)
-        buf.flush()
+        try:
+            rc, records = mod.run_form_b_parallel(steps, root, "/nonexistent-memo", jobs)
+        finally:
+            buf.flush()
+    assert not mod._WD, "an in-process parallel run started a real orphan watchdog"
     return rc, records, buf.buffer.getvalue().decode()
 
 
@@ -1745,7 +1759,7 @@ def test_parallel_interrupt_in_launch_window():
     launched = []
 
     def popen(*a, **k):
-        launched.append(a[0])
+        launched.append(_cmd_of(a[0]))
         signal.raise_signal(signal.SIGHUP)   # blocked here: pending until restore
         return _FakeProc(0, holds=50)
     (rc, recs, _), _, _ = _with_outer_handlers(
@@ -1764,7 +1778,7 @@ def test_parallel_interrupt_before_launch():
     launched = []
 
     def popen(*a, **k):
-        launched.append(a[0])
+        launched.append(_cmd_of(a[0]))
         return _FakeProc(0, holds=50)
 
     def noisy(orig):

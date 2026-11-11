@@ -3058,15 +3058,28 @@ def check_gate_pool_doctor():
                        {"type": "command", "command": 'bash "$HOME/.claude/scripts/orchestrate-guard.sh"'}]}]}},
                   open(wired, "w"))
 
+        WATCHDOGLESS = {"no-watchdog": "\n", "watchdog-indented": "\nif True:\n    POOL_WATCHDOG = 1\n",
+                        "watchdog-zero": "\nPOOL_WATCHDOG = 0\n"}
+        # The STATED LIMIT of POOL_WATCHDOG_RE (as of POOL_IMPORT_RE): a column-0
+        # `POOL_WATCHDOG = 1` line inside a string literal reads as capable. Pinned below.
+        IN_STRING = {"watchdog-in-string": '\n_X = """\nPOOL_WATCHDOG = 1\n"""\n'}
+
         def scripts(name, kind):
             """A scripts dir holding a gate-runner copy: `capable` (the real runner and module),
-            `no-module` (the real runner alone) or `pre-pool` (a runner with no pool import)."""
+            `no-module` (the real runner alone), `pre-pool` (a runner with no pool import), or
+            one of WATCHDOGLESS (the real runner and module, its `POOL_WATCHDOG = 1` line
+            removed or misspelled: an A1-A3 copy, #539 A4)."""
             d = os.path.join(td, name, "scripts"); os.makedirs(d)
             if kind == "pre-pool":
                 open(os.path.join(d, "gate-runner.py"), "w").write("#!/usr/bin/env python3\n# a comment is no statement: import gate_pool\n")
+            elif kind in WATCHDOGLESS or kind in IN_STRING:
+                src = open(os.path.join(here, "gate-runner.py")).read()
+                assert src.count("\nPOOL_WATCHDOG = 1\n") == 1
+                open(os.path.join(d, "gate-runner.py"), "w").write(
+                    src.replace("\nPOOL_WATCHDOG = 1\n", {**WATCHDOGLESS, **IN_STRING}[kind]))
             else:
                 shutil.copy(os.path.join(here, "gate-runner.py"), d)
-            if kind == "capable":
+            if kind in ("capable", *WATCHDOGLESS, *IN_STRING):
                 shutil.copy(os.path.join(here, "gate_pool.py"), d)
             return d
         bundle, deployed = scripts("bundle", "capable"), scripts("deployed", "capable")
@@ -3108,17 +3121,42 @@ def check_gate_pool_doctor():
         lines = doctor("all capable", home(on))
         check("gate pool: a budget and every visible copy pool-capable is ONE PASS line",
               lines == ["[PASS] gate pool: budget 10 configured (protocol 1); the 3 gate-runner "
-                        "copies doctor can see have the pool import and module (watchdog marker "
-                        "not checked until A4)"])
-        check("gate pool: the PASS line never claims 'pool-capable'", "pool-capable" not in lines[0])
+                        "copies doctor can see are pool-capable (the pool import, the module "
+                        "beside it and the watchdog marker)"])
+        with open(os.path.join(here, "gate-runner.py")) as f:
+            check("gate pool: the runner under test carries the `POOL_WATCHDOG = 1` marker at "
+                  "column 0, exactly once (A4)", f.read().count("\nPOOL_WATCHDOG = 1\n") == 1)
 
         empty_dir = os.path.join(td, "empty-deployed"); os.makedirs(empty_dir)
         lines = doctor("one copy", home(on), ORCHESTRATE_SCRIPTS_DIR=empty_dir,
                        ORCHESTRATE_PLUGINS_DIR=os.path.join(td, "no-plugins"))
-        check("gate pool: ONE visible copy reads 'the 1 gate-runner copy ... has'",
+        check("gate pool: ONE visible copy reads 'the 1 gate-runner copy ... is'",
               lines == ["[PASS] gate pool: budget 10 configured (protocol 1); the 1 gate-runner "
-                        "copy doctor can see has the pool import and module (watchdog marker "
-                        "not checked until A4)"])
+                        "copy doctor can see is pool-capable (the pool import, the module beside "
+                        "it and the watchdog marker)"])
+
+        # A4: the import and the module beside it are NOT enough. A copy without the watchdog
+        # marker at column 0 (an A1-A3 runner) is not pool-capable, whatever else it has.
+        for kind in WATCHDOGLESS:
+            d = scripts(f"wd-{kind}", kind)
+            lines = doctor(f"{kind} copy", home(on), ORCHESTRATE_SCRIPTS_DIR=d,
+                           ORCHESTRATE_PLUGINS_DIR=os.path.join(td, "no-plugins"))
+            check(f"gate pool: a copy with the pool import and gate_pool.py beside it but no "
+                  f"column-0 `POOL_WATCHDOG = 1` line ({kind}) is NOT pool-capable: ONE WARN "
+                  "naming that part alone",
+                  len(lines) == 1 and lines[0].startswith(
+                      f"[WARN] gate pool: the deployed copy at {d} is not pool-capable: its "
+                      "gate-runner.py has no `POOL_WATCHDOG = 1` line, so it has no orphan "
+                      "watchdog") and "import gate_pool" not in lines[0]
+                  and "no gate_pool.py" not in lines[0])
+        # The stated limit, pinned so a change to it is a decision: the marker line held only
+        # inside a string literal (the real assignment gone) still reads as pool-capable.
+        d = scripts("wd-watchdog-in-string", "watchdog-in-string")
+        lines = doctor("watchdog-in-string copy", home(on), ORCHESTRATE_SCRIPTS_DIR=d,
+                       ORCHESTRATE_PLUGINS_DIR=os.path.join(td, "no-plugins"))
+        check("gate pool: a copy whose only `POOL_WATCHDOG = 1` line sits at column 0 INSIDE a "
+              "string literal reads as pool-capable (the stated limit of a line match)",
+              len(lines) == 1 and lines[0].startswith("[PASS] gate pool:"))
 
         h = home(on, mode=0o755)
         lines = doctor("root mode", h)

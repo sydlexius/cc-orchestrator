@@ -637,10 +637,24 @@ is gone, SIGKILL included) the watchdog SIGKILLs the groups still listed. RUN (E
   then writes `-<pgid>`, as the FIRST thing after reaping the leader. The watchdog never signals a pruned pgid. RESIDUAL, stated
   plainly: a runner SIGKILLed in the instants between that reap and that write leaves a listed pgid whose number is free; harm
   needs the kernel to hand that exact number to a new group before the watchdog reads EOF (milliseconds). The earlier text called
-  this "safe against pid reuse"; it is narrow, not closed. WHERE `os.waitid` EXISTS the window is closed instead: the runner learns
-  of the leader's exit with `WNOWAIT` (the leader stays an unreaped zombie, so its number cannot be reused), sweeps the group,
-  writes `-<pgid>`, and only then reaps. That is every Linux, and macOS from Python 3.13 (PRIOR, from the Python docs; not run).
-  On an older macOS Python the order above applies and the residual stands.
+  this "safe against pid reuse"; it is narrow, not closed. WHERE THE WINDOW IS CLOSED, exactly (A4 as built, corrected in its
+  review): the runner learns of the leader's exit with `os.waitid(..., WNOWAIT)` (the leader stays an unreaped zombie, so its
+  number cannot be reused), writes `-<pgid>` once the group reads as gone, and only then reaps. That holds ONLY for a leader that
+  was ALONE in its group, on the pooled serial step sweep (`_sweep_step`) and the parallel leader poll (`_poll_leader`), and only
+  where the platform reports a zombie-only group as gone: macOS (MEASURED: `killpg(pgid, 0)` on a zombie-only group raises EPERM).
+  Everywhere else THE REAP STILL COMES FIRST and the residual above stands: the serial sweep's background-job branch (it reaps the
+  leader before sweeping what the leader left), `_terminate_groups` (the cancelled, overdue and give-up paths reap every proc before
+  `_prune_watched`), the parallel path's lingering groups, and Linux as coded (a zombie counts as a member there, so a group reads
+  as alive until its leader is reaped). Where `os.waitid` is missing (macOS before Python 3.13) the reap-first order applies on
+  every path.
+- KNOWN LIMIT, LINUX ZOMBIES (REASONED, not run: Linux is unverified locally until CI). The watchdog's "gone" test is
+  `killpg(g, 0)`, which on Linux succeeds while any member is an unreaped zombie. Under a PID 1 that never reaps (a container with
+  no init), a killed group's zombies persist: the watchdog re-sends SIGKILL each second forever and that worktree's `.sweep` claim
+  is held until the watchdog pid is killed by hand. The fix (read `/proc` and treat an all-zombie group as gone) is not built.
+- A CLAIM THE WATCHDOG CANNOT TAKE FAILS FAST. An `S<path>` it cannot open or lock ends the watchdog's reading at once: it kills
+  whatever it lists and exits 3, so the holder's claim wait (`CLAIM_WAIT_S`, 10 s, under `admit.lock`) ends at the watchdog's
+  exit instead of its timeout, and the run is NOT RUN with reason `pool-watchdog`. The pool root is made ABSOLUTE where gate-runner
+  resolves it: the watchdog runs with cwd `/`, so a relative `GATEQ_HOME` would otherwise send it a path naming nothing.
 - THE WORKTREE STAYS CLAIMED UNTIL THE SWEEP IS DONE (PR #543 review). A SIGKILLed holder's ticket lock frees at once, about a
   second before the watchdog has killed its step groups, and a waiter must not start in that worktree beside an orphaned mutation
   step. So with the pool on, a holder creates `waiters/<ticket name>.sweep` (`{pool_protocol, worktree}`) in the same `admit.lock`
@@ -663,7 +677,10 @@ is gone, SIGKILL included) the watchdog SIGKILLs the groups still listed. RUN (E
   file fails (its watchdog has it; milliseconds, and the only thing ever waited for under that lock). A `.sweep` whose lock is free
   therefore always belongs to a finished watchdog, and any evaluator unlinks it. NOT COVERED, stated plainly: SLOTS are not held through the sweep (they free with the holder), so for
   about a second the machine can run an orphan's load on top of a full budget; and a watchdog killed together with its holder
-  claims nothing. REASONED, not run; A4 adds both sides (the watchdog's lock and the `busy` reader) and the test.
+  claims nothing. REASONED, not run; A4 adds both sides (the watchdog's lock and the `busy` reader) and the test. Also NOT
+  COVERED: a dead `.sweep` of ANOTHER pool protocol (its lock free) is never unlinked, since no process touches a record of another
+  protocol, and doctor's dead-foreign scan covers tickets only; it claims nothing (a free claim adds nothing to `busy`) but stays
+  on disk until the user deletes it.
 
 The watchdog is started with `Popen` and `close_fds=True` like every other child, so it INHERITS no lock descriptor. The one lock
 it holds is the `.sweep` file it opened itself (above); it never holds a slot, a ticket or `admit.lock`. It covers the

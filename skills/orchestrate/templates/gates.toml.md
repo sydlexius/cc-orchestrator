@@ -100,7 +100,8 @@ With `jobs` > 1:
   still warns and continues. Ctrl-C (or SIGTERM or SIGHUP to the runner) kills
   every group; further INT/TERM/HUP are ignored while that cleanup runs, so a
   second Ctrl-C cannot cut it short. Steps run in their own sessions, so SIGKILL
-  to the runner (which cannot be handled) orphans every in-flight group.
+  to the runner (which cannot be handled) would orphan every in-flight group:
+  the ORPHAN WATCHDOG (below) kills them instead.
 - The runner sweeps (SIGTERM, then SIGKILL) the process group of every step it
   launched on every exit path, all-pass included, so a step's stray background
   job (`sleep 30 &`) never outlives the run.
@@ -289,6 +290,38 @@ until `job_timeout_s`. With the pool off none of this applies: no group, no
 forwarding, no timeout. The commands' pool check (`pool=on` / `pool=off`) reads
 `~/.claude/gate-queue/config.toml` only and does not follow `GATEQ_HOME`.
 
+**The orphan watchdog (#539 A4).** A runner that starts step groups (the
+parallel path with the pool on or off, the pooled serial path, `--pool-run`;
+never the pool-off serial path) also starts one small `python3` child, the
+watchdog, in a session of its own. Each step starts HELD: its shell waits for a
+start byte, which the runner sends only after it has registered the step's
+process group with the watchdog, so a runner that dies in between leaves no step
+running. When the runner dies, SIGKILL included, the watchdog SIGKILLs every
+group still registered, again each second, until all are gone, and only then
+exits. With the pool on, the grant also takes a worktree claim,
+`waiters/<ticket>.sweep` (a nested run takes its own,
+`waiters/<holder ticket>.<pid>.sweep`), whose lock the WATCHDOG holds: a
+SIGKILLed holder's slots free at once, but its worktree stays claimed until its
+orphans are gone, and a waiter there prints `waiting for this worktree (held by
+sweep pid <n>)`. There is no time limit: a process the kernel will not kill keeps
+that one worktree claimed while it lives, and killing that pid by hand releases
+it. STATED LIMITS: slots are not held through the sweep (for about a second an
+orphan's load can run on top of a full budget), and a watchdog killed together
+with its runner (a `kill -9` aimed at it too) claims nothing. With the pool on,
+a watchdog that cannot be started or cannot take the claim makes the run NOT
+RUN (exit 2, reason `pool-watchdog`), never unpooled, and a claim it cannot take
+fails at once; with the pool off it is one warning and the steps run as before.
+PRUNE ORDER, exactly: the runner tells the watchdog a group is gone BEFORE it
+reaps the leader only on macOS, for a leader that was alone in its group (the
+pooled serial step and the parallel leader poll). Everywhere else (a group the
+leader left a background job in, a cancelled or timed-out run, the parallel
+path's lingering groups, and Linux) it reaps first, and a window of
+milliseconds remains in which a SIGKILLed runner leaves a listed number that the
+kernel could hand to a new group. KNOWN LIMIT (Linux, reasoned): a zombie counts
+as a group member there, so under a PID 1 that never reaps (a container with no
+init) the sweep never ends and that worktree stays claimed until the watchdog
+pid is killed by hand.
+
 A gate started BY a pooled gate in the same worktree (the pre-push hook under a
 gate step that uploads, a gate run from a step) runs under its holder's slots
 instead of waiting on them, one such nested run at a time; one that would cost
@@ -361,7 +394,8 @@ one.
   flag warns `unrecognized argument '--pool-run'`, ignores it and the name, and
   runs the repo's FULL GATE: that warning is the one case a caller reports as
   NOT RUN. Otherwise the runner was killed before it could print the line, and
-  the command may STILL BE RUNNING (until the A4 watchdog, nothing reaps it):
+  the command may STILL BE RUNNING (the orphan watchdog kills its group about a
+  second after the runner dies, later only for a process the kernel will not kill):
   report the outcome as UNKNOWN, and check for the command's live processes
   before any retry, since a blind retry can run it twice in one worktree. A
   caller checks its leg first (`grep -q -- '--pool-run' <the literal leg

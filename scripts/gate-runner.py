@@ -48,6 +48,14 @@ With the pool on a serial step runs in its own process group with /dev/null as
 stdin, INT/TERM/HUP/QUIT are forwarded to it (SIGTSTP is not), and the whole
 run is killed at `job_timeout_s` (exit 1, `KILLED`, a fail receipt).
 
+THE ORPHAN WATCHDOG (#539 A4). Wherever a step runs in a process group of its own
+(the parallel path, pool on or off; the pooled serial path; `--pool-run`) the
+runner also starts one small `python3` child that SIGKILLs every registered group
+once the runner is gone, SIGKILL included; each step starts held until its group
+is registered. With the pool on it also holds the worktree's `.sweep` claim, so a
+dead holder's worktree stays busy until its orphans are gone. The pool-off serial
+path starts none.
+
 Exit codes: 0 = all gates passed / skipped / fell open; 75 = NOT RUN (pool on,
 no slot in time); 130 = SIGINT while waiting for a slot (NOT RUN); other
 non-zero = a required gate failed (1) or a config error (2).
@@ -66,6 +74,7 @@ live processes before any retry.
 
 Run: python3 gate-runner.py   (from anywhere inside the repo)
 """
+import fcntl
 import glob
 import hashlib
 import io
@@ -75,6 +84,7 @@ import re
 import shutil
 import signal
 import subprocess
+import subprocess as _sp   # the watchdog's: a harness that stubs `subprocess` never stubs it
 import sys
 import tempfile
 import time
@@ -480,6 +490,7 @@ def _prune_lingering(lingering):
     signalling a pgid the kernel has since recycled for an unrelated process."""
     for pgid in [g for g in lingering if not _group_alive(g)]:
         lingering.discard(pgid)
+        _unwatch(pgid)
 
 
 def _reap(p, block=False):
@@ -526,6 +537,296 @@ def _terminate_groups(running, lingering=(), grace=KILL_GRACE_S):
             pass
 
 
+# --- The orphan watchdog (#539, PR A4) ---------------------------------------
+#
+# Design: DESIGN-gate-pool.md section 4, "The orphan watchdog". A step group lives in a
+# process group of its own, so a runner killed by SIGKILL (which no handler sees) would leave
+# it running; with the pool on, its slots are already free. So the runner starts ONE tiny
+# `python3 -c` child in a session of its own whose stdin is a pipe: `+<pgid>` when a step
+# group starts, `-<pgid>` once it is gone, `S<path>` for a `.sweep` claim file. On EOF (the
+# runner is gone, however it died) the watchdog SIGKILLs every group still listed, re-sends
+# SIGKILL each second until every one is gone (no time limit), and only then exits, which
+# frees the `.sweep` lock it holds. An `S<path>` it cannot open or lock ends its reading at
+# once (it sweeps what is listed and exits 3), so the runner's claim() sees it gone and fails
+# fast instead of waiting CLAIM_WAIT_S under admit.lock. It covers the parallel step path, the pooled serial step
+# path and `--pool-run`; the pool-OFF serial path has no group and never starts one.
+
+# Doctor's third pool-capable part: the claim this copy makes about itself that a SIGKILLed
+# holder leaves no step group running (DESIGN-gate-pool.md section 4). It must stay a plain
+# assignment at column 0; test-gate-watchdog.py ties it to a working watchdog.
+POOL_WATCHDOG = 1
+
+# The watchdog's whole program. It inherits no descriptor but its stdin pipe (close_fds), holds
+# no lock but the `.sweep` files it opens ITSELF, and never signals a pgid the runner pruned.
+_WATCHDOG_SRC = r"""
+import fcntl, os, signal, time
+def trace(line):
+    pass
+def alive(g):
+    try:
+        os.killpg(g, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+groups, claims, buf, failed = set(), [], b"", False
+while not failed:
+    chunk = os.read(0, 4096)
+    if not chunk:
+        break
+    buf += chunk
+    *lines, buf = buf.split(b"\n")
+    for line in lines:
+        trace(line)
+        try:
+            if line[:1] == b"+":
+                groups.add(int(line[1:]))
+            elif line[:1] == b"-":
+                groups.discard(int(line[1:]))
+            elif line[:1] == b"S":
+                try:
+                    fd = os.open(line[1:], os.O_RDONLY)
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                except OSError:
+                    failed = True
+                    break
+                claims.append(fd)
+        except ValueError:
+            pass
+trace(b"EOF")
+last = None
+while groups:
+    if last is None or time.monotonic() - last >= 1.0:
+        for g in sorted(groups):
+            trace(b"K%d" % g)
+            try:
+                os.killpg(g, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        last = time.monotonic()
+    groups = {g for g in groups if alive(g)}
+    if groups:
+        time.sleep(0.02)
+trace(b"DONE")
+raise SystemExit(3 if failed else 0)
+"""
+# A watched step starts HELD: its shell reads one byte from the start pipe (its stdin) before
+# it runs anything, then takes /dev/null as stdin and execs the shell `shell=True` would have
+# run, in the same process (same pid, same group). A pipe at EOF (the runner died before the
+# byte) exits 1 having run nothing. The variable `read` fills is not exported (unless the
+# caller's environment already exports that unlikely name) and dies with the exec.
+_HOLD = 'IFS= read -r __gate_runner_hold || exit 1; exec </dev/null; exec /bin/sh -c "$1"'
+# Where os.waitid exists a leader's exit is seen WITHOUT reaping it: an unreaped zombie keeps
+# its number, so a group it was the last member of is pruned BEFORE the reap (no reuse window).
+_WAITID = all(hasattr(os, n) for n in ("waitid", "WNOWAIT", "WEXITED", "WNOHANG", "P_PID"))
+CLAIM_WAIT_S = 10.0   # how long a holder waits under admit.lock for its watchdog's claim
+_WD = None            # this run's _Watchdog; False once one could not be had (pool off only)
+
+
+class _ClaimError(OSError):
+    """The watchdog did not take the `.sweep` claim: the gate is NOT RUN, reason pool-watchdog."""
+
+
+class _Watchdog:
+    """The runner's side of the death pipe. `required` (the pool is on): a watchdog that
+    cannot be told something is an error, never a silent gap in the budget's promise."""
+
+    def __init__(self, required):
+        self.required, self.listed, self.broken = required, set(), False
+        # Its own session: no terminal signal reaches it, and the runner's death is its EOF.
+        # The mask is cleared in the child: one started inside a launch window must still
+        # die of a SIGTERM sent by hand (which is how a stuck sweep is released).
+        self.proc = _sp.Popen(
+            [sys.executable, "-I", "-B", "-c", _WATCHDOG_SRC], stdin=_sp.PIPE,
+            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, cwd="/", close_fds=True,
+            start_new_session=True,
+            preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, []))
+        self.pid = self.proc.pid
+
+    def send(self, line):
+        if self.broken:
+            raise BrokenPipeError("the orphan watchdog is gone")
+        try:
+            os.write(self.proc.stdin.fileno(), line + b"\n")
+        except OSError:
+            self.broken = True
+            raise
+
+    def claim(self, path):
+        """Hand the `.sweep` file at `path` to the watchdog and return once IT holds the lock
+        (a fresh try-lock here fails). Called by gate_pool under admit.lock, which the caller
+        keeps until this returns, so no evaluator ever sees the file unlocked."""
+        raw = os.fsencode(path)
+        if b"\n" in raw:
+            raise _ClaimError(f"a sweep path with a newline cannot be sent: {path!r}")
+        try:
+            self.send(b"S" + raw)
+            end = time.monotonic() + CLAIM_WAIT_S
+            while True:
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return                 # the watchdog has it
+                finally:
+                    os.close(fd)           # a trial lock that won is dropped at once
+                if self.proc.poll() is not None or time.monotonic() >= end:
+                    raise _ClaimError("the orphan watchdog did not take the sweep claim")
+                time.sleep(0.001)
+        except _ClaimError:
+            raise
+        except OSError as e:
+            raise _ClaimError(f"the orphan watchdog did not take the sweep claim: {e}") from e
+
+    def close(self, wait=5.0):
+        """The run is over: EOF to the watchdog, then wait (bounded) for it to exit. Every group
+        is already pruned, so it exits at once; one still listed is alive and is killed."""
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.proc.wait(timeout=wait)
+        except _sp.TimeoutExpired:         # it is still sweeping a live group: let it
+            pass
+
+
+def _watchdog():
+    """This run's watchdog, started on first use -> a _Watchdog, or None with the pool off when
+    none could be started (one warning; the steps then run unwatched, as before A4)."""
+    global _WD
+    if _WD is None:
+        try:
+            _WD = _Watchdog(False)
+        except (OSError, ValueError) as e:
+            warn(f"could not start the orphan watchdog ({e}); a SIGKILLed runner may leave "
+                 "its step groups running")
+            _WD = False
+    return _WD or None
+
+
+def _watchdog_start():
+    """The pool is ON: a watchdog is REQUIRED before any ticket is taken (it holds the sweep
+    claim). -> None, or the reason it could not be had (the caller says NOT RUN)."""
+    global _WD
+    try:
+        if _WD:
+            _WD.required = True
+        else:
+            _WD = _Watchdog(True)
+    except (OSError, ValueError) as e:
+        return f"could not start the orphan watchdog: {e}"
+    return None
+
+
+def _watchdog_close():
+    global _WD
+    if _WD:
+        _WD.close()
+    _WD = None
+
+
+def _watch(pgid):
+    """`+<pgid>`: list a group with the watchdog. Raises only when the pool is on."""
+    wd = _watchdog()
+    if wd is None:
+        return
+    try:
+        wd.send(b"+%d" % pgid)
+        wd.listed.add(pgid)
+    except OSError as e:
+        if wd.required:
+            raise
+        if wd.broken and not getattr(wd, "warned", False):
+            wd.warned = True
+            warn(f"the orphan watchdog is gone ({e}); later step groups run unwatched")
+
+
+def _unwatch(pgid):
+    """`-<pgid>`: the group is gone, so the watchdog must never signal that number again."""
+    wd = _WD or None
+    if wd is None or pgid not in wd.listed:
+        return
+    wd.listed.discard(pgid)
+    try:
+        wd.send(b"-%d" % pgid)
+    except OSError:
+        pass                               # nothing left to tell: it is gone
+
+
+def _unwatch_if_gone(pgid):
+    if not _group_alive(pgid):
+        _unwatch(pgid)
+
+
+def _prune_watched(wait=0.0):
+    """Drop every listed group that is gone, waiting up to `wait` seconds for the ones a sweep
+    just SIGKILLed to finish dying. One still alive then stays listed: it is a live group (its
+    number cannot be reused), and the watchdog kills it again if the runner goes."""
+    end = time.monotonic() + wait
+    while True:
+        for pgid in sorted(_WD.listed if _WD else ()):
+            _unwatch_if_gone(pgid)
+        if not (_WD and _WD.listed) or time.monotonic() >= end:
+            return
+        time.sleep(POLL_S)
+
+
+def _held_popen(popen, command, **kw):
+    """Start `command` HELD -> (proc, start fd). Nothing in it runs until `_release`."""
+    r, w = os.pipe()
+    try:
+        proc = popen(["/bin/sh", "-c", _HOLD, "sh", command], stdin=r, **kw)
+    except BaseException:
+        os.close(w)
+        raise
+    finally:
+        os.close(r)
+    return proc, w
+
+
+def _release(proc, w):
+    """List the step's group with the watchdog, THEN send its start byte: a runner killed in
+    between leaves a listed group (which the watchdog kills) that never ran anything. With the
+    pool on, a watchdog that cannot be told raises OSError and the step never starts (its
+    start pipe closes at EOF and it exits having run nothing)."""
+    try:
+        _watch(proc.pid)
+        try:
+            os.write(w, b"\n")
+        except BrokenPipeError:            # the held shell is already gone: its exit says so
+            pass
+    finally:
+        os.close(w)
+
+
+def _leader_gone(proc):
+    """True once the step's leader has exited, WITHOUT reaping it where os.waitid exists (its
+    zombie then keeps its number until the group is pruned); else this reaps it."""
+    if proc.returncode is not None:
+        return True
+    if _WAITID:
+        try:
+            return os.waitid(os.P_PID, proc.pid,
+                             os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+        except ChildProcessError:
+            pass                           # not a child of ours (a harness stand-in)
+    return _reap(proc)
+
+
+def _poll_leader(proc):
+    """proc.poll() for the parallel path, with the prune order: a leader whose exit os.waitid
+    reports is still an unreaped zombie, so the group it was the last member of is pruned
+    from the watchdog BEFORE poll() reaps it."""
+    if proc.returncode is None and _WAITID:
+        try:
+            if os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+                return None
+            _unwatch_if_gone(proc.pid)
+        except ChildProcessError:
+            pass
+    return proc.poll()
+
+
 # --- Pooled serial step path (#539, PR A2; reached ONLY with the pool on) -----
 #
 # Design: DESIGN-gate-pool.md section 4, "Pooled serial step path". With the pool
@@ -561,12 +862,19 @@ def _pool_overdue():
 def _sweep_step(proc):
     """The SIGTERM-then-SIGKILL sweep of one serial step's group, on EVERY exit
     path. A leader still running (a step that outlived a forwarded signal) is
-    killed with its group and reaped; a leader already reaped may have left a
-    background job in the group, which must not outlive the slots."""
-    if not _reap(proc):
+    killed with its group and reaped; a leader that exited may have left a
+    background job in the group, which must not outlive the slots. Then the
+    PRUNE ORDER (A4): the group is dropped from the watchdog, and only then is a
+    leader still unreaped (os.waitid saw its exit) reaped, so its number cannot
+    be reused while the watchdog still lists it. Where a zombie leader still
+    counts as a member (Linux), the leader is reaped first and the pgid pruned
+    the instant after: the narrow residual DESIGN-gate-pool.md states."""
+    if not _leader_gone(proc):
         _terminate_groups({0: {"proc": proc}})
-    elif _group_alive(proc.pid):
+    elif _group_alive(proc.pid) and _reap(proc, block=True) and _group_alive(proc.pid):
         _terminate_groups({}, [proc.pid])
+    _prune_watched(KILL_GRACE_S if _group_alive(proc.pid) else 0.0)
+    _reap(proc, block=True)
 
 
 def _run_group(command, cwd, session=False, env=None):
@@ -587,10 +895,17 @@ def _run_group(command, cwd, session=False, env=None):
     # child inherits the mask through fork, so preexec_fn puts the caller's back.
     prev = signal.pthread_sigmask(signal.SIG_BLOCK, _FORWARD_SIGS)
     try:
-        proc = subprocess.Popen(
-            command, shell=True, cwd=cwd, stdin=subprocess.DEVNULL, env=env,
+        # HELD (A4): nothing runs until the group is listed with the watchdog. The held
+        # shell takes /dev/null as the step's stdin once it has its start byte.
+        proc, start = _held_popen(
+            subprocess.Popen, command, cwd=cwd, env=env,
             process_group=None if session else 0, start_new_session=session,
             preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, prev))
+        try:
+            _release(proc, start)
+        except OSError:                    # pool on, no watchdog: the step ran nothing
+            _reap(proc, block=True)
+            raise
         # The handlers only RECORD (#546: one that raises can land inside any
         # call). A signal inherited as ignored stays ignored, runner and step
         # alike, as with the pool off.
@@ -601,7 +916,7 @@ def _run_group(command, cwd, session=False, env=None):
         signal.pthread_sigmask(signal.SIG_SETMASK, prev)
     sent, give_up, delay, overdue = 0, None, 0.001, False
     try:
-        while not _reap(proc):
+        while not _leader_gone(proc):
             if _pool_overdue():            # the sweep below is the kill
                 overdue = True
                 break
@@ -753,6 +1068,7 @@ def run_form_b_parallel(steps, root, memoize_dir, jobs, cli_skip=None):
     old = {s: signal.signal(s, _note) for s in _LAUNCH_SIGS
            if not (s == signal.SIGINT
                    and signal.getsignal(s) == signal.SIG_IGN)}
+    _watchdog()   # A4: started BEFORE any launch window (a pool-on main() already has one)
     try:
         while True:
             if got:
@@ -807,13 +1123,19 @@ def run_form_b_parallel(steps, root, memoize_dir, jobs, cli_skip=None):
                 prev = signal.pthread_sigmask(signal.SIG_BLOCK, _LAUNCH_SIGS)
                 try:
                     try:
+                        # HELD (A4): nothing runs until the group is listed with
+                        # the watchdog; the held shell then takes /dev/null as stdin.
                         with open(e["out"], "wb") as out:
-                            e["proc"] = subprocess.Popen(
-                                e["run"], shell=True, cwd=root,
-                                stdin=subprocess.DEVNULL, stdout=out,
+                            e["proc"], start = _held_popen(
+                                subprocess.Popen, e["run"], cwd=root, stdout=out,
                                 stderr=subprocess.STDOUT, start_new_session=True,
                                 preexec_fn=lambda: signal.pthread_sigmask(
                                     signal.SIG_SETMASK, prev))
+                        try:
+                            _release(e["proc"], start)
+                        except OSError:    # pool on, no watchdog: it ran nothing
+                            _reap(e["proc"], block=True)
+                            raise
                     except OSError as err:
                         e["post"].append(
                             f"[FAIL] {e['name']}: could not launch ({err}), "
@@ -835,13 +1157,15 @@ def run_form_b_parallel(steps, root, memoize_dir, jobs, cli_skip=None):
             _prune_lingering(lingering)
             for idx in list(running):
                 e = running[idx]
-                code = e["proc"].poll()
+                code = _poll_leader(e["proc"])
                 if code is None:
                     continue
                 del running[idx]
                 # The leader is reaped, but a background descendant may still
-                # hold its group; keep that group for the final sweep.
+                # hold its group; keep that group for the final sweep. One that
+                # is already empty leaves the watchdog's list NOW (A4).
                 lingering.add(e["proc"].pid)
+                _unwatch_if_gone(e["proc"].pid)
                 ok = code == 0
                 e["post"].append(f"[{'PASS' if ok else 'FAIL'}] {e['name']} "
                                  f"(exit {code}, "
@@ -881,6 +1205,7 @@ def run_form_b_parallel(steps, root, memoize_dir, jobs, cli_skip=None):
         _prune_lingering(lingering)
         if running or lingering:
             _terminate_groups(running, lingering)
+            _prune_watched(KILL_GRACE_S)
             for e in running.values():
                 e["post"].append(f"[FAIL] {e['name']} (cancelled, "
                                  f"{time.perf_counter() - e['start']:.1f}s)")
@@ -1474,9 +1799,11 @@ POOL_KEYS = ("protocol", "budget", "backfill_bypass_limit", "small_check_cap",
 
 
 def _pool_home():
-    """The pool root: $GATEQ_HOME (empty reads as unset), else ~/.claude/gate-queue."""
-    return os.environ.get("GATEQ_HOME") or os.path.join(
-        os.path.expanduser("~"), ".claude", "gate-queue")
+    """The pool root: $GATEQ_HOME (empty reads as unset), else ~/.claude/gate-queue. Made
+    ABSOLUTE here: the watchdog runs with cwd "/", so a relative `.sweep` path sent to it would
+    name another file (or none)."""
+    return os.path.abspath(os.environ.get("GATEQ_HOME") or os.path.join(
+        os.path.expanduser("~"), ".claude", "gate-queue"))
 
 
 def _pool_config():
@@ -1573,6 +1900,14 @@ def _pool_say(line):
 
 
 def _pool_enter(cfg, root, cost, kind="gate", name="gate"):
+    """_pool_take, and the watchdog it started is closed again when nothing was granted."""
+    got = _pool_take(cfg, root, cost, kind, name)
+    if got[0] is None:
+        _watchdog_close()
+    return got
+
+
+def _pool_take(cfg, root, cost, kind, name):
     """Take `cost` units, waiting for them -> (holder, None, None), or (None, exit code,
     reason slug) with the reason already printed: 2 for a pool this code cannot use, 75 for
     a wait that gave up (NOT RUN), 130 for an interrupted wait. `kind` is `gate` (a hand-run
@@ -1592,6 +1927,12 @@ def _pool_enter(cfg, root, cost, kind="gate", name="gate"):
         if where not in sys.path:          # a runner reached through a symlink
             sys.path.insert(0, where)
         import gate_pool
+        # A4: the watchdog first. The grant takes the worktree's `.sweep` claim through it, and
+        # without one a SIGKILLed holder would free its worktree beside its running steps.
+        why = _watchdog_start()
+        if why:
+            _pool_say(f"gate-runner: NOT RUN - {why}")
+            return None, 2, "pool-watchdog"
         try:
             # Pool() refuses another pool protocol and a root that is not the user's own 0700
             # directory BEFORE it touches anything there.
@@ -1600,13 +1941,16 @@ def _pool_enter(cfg, root, cost, kind="gate", name="gate"):
             # taken, from the worktree ROOT (a subdirectory would get a different key).
             key = gate_pool.worktree_key(root)
             return pool.acquire(kind, name, cost, key, environ=os.environ,
-                                say=_pool_say), None, None
+                                say=_pool_say, sweeper=_WD), None, None
         except gate_pool.NotRun as e:
             _pool_say(e.message)
             return None, e.code, e.reason
         except KeyboardInterrupt:          # the ticket was given up by acquire()
             _pool_say("gate-runner: NOT RUN - interrupted while waiting for a gate slot")
             return None, 130, "interrupted"
+        except _ClaimError as e:           # the watchdog's half of the grant: its own reason
+            _pool_say(f"gate-runner: NOT RUN - {e}")
+            return None, 2, "pool-watchdog"
         except OSError as e:               # a pool directory this run cannot use: never unpooled
             _pool_say(f"gate-runner: NOT RUN - pool error: {e}")
             return None, 2, "pool-error"
@@ -1791,6 +2135,7 @@ def _pool_run(argv):
                     status = proc.returncode if proc.returncode >= 0 else 128 - proc.returncode
     finally:
         _POOL_RUN = None
+        _watchdog_close()                  # A4: first, so its `.sweep` claim is free to unlink
         if holder is not None:
             try:
                 holder.release()
@@ -1881,6 +2226,7 @@ def main(argv=None):
         signalled = e.sig
     finally:
         _POOL_RUN = None
+        _watchdog_close()                  # A4: first, so its `.sweep` claim is free to unlink
         if holder is not None:
             try:
                 holder.release()
