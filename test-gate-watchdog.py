@@ -513,8 +513,9 @@ def case_nested(tmp, home):
     tp.wait_for("the waiter to wait", lambda: "waiting" in tp.read(p1.err), p1, timeout=30)
     sweeps = sorted(n for n in os.listdir(os.path.join(home, "waiters")) if n.endswith(".sweep"))
     same("nested: the holder and its nested run each hold a `.sweep` claim of their own",
-         [re.sub(r"\.[0-9]+\.sweep$", ".<pid>.sweep", re.sub(r"^.*?\.ticket", "T", n))
-          for n in sweeps], ["T.<pid>.sweep", "T.sweep"])
+         [re.sub(r"\.[0-9]+\.[0-9a-f]{8}\.sweep$", ".<pid>.<hex>.sweep",
+                 re.sub(r"^.*?\.ticket", "T", n))
+          for n in sweeps], ["T.<pid>.<hex>.sweep", "T.sweep"])
     sigkill(h)
     t0 = time.monotonic()
     while time.monotonic() - t0 < 3.0 and not started(w1):
@@ -535,7 +536,7 @@ def case_busy():
         waiters = os.path.join(home, "waiters")
         rec = {"pool_protocol": gp.POOL_PROTOCOL, "worktree": "/wt/a", "pid": 4242}
         held = {}
-        for name in ("0000000009-x-aa.ticket.sweep", "0000000009-x-aa.ticket.777.sweep"):
+        for name in ("0000000009-x-aa.ticket.sweep", "0000000009-x-aa.ticket.777.0a1b2c3d.sweep"):
             path = tp.put(os.path.join(waiters, name), json.dumps(rec) + "\n")
             fd = os.open(path, os.O_RDONLY)
             fcntl.flock(fd, fcntl.LOCK_EX)
@@ -549,9 +550,9 @@ def case_busy():
              (False, "gate-runner: waiting for this worktree (held by sweep pid 4242)"))
         same("busy: a waiter in another worktree starts", other.poll(), True)
         os.close(held.pop("0000000009-x-aa.ticket.sweep"))
-        same("busy: a nested run's held `<ticket>.<pid>.sweep` claims it just the same",
+        same("busy: a nested run's held `<ticket>.<pid>.<hex>.sweep` claims it just the same",
              w.poll(), False)
-        os.close(held.pop("0000000009-x-aa.ticket.777.sweep"))
+        os.close(held.pop("0000000009-x-aa.ticket.777.0a1b2c3d.sweep"))
         same("busy: once every claim is free the waiter starts, the free claims of this protocol "
              "are unlinked, and one of another protocol is left alone",
              (w.poll(), sorted(n for n in tp.listing(home) if n.endswith(".sweep"))),
@@ -580,8 +581,8 @@ class _Sweeper:
     """A stand-in watchdog for the gate_pool side: records what it was asked, locks the claim
     on a descriptor of its own (as the real one does in its own process)."""
 
-    def __init__(self, home, fail=False):
-        self.pid, self.home, self.fail, self.fds, self.seen = 4343, home, fail, [], []
+    def __init__(self, home, fail=False, pid=4343):
+        self.pid, self.home, self.fail, self.fds, self.seen = pid, home, fail, [], []
 
     def claim(self, path):
         admit_free = gp_free(os.path.join(self.home, "admit.lock"))
@@ -629,6 +630,94 @@ def case_claim():
               [gp_free(os.path.join(home, "slots", n)) for n in tp.listing(home, "slots")]),
              (True, [], "waiting", [True] * 10))
         w.leave()
+
+
+def _locked(path, text):
+    """Write `path` and hold an exclusive flock on it (an orphan watchdog's claim) -> fd."""
+    tp.put(path, text)
+    fd = os.open(path, os.O_RDONLY)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def case_claim_exclusive():
+    # PR #581 review: a claim is never written over an existing file. A reused pid under the
+    # same holder must not replace a claim whose OLD inode an orphan watchdog still flocks.
+    with tempfile.TemporaryDirectory(prefix="wd-excl-") as tmp:
+        home = os.path.join(tmp, "gq")
+        pool = gp.Pool(home, tp.cfg())
+        h = pool.enter("gate", "gate", 4, "/wt/e", sweeper=_Sweeper(home))
+        h.poll()
+        hname = os.path.basename(h.path)
+        waiters = os.path.join(home, "waiters")
+        rec = {"pool_protocol": gp.POOL_PROTOCOL, "worktree": "/wt/e", "pid": 5151,
+               "nest": hname + ".nest"}
+        # A direct claim at a path that exists is REFUSED and touches nothing.
+        taken = os.path.join(waiters, hname + ".1.0a0a0a0a.sweep")
+        fd0 = _locked(taken, json.dumps(rec) + "\n")
+        ino = os.stat(taken).st_ino
+        s0 = _Sweeper(home, pid=6161)
+        with pool._admit():
+            try:
+                pool._claim(taken, "/wt/e", s0)
+                refused = False
+            except FileExistsError:
+                refused = True
+        same("claim exclusive: a claim at a path that already exists is refused: the existing "
+             "file keeps its inode, its lock and its record, and no watchdog was handed it",
+             (refused, os.stat(taken).st_ino == ino, not gp_free(taken),
+              tp._load_json(taken), s0.seen), (True, True, True, rec, []))
+        os.close(fd0)
+        # A nested run (one level down a live chain) whose OWN pid names a held claim of an
+        # ancestor-depth run (a SIGKILLed ancestor's, still sweeping): it starts, and its claim
+        # is a separate file beside the held one.
+        parent = _locked(os.path.join(waiters, hname + ".nest"), "")
+        old = os.path.join(waiters, "%s.%d.sweep" % (hname, os.getpid()))
+        fd1 = _locked(old, json.dumps(rec) + "\n")
+        ino = os.stat(old).st_ino
+        s1 = _Sweeper(home, pid=7171)
+        n = pool.nested(2, "/wt/e", {"GATEQ_HOLDER": h.path,
+                                    "GATEQ_NEST": os.path.join(waiters, hname + ".nest")},
+                        print, s1)
+        started_ = n is not None and n.poll()
+        mine = [x[0] for x in s1.seen]
+        same("claim exclusive: a nested run whose pid names a HELD claim never replaces it: that "
+             "claim keeps its inode, lock and record, and the run's own claim is another file",
+             (started_, os.stat(old).st_ino == ino, not gp_free(old), tp._load_json(old),
+              len(mine) == 1 and mine[0] != os.path.basename(old)),
+             (True, True, True, rec, True))
+        n.leave(); s1.let_go(); os.close(fd1); os.close(parent)
+        h.holder.release()
+
+
+def case_nested_sweep():
+    # PR #581 review: a nested run that is done (its child lock free) while its watchdog still
+    # kills its groups keeps the NEXT nested run under that holder from starting beside them.
+    with tempfile.TemporaryDirectory(prefix="wd-nsweep-") as tmp:
+        home = os.path.join(tmp, "gq")
+        pool = gp.Pool(home, tp.cfg())
+        hs = _Sweeper(home)
+        h = pool.enter("gate", "gate", 4, "/wt/s", sweeper=hs)
+        h.poll()
+        env = {"GATEQ_HOLDER": h.path}
+        s1, s2, s3 = (_Sweeper(home, pid=p) for p in (8101, 8102, 8103))
+        n1 = pool.nested(2, "/wt/s", env, print, s1)
+        same("nested sweep: the first nested run starts and takes its claim",
+             (n1.poll(), len(s1.seen)), (True, 1))
+        n1.leave()                     # done; its watchdog (s1) is still sweeping
+        n2 = pool.nested(2, "/wt/s", env, print, s2)
+        same("nested sweep: a second nested run under the same holder does not start while the "
+             "first one's `.sweep` is still held, and says so",
+             (n2.poll(), n2.status(), s2.seen),
+             (False, "gate-runner: waiting for a nested sweep under this holder to finish "
+                     "(sweep pid 8101)", []))
+        s1.let_go()
+        same("nested sweep: it starts once that sweep is done", n2.poll(), True)
+        # A nested run's OWN child (one level down) is not held up by its live parent's claim.
+        n3 = pool.nested(1, "/wt/s", {**env, **n2.holder.child_env()}, print, s3)
+        same("nested sweep: a nested run's own child starts beside its live parent's claim "
+             "(an ancestor never blocks)", n3 is not None and n3.poll(), True)
+        n3.leave(); s3.let_go(); n2.leave(); s2.let_go(); h.holder.release(); hs.let_go()
 
 
 @case_of
@@ -722,6 +811,7 @@ CASES = [
     ("held", case_held), ("inherit", case_inherit), ("sweep-claim", case_sweep_claim),
     ("nested", case_nested), ("busy", case_busy), ("nest-file", case_nest_file),
     ("claim", case_claim), ("claim-fail", case_claim_fail), ("claim-fast", case_claim_fast),
+    ("claim-exclusive", case_claim_exclusive), ("nested-sweep", case_nested_sweep),
     ("relative-home", case_relative_home), ("pool-off-serial", case_pool_off_serial),
 ]
 
@@ -834,6 +924,31 @@ MUTATIONS = [
      "claim-fail",
      "claim fail: a `--pool-run` whose watchdog cannot take the claim is NOT RUN with "
      "reason=pool-watchdog (the watchdog's claim), not pool-error"),
+    # --- the bot review round (PR #581): exclusive nested claims, nested runs wait on a sweep ---
+    ("a nested claim named by pid alone and written over an existing file", M,
+     [('                sweep = os.path.join(self.pool.waiters, "%s.%d.%s.sweep" % (\n'
+       '                    hname, os.getpid(), os.urandom(4).hex()))\n',
+       '                sweep = os.path.join(self.pool.waiters, "%s.%d.sweep" % (\n'
+       '                    hname, os.getpid()))\n'),
+      ("            os.link(tmp, path)             # exclusive: EEXIST leaves the existing claim alone\n",
+       "            os.replace(tmp, path)\n")],
+     "claim-exclusive",
+     "claim exclusive: a nested run whose pid names a HELD claim never replaces it: that claim "
+     "keeps its inode, lock and record, and the run's own claim is another file"),
+    ("a claim written over an existing file", M,
+     [("            os.link(tmp, path)             # exclusive: EEXIST leaves the existing claim alone\n",
+       "            os.replace(tmp, path)\n")],
+     "claim-exclusive",
+     "claim exclusive: a claim at a path that already exists is refused: the existing file keeps "
+     "its inode, its lock and its record, and no watchdog was handed it"),
+    ("a nested run that ignores a held nested `.sweep`", M,
+     [("            if orphan is not None:\n", "            if False:\n")], "nested-sweep",
+     "nested sweep: a second nested run under the same holder does not start while the first "
+     "one's `.sweep` is still held, and says so"),
+    ("a nested run blocked by its own ancestors' claims", M,
+     [("            ancestors.add(cur)\n", "            pass\n")], "nested-sweep",
+     "nested sweep: a nested run's own child starts beside its live parent's claim (an ancestor "
+     "never blocks)"),
 ]
 
 

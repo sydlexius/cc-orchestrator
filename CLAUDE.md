@@ -309,7 +309,9 @@ Runtime (`scripts/`; canonical source is this repo):
   prune comes BEFORE the reap (`os.waitid` with `WNOWAIT` leaves the leader an unreaped zombie
   that keeps its number) ONLY for a leader that was ALONE in its group, on the pooled serial
   step sweep and the parallel leader poll, where the platform reports a zombie-only group as
-  gone (macOS, measured). Everywhere else the reap comes first and the narrow residual stands
+  gone (macOS with Python 3.13 or later, where `os.waitid` exists; measured). Older macOS
+  Pythons take the reap-first order below, and CI pins Python 3.12, so macOS CI exercises
+  reap-first. Everywhere else the reap comes first and the narrow residual stands
   (milliseconds, needing exact pid reuse): the serial sweep's background-job branch,
   `_terminate_groups` (the cancel, overdue and give-up paths), parallel lingering groups, and
   Linux as coded (it counts the zombie as a member). LINUX ZOMBIES: `killpg(g, 0)` counts a
@@ -319,10 +321,16 @@ Runtime (`scripts/`; canonical source is this repo):
   reaps. No `/proc`, or a group `/proc` does not show, keeps the `killpg` answer (alive, on
   doubt). MEASURED in a Linux container (non-root): without it the `protocol` and `claim-fast`
   cases hang, exactly as the first PR #581 CI run failed. THE SWEEP CLAIM: with the pool on the grant writes `waiters/<ticket>.sweep`
-  (`{pool_protocol, worktree, pid}`; a nested run its own `<holder ticket>.<its pid>.sweep`)
-  under `admit.lock`, hands it to the watchdog, and keeps `admit.lock` until a try-lock on it
+  (`{pool_protocol, worktree, pid}`; a nested run its own
+  `<holder ticket>.<its pid>.<random hex>.sweep`, whose record adds `nest`, the child lock it
+  holds) under `admit.lock`, staged and HARD-LINKED into place so an existing path is REFUSED,
+  never written over (PR #581 review: a reused pid must not hide a claim an orphan watchdog
+  still holds), hands it to the watchdog, and keeps `admit.lock` until a try-lock on it
   FAILS (the WATCHDOG holds the lock, from its own open); `busy` counts every held `.sweep`
-  (`held by sweep pid <n>`), a free one of this protocol is unlinked by any evaluator. So a
+  (`held by sweep pid <n>`), a free one of this protocol is unlinked by any evaluator. A NESTED
+  run also waits (never fails) while a held nested claim under its holder that is not one of
+  its ancestors' exists, i.e. an earlier nested run is done but its watchdog still sweeps
+  (`waiting for a nested sweep under this holder to finish`). So a
   SIGKILLed holder frees its SLOTS at once and its WORKTREE once its orphans are gone. With the
   pool on a watchdog that cannot start or take the claim is NOT RUN (exit 2, reason
   `pool-watchdog`); pool off it is one warning. An `S<path>` the watchdog cannot open or lock

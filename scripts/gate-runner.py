@@ -665,6 +665,9 @@ class _Watchdog:
         self.pid = self.proc.pid
 
     def send(self, line):
+        """Write one protocol line (`+<pgid>`, `-<pgid>` or `S<path>`, no newline) to the
+        watchdog's stdin. Raises BrokenPipeError once a write has failed: a watchdog that missed
+        one line cannot be trusted with the next, so `broken` stays set."""
         if self.broken:
             raise BrokenPipeError("the orphan watchdog is gone")
         try:
@@ -741,6 +744,8 @@ def _watchdog_start():
 
 
 def _watchdog_close():
+    """End this run's watchdog (EOF, bounded wait; see `_Watchdog.close`) and forget it, so the
+    `.sweep` claim it held is free for the pool release that follows to unlink."""
     global _WD
     if _WD:
         _WD.close()
@@ -776,6 +781,7 @@ def _unwatch(pgid):
 
 
 def _unwatch_if_gone(pgid):
+    """Send `-<pgid>` only once the group has no live member; a live one stays listed."""
     if not _group_alive(pgid):
         _unwatch(pgid)
 

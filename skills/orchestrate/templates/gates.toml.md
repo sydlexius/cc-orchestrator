@@ -300,10 +300,13 @@ running. When the runner dies, SIGKILL included, the watchdog SIGKILLs every
 group still registered, again each second, until all are gone, and only then
 exits. With the pool on, the grant also takes a worktree claim,
 `waiters/<ticket>.sweep` (a nested run takes its own,
-`waiters/<holder ticket>.<pid>.sweep`), whose lock the WATCHDOG holds: a
+`waiters/<holder ticket>.<pid>.<random hex>.sweep`; a claim is created
+exclusively and never written over an existing file), whose lock the WATCHDOG
+holds: a
 SIGKILLed holder's slots free at once, but its worktree stays claimed until its
 orphans are gone, and a waiter there prints `waiting for this worktree (held by
-sweep pid <n>)`. There is no time limit: a process the kernel will not kill keeps
+sweep pid <n>)`. A nested run likewise waits while an earlier nested run under
+the same holder is done but its watchdog is still sweeping. There is no time limit: a process the kernel will not kill keeps
 that one worktree claimed while it lives, and killing that pid by hand releases
 it. STATED LIMITS: slots are not held through the sweep (for about a second an
 orphan's load can run on top of a full budget), and a watchdog killed together
@@ -312,8 +315,9 @@ a watchdog that cannot be started or cannot take the claim makes the run NOT
 RUN (exit 2, reason `pool-watchdog`), never unpooled, and a claim it cannot take
 fails at once; with the pool off it is one warning and the steps run as before.
 PRUNE ORDER, exactly: the runner tells the watchdog a group is gone BEFORE it
-reaps the leader only on macOS, for a leader that was alone in its group (the
-pooled serial step and the parallel leader poll). Everywhere else (a group the
+reaps the leader only on macOS with Python 3.13 or later (where `os.waitid`
+exists), for a leader that was alone in its group (the pooled serial step and
+the parallel leader poll). Everywhere else (older macOS Pythons, a group the
 leader left a background job in, a cancelled or timed-out run, the parallel
 path's lingering groups, and Linux) it reaps first, and a window of
 milliseconds remains in which a SIGKILLed runner leaves a listed number that the

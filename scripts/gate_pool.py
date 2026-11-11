@@ -10,7 +10,8 @@ function. The POOL ON DISK (`Pool`, `Waiter`, `Nested`, `Holder`) is sections 1,
 one kernel flock per budget unit under slots/, one flocked ticket per waiting or running
 process under waiters/, and ONE short lock, admit.lock, around every scheduling pass and every
 change to waiters/. A granted run also holds a worktree claim, waiters/<ticket>.sweep (a nested
-run its own <holder ticket>.<pid>.sweep), whose flock its caller's ORPHAN WATCHDOG holds (PR A4),
+run its own <holder ticket>.<pid>.<random hex>.sweep, created exclusively, never over an existing
+file), whose flock its caller's ORPHAN WATCHDOG holds (PR A4),
 so a holder killed by SIGKILL keeps its worktree busy until its orphaned step groups are gone. A run started BY a holder (a hook under its upload, a named command
 inside a gate step) goes under that holder's slots instead of waiting on them, on three exact
 conditions. No lock here can go stale: the kernel drops each one when its process dies.
@@ -370,15 +371,30 @@ class Pool:
             os.close(fd)
         os.replace(tmp, path)
 
-    def _claim(self, path, worktree, sweeper):
+    def _claim(self, path, worktree, sweeper, nest=None):
         """THE SWEEP CLAIM (doc section 4, "The orphan watchdog"). Under admit.lock: write the
-        `.sweep` record at `path` (`{pool_protocol, worktree, pid}`, `pid` the watchdog's), hand
-        it to the caller's watchdog, and return only once a try-lock on it FAILS, i.e. the
-        watchdog holds it. admit.lock is held throughout, so no evaluator ever sees the file
-        unlocked: a `.sweep` whose lock is free belongs to a finished watchdog. The record is
-        staged and renamed (nobody flocks it yet, so rule 3 allows that)."""
-        self._put(path, json.dumps({"pool_protocol": POOL_PROTOCOL, "worktree": worktree,
-                                    "pid": sweeper.pid}) + "\n")
+        `.sweep` record at `path` (`{pool_protocol, worktree, pid}`, `pid` the watchdog's, plus
+        `nest`, the basename of the child lock a NESTED run holds), hand it to the caller's
+        watchdog, and return only once a try-lock on it FAILS, i.e. the watchdog holds it.
+        admit.lock is held throughout, so no evaluator ever sees the file unlocked: a `.sweep`
+        whose lock is free belongs to a finished watchdog. The record is staged in tmp/ and
+        HARD-LINKED into place, which REFUSES an existing path (FileExistsError, nothing
+        touched): a claim is never written over another, whose old inode an orphan watchdog
+        may still hold (rule 3) while the new name hid it from every scan."""
+        rec = {"pool_protocol": POOL_PROTOCOL, "worktree": worktree, "pid": sweeper.pid}
+        if nest is not None:
+            rec["nest"] = nest
+        tmp = os.path.join(self.tmp, os.path.basename(path))
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, (json.dumps(rec) + "\n").encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.link(tmp, path)             # exclusive: EEXIST leaves the existing claim alone
+        finally:
+            _rm(tmp)
         try:
             sweeper.claim(path)
         except BaseException:
@@ -495,6 +511,37 @@ class Pool:
         if verdict == "leak":
             say("gate-runner: ignoring GATEQ_HOLDER, its holder is in another worktree "
                 f"({detail}); taking a ticket")
+        return None
+
+    def _nested_sweep(self, hname, lock):
+        """Under admit.lock, for a nested run about to take the child lock `lock` (a basename,
+        `<hname>.nest[.nest ...]`) under the holder ticket `hname` -> the watchdog pid (or "?")
+        of a HELD nested `.sweep` claim that is NOT one of this run's ancestors, else None.
+        The holder's own `<hname>.sweep` never counts. An ANCESTOR is a run holding a shorter
+        child lock of this chain (`<hname>.nest` .. the parent's): it is still running, and this
+        run is its child. Any other held nested claim (same depth or deeper) belongs to a run
+        that already let its child lock go while its watchdog still kills its groups, so this
+        run waits, as a same-worktree waiter waits on `busy` (doc section 4). A claim whose
+        record names no readable `nest` is DOUBT and also waits."""
+        ancestors, cur = set(), hname + ".nest"
+        while len(cur) < len(lock):
+            ancestors.add(cur)
+            cur += ".nest"
+        prefix = hname + "."
+        for name in sorted(os.listdir(self.waiters)):
+            if not (name.startswith(prefix) and name.endswith(".sweep")) \
+                    or name == hname + ".sweep":
+                continue
+            path = os.path.join(self.waiters, name)
+            if not _is_file(path):
+                continue
+            held, text = _probe(path)
+            if not held:
+                continue
+            rec = _load(text)
+            nest = rec.get("nest")
+            if not isinstance(nest, str) or nest not in ancestors:
+                return rec.get("pid", "?")
         return None
 
     def _free_slots(self):
@@ -664,6 +711,7 @@ class Nested:
     def __init__(self, pool, cost, worktree, environ, sweeper=None):
         self.pool, self.cost, self.worktree, self.environ = pool, cost, worktree, dict(environ)
         self.holder, self.lost, self.sweeper = None, False, sweeper
+        self._why = "gate-runner: waiting for another nested run under this holder to finish"
 
     def poll(self):
         """One try under admit.lock, where every child lock is created, opened and locked. The
@@ -679,16 +727,29 @@ class Nested:
             fd = _open_lock(lock)
             if not _try_lock(fd):
                 os.close(fd)
+                self._why = "gate-runner: waiting for another nested run under this holder to finish"
+                return False
+            hname = os.path.basename(self.environ["GATEQ_HOLDER"])
+            orphan = self.pool._nested_sweep(hname, os.path.basename(lock))
+            if orphan is not None:
+                # An EARLIER nested run under this holder is done (its child lock is free) but
+                # its watchdog is still killing that run's step groups: never start beside them.
+                os.close(fd)
+                self._why = ("gate-runner: waiting for a nested sweep under this holder to "
+                             f"finish (sweep pid {orphan})")
                 return False
             # A nested run starts step groups under its OWN watchdog, which may still be
             # killing them after its holder's watchdog is done: so it holds a claim of its own,
-            # `<holder ticket name>.<its pid>.sweep`, with the same worktree key.
+            # `<holder ticket name>.<its pid>.<random hex>.sweep`, with the same worktree key
+            # and the name of its child lock. The random part means a reused pid can never name
+            # a claim an orphan watchdog still holds, and `_claim` refuses an existing path.
             sweep = None
             if self.sweeper is not None:
-                sweep = os.path.join(self.pool.waiters, "%s.%d.sweep" % (
-                    os.path.basename(self.environ["GATEQ_HOLDER"]), os.getpid()))
+                sweep = os.path.join(self.pool.waiters, "%s.%d.%s.sweep" % (
+                    hname, os.getpid(), os.urandom(4).hex()))
                 try:
-                    self.pool._claim(sweep, self.worktree, self.sweeper)
+                    self.pool._claim(sweep, self.worktree, self.sweeper,
+                                     nest=os.path.basename(lock))
                 except BaseException:
                     os.close(fd)
                     raise
@@ -697,7 +758,8 @@ class Nested:
         return True
 
     def status(self):
-        return "gate-runner: waiting for another nested run under this holder to finish"
+        """The wait line for the last failed poll."""
+        return self._why
 
     def leave(self):
         if self.holder is not None:

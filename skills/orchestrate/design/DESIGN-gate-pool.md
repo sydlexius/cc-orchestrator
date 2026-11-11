@@ -662,7 +662,7 @@ is gone, SIGKILL included) the watchdog SIGKILLs the groups still listed. RUN (E
   resolves it: the watchdog runs with cwd `/`, so a relative `GATEQ_HOME` would otherwise send it a path naming nothing.
 - THE WORKTREE STAYS CLAIMED UNTIL THE SWEEP IS DONE (PR #543 review). A SIGKILLed holder's ticket lock frees at once, about a
   second before the watchdog has killed its step groups, and a waiter must not start in that worktree beside an orphaned mutation
-  step. So with the pool on, a holder creates `waiters/<ticket name>.sweep` (`{pool_protocol, worktree}`) in the same `admit.lock`
+  step. So with the pool on, a holder creates `waiters/<ticket name>.sweep` (`{pool_protocol, worktree, pid}`, `pid` the watchdog's) in the same `admit.lock`
   section as its commit and sends the path to its watchdog over the pipe. The WATCHDOG opens that file itself and holds an
   exclusive `flock` on it (its own open, nothing inherited, so rule 1 of the locks section holds); the holder starts its first step
   only once a try-lock on the file fails. `busy` is the worktree keys of held tickets PLUS held `.sweep` files. On EOF the watchdog
@@ -675,9 +675,22 @@ is gone, SIGKILL included) the watchdog SIGKILLs the groups still listed. RUN (E
 - EVERY RUNNER WITH A WATCHDOG HOLDS A CLAIM, NESTED ONES INCLUDED (PR #543 review). A nested gate or `--pool-run` takes no
   ticket, but it starts its own step groups under its own watchdog. If the outer holder is SIGKILLed, the outer watchdog is done as
   soon as the nested RUNNER is dead, while the nested watchdog may still be killing the nested step group; with only the outer
-  claim, a waiter could start beside that orphan. So a nested run creates its own `waiters/<holder ticket name>.<its pid>.sweep`
-  with the same worktree key, and its own watchdog locks it, exactly as above. `busy` counts EVERY held `.sweep` file, whoever made
+  claim, a waiter could start beside that orphan. So a nested run creates its own
+  `waiters/<holder ticket name>.<its pid>.<random hex>.sweep` with the same worktree key (its record adds `nest`, the basename of
+  the child lock it holds), and its own watchdog locks it, exactly as above. `busy` counts EVERY held `.sweep` file, whoever made
   it, so the worktree stays claimed until the last watchdog in the tree is done.
+- A CLAIM IS NEVER WRITTEN OVER ANOTHER (PR #581 review). Every `.sweep` record is staged in `tmp/` and HARD-LINKED into place,
+  which refuses an existing path, and the nested name carries a random part. With a pid-only name and a rename, a nested runner
+  whose pid was reused under the same holder replaced a claim whose OLD inode an orphan watchdog still flocked, and every scan then
+  saw only the new file: a same-worktree waiter could start beside that orphan once the visible claims were free.
+- A NESTED RUN WAITS ON AN EARLIER NESTED SWEEP (PR #581 review). A nested run frees its child lock when it ends, while its
+  watchdog may still be killing its groups; the next nested run under the same holder takes that free lock, so the lock alone
+  does not keep it out. So under `admit.lock`, after it takes its child lock, a nested run looks at every HELD
+  `<holder ticket>.*.sweep` other than the holder's own and WAITS (`waiting for a nested sweep under this holder to finish`) while
+  one is not an ANCESTOR's. An ancestor is a run holding a shorter child lock of this run's chain (`<ticket>.nest` up to the
+  parent's): it is still running and this run is its child, so waiting on it would deadlock. A record with no readable `nest`
+  is doubt and waits. STATED LIMIT: a SIGKILLed ancestor's claim still reads as an ancestor's, so its live descendants keep
+  running beside its orphan (they already were).
 - NO UNLOCKED WINDOW: whoever creates a `.sweep` file does so under `admit.lock` and keeps `admit.lock` until its try-lock on the
   file fails (its watchdog has it; milliseconds, and the only thing ever waited for under that lock). A `.sweep` whose lock is free
   therefore always belongs to a finished watchdog, and any evaluator unlinks it. NOT COVERED, stated plainly: SLOTS are not held through the sweep (they free with the holder), so for

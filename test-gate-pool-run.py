@@ -463,8 +463,9 @@ def case_nested(tmp, home):
     ls = tp.read(os.path.join(seen, "ls")).split()
     ticket = next((n for n in ls if n.endswith(".ticket")), "?")
     # Since A4 each runner with a watchdog also holds a `.sweep` claim: the gate's own
-    # (`<ticket>.sweep`) and the nested run's (`<ticket>.<its pid>.sweep`).
-    own_sweep = [n for n in ls if re.fullmatch(re.escape(ticket) + r"\.[0-9]+\.sweep", n)]
+    # (`<ticket>.sweep`) and the nested run's (`<ticket>.<its pid>.<random hex>.sweep`).
+    own_sweep = [n for n in ls
+                 if re.fullmatch(re.escape(ticket) + r"\.[0-9]+\.[0-9a-f]{8}\.sweep", n)]
     same("nested: --pool-run inside a gate step, at a weight the gate's own covers, runs "
          "UNDER the gate (GATEQ_HOLDER): no ticket of its own, one child lock, exit 0",
          (rc, tp.read(os.path.join(seen, "small.rc")), tp.read(os.path.join(seen, "small.out")),
