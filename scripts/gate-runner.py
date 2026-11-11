@@ -567,7 +567,29 @@ def alive(g):
         os.killpg(g, 0)
     except (ProcessLookupError, PermissionError):
         return False
-    return True
+    # Linux counts a zombie as a group member, so a group whose only members are unreaped
+    # zombies would read as alive until its parent reaps (forever under a PID 1 that never
+    # does). A zombie runs nothing, so where /proc is readable the group is alive only while
+    # one member is NOT a zombie. No /proc (macOS, where killpg already fails EPERM on a
+    # zombie-only group) or an unreadable /proc keeps the killpg answer.
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return True
+    seen = False
+    for p in pids:
+        try:
+            with open("/proc/" + p + "/stat", "rb") as f:
+                rest = f.read().rsplit(b")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        if len(rest) > 2 and rest[2] == str(g).encode():
+            if rest[0] not in (b"Z", b"X"):
+                return True
+            seen = True
+    # Alive unless /proc SHOWED the members and every one was a zombie: a group killpg can
+    # signal but /proc does not show (a hidepid mount) stays alive, on doubt.
+    return not seen
 groups, claims, buf, failed = set(), [], b"", False
 while not failed:
     chunk = os.read(0, 4096)

@@ -317,10 +317,10 @@ pooled serial step and the parallel leader poll). Everywhere else (a group the
 leader left a background job in, a cancelled or timed-out run, the parallel
 path's lingering groups, and Linux) it reaps first, and a window of
 milliseconds remains in which a SIGKILLed runner leaves a listed number that the
-kernel could hand to a new group. KNOWN LIMIT (Linux, reasoned): a zombie counts
-as a group member there, so under a PID 1 that never reaps (a container with no
-init) the sweep never ends and that worktree stays claimed until the watchdog
-pid is killed by hand.
+kernel could hand to a new group. On Linux a zombie counts as a group member,
+so the watchdog also reads `/proc` and treats a group whose members are all
+zombies as gone; a sweep therefore ends even under a PID 1 that never reaps (a
+container with no init).
 
 A gate started BY a pooled gate in the same worktree (the pre-push hook under a
 gate step that uploads, a gate run from a step) runs under its holder's slots

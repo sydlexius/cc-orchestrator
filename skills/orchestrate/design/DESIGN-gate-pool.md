@@ -647,10 +647,15 @@ is gone, SIGKILL included) the watchdog SIGKILLs the groups still listed. RUN (E
   `_prune_watched`), the parallel path's lingering groups, and Linux as coded (a zombie counts as a member there, so a group reads
   as alive until its leader is reaped). Where `os.waitid` is missing (macOS before Python 3.13) the reap-first order applies on
   every path.
-- KNOWN LIMIT, LINUX ZOMBIES (REASONED, not run: Linux is unverified locally until CI). The watchdog's "gone" test is
-  `killpg(g, 0)`, which on Linux succeeds while any member is an unreaped zombie. Under a PID 1 that never reaps (a container with
-  no init), a killed group's zombies persist: the watchdog re-sends SIGKILL each second forever and that worktree's `.sweep` claim
-  is held until the watchdog pid is killed by hand. The fix (read `/proc` and treat an all-zombie group as gone) is not built.
+- LINUX ZOMBIES. `killpg(g, 0)` succeeds on Linux while any member is an unreaped zombie, so a killed group whose leaders wait
+  on a parent that has not reaped them (or a PID 1 that never reaps: a container with no init) would read as alive forever, the
+  watchdog would re-send SIGKILL each second, and that worktree's `.sweep` claim would never free. So the watchdog's "gone" test
+  also reads `/proc`: a group whose members `/proc` shows are ALL zombies (state `Z` or `X`) is gone, since a zombie runs
+  nothing. No `/proc` (macOS, where `killpg` already raises EPERM on a zombie-only group), an unreadable `/proc`, or a group
+  `killpg` can signal but `/proc` does not show (a `hidepid` mount) keeps the `killpg` answer: alive, on doubt. MEASURED in PR
+  #581: the first Linux CI run failed on exactly this (the harness, the leaders' parent, reaps after the watchdog's exit), and a
+  non-root Linux container reproduced it on the unfixed commit and passed with the `/proc` check. This is the WATCHDOG's test
+  only; the runner's own `_group_alive` is unchanged, since the runner reaps its own leaders.
 - A CLAIM THE WATCHDOG CANNOT TAKE FAILS FAST. An `S<path>` it cannot open or lock ends the watchdog's reading at once: it kills
   whatever it lists and exits 3, so the holder's claim wait (`CLAIM_WAIT_S`, 10 s, under `admit.lock`) ends at the watchdog's
   exit instead of its timeout, and the run is NOT RUN with reason `pool-watchdog`. The pool root is made ABSOLUTE where gate-runner

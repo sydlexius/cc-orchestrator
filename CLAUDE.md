@@ -312,10 +312,13 @@ Runtime (`scripts/`; canonical source is this repo):
   gone (macOS, measured). Everywhere else the reap comes first and the narrow residual stands
   (milliseconds, needing exact pid reuse): the serial sweep's background-job branch,
   `_terminate_groups` (the cancel, overdue and give-up paths), parallel lingering groups, and
-  Linux as coded (it counts the zombie as a member). KNOWN LIMIT (REASONED, Linux not run):
-  `killpg(g, 0)` counts zombies on Linux, so under a PID 1 that never reaps (a container with
-  no init) a killed group never reads as gone, the sweep never ends, and that worktree's claim
-  is held until the watchdog pid is killed by hand. THE SWEEP CLAIM: with the pool on the grant writes `waiters/<ticket>.sweep`
+  Linux as coded (it counts the zombie as a member). LINUX ZOMBIES: `killpg(g, 0)` counts a
+  zombie as a group member on Linux, so the WATCHDOG's "gone" test also reads `/proc`: a group
+  whose members `/proc` shows are ALL zombies is gone (a zombie runs nothing), so a sweep ends
+  even while the dead runner's step leaders wait to be reaped, or under a PID 1 that never
+  reaps. No `/proc`, or a group `/proc` does not show, keeps the `killpg` answer (alive, on
+  doubt). MEASURED in a Linux container (non-root): without it the `protocol` and `claim-fast`
+  cases hang, exactly as the first PR #581 CI run failed. THE SWEEP CLAIM: with the pool on the grant writes `waiters/<ticket>.sweep`
   (`{pool_protocol, worktree, pid}`; a nested run its own `<holder ticket>.<its pid>.sweep`)
   under `admit.lock`, hands it to the watchdog, and keeps `admit.lock` until a try-lock on it
   FAILS (the WATCHDOG holds the lock, from its own open); `busy` counts every held `.sweep`
